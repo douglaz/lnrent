@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.1)
+# lnrent — Spec (draft v0.2)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -45,11 +45,14 @@ recipes, not hardcoded. Adding a service means dropping in a new recipe.
 
 - **Operator (primary, v1):** owns a box, wants recurring sats for running services.
   Technical, comfortable with a CLI and with Claude skills. Runs `lnrentd`.
-- **Buyer (v1, thin):** has a Nostr identity and a Lightning wallet. Discovers
-  offers, pays invoices, receives credentials over an encrypted Nostr DM.
+- **Buyer (v1):** has a Nostr identity and a Lightning wallet. Discovers offers,
+  pays invoices, receives credentials over an encrypted Nostr DM. Uses either the
+  lnrent **CLI buyer** or the **web client**; both talk straight to relays and the
+  buyer's own wallet, with no lnrent backend between buyer and operator.
 - **Marketplace (long-term, two-sided):** emerges from many operators publishing to
   shared Nostr relays. No central party owns it. v1 ships the operator half well;
-  the buyer half is a minimal reference client plus the published event spec.
+  the buyer half is two reference clients (CLI + static web) plus the published
+  listing and DM-protocol spec.
 
 ## 4. Architecture
 
@@ -93,6 +96,11 @@ plane. The rule is about our serving path, not the buyer's workload.
 Claude skills sit beside this, not inside it. They read and write the same sqlite
 state and recipe files, but only when a human runs them.
 
+Buyers use the lnrent **CLI** or **static web client**. Both connect directly to
+relays and to the buyer's own Lightning wallet, with no lnrent server in between.
+The web client is a static SPA: it signs with a NIP-07 browser extension (or a
+locally held key) and pays via WebLN or a copied bolt11.
+
 ### 4.3 Trust model
 
 - Buyer pays the first period invoice **before** provisioning. Operator provisions
@@ -105,28 +113,47 @@ state and recipe files, but only when a human runs them.
 
 ## 5. Marketplace over Nostr
 
-Follow Nostr best practices. Mapping:
+Principle: use a standard NIP where it genuinely fits; where none fits, define an
+explicit lnrent application protocol carried over Nostr's encrypted-DM transport.
+Do not bend a NIP to a job it was not designed for.
 
-| Concern | Mechanism | Kind |
+| Concern | Mechanism |
+|--|--|
+| Storefront / offer listing | **NIP-99** classified listing (kind `30402`) |
+| Order, invoice, credential delivery, billing notices, cancel | **lnrent DM protocol** (JSON) inside **NIP-17** gift-wrapped private DMs (kind `1059`) |
+| Identity | Nostr pubkeys (operator and buyer) |
+| Auto-renew pull payments (v2) | **NIP-47** Nostr Wallet Connect |
+
+NIP-90 (Data Vending Machines) was considered for ordering and dropped: it is
+job-shaped (single request, single result) and does not fit ongoing subscriptions.
+Forcing it would be a hack. Ordering and the full subscription lifecycle ride
+NIP-17 DMs with an explicit message schema instead. This is exactly how NIP-15
+carries its orders, so it is idiomatic, not ad hoc.
+
+### 5.1 lnrent DM protocol
+
+Each message is a JSON object with a `type` discriminator, sent as the content of a
+NIP-17 private DM between the buyer and operator pubkeys:
+
+| type | direction | payload |
 |--|--|--|
-| Storefront / offer listing | NIP-99 classified listing | `30402` |
-| Order / provision request + paid-job loop | NIP-90 Data Vending Machine | request `5xxx`, result `6xxx`, feedback `7000` |
-| Invoice delivery, credential delivery, billing notices | NIP-17 private DM (gift-wrapped) | `1059` wrap |
-| Auto-renew pull payments (later) | NIP-47 Nostr Wallet Connect | — |
+| `order.request`   | buyer -> operator | `listing_id`, validated `params` |
+| `order.invoice`   | operator -> buyer | `order_id`, `bolt11`, `amount_sat`, `period`, `expires_at` |
+| `order.error`     | operator -> buyer | `order_id`, `reason` |
+| `provision.ready` | operator -> buyer | `subscription_id`, `payload` (the credentials) |
+| `billing.invoice` | operator -> buyer | `subscription_id`, `bolt11`, `amount_sat`, `due_at` |
+| `billing.notice`  | operator -> buyer | `subscription_id`, `state`, `message` (grace/suspend/terminate) |
+| `sub.cancel`      | buyer -> operator | `subscription_id` |
 
-Flow:
+Payment is settled out-of-band with the buyer's own Lightning wallet. lnrentd
+confirms settlement through its `PaymentBackend` (phoenixd/Fedimint), never by
+trusting a Nostr message that claims payment.
 
-1. Operator publishes a **listing** (`30402`) per offered service: title, summary,
-   price (`price` tag: amount, `SAT`, `month`), category `t` tags, `d` identifier.
-2. Buyer sends a **NIP-90 job request** ("provision service X with these params").
-3. `lnrentd` replies with a **NIP-90 feedback** (`7000`, status `payment-required`)
-   carrying a bolt11 invoice (or a Fedimint-routable invoice).
-4. On payment, `lnrentd` runs the recipe's `provision` hook, then delivers
-   credentials as a **NIP-17 DM**, and emits a NIP-90 **job result** (`6xxx`) with
-   non-sensitive status only.
-5. Renewal notices and suspend/terminate warnings go out as NIP-17 DMs.
+### 5.2 Relays
 
-Exact kind numbers in the NIP-90 range get pinned in M1 against the current spec.
+Default to a set of popular public relays (operator-overridable). Operator-run or
+service-specific relays come later, once listing and order-DM delivery reliability
+on public relays is understood.
 
 ## 6. Payments and subscriptions
 
@@ -289,22 +316,26 @@ access details.
 | **wireguard** | host | add a peer, allocate IP | `.conf` / QR |
 | **vm** (flagship) | vm (incus) | create VM, inject SSH key | host, port, user |
 | **hermes** | vm or container | create tenant, run hermes install script, buyer brings LLM keys | SSH + `hermes` usage note |
-| **fedimint** | vm or container | bring up a Fedimint client/guardian-adjacent instance against config | endpoint + admin creds |
+| **fedimint** | vm | run a `fedimintd` **guardian**, ready for the DKG setup ceremony with peer guardians | guardian admin URL + setup/connection code |
 
 Notes:
 - **hermes** = NousResearch/hermes-agent: Python 3.11+/Node, installed via its
   `install.sh`, config in `~/.hermes/`, buyer supplies their own LLM provider keys.
   Runs fully inside the tenant sandbox. Confirms the AI-free-control-plane rule.
-- **fedimint** scope (run a guardian vs run a client/gateway-adjacent service) is an
-  open question, see §15.
+- **fedimint** = a single `fedimintd` **guardian** instance, provisioned ready to
+  run the distributed key generation (DKG) setup ceremony and coordinate with other
+  guardians to form a federation. Delivery payload is the guardian admin endpoint
+  and the setup/connection code the buyer shares with peer guardians. Not a
+  pre-formed federation, and not just a client.
 
 ## 10. Claude skills (author-time and operator-time)
 
 These never run in the serving path. They are how a human drives lnrent.
 
-- **lnrent-onboard** — set up a box: install `lnrentd`, pick payment backend
-  (phoenixd or fedimint), pick provisioning backend, generate the operator Nostr
-  key, configure relays.
+- **lnrent-onboard** — given an existing box reachable over **SSH with sudo**,
+  connect, install `lnrentd` (Nix on NixOS, apt+systemd on Debian), pick payment
+  backend (phoenixd or fedimint), pick provisioning backend, generate the operator
+  Nostr key, and set default relays.
 - **lnrent-recipe** — scaffold, edit, and test a service recipe; dry-run the
   lifecycle hooks against a throwaway tenant.
 - **lnrent-list** — compose and publish a NIP-99 listing for a recipe; price it.
@@ -374,6 +405,9 @@ lnrent/
     wireguard/ vm/ hermes/ fedimint/
   skills/                 # Claude skills (author/operator-time)
     lnrent-onboard/ lnrent-recipe/ lnrent-list/ lnrent-subs/ lnrent-doctor/
+  clients/
+    cli/                  # Rust: lnrent buyer CLI
+    web/                  # static web client (SPA over relays + NIP-07 + WebLN)
   nix/                    # flake + NixOS module
   packaging/debian/       # systemd unit + install script
   docs/                   # protocol notes, NIP mapping, ADRs
@@ -383,32 +417,38 @@ lnrent/
 
 - **M0 — Skeleton.** Repo, `lnrentd` skeleton, sqlite, recipe loader, `PaymentBackend`
   + `ProvisionBackend` traits with `host` and `phoenixd` stubs.
-- **M1 — WireGuard proof-of-life (MVP).** Full loop on one box: publish listing ->
-  NIP-90 order -> phoenixd invoice -> pay -> `provision` peer -> NIP-17 deliver
-  config -> renew/suspend/destroy via the state machine. Pin NIP-90 kinds here.
+- **M1 — WireGuard proof-of-life (MVP).** Full loop on one box: publish NIP-99
+  listing -> NIP-17 `order.request` -> phoenixd invoice -> pay -> `provision` peer
+  -> NIP-17 `provision.ready` -> renew/suspend/destroy via the state machine. Pin
+  the lnrent DM protocol schema here. Includes a minimal CLI buyer to drive the loop.
 - **M2 — VM-for-others.** Incus backend, `vm` recipe, SSH-key injection, delivery.
-- **M3 — More recipes.** Hermes and Fedimint recipes; recipe-authoring skill polish.
+- **M3 — More recipes.** Hermes and Fedimint guardian recipes; recipe-authoring
+  skill polish.
 - **M4 — Fedimint payment backend.** Receive via existing federation + gatewayd as
   an alternative to phoenixd.
-- **M5 — Buyer reference client + NixOS module + Debian packaging.**
+- **M5 — Web buyer client + NixOS module + Debian packaging.**
 - **M6 — v2 hands-off:** NWC (NIP-47) pull subscriptions; reputation hooks.
 
 ## 16. Open questions
 
-1. **Fedimint recipe scope:** does "Fedimint instance" mean run a full guardian, a
-   client/gateway-adjacent service, or a single-guardian dev federation? Each is a
-   very different recipe.
-2. **NIP-90 vs NIP-15:** confirm NIP-90 DVM is the right ordering protocol for
-   *ongoing subscriptions* (it is job-shaped). NIP-15 stalls/orders is an alt for
-   the order step. Decide during M1.
-3. **Buyer client:** how much do we build vs rely on existing Nostr clients that
-   speak NIP-90? v1 may ship a minimal CLI buyer only.
-4. **Provisioning the box itself:** you mentioned provisioning VMs for others as
-   the first external service. Do we also want lnrent to provision the *operator's
-   own* box from bare metal (cloud-init/nixos-anywhere), or assume an existing box
-   in v1? (Spec currently assumes existing box; "sell VMs" is the M2 service.)
-5. **Relay strategy:** which relays, and do operators run their own relay for their
-   listings/orders to avoid dropped events?
+Resolved in v0.2: Fedimint = single guardian for DKG (§9); NIP-90 dropped in favor
+of an lnrent DM protocol over NIP-17 (§5); buyer clients = CLI + web (§3, §14);
+operator box assumed to exist with SSH+sudo (§10); default to popular relays (§5.2).
+
+Still open:
+
+1. **DKG coordination UX:** how do peer guardians discover and authenticate each
+   other for the federation-creation ceremony? Out-of-band exchange of setup codes
+   in v1, or a Nostr-mediated rendezvous?
+2. **Web client trust surface:** require a NIP-07 browser signer + WebLN wallet, or
+   ship an embedded key + manual bolt11 copy as a fallback? Affects how "no backend"
+   the web client truly is.
+3. **Resource enforcement:** per-tenant CPU/mem/disk and port allocation are in the
+   manifest but not yet enforced. Which limits does the daemon enforce vs delegate
+   to the provisioning backend?
+4. **Listing updates:** price or availability changes mean re-publishing the
+   `30402` event. Define update/withdraw semantics (replaceable-event `d` tag
+   handling, sold-out signaling).
 
 ## 17. Out of scope (v1)
 
