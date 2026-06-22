@@ -1,30 +1,45 @@
-# lnrent — Spec (draft v0.2)
+# lnrent — Spec (draft v0.3)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
 
 ## 1. What this is
 
-lnrent lets a person with a box (a rented VPS or a home-lab machine) install a
-self-hostable service, list it on a Nostr-based marketplace, and rent it to others
-on a Lightning-settled subscription. Operators run everything themselves. There is
-no central marketplace server and no central payment custodian.
+lnrent is a **VPS manager**. An operator points it at a box (eventually several)
+reachable over SSH with sudo and manages everything on it from one control plane:
+virtual machines and containers, networking, storage, and the services running on
+top. On top of management, lnrent can **rent any managed service to others**,
+settled in Bitcoin Lightning and discovered over a Nostr marketplace. No central
+marketplace server, no central payment custodian.
+
+Renting is one capability, not the whole product. A managed service is either:
+
+- **self-use** — the operator runs it for themselves; no Listing, no billing; or
+- **rented** — the operator publishes a Listing and a Buyer pays a Lightning
+  subscription to use it.
+
+The management machinery underneath is identical. Renting only adds a Listing, a
+Subscription, and Lightning billing on top of a managed Instance.
 
 The product is two things:
 
-1. **A small always-on control plane** (`lnrentd`, Rust) that watches for payments,
-   provisions and tears down services, enforces subscriptions, and speaks Nostr.
-2. **A set of Claude skills** used by a human operator at author-time and setup-time
-   to onboard a box, write service recipes, publish listings, and inspect state.
+1. **An always-on control plane** (`lnrentd`, Rust) that manages compute, network,
+   storage, and services on the operator's boxes, watches for payments, enforces
+   subscriptions, and speaks Nostr. Pure Rust/bash, no LLM in the path (§4.1).
+2. **A set of Claude skills** used by a human operator at author-time and
+   setup-time: onboard a box, write recipes, manage resources, publish listings,
+   inspect state.
 
-First services: **WireGuard VPN**, **VM-for-others** (provisioning as a service),
-**Hermes agent** (NousResearch/hermes-agent), **Fedimint instance**. These are
-recipes, not hardcoded. Adding a service means dropping in a new recipe.
+First services: **WireGuard VPN**, **VMs** (for self and for rent), **Hermes agent**
+(NousResearch/hermes-agent), **Fedimint guardian**. These are recipes, not
+hardcoded. Adding a service means dropping in a new recipe.
 
 ## 2. Goals and non-goals
 
 ### Goals
-- An operator can go from a bare NixOS or Debian box to a published, rentable
+- From one control plane, an operator manages compute, networking, storage, and
+  services across one or more boxes, for self-use or for rent.
+- An operator can go from a NixOS or Debian box (SSH+sudo) to a published, rentable
   service in a few skill-driven steps.
 - A buyer with a Nostr key and a Lightning wallet can discover an offer, pay, and
   receive working credentials, with no account and no operator-side AI.
@@ -40,6 +55,28 @@ recipes, not hardcoded. Adding a service means dropping in a new recipe.
 - No fiat. No on-chain-only path (Lightning first; on-chain is a later fallback).
 - No AI anywhere in the runtime serving path (hard rule, see §4).
 - No multi-tenant bin-packing guarantees or SLAs. Best-effort, operator-owned.
+
+### 2.1 Capability surface ("do everything")
+
+lnrent's job is the full management surface of a box, with renting layered on top.
+Capabilities, grouped and phased:
+
+| Subsystem | Manages | Phase |
+|--|--|--|
+| Box / fleet | onboard over SSH+sudo, inventory, health; later provision the box itself (cloud API / nixos-anywhere) | core, then later |
+| Compute | VMs and system containers (Incus default; libvirt/proxmox later) | core |
+| Networking | WireGuard, firewall, port allocation, reverse-proxy/ingress, DNS | phased |
+| Storage | volumes, snapshots, backups | phased |
+| Services | install and run Recipes, for self-use or rent | core |
+| Observability | status, logs, metrics, alerts | phased |
+| Marketplace | Listings, Subscriptions, Lightning billing, Nostr | the rental layer |
+
+Everything is a Recipe or a managed resource behind the same `ProvisionBackend` and
+lifecycle machinery. Renting only adds Listing + Subscription + billing on top.
+
+Prior art to learn from, not reinvent: Coolify, CapRover, Cloudron, YunoHost,
+Cockpit, Proxmox. lnrent's differentiators are the AI-free control plane, native
+Nostr/Lightning rental, and self-sovereign single-operator ownership.
 
 ## 3. Personas
 
@@ -421,13 +458,19 @@ lnrent/
   listing -> NIP-17 `order.request` -> phoenixd invoice -> pay -> `provision` peer
   -> NIP-17 `provision.ready` -> renew/suspend/destroy via the state machine. Pin
   the lnrent DM protocol schema here. Includes a minimal CLI buyer to drive the loop.
-- **M2 — VM-for-others.** Incus backend, `vm` recipe, SSH-key injection, delivery.
+- **M2 — Compute management.** Incus backend: create/start/stop/destroy VMs and
+  system containers, for the operator's own use and for rent (`vm` recipe, SSH-key
+  injection, delivery).
 - **M3 — More recipes.** Hermes and Fedimint guardian recipes; recipe-authoring
   skill polish.
 - **M4 — Fedimint payment backend.** Receive via existing federation + gatewayd as
   an alternative to phoenixd.
 - **M5 — Web buyer client + NixOS module + Debian packaging.**
 - **M6 — v2 hands-off:** NWC (NIP-47) pull subscriptions; reputation hooks.
+- **M7 — Manager breadth.** Networking (firewall, port allocation, ingress/reverse
+  proxy, DNS), storage (volumes, snapshots, backups), observability, multi-box
+  fleet, and provisioning the box itself (cloud API / nixos-anywhere). This is where
+  "do everything" lands; capabilities ship incrementally, not as one block.
 
 ## 16. Open questions
 
@@ -453,6 +496,8 @@ Still open:
 ## 17. Out of scope (v1)
 
 - Central marketplace site, hosted directory, custodial escrow, disputes.
-- Fiat, on-chain-only settlement, multi-box orchestration/clustering.
+- Fiat, on-chain-only settlement.
+- Kubernetes-style clustering / HA across boxes. lnrent manages a fleet of boxes
+  but does not cluster them under one scheduler.
 - Any LLM/AI in the control plane (permanent rule, not just v1).
 - SLAs, autoscaling, bin-packing guarantees.
