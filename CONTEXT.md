@@ -95,6 +95,21 @@ window) from which the Operator nudges the Buyer to renew, so renewing early avo
 interruption. Not a hard transition.
 _Avoid_: grace, reminder date.
 
+### VM security
+
+**Security tier**:
+The honestly-advertised privacy guarantee of a VM Listing: Tier 0 (no guarantee vs
+the host), 1 (tenant-encrypted disk), 1.5 (hardened provider-encrypted host), 2
+(attested confidential VM). A Listing must never claim above its tier. See
+docs/security/vm-deployment-guidelines.md.
+_Avoid_: security level, privacy mode.
+
+**Host security profile**:
+A signed record a Host publishes (its `host_id` = the Operator's Nostr key) declaring
+its tier, hardware, boot integrity, encryption, and operations posture, so Buyers can
+verify what they are trusting.
+_Avoid_: host manifest (that is the operator manifest), attestation.
+
 ## Example dialogue
 
 **Dev:** A buyer wants the "5-device WireGuard" thing. Is that a Recipe?

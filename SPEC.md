@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.10)
+# lnrent — Spec (draft v0.11)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -551,7 +551,7 @@ it sits cleanly inside the AI-free invariant. Trait stub in v1.
 | Recipe | Isolation | What provision does | Delivery payload |
 |--|--|--|--|
 | **wireguard** | host | add a peer, allocate IP | `.conf` / QR |
-| **vm** (flagship) | vm (incus) | create VM, inject SSH key | host, port, user |
+| **vm** (flagship) | vm (incus) | create VM, inject SSH key | host, port, user (+ security `tier`, §9.1) |
 | **hermes** | vm or container | create instance, run hermes install script, buyer brings LLM keys | SSH + `hermes` usage note |
 | **fedimint** | vm | run a `fedimintd` **guardian**, ready for the DKG setup ceremony with peer guardians | guardian admin URL + setup/connection code |
 
@@ -564,6 +564,34 @@ Notes:
   guardians to form a federation. Delivery payload is the guardian admin endpoint
   and the setup/connection code the buyer shares with peer guardians. Not a
   pre-formed federation, and not just a client.
+
+### 9.1 VM rental security tiers
+
+VM rental follows the security model in
+[docs/security/vm-deployment-guidelines.md](docs/security/vm-deployment-guidelines.md)
+(ADR-0007). A normal VM is not a cryptographic boundary against its host, so every VM
+Listing advertises an **honest tier** and never claims more:
+
+| Tier | Label | Guarantee |
+|--|--|--|
+| 0 | Basic VPS | No privacy guarantee against the host operator. |
+| 1 | Encrypted VPS | Tenant owns the disk key; host stores ciphertext. Runtime still trusts the host. |
+| 1.5 | Hardened VPS | Provider-encrypted, Secure Boot + TPM, per-VM keys, sVirt, audit logs, quarantine. Tenant still trusts the host. |
+| 2 | Confidential VPS | Attested confidential VM (SEV-SNP / TDX); secrets released only after attestation. |
+
+**M1 ships Tier 0**, labeled honestly. The tier ladder is the security roadmap (§15).
+Governing rules from the guidelines, load-bearing for the design:
+
+- **Never overclaim** (the guidelines' final rule: weaker claim, stronger implementation).
+- The control-plane **node agent exposes only narrow VM ops** (create/start/stop/
+  reboot/snapshot/rotate-key/health), never arbitrary shell or libvirt/QEMU args.
+  This matches the AI-free control plane and ADR-0001.
+- **Tenant-provided images are hostile**; their hooks never run on the host.
+- Each host publishes a **signed security profile** (guidelines §25; `host_id` is the
+  operator's Nostr key) that buyers read before renting.
+
+The full guidelines govern host onboarding, encryption, isolation, attestation, and
+the pre-launch test plan; they are the source of truth for VM security.
 
 ## 10. Claude skills (author-time and operator-time)
 
@@ -684,6 +712,12 @@ lnrent/
   proxy, DNS), storage (volumes, snapshots, backups), observability, multi-box
   fleet, and provisioning the box itself (cloud API / nixos-anywhere). This is where
   "do everything" lands; capabilities ship incrementally, not as one block.
+- **Security tier roadmap (VM rental).** VM Listings advertise an honest security
+  tier (ADR-0007, §9.1, docs/security/vm-deployment-guidelines.md). M1 ships **Tier 0**
+  (Basic VPS). Later tiers are their own milestones: Tier 1 (tenant-managed LUKS),
+  Tier 1.5 (the guidelines' "minimum viable secure launch": Secure Boot + TPM + per-VM
+  encryption + KMS-style key release + sVirt + remote audit logs + quarantine), Tier 2
+  (attested confidential VMs, SEV-SNP/TDX).
 
 ## 16. Open questions
 
