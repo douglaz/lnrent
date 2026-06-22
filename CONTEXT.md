@@ -77,6 +77,19 @@ the Operator directly (self-use) or by one Subscription (rented). One Subscripti
 -> one Instance (v1).
 _Avoid_: tenant, node, deployment, server
 
+### Billing
+
+**Paid-through date**:
+The hard expiry timestamp of a Subscription. The Instance runs until this date; past
+it, unpaid, the service is interrupted. A renewal payment extends it by one period.
+_Avoid_: due date, expiry, renewal date.
+
+**Soft date**:
+A recommendation timestamp before the Paid-through date (paid-through minus a lead
+window) from which the Operator nudges the Buyer to renew, so renewing early avoids
+interruption. Not a hard transition.
+_Avoid_: grace, reminder date.
+
 ## Example dialogue
 
 **Dev:** A buyer wants the "5-device WireGuard" thing. Is that a Recipe?

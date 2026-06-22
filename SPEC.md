@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.8)
+# lnrent — Spec (draft v0.9)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -43,8 +43,9 @@ hardcoded. Adding a service means dropping in a new recipe.
   service in a few skill-driven steps.
 - A buyer with a Nostr key and a Lightning wallet can discover an offer, pay, and
   receive working credentials, with no account and no operator-side AI.
-- Subscriptions are enforced automatically: pay to start, keep paying to stay up,
-  lapse means grace then suspend then destroy.
+- Subscriptions are enforced automatically: prepaid to an expiry date, renew before
+  it (nudged early from a soft date), lapse means suspend at the date then destroy
+  after retention.
 - New services are added as self-contained recipes without touching daemon code.
 - The whole thing runs on NixOS (declarative) and Debian (imperative).
 
@@ -252,8 +253,9 @@ NIP-17 private DM between the buyer and operator pubkeys:
 | `order.error`     | operator -> buyer | `order_id`, `reason` |
 | `provision.ready` | operator -> buyer | `subscription_id`, `payload` (the credentials) |
 | `billing.invoice` | operator -> buyer | `subscription_id`, `bolt11`, `amount_sat`, `due_at` |
-| `billing.notice`  | operator -> buyer | `subscription_id`, `state`, `message` (grace/suspend/terminate) |
+| `billing.notice`  | operator -> buyer | `subscription_id`, `state`, `message` (renewal reminder / suspend / terminate) |
 | `billing.refund`  | operator -> buyer | `subscription_id`, `amount_sat`, `status` (sent / failed) |
+| `renew.request`   | buyer -> operator | `subscription_id` (request a renewal invoice on demand) |
 | `sub.cancel`      | buyer -> operator | `subscription_id` |
 
 Payment is settled out-of-band with the buyer's own Lightning wallet. lnrentd
@@ -292,24 +294,31 @@ trait PaymentBackend {
 
 Operator picks one backend per box in config. All expose the same trait.
 
-### 6.2 Subscription model: push billing (v1)
+### 6.2 Subscription model: prepaid expiry, renew before the date (v1)
 
-Push model, agreed:
+A subscription is **prepaid to a hard expiry date** (`paid_through`):
 
-- Service runs while paid. Each period the operator issues a fresh invoice.
-- Non-payment moves the subscription through a state machine (below), ending in
-  suspend and then destroy.
-- **NWC pull** (NIP-47), where the buyer grants a budgeted wallet connection and the
-  operator auto-charges, is the v2 hands-off upgrade. The state machine is designed
-  so pull is a drop-in trigger for the renewal step.
+- Each payment extends `paid_through` by `period`. The buyer renews any time before
+  it; renewing early just pushes the date out (early renewals stack, never wasted).
+- A **soft date** (`paid_through - renew_lead`) is a recommendation: from there the
+  daemon nudges the buyer to renew (NIP-17 reminders) so the service is never
+  interrupted. Renewing well before expiry is the encouraged path.
+- At the **hard date**, if unpaid, the service is interrupted (`suspend`), then
+  destroyed after `retention`. There is no post-expiry grace; the soft-date
+  recommendation is the buffer.
+- **NWC pull** (NIP-47) is the v2 hands-off upgrade: the buyer grants a budgeted
+  wallet connection and the daemon auto-renews before the soft date, so it never
+  interrupts.
 
 ### 6.3 Subscription state machine
 
-States: `PENDING`, `PROVISIONING`, `ACTIVE`, `DUE`, `GRACE`, `SUSPENDED`,
-`TERMINATED`, `EXPIRED`, `CANCELLED`, `REFUND_DUE`, `REFUNDED`.
+States: `PENDING`, `PROVISIONING`, `ACTIVE`, `SUSPENDED`, `TERMINATED`, `EXPIRED`,
+`CANCELLED`, `REFUND_DUE`, `REFUNDED`.
 
-Timers per Listing (operator-tunable): `period` (e.g. 30d), `grace` (e.g. 3d,
-Instance still up), `retention` (e.g. 7d after suspend, data kept before destroy).
+Timers per Listing (operator-tunable): `period` (how much a payment extends
+`paid_through`, e.g. 30d), `renew_lead` (how far before expiry renewal is recommended
+and reminders start, e.g. 7d), `retention` (after suspend, data kept before destroy,
+e.g. 7d).
 
 **Order and first capture** (no hold; capture-then-refund, §6.4):
 - **PENDING** — pre-flight passed, first invoice issued, awaiting payment.
@@ -317,7 +326,8 @@ Instance still up), `retention` (e.g. 7d after suspend, data kept before destroy
   is not silently resurrected).
 - **PENDING -> PROVISIONING** — first payment settles and is captured. Run
   `provision`, retried with backoff.
-- **PROVISIONING -> ACTIVE** — provision succeeded; deliver credentials.
+- **PROVISIONING -> ACTIVE** — provision succeeded; deliver credentials and set
+  `paid_through = now + period`.
 - **PROVISIONING -> REFUND_DUE** — provision failed permanently after retries.
 
 **Refund path** (§6.4):
@@ -326,18 +336,22 @@ Instance still up), `retention` (e.g. 7d after suspend, data kept before destroy
 - **REFUND_DUE (stuck)** — the refund payment itself failed (payer offline, no
   liquidity); operator alerted, manual resolution. Funds never silently vanish.
 
-**Renewal and lapse** (ordinary invoices, no hold needed):
-- **ACTIVE -> DUE** — period ended; renewal invoice issued; NIP-17 reminder sent.
-- **DUE -> ACTIVE** — renewal paid.
-- **DUE -> GRACE** — renewal unpaid past period end; Instance stays up; sterner notice.
-- **GRACE -> ACTIVE** — late renewal paid; Instance never stopped.
-- **GRACE -> SUSPENDED** — grace ended unpaid; run `suspend` (stop, keep data).
-- **SUSPENDED -> ACTIVE** — late payment; run `resume`.
+**Renewal** (prepaid, renew before the date, §6.2):
+- While **ACTIVE**, the Instance runs until `paid_through`. A renewal payment extends
+  `paid_through` by `period`; early renewals stack, so renewing early never wastes
+  time.
+- At `soft_date` (= `paid_through - renew_lead`) the daemon starts NIP-17 renewal
+  reminders and makes a renewal invoice available. This is a recommendation; the
+  service is not interrupted.
+- **ACTIVE -> SUSPENDED** — `paid_through` reached unpaid; run `suspend` (service
+  interrupted, data kept).
+- **SUSPENDED -> ACTIVE** — late renewal within retention; run `resume`; extend
+  `paid_through`.
 - **SUSPENDED -> TERMINATED** — retention ended; run `destroy` (purge data).
 
 **Buyer-initiated:**
-- **ACTIVE/DUE/GRACE -> CANCELLED** — buyer cancels; run `suspend`, then `destroy`
-  after retention. The current paid period is not refunded.
+- **ACTIVE/SUSPENDED -> CANCELLED** — buyer cancels; run `suspend`, then `destroy`
+  after retention. Remaining prepaid time is not refunded.
 
 ### 6.4 Provisioning atomicity and refunds
 
@@ -357,6 +371,20 @@ provision succeeds (ADR-0003). Two consequences:
 Operators who require true provision-then-capture atomicity can run an **LND payment
 backend** (native hold invoices) instead of phoenixd. That backend is a later option,
 not v1.
+
+### 6.5 Enforcement engine
+
+A single periodic **reconcile loop** advances subscriptions: it scans those whose
+`next_deadline <= now` and fires the due transition (remind at `soft_date`, `suspend`
+at `paid_through`, `destroy` at retention end), recomputing `next_deadline` each time.
+Transitions are idempotent and journaled to `event_log`, so a crash mid-hook cannot
+double-run or wedge.
+
+Because all dates are absolute wall-clock timestamps, the loop is **downtime-safe**:
+if the Box was off across a deadline, the transition fires on restart. The buyer is
+expected to renew before `paid_through` (nudged early from `soft_date`), so suspension
+at the hard date is the agreed outcome regardless of operator uptime. Reminders are
+best-effort; the buyer can also request a renewal invoice on demand (`renew.request`).
 
 ## 7. Service recipe spec
 
@@ -391,7 +419,7 @@ category = ["vpn", "privacy"]
 [pricing]
 amount_sat = 5000
 period = "30d"
-grace = "3d"
+renew_lead = "7d"
 retention = "7d"
 
 [provisioning]
@@ -542,12 +570,14 @@ CREATE TABLE recipe (                -- mirror of on-disk recipes for fast looku
 CREATE TABLE subscription (
   id TEXT PRIMARY KEY,
   recipe_id TEXT, buyer_pubkey TEXT,
-  state TEXT,                        -- see §6.3 (PENDING|PROVISIONING|ACTIVE|DUE|GRACE|SUSPENDED|TERMINATED|EXPIRED|CANCELLED|REFUND_DUE|REFUNDED)
+  state TEXT,                        -- see §6.3 (PENDING|PROVISIONING|ACTIVE|SUSPENDED|TERMINATED|EXPIRED|CANCELLED|REFUND_DUE|REFUNDED)
   params_json TEXT,                  -- validated buyer params
   refund_dest TEXT,                  -- BOLT12 offer or Lightning address, for refunds
   instance_handle_json TEXT,         -- backend handles for later hooks
-  period_s INTEGER, grace_s INTEGER, retention_s INTEGER,
-  current_period_end INTEGER, next_deadline INTEGER,
+  period_s INTEGER, renew_lead_s INTEGER, retention_s INTEGER,
+  paid_through INTEGER,              -- hard expiry; service interrupted after this
+  soft_date INTEGER,                 -- paid_through - renew_lead_s; renewal recommended from here
+  next_deadline INTEGER,             -- reconcile-loop cursor
   created_at INTEGER, updated_at INTEGER);
 
 CREATE TABLE invoice (
