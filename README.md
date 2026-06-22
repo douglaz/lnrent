@@ -12,4 +12,26 @@ recipes, so the set is open-ended.
   payments, subscriptions, Nostr.
 - **Author-time tooling:** Claude skills — onboard, write recipes, manage, list, inspect.
 
-See **[SPEC.md](./SPEC.md)** for the full design. Status: early draft.
+## Status
+
+Spec-stage, building toward **M1** (the WireGuard rental loop). **M0 (skeleton)** is in:
+core domain types, subsystem traits (`ComputeBackend`/`NetworkBackend`/`PaymentBackend`)
+with `host`/WireGuard/phoenixd stubs, the recipe loader, and the sqlite schema.
+
+Design: [SPEC.md](./SPEC.md) · glossary: [CONTEXT.md](./CONTEXT.md) · decisions:
+[docs/adr/](./docs/adr/) (0001–0006).
+
+## Build
+
+```sh
+cargo build
+cargo test
+LNRENT_DATA_DIR=./data LNRENT_RECIPES_DIR=./recipes cargo run --bin lnrentd
+cargo run --bin lnrent -- recipes
+```
+
+## Layout
+
+- `daemon/` — Rust: `lnrentd` (control plane) + `lnrent` (operator CLI)
+- `recipes/` — service recipes (`wireguard/` so far: manifest + lifecycle hook stubs)
+- `docs/adr/` — architecture decision records

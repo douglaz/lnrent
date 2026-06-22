@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# WireGuard provision hook. SPEC.md §7.2.
+# Input: subscription JSON on stdin (subscription, instance, validated params, host facts).
+# Output: delivery payload JSON on stdout (the .conf for the buyer) + internal handles.
+# M0 stub. M1: allocate an IP, add the wg peer, return the client config.
+set -euo pipefail
+echo '{"error":"wireguard provision not implemented (M0 stub)"}'
+exit 1

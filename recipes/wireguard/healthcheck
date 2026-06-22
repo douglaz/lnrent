@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# WireGuard healthcheck hook: exit 0 if the peer is healthy. SPEC.md §7.2.
+# M0 stub: report healthy. M1: verify the peer exists in `wg show`.
+exit 0

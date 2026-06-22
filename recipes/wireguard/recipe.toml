@@ -1,0 +1,26 @@
+[service]
+id = "wireguard"
+name = "WireGuard VPN"
+summary = "Private WireGuard peer, 1 device, unmetered."
+version = "0.1.0"
+category = ["vpn", "privacy"]
+
+[pricing]
+amount_sat = 5000
+period = "30d"
+renew_lead = "7d"
+retention = "7d"
+
+[provisioning]
+backend = "host"
+isolation = "none"
+resources = { cpu = 0, mem_mb = 0, disk_gb = 0 }
+
+[os]
+supports = ["nixos", "debian"]
+
+[[params]]
+key = "pubkey"
+label = "Your WireGuard public key"
+type = "string"
+required = true

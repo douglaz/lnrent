@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# WireGuard suspend hook: stop serving the peer, keep its allocation. SPEC.md §7.2.
+# M0 stub. M1: disable the peer (keep config/IP reserved).
+set -euo pipefail
+echo '{"error":"wireguard suspend not implemented (M0 stub)"}'
+exit 1

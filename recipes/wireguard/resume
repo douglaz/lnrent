@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# WireGuard resume hook: re-enable a suspended peer. SPEC.md §7.2.
+# M0 stub. M1: re-add the peer with its reserved IP.
+set -euo pipefail
+echo '{"error":"wireguard resume not implemented (M0 stub)"}'
+exit 1

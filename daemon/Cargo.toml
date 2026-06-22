@@ -1,0 +1,24 @@
+[package]
+name = "lnrentd"
+version = "0.1.0"
+edition = "2021"
+description = "lnrent control plane (daemon) and operator CLI"
+
+[[bin]]
+name = "lnrentd"
+path = "src/main.rs"
+
+[[bin]]
+name = "lnrent"
+path = "src/bin/lnrent.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
