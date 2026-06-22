@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.7)
+# lnrent — Spec (draft v0.8)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -167,8 +167,8 @@ locally held key) and pays via WebLN or a copied bolt11.
 
 - Buyer pays the first period invoice **before** provisioning. Operator provisions
   on confirmed payment. No escrow.
-- Operator reputation accrues to their Nostr pubkey (reviews, longevity). v1 does
-  not build a reputation system; it leaves the pubkey-as-identity hook so one can
+- Operator reputation accrues to the **master operator identity** (§4.6), not to any
+  Box. v1 does not build a reputation system; it leaves the identity hook so one can
   be layered on (e.g. NIP-32 labels, web-of-trust).
 - Credentials are delivered only over NIP-17 gift-wrapped DMs (sender and recipient
   hidden from relays).
@@ -190,6 +190,36 @@ direct manager operations also produce them. Settings applied to a Box or an Ins
   central control node driving boxes over SSH, vs one `lnrentd` per Box plus a
   coordinator, vs a per-Box agent) is an open decision, see §16. Whatever wins,
   lnrent manages a fleet but does not cluster boxes under one scheduler (§17).
+
+### 4.6 Identity and key management
+
+All operator keys derive from a single **BIP39 seed** (the one thing to back up).
+Derivation follows NIP-06 (`m/44'/1237'/<account>'/0/0`, secp256k1, the Nostr coin
+type), so every key is regenerable from the seed:
+
+- **Master identity** — the operator's brand, derived at account 0. Reputation accrues
+  here. It signs an **operator manifest**: a replaceable, master-signed event listing
+  the operational pubkeys that act on the brand's behalf (app-defined; no NIP fits).
+- **Operational key (per Box)** — derived at account = Box index. Each Box signs its
+  Listings and receives/decrypts buyer NIP-17 DMs with its own operational key, so the
+  master key need not be hot on every Box. Buyers verify a Listing by checking the
+  master manifest covers its signing key.
+- **Payment backend seed** — ideally also derived from the same BIP39 seed so one
+  backup covers funds. Whether phoenixd accepts an imported seed is unverified (§16);
+  if not, its seed is backed up separately in v1.
+
+Custody and rotation:
+- The **seed and master key stay off the Boxes** where practical (generated on the
+  operator's machine; only the derived operational key is deployed to a Box). A Box
+  compromise then leaks only that Box's operational key, which the master revokes by
+  re-issuing the manifest; the seed and reputation survive.
+- v1 single-Box operators may keep the seed on the Box for convenience, accepting that
+  a Box compromise is then a seed compromise. Onboard makes the backup explicit.
+- Losing the seed without a backup loses the identity and its reputation. Onboard
+  forces a backup step.
+
+The marketplace identity is portable because reputation lives on the seed-rooted
+master, not on any Box.
 
 ## 5. Marketplace over Nostr
 
@@ -486,8 +516,9 @@ These never run in the serving path. They are how a human drives lnrent.
 
 - **lnrent-onboard** — given an existing box reachable over **SSH with sudo**,
   connect, install `lnrentd` (Nix on NixOS, apt+systemd on Debian), pick payment
-  backend (phoenixd or fedimint), pick compute backend, generate the operator
-  Nostr key, and set default relays.
+  backend (phoenixd or fedimint), pick compute backend, create or restore the
+  operator **BIP39 seed** (deriving the master identity + this Box's operational key
+  per NIP-06, §4.6) with a forced backup step, and set default relays.
 - **lnrent-recipe** — scaffold, edit, and test a service recipe; dry-run the
   lifecycle hooks against a throwaway tenant.
 - **lnrent-list** — compose and publish a NIP-99 listing for a recipe; price it.
@@ -499,8 +530,11 @@ These never run in the serving path. They are how a human drives lnrent.
 ## 11. Data model (sqlite)
 
 ```sql
-CREATE TABLE operator (              -- single row, this box's identity
-  nostr_pubkey TEXT, payment_backend TEXT, compute_backend TEXT, relays TEXT);
+CREATE TABLE operator (              -- single row, this Box's identity (seed lives in the data dir, not here)
+  master_pubkey TEXT,                 -- brand identity (NIP-06 account 0)
+  box_index INTEGER,                  -- this Box's derivation account
+  op_pubkey TEXT,                     -- this Box's operational pubkey
+  payment_backend TEXT, compute_backend TEXT, relays TEXT);
 
 CREATE TABLE recipe (                -- mirror of on-disk recipes for fast lookup
   id TEXT PRIMARY KEY, version TEXT, manifest_json TEXT, listing_event_id TEXT);
@@ -535,8 +569,9 @@ CREATE TABLE event_log (             -- audit trail of every transition + paymen
 
 ## 13. Security
 
-- Operator Nostr key and payment-backend credentials live in the data dir with
-  tight perms; never in recipe output or logs.
+- The operator **BIP39 seed** and derived keys, plus payment-backend credentials,
+  live in the data dir with tight perms; never in recipe output or logs. The seed and
+  master key stay off Boxes where practical (§4.6).
 - Tenant isolation is the provisioning backend's job; the `host` backend (no
   isolation) is only for services that are safe to run unsandboxed (WireGuard).
 - Hooks run with least privilege; the daemon passes secrets via stdin JSON, not
@@ -599,7 +634,9 @@ Resolved in v0.2: Fedimint = single guardian for DKG (§9); NIP-90 dropped in fa
 of an lnrent DM protocol over NIP-17 (§5); buyer clients = CLI + web (§3, §14);
 operator box assumed to exist with SSH+sudo (§10); default to popular relays (§5.2).
 Resolved in v0.5: daemon is the sole writer of state; skills act only through the
-`lnrent` CLI (ADR-0001).
+`lnrent` CLI (ADR-0001). Resolved in v0.7: capture-then-refund, no hold invoices
+(ADR-0003, §6.4). Resolved in v0.8: operator identity is a single BIP39 seed deriving
+a master identity + per-Box operational keys, NIP-06 (ADR-0004, §4.6).
 
 Still open:
 
@@ -617,6 +654,9 @@ Still open:
    handling, sold-out signaling).
 5. **Fleet topology:** central control node over SSH, one `lnrentd` per Box plus a
    coordinator, or a per-Box agent? (M7.)
+6. **Unified seed for payments:** can phoenixd (and the Fedimint client) be
+   initialized from the operator's BIP39 seed so one backup covers funds too? If not,
+   payment seeds are backed up separately in v1. (Verify, §4.6.)
 
 ## 17. Out of scope (v1)
 

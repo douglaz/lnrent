@@ -26,6 +26,21 @@ A machine lnrent manages, reachable over SSH with sudo (a rented VPS or a home-l
 host). An Operator may manage several Boxes (a fleet). Instances live on a Box.
 _Avoid_: server, host, node, machine
 
+### Identity
+
+**Operator seed**:
+The single BIP39 mnemonic an Operator backs up. Every operator key derives from it
+(NIP-06). _Avoid_: wallet, private key.
+
+**Master identity**:
+The Operator's brand, a Nostr key derived from the Operator seed at account 0.
+Reputation accrues here, not to any Box. _Avoid_: root key, operator key.
+
+**Operational key**:
+A per-Box Nostr key derived from the Operator seed; signs that Box's Listings and
+handles its buyer DMs. Linked to the Master identity by a master-signed operator
+manifest. _Avoid_: box key, device key.
+
 ### Unit of sale
 
 **Service**:
