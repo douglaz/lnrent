@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.4)
+# lnrent — Spec (draft v0.5)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -152,9 +152,11 @@ manager can also drive them directly for operator self-use (e.g. "create a VM fo
 me", "open port 443").
 
 Claude skills sit beside this, not inside it, and run only when a human invokes
-them. How skills touch state (write sqlite directly, or act only through the
-`lnrent` CLI with the daemon as sole writer) is an open architecture decision
-(grill Q2 / §16); the recommended model is daemon-as-sole-writer.
+them. The daemon is the **sole writer** of state: skills never touch sqlite
+directly, they act only through the `lnrent` CLI, and the one thing they author
+directly is recipe files on disk (ADR-0001). This keeps the AI-free invariant
+enforceable: the LLM can request actions through a typed, audited surface but
+cannot silently mutate live state.
 
 Buyers use the lnrent **CLI** or **static web client**. Both connect directly to
 relays and to the buyer's own Lightning wallet, with no lnrent server in between.
@@ -556,6 +558,8 @@ lnrent/
 Resolved in v0.2: Fedimint = single guardian for DKG (§9); NIP-90 dropped in favor
 of an lnrent DM protocol over NIP-17 (§5); buyer clients = CLI + web (§3, §14);
 operator box assumed to exist with SSH+sudo (§10); default to popular relays (§5.2).
+Resolved in v0.5: daemon is the sole writer of state; skills act only through the
+`lnrent` CLI (ADR-0001).
 
 Still open:
 
@@ -571,10 +575,7 @@ Still open:
 4. **Listing updates:** price or availability changes mean re-publishing the
    `30402` event. Define update/withdraw semantics (replaceable-event `d` tag
    handling, sold-out signaling).
-5. **State ownership:** does the daemon own sqlite as sole writer (skills act only
-   through the `lnrent` CLI), or do skills write sqlite directly? Recommended:
-   sole-writer. (Grill Q2, unresolved.)
-6. **Fleet topology:** central control node over SSH, one `lnrentd` per Box plus a
+5. **Fleet topology:** central control node over SSH, one `lnrentd` per Box plus a
    coordinator, or a per-Box agent? (M7.)
 
 ## 17. Out of scope (v1)
