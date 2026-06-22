@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.3)
+# lnrent — Spec (draft v0.4)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -71,7 +71,7 @@ Capabilities, grouped and phased:
 | Observability | status, logs, metrics, alerts | phased |
 | Marketplace | Listings, Subscriptions, Lightning billing, Nostr | the rental layer |
 
-Everything is a Recipe or a managed resource behind the same `ProvisionBackend` and
+Everything is a Recipe or a managed resource behind the same subsystems and
 lifecycle machinery. Renting only adds Listing + Subscription + billing on top.
 
 Prior art to learn from, not reinvent: Coolify, CapRover, Cloudron, YunoHost,
@@ -115,23 +115,46 @@ plane. The rule is about our serving path, not the buyer's workload.
 ```
                          Nostr relays
                               |
-        listings (30402) / orders (NIP-90) / DMs (NIP-17)
+            listings (NIP-99) / DMs (NIP-17)
                               |
-   +--------------------------+---------------------------+
-   |                       lnrentd (Rust)                 |
-   |  nostr engine | billing engine | lifecycle engine    |
-   |        sqlite state | payment backend trait          |
-   +----+----------------+-------------------+------------+
-        |                |                   |
-   PaymentBackend   ProvisionBackend    Recipe runner
-   - phoenixd       - incus (default)   - provision/suspend/
-   - fedimint       - libvirt/kvm         resume/destroy/
-     (federation+   - proxmox             healthcheck hooks
-      gatewayd)     - cloud (hetzner...)
+   +--------------------------+----------------------------+
+   |                       lnrentd (Rust)                   |
+   |                                                        |
+   |  RENTAL LAYER:  nostr | billing | subscription cycle   |
+   |  ------------------------------------------------------|
+   |  MANAGER CORE:  resource manager (Instance inventory)  |
+   |                 recipe runner (lifecycle hooks)        |
+   |                 event log                              |
+   |  ------------------------------------------------------|
+   |  SUBSYSTEMS:    Compute | Network | Storage | Payment  |
+   |                         | Observability                |
+   |  sqlite state                                          |
+   +----+---------+---------+---------+---------+-----------+
+        |         |         |         |         |
+     Compute   Network   Storage   Payment   Observ.
+     - host    - wg peer - volumes  - phoenixd  - status
+     - incus   - firewall- snapshot - fedimint  - logs
+     - libvirt - ports   - backup   (federation - metrics
+     - proxmox - ingress             + gatewayd)
+     - cloud   - dns
 ```
 
-Claude skills sit beside this, not inside it. They read and write the same sqlite
-state and recipe files, but only when a human runs them.
+Two layers:
+
+- **Manager core** owns the inventory of managed Instances, runs their lifecycle,
+  and drives the subsystems. It behaves identically whether an Instance is self-use
+  or rented.
+- **Rental layer** (billing, subscription cycle, Nostr) sits on top and engages only
+  for rented Instances. Strip it away and lnrent is still a working VPS manager.
+
+Subsystems are trait-bounded backends (§8). Recipes orchestrate them via hooks; the
+manager can also drive them directly for operator self-use (e.g. "create a VM for
+me", "open port 443").
+
+Claude skills sit beside this, not inside it, and run only when a human invokes
+them. How skills touch state (write sqlite directly, or act only through the
+`lnrent` CLI with the daemon as sole writer) is an open architecture decision
+(grill Q2 / §16); the recommended model is daemon-as-sole-writer.
 
 Buyers use the lnrent **CLI** or **static web client**. Both connect directly to
 relays and to the buyer's own Lightning wallet, with no lnrent server in between.
@@ -147,6 +170,24 @@ locally held key) and pays via WebLN or a copied bolt11.
   be layered on (e.g. NIP-32 labels, web-of-trust).
 - Credentials are delivered only over NIP-17 gift-wrapped DMs (sender and recipient
   hidden from relays).
+
+### 4.4 Resource model
+
+Everything the manager tracks with a lifecycle is an **Instance**: a VM, a container,
+a WireGuard peer, a volume, a fedimintd guardian. An Instance records its kind, the
+backend handles needed to manage it later, its owner (the Operator for self-use, or
+one Subscription for rented), its Box, and its state. Recipes produce Instances;
+direct manager operations also produce them. Settings applied to a Box or an Instance
+(a firewall rule, a DNS record) are configuration, not Instances.
+
+### 4.5 Fleet topology
+
+- **v1:** one `lnrentd` runs locally on the single Box it manages. Skills and the
+  `lnrent` CLI target that daemon.
+- **Fleet (M7):** an Operator manages several Boxes. The aggregation topology (a
+  central control node driving boxes over SSH, vs one `lnrentd` per Box plus a
+  coordinator, vs a per-Box agent) is an open decision, see §16. Whatever wins,
+  lnrent manages a fleet but does not cluster boxes under one scheduler (§17).
 
 ## 5. Marketplace over Nostr
 
@@ -261,10 +302,10 @@ it only runs hooks and reads the manifest.
 ```
 recipes/wireguard/
   recipe.toml          # manifest: metadata, pricing, params, OS support
-  provision            # executable: create tenant resources, print JSON result
+  provision            # executable: create Instance resources, print JSON result
   suspend              # executable: stop, keep data
   resume               # executable: start again
-  destroy              # executable: purge tenant resources
+  destroy              # executable: purge Instance resources
   healthcheck          # executable: exit 0 if healthy
   nixos/               # optional: declarative module fragments for NixOS hosts
   debian/              # optional: imperative install scripts for Debian hosts
@@ -294,7 +335,7 @@ resources = { cpu = 0, mem_mb = 0, disk_gb = 0 }
 [os]
 supports = ["nixos", "debian"]
 
-# Buyer-supplied parameters collected in the NIP-90 order, validated by the daemon.
+# Buyer-supplied parameters collected in the order, validated by the daemon.
 [[params]]
 key = "pubkey"
 label = "Your WireGuard public key"
@@ -306,7 +347,8 @@ required = true
 
 - Hooks are plain executables (bash, or any language). No daemon coupling.
 - Input: environment variables + a JSON document on stdin describing the
-  subscription, tenant, validated params, and host facts (OS, backend handles).
+  subscription (if the Instance is rented), the Instance, validated params, and
+  host facts (OS, backend handles).
 - Output: JSON on stdout. `provision` returns the **delivery payload** (the object
   DM'd to the buyer, e.g. a WireGuard config) plus internal handles the daemon
   records (container id, peer index) for later hooks.
@@ -322,29 +364,65 @@ required = true
 - The daemon exposes host facts so a single hook can branch, or the recipe can ship
   separate `nixos/` and `debian/` paths.
 
-## 8. Provisioning backends
+## 8. Subsystems and backends
 
-A `ProvisionBackend` trait abstracts where a tenant workload runs:
+The manager core drives a Box through trait-bounded subsystems. Recipes declare which
+subsystems they use; the manager wires them. The same subsystems serve self-use and
+rented Instances; only the rental layer differs.
+
+v1 implements **Compute** (`host` + `incus`) and **Network** (WireGuard, firewall,
+port allocation) fully. **Storage** and **Observability** ship as trait stubs and
+fill in at M7.
+
+### 8.1 Compute (`ComputeBackend`)
+
+Where a workload runs. (Called `ProvisionBackend` in earlier drafts; recipes still
+select it via the manifest's `provisioning.backend` field.)
 
 ```rust
-trait ProvisionBackend {
-    fn create(&self, spec: &TenantSpec) -> TenantHandle;   // container/VM
-    fn stop(&self, h: &TenantHandle);
-    fn start(&self, h: &TenantHandle);
-    fn destroy(&self, h: &TenantHandle);
-    fn exec(&self, h: &TenantHandle, cmd: &[&str]) -> ExecResult;
+trait ComputeBackend {
+    fn create(&self, spec: &InstanceSpec) -> InstanceHandle;   // container/VM
+    fn stop(&self, h: &InstanceHandle);
+    fn start(&self, h: &InstanceHandle);
+    fn destroy(&self, h: &InstanceHandle);
+    fn exec(&self, h: &InstanceHandle, cmd: &[&str]) -> ExecResult;
 }
 ```
 
-- **host:** no isolation; the service runs directly on the operator box (WireGuard).
-- **incus (default for isolated tenants):** system containers and KVM VMs from one
+- **host:** no isolation; runs directly on the Box (WireGuard peer, simple daemons).
+- **incus (default for isolated Instances):** system containers and KVM VMs from one
   CLI/API, packaged in nixpkgs and Debian. Good single-box default.
 - **libvirt/kvm, proxmox:** later adapters for operators already on those.
-- **cloud (hetzner/DO/vultr):** thin API adapters for "resell a VPS" later.
+- **cloud (hetzner/DO/vultr):** thin API adapters for reselling a VPS, and (M7) for
+  provisioning the Operator's own Box.
 
-The **VM-for-others** flagship service is a recipe whose `provision` hook calls the
-selected backend to create a VM, injects the buyer's SSH key, and DMs back the IP +
-access details.
+The **VM** service is a recipe whose `provision` hook calls the selected backend to
+create a VM, injects the buyer's SSH key, and returns access details.
+
+### 8.2 Network (`NetworkBackend`)
+
+```rust
+trait NetworkBackend {
+    fn add_wireguard_peer(&self, cfg: &PeerSpec) -> PeerConfig;
+    fn remove_wireguard_peer(&self, peer: &PeerId);
+    fn open_port(&self, spec: &PortSpec) -> PortHandle;        // firewall + allocation
+    fn close_port(&self, h: &PortHandle);
+    // phased: ingress/reverse-proxy routes, DNS records
+}
+```
+
+- v1: WireGuard peer management, firewall rules, per-Instance port allocation.
+- phased: reverse-proxy/ingress (route a hostname to an Instance), DNS records.
+
+### 8.3 Storage (`StorageBackend`) — phased (M7)
+
+Volumes attached to Instances, snapshots, and backups (local + offsite). Trait stub
+in v1.
+
+### 8.4 Observability — phased (M7)
+
+Read-only: Instance and Box status, logs, metrics, alerts. It never mutates state, so
+it sits cleanly inside the AI-free invariant. Trait stub in v1.
 
 ## 9. Example services (v1 recipes)
 
@@ -352,13 +430,13 @@ access details.
 |--|--|--|--|
 | **wireguard** | host | add a peer, allocate IP | `.conf` / QR |
 | **vm** (flagship) | vm (incus) | create VM, inject SSH key | host, port, user |
-| **hermes** | vm or container | create tenant, run hermes install script, buyer brings LLM keys | SSH + `hermes` usage note |
+| **hermes** | vm or container | create instance, run hermes install script, buyer brings LLM keys | SSH + `hermes` usage note |
 | **fedimint** | vm | run a `fedimintd` **guardian**, ready for the DKG setup ceremony with peer guardians | guardian admin URL + setup/connection code |
 
 Notes:
 - **hermes** = NousResearch/hermes-agent: Python 3.11+/Node, installed via its
   `install.sh`, config in `~/.hermes/`, buyer supplies their own LLM provider keys.
-  Runs fully inside the tenant sandbox. Confirms the AI-free-control-plane rule.
+  Runs fully inside the Instance's sandbox. Confirms the AI-free-control-plane rule.
 - **fedimint** = a single `fedimintd` **guardian** instance, provisioned ready to
   run the distributed key generation (DKG) setup ceremony and coordinate with other
   guardians to form a federation. Delivery payload is the guardian admin endpoint
@@ -371,7 +449,7 @@ These never run in the serving path. They are how a human drives lnrent.
 
 - **lnrent-onboard** — given an existing box reachable over **SSH with sudo**,
   connect, install `lnrentd` (Nix on NixOS, apt+systemd on Debian), pick payment
-  backend (phoenixd or fedimint), pick provisioning backend, generate the operator
+  backend (phoenixd or fedimint), pick compute backend, generate the operator
   Nostr key, and set default relays.
 - **lnrent-recipe** — scaffold, edit, and test a service recipe; dry-run the
   lifecycle hooks against a throwaway tenant.
@@ -379,13 +457,13 @@ These never run in the serving path. They are how a human drives lnrent.
 - **lnrent-subs** — inspect subscriptions, payments, and lifecycle state; force a
   transition (manual suspend/resume) when needed.
 - **lnrent-doctor** — diagnose: relay connectivity, payment backend health,
-  provisioning backend health, stuck subscriptions.
+  compute backend health, stuck subscriptions.
 
 ## 11. Data model (sqlite)
 
 ```sql
 CREATE TABLE operator (              -- single row, this box's identity
-  nostr_pubkey TEXT, payment_backend TEXT, provision_backend TEXT, relays TEXT);
+  nostr_pubkey TEXT, payment_backend TEXT, compute_backend TEXT, relays TEXT);
 
 CREATE TABLE recipe (                -- mirror of on-disk recipes for fast lookup
   id TEXT PRIMARY KEY, version TEXT, manifest_json TEXT, listing_event_id TEXT);
@@ -395,7 +473,7 @@ CREATE TABLE subscription (
   recipe_id TEXT, buyer_pubkey TEXT,
   state TEXT,                        -- PENDING|ACTIVE|DUE|GRACE|SUSPENDED|TERMINATED|EXPIRED|CANCELLED
   params_json TEXT,                  -- validated buyer params
-  tenant_handle_json TEXT,           -- backend handles for later hooks
+  instance_handle_json TEXT,         -- backend handles for later hooks
   period_s INTEGER, grace_s INTEGER, retention_s INTEGER,
   current_period_end INTEGER, next_deadline INTEGER,
   created_at INTEGER, updated_at INTEGER);
@@ -452,8 +530,9 @@ lnrent/
 
 ## 15. Milestones
 
-- **M0 — Skeleton.** Repo, `lnrentd` skeleton, sqlite, recipe loader, `PaymentBackend`
-  + `ProvisionBackend` traits with `host` and `phoenixd` stubs.
+- **M0 — Skeleton.** Repo, `lnrentd` skeleton, sqlite, recipe loader, and the
+  subsystem traits (`ComputeBackend`, `NetworkBackend`, `PaymentBackend`) with
+  `host` compute, WireGuard network, and `phoenixd` payment stubs.
 - **M1 — WireGuard proof-of-life (MVP).** Full loop on one box: publish NIP-99
   listing -> NIP-17 `order.request` -> phoenixd invoice -> pay -> `provision` peer
   -> NIP-17 `provision.ready` -> renew/suspend/destroy via the state machine. Pin
@@ -486,12 +565,17 @@ Still open:
 2. **Web client trust surface:** require a NIP-07 browser signer + WebLN wallet, or
    ship an embedded key + manual bolt11 copy as a fallback? Affects how "no backend"
    the web client truly is.
-3. **Resource enforcement:** per-tenant CPU/mem/disk and port allocation are in the
-   manifest but not yet enforced. Which limits does the daemon enforce vs delegate
-   to the provisioning backend?
+3. **Resource enforcement:** per-Instance CPU/mem/disk and port allocation are in
+   the manifest but not yet enforced. Which limits does the daemon enforce vs
+   delegate to the compute backend?
 4. **Listing updates:** price or availability changes mean re-publishing the
    `30402` event. Define update/withdraw semantics (replaceable-event `d` tag
    handling, sold-out signaling).
+5. **State ownership:** does the daemon own sqlite as sole writer (skills act only
+   through the `lnrent` CLI), or do skills write sqlite directly? Recommended:
+   sole-writer. (Grill Q2, unresolved.)
+6. **Fleet topology:** central control node over SSH, one `lnrentd` per Box plus a
+   coordinator, or a per-Box agent? (M7.)
 
 ## 17. Out of scope (v1)
 
