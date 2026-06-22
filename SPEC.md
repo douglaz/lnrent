@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.11)
+# lnrent — Spec (draft v0.12)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -592,6 +592,37 @@ Governing rules from the guidelines, load-bearing for the design:
 
 The full guidelines govern host onboarding, encryption, isolation, attestation, and
 the pre-launch test plan; they are the source of truth for VM security.
+
+### 9.2 VM rental networking
+
+Per the guidelines (§12) and ADR-0007. Default posture: no public exposure; the tenant
+opts into reachability. WireGuard does double duty here, so the WireGuard provisioning
+machinery is reused as the VM access layer and control-plane transport.
+
+**Per-VM network:**
+- Per-VM tap interface, private VM IP, default-deny inbound, anti-spoofing.
+- No VM-to-VM traffic unless explicitly declared (moot at 1 subscription -> 1 Instance;
+  matters only for a multi-VM tenant network, later).
+- No tenant access to host management; no EC2-style metadata service.
+
+**Control plane (operator / agent):**
+- The host agent, KMS, payment, reputation, and control surfaces are reachable **only
+  over WireGuard**. No public admin API.
+
+**Tenant access to their VM (M1 default = WireGuard):**
+- Default: the tenant reaches their VM over a **tenant WireGuard** peer (delivered with
+  the VM access details). No public SSH port; reuses the WireGuard machinery.
+- Opt-in: SSH via an explicitly **published management port** (a host public port DNAT'd
+  to the VM), for tenants who want plain SSH.
+- Console / recovery only through the authenticated control plane. Deferred past M1;
+  the tenant uses WireGuard + SSH in the meantime.
+
+**Public exposure (tenant-declared):**
+- None by default. The tenant declares published services; M1 maps each via
+  **port-forward** (allocate a host public port -> VM private IP:port). Routed dedicated
+  IPs and an ingress / reverse-proxy (hostname routing) come later (§8.2, M7).
+- Published ports are a scarce host resource, so they count toward capacity and are
+  reserved on a PENDING order (§6.4 pre-flight + reservation).
 
 ## 10. Claude skills (author-time and operator-time)
 
