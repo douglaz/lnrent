@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.5)
+# lnrent — Spec (draft v0.6)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -301,6 +301,9 @@ destroy).
 A recipe is a self-contained directory. The daemon never special-cases a service;
 it only runs hooks and reads the manifest.
 
+Recipes are **trusted code**: built into lnrent or authored by the Operator, run
+with daemon privilege. There is no third-party recipe installation in v1 (ADR-0002).
+
 ```
 recipes/wireguard/
   recipe.toml          # manifest: metadata, pricing, params, OS support
@@ -505,6 +508,8 @@ CREATE TABLE event_log (             -- audit trail of every transition + paymen
   isolation) is only for services that are safe to run unsandboxed (WireGuard).
 - Hooks run with least privilege; the daemon passes secrets via stdin JSON, not
   argv or env where avoidable.
+- Recipes are trusted code (built-in or operator-authored). v1 does not install or
+  run untrusted/third-party recipes. See ADR-0002.
 - Credential delivery is NIP-17 only (metadata-private). No plaintext creds on
   public Nostr events.
 - Payment verification is settlement-based (backend confirms settled), never
@@ -581,6 +586,8 @@ Still open:
 ## 17. Out of scope (v1)
 
 - Central marketplace site, hosted directory, custodial escrow, disputes.
+- Installing third-party/community recipes. Recipes are trusted code (ADR-0002); a
+  signed recipe registry is a possible later direction, not v1.
 - Fiat, on-chain-only settlement.
 - Kubernetes-style clustering / HA across boxes. lnrent manages a fleet of boxes
   but does not cluster them under one scheduler.
