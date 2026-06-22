@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.6)
+# lnrent — Spec (draft v0.7)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -217,12 +217,13 @@ NIP-17 private DM between the buyer and operator pubkeys:
 
 | type | direction | payload |
 |--|--|--|
-| `order.request`   | buyer -> operator | `listing_id`, validated `params` |
+| `order.request`   | buyer -> operator | `listing_id`, validated `params`, `refund_dest` (BOLT12 offer or Lightning address) |
 | `order.invoice`   | operator -> buyer | `order_id`, `bolt11`, `amount_sat`, `period`, `expires_at` |
 | `order.error`     | operator -> buyer | `order_id`, `reason` |
 | `provision.ready` | operator -> buyer | `subscription_id`, `payload` (the credentials) |
 | `billing.invoice` | operator -> buyer | `subscription_id`, `bolt11`, `amount_sat`, `due_at` |
 | `billing.notice`  | operator -> buyer | `subscription_id`, `state`, `message` (grace/suspend/terminate) |
+| `billing.refund`  | operator -> buyer | `subscription_id`, `amount_sat`, `status` (sent / failed) |
 | `sub.cancel`      | buyer -> operator | `subscription_id` |
 
 Payment is settled out-of-band with the buyer's own Lightning wallet. lnrentd
@@ -246,6 +247,7 @@ trait PaymentBackend {
     fn create_invoice(&self, amount_sat: u64, memo: &str, expiry_s: u32) -> Invoice;
     fn watch(&self) -> PaymentStream;            // stream of settled payments
     fn lookup(&self, id: &InvoiceId) -> PaymentStatus;
+    fn pay(&self, dest: &RefundDest, amount_sat: u64) -> PayResult;   // outbound, for refunds
 }
 ```
 
@@ -254,8 +256,11 @@ trait PaymentBackend {
 - **fedimint:** connect to an **existing federation** and route through an
   **existing gatewayd**. Receives to ecash; invoices are gateway-issued bolt11.
   Reuses the operator's federation membership rather than running a guardian.
+- Neither phoenixd nor Fedimint supports **hold invoices**, so v1 captures on
+  settlement and refunds on failure (§6.4, ADR-0003). An **LND** backend (native
+  holds) is a later option for operators who want provision-then-capture.
 
-Operator picks one backend per box in config. Both expose the same trait.
+Operator picks one backend per box in config. All expose the same trait.
 
 ### 6.2 Subscription model: push billing (v1)
 
@@ -270,31 +275,58 @@ Push model, agreed:
 
 ### 6.3 Subscription state machine
 
-```
-            first payment            period elapses, invoice issued
-  PENDING --------------------> ACTIVE -----------------------------> DUE
-     |  (no pay before expiry)    ^                                    |
-     v                            | payment received                  | grace window
-  EXPIRED                         +------------------------------------+  elapses
-                                  |              (renew)               |
-                                  |                                    v
-   buyer cancels: ACTIVE/DUE -> CANCELLED -> (suspend) -> SUSPENDED -> GRACE
-                                                              |          |
-                                            retention elapses |          | payment in grace
-                                                              v          v
-                                                         TERMINATED    ACTIVE
-```
+States: `PENDING`, `PROVISIONING`, `ACTIVE`, `DUE`, `GRACE`, `SUSPENDED`,
+`TERMINATED`, `EXPIRED`, `CANCELLED`, `REFUND_DUE`, `REFUNDED`.
 
-Timers per recipe/listing (operator-tunable): `period` (e.g. 30d), `grace`
-(e.g. 3d, service still up), `retention` (e.g. 7d after suspend, data kept before
-destroy).
+Timers per Listing (operator-tunable): `period` (e.g. 30d), `grace` (e.g. 3d,
+Instance still up), `retention` (e.g. 7d after suspend, data kept before destroy).
 
-- **ACTIVE -> DUE:** invoice issued, NIP-17 reminder sent.
-- **DUE -> GRACE:** period ended unpaid; service stays up, sterner notice.
-- **GRACE -> ACTIVE:** payment lands; `resume` not needed (never stopped).
-- **GRACE -> SUSPENDED:** grace ended unpaid; run `suspend` hook (stop, keep data).
-- **SUSPENDED -> ACTIVE:** late payment; run `resume` hook.
-- **SUSPENDED -> TERMINATED:** retention ended; run `destroy` hook (purge data).
+**Order and first capture** (no hold; capture-then-refund, §6.4):
+- **PENDING** — pre-flight passed, first invoice issued, awaiting payment.
+- **PENDING -> EXPIRED** — invoice expires unpaid; the order is dead (a later payment
+  is not silently resurrected).
+- **PENDING -> PROVISIONING** — first payment settles and is captured. Run
+  `provision`, retried with backoff.
+- **PROVISIONING -> ACTIVE** — provision succeeded; deliver credentials.
+- **PROVISIONING -> REFUND_DUE** — provision failed permanently after retries.
+
+**Refund path** (§6.4):
+- **REFUND_DUE -> REFUNDED** — auto-refund to the buyer's `refund_dest` succeeded
+  (terminal).
+- **REFUND_DUE (stuck)** — the refund payment itself failed (payer offline, no
+  liquidity); operator alerted, manual resolution. Funds never silently vanish.
+
+**Renewal and lapse** (ordinary invoices, no hold needed):
+- **ACTIVE -> DUE** — period ended; renewal invoice issued; NIP-17 reminder sent.
+- **DUE -> ACTIVE** — renewal paid.
+- **DUE -> GRACE** — renewal unpaid past period end; Instance stays up; sterner notice.
+- **GRACE -> ACTIVE** — late renewal paid; Instance never stopped.
+- **GRACE -> SUSPENDED** — grace ended unpaid; run `suspend` (stop, keep data).
+- **SUSPENDED -> ACTIVE** — late payment; run `resume`.
+- **SUSPENDED -> TERMINATED** — retention ended; run `destroy` (purge data).
+
+**Buyer-initiated:**
+- **ACTIVE/DUE/GRACE -> CANCELLED** — buyer cancels; run `suspend`, then `destroy`
+  after retention. The current paid period is not refunded.
+
+### 6.4 Provisioning atomicity and refunds
+
+phoenixd and Fedimint cannot hold an invoice (accept-but-not-settle), so v1 captures
+the first payment on settlement and provisions afterward rather than holding until
+provision succeeds (ADR-0003). Two consequences:
+
+- **Pre-flight before the first invoice.** The daemon validates params and checks the
+  compute/network capacity a Recipe needs before issuing the bolt11. Most provision
+  failures are caught here, before any money moves.
+- **Capture-then-refund on failure.** If `provision` still fails after capture, the
+  daemon refunds. The buyer supplies a `refund_dest` in `order.request` (a BOLT12
+  offer, preferred, or a Lightning address), which the daemon pushes to via phoenixd
+  `payoffer` / `paylnaddress`. If the refund payment itself fails, the subscription
+  stays `REFUND_DUE` and the operator is alerted.
+
+Operators who require true provision-then-capture atomicity can run an **LND payment
+backend** (native hold invoices) instead of phoenixd. That backend is a later option,
+not v1.
 
 ## 7. Service recipe spec
 
@@ -476,8 +508,9 @@ CREATE TABLE recipe (                -- mirror of on-disk recipes for fast looku
 CREATE TABLE subscription (
   id TEXT PRIMARY KEY,
   recipe_id TEXT, buyer_pubkey TEXT,
-  state TEXT,                        -- PENDING|ACTIVE|DUE|GRACE|SUSPENDED|TERMINATED|EXPIRED|CANCELLED
+  state TEXT,                        -- see §6.3 (PENDING|PROVISIONING|ACTIVE|DUE|GRACE|SUSPENDED|TERMINATED|EXPIRED|CANCELLED|REFUND_DUE|REFUNDED)
   params_json TEXT,                  -- validated buyer params
+  refund_dest TEXT,                  -- BOLT12 offer or Lightning address, for refunds
   instance_handle_json TEXT,         -- backend handles for later hooks
   period_s INTEGER, grace_s INTEGER, retention_s INTEGER,
   current_period_end INTEGER, next_deadline INTEGER,
@@ -541,8 +574,9 @@ lnrent/
   subsystem traits (`ComputeBackend`, `NetworkBackend`, `PaymentBackend`) with
   `host` compute, WireGuard network, and `phoenixd` payment stubs.
 - **M1 — WireGuard proof-of-life (MVP).** Full loop on one box: publish NIP-99
-  listing -> NIP-17 `order.request` -> phoenixd invoice -> pay -> `provision` peer
-  -> NIP-17 `provision.ready` -> renew/suspend/destroy via the state machine. Pin
+  listing -> NIP-17 `order.request` -> pre-flight -> phoenixd invoice -> pay
+  (capture) -> `provision` peer -> NIP-17 `provision.ready` -> renew/suspend/destroy
+  via the state machine, with capture-then-refund on provision failure (§6.4). Pin
   the lnrent DM protocol schema here. Includes a minimal CLI buyer to drive the loop.
 - **M2 — Compute management.** Incus backend: create/start/stop/destroy VMs and
   system containers, for the operator's own use and for rent (`vm` recipe, SSH-key
@@ -550,7 +584,8 @@ lnrent/
 - **M3 — More recipes.** Hermes and Fedimint guardian recipes; recipe-authoring
   skill polish.
 - **M4 — Fedimint payment backend.** Receive via existing federation + gatewayd as
-  an alternative to phoenixd.
+  an alternative to phoenixd. Optional **LND backend** (native hold invoices) for
+  operators wanting true provision-then-capture atomicity (§6.4).
 - **M5 — Web buyer client + NixOS module + Debian packaging.**
 - **M6 — v2 hands-off:** NWC (NIP-47) pull subscriptions; reputation hooks.
 - **M7 — Manager breadth.** Networking (firewall, port allocation, ingress/reverse
