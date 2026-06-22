@@ -41,6 +41,11 @@ A per-Box Nostr key derived from the Operator seed; signs that Box's Listings an
 handles its buyer DMs. Linked to the Master identity by a master-signed operator
 manifest. _Avoid_: box key, device key.
 
+**Operator manifest**:
+A master-signed, replaceable Nostr event listing the Operational keys the Master
+identity vouches for. Buyers verify a Listing by checking its signing key appears
+here. _Avoid_: keylist, attestation.
+
 ### Unit of sale
 
 **Service**:

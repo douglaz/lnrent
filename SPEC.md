@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.9)
+# lnrent — Spec (draft v0.10)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -234,6 +234,7 @@ Do not bend a NIP to a job it was not designed for.
 | Order, invoice, credential delivery, billing notices, cancel | **lnrent DM protocol** (JSON) inside **NIP-17** gift-wrapped private DMs (kind `1059`) |
 | Identity | Nostr pubkeys (operator and buyer) |
 | Auto-renew pull payments (v2) | **NIP-47** Nostr Wallet Connect |
+| Listing authenticity / operator brand | **Operator manifest** (master-signed, parameterized-replaceable; §5.3) |
 
 NIP-90 (Data Vending Machines) was considered for ordering and dropped: it is
 job-shaped (single request, single result) and does not fit ongoing subscriptions.
@@ -267,6 +268,32 @@ trusting a Nostr message that claims payment.
 Default to a set of popular public relays (operator-overridable). Operator-run or
 service-specific relays come later, once listing and order-DM delivery reliability
 on public relays is understood.
+
+### 5.3 Listing authenticity (operator manifest)
+
+Listings are signed by a Box's **operational key**, so a Box self-publishes and edits
+its own Listings while the master identity stays cold (§4.6). A buyer verifies a
+Listing belongs to a brand via the master-signed **operator manifest**:
+
+- **Operator manifest** — a parameterized-replaceable event signed by the master
+  identity, listing the operational pubkeys it vouches for. App-defined kind in the
+  30000 range with a fixed `d` tag (exact kind pinned in M1). Replaceable, so the
+  master updates it to add or revoke Boxes.
+- Each Listing (kind `30402`) carries an `operator` tag naming the master pubkey.
+
+Buyer verification (CLI and web both run this):
+
+1. Read Listing `L`, signed by operational key `K`.
+2. Read `L`'s `operator` tag -> master pubkey `M`.
+3. Fetch `M`'s operator manifest; verify it is signed by `M` and that `K` is in it.
+4. If `K` is not attested, treat `L` as unverified and do not show it as `M`'s.
+
+This binds a Listing to a brand without the master key being hot: an attacker can put
+`M` in an `operator` tag, but cannot get their key into `M`'s manifest. Reputation
+attaches to `M`, so buyers compare brands, not Boxes. **Revocation:** the master
+re-publishes the manifest without a compromised Box's key, and that Box's Listings
+immediately stop verifying. The manifest is cacheable per operator; a Listing is
+unverifiable only while the manifest cannot be fetched (relay gap).
 
 ## 6. Payments and subscriptions
 
@@ -666,7 +693,10 @@ operator box assumed to exist with SSH+sudo (§10); default to popular relays (�
 Resolved in v0.5: daemon is the sole writer of state; skills act only through the
 `lnrent` CLI (ADR-0001). Resolved in v0.7: capture-then-refund, no hold invoices
 (ADR-0003, §6.4). Resolved in v0.8: operator identity is a single BIP39 seed deriving
-a master identity + per-Box operational keys, NIP-06 (ADR-0004, §4.6).
+a master identity + per-Box operational keys, NIP-06 (ADR-0004, §4.6). Resolved in
+v0.9: prepaid-expiry subscriptions, renew before the date (ADR-0005, §6.2). Resolved
+in v0.10: listing authenticity via a master-signed operator manifest; Listings signed
+by operational keys (ADR-0006, §5.3).
 
 Still open:
 
