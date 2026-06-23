@@ -1,5 +1,5 @@
 //! Subsystem backends. SPEC.md §8. v1 implements Compute (host) + Network
-//! (WireGuard) and Payment (phoenixd); these are M0 stubs that compile and fail
+//! (WireGuard) and Payment (Fedimint, ADR-0012); these are M0 stubs that compile and fail
 //! loudly until M1 fills them in.
 
 use anyhow::{bail, Result};
@@ -39,14 +39,14 @@ pub trait PaymentBackend: Send + Sync {
     /// Status of an outbound payment by its id (ADR-0009 refund ledger).
     fn payment_status(&self, payment_id: &str) -> Result<PaymentStatus>;
     /// Stream of settled payments (push). `Settlement.external_id` carries the order id
-    /// (SPEC §6.1). M1a wires this to the phoenixd websocket.
+    /// (SPEC §6.1). M1a wires this to the Fedimint client settlement stream.
     fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>>;
 }
 
 #[derive(Debug, Clone)]
 pub struct Invoice {
     pub id: String,
-    pub external_id: String, // = order/subscription id (ADR-0009)
+    pub external_id: String, // unique per-invoice token binding settlement->order (ADR-0009)
     pub bolt11: String,
     pub amount_sat: u64,
 }
@@ -58,11 +58,13 @@ pub enum PaymentStatus {
     Expired,
 }
 
-/// A settled incoming payment; `external_id` correlates to the order (SPEC §6.1).
+/// A settled incoming payment for one of OUR invoices. The backend filters out any
+/// non-lnrent payments, so `external_id` is always the invoice's correlation token
+/// (ADR-0009); capture binds it to the order.
 #[derive(Debug, Clone)]
 pub struct Settlement {
     pub invoice_id: String,
-    pub external_id: Option<String>,
+    pub external_id: String,
     pub amount_sat: u64,
 }
 
@@ -105,10 +107,11 @@ impl NetworkBackend for WireguardNetwork {
     }
 }
 
-/// phoenixd payment backend. SPEC.md §6.1. Cannot hold invoices (ADR-0003).
-pub struct PhoenixdPayment;
+/// Fedimint payment backend (PRIMARY, ADR-0012): ecash via an existing federation +
+/// gateway. Cannot hold invoices (ADR-0003). phoenixd is a secondary backend (M3).
+pub struct FedimintPayment;
 
-impl PaymentBackend for PhoenixdPayment {
+impl PaymentBackend for FedimintPayment {
     fn create_invoice(
         &self,
         _amount_sat: u64,
@@ -116,19 +119,19 @@ impl PaymentBackend for PhoenixdPayment {
         _expiry_s: u32,
         _external_id: &str,
     ) -> Result<Invoice> {
-        bail!("phoenixd.create_invoice not implemented (M0 stub)")
+        bail!("fedimint.create_invoice not implemented (M0 stub)")
     }
     fn lookup(&self, _id: &str) -> Result<PaymentStatus> {
-        bail!("phoenixd.lookup not implemented (M0 stub)")
+        bail!("fedimint.lookup not implemented (M0 stub)")
     }
     fn pay(&self, _dest: &str, _amount_sat: u64) -> Result<String> {
-        bail!("phoenixd.pay not implemented (M0 stub)")
+        bail!("fedimint.pay not implemented (M0 stub)")
     }
     fn payment_status(&self, _payment_id: &str) -> Result<PaymentStatus> {
-        bail!("phoenixd.payment_status not implemented (M0 stub)")
+        bail!("fedimint.payment_status not implemented (M0 stub)")
     }
     fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
-        bail!("phoenixd.watch not implemented (M0 stub)")
+        bail!("fedimint.watch not implemented (M0 stub)")
     }
 }
 

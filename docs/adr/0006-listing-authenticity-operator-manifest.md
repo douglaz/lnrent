@@ -1,7 +1,8 @@
 # 0006 — Listing authenticity via a master-signed operator manifest
 
-Listings are signed by a Box's operational key (so a Box self-publishes and edits its
-own Listings while the master identity stays cold, per ADR-0004), and each Listing
+Listings are signed by an operational key (on a fleet, the control node's marketplace key —
+ADR-0010; on single-box M1a, account-0; the master identity stays cold, per ADR-0004), and
+each Listing
 carries an `operator` tag naming the master pubkey. A buyer authenticates a Listing
 against the master-signed **operator manifest**: a parameterized-replaceable event
 (app-defined kind in the 30000 range, fixed `d` tag, pinned in M5 when the manifest ships) that the master

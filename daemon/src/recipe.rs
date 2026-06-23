@@ -41,10 +41,14 @@ pub struct Provisioning {
     pub backend: String,
     pub isolation: String,
     /// Honest security tier the Listing advertises: "0" | "1" | "1.5" | "2" (ADR-0007, §9.1).
-    #[serde(default)]
+    #[serde(default = "default_tier")]
     pub tier: String,
     #[serde(default)]
     pub resources: Resources,
+}
+
+fn default_tier() -> String {
+    "0".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

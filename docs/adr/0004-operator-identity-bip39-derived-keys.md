@@ -6,10 +6,11 @@ from a single BIP39 seed (NIP-06 derivation, `m/44'/1237'/<account>'/0/0`): a ma
 identity at account 0 carries the brand and signs an operator manifest, and each Box
 gets its own operational key derived at the Box's account index (>= 1; account 0 is the
 master, never a Box, so the first Box never collides with it — M1's single-key build uses
-account 0 directly). Boxes sign their own
-Listings and handle their own buyer DMs with the operational key, so the master need
-not be hot on every Box, and a compromised Box leaks only its operational key, which
-the master revokes by re-issuing the manifest.
+account 0 directly). On a fleet (ADR-0010) the control node holds a marketplace operational
+key that signs Listings and handles buyer DMs, while each hosting box's operational key
+signs its host security profile and authenticates the box; the master need not be hot, and
+a compromised box leaks only its revocable operational key, which the master removes by
+re-issuing the manifest.
 
 ## Considered options
 

@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.24)
+# lnrent — Spec (draft v0.25)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -136,10 +136,10 @@ plane. The rule is about our serving path, not the buyer's workload.
    +----+---------+---------+---------+---------+-----------+
         |         |         |         |         |
      Compute   Network   Storage   Payment   Observ.
-     - host    - wg peer - volumes  - phoenixd  - status
-     - incus   - firewall- snapshot - fedimint  - logs
-     - libvirt - ports   - backup   (federation - metrics
-     - proxmox - ingress             + gatewayd)
+     - host    - wg peer - volumes  - fedimint  - status
+     - incus   - firewall- snapshot - phoenixd  - logs
+     - libvirt - ports   - backup   (fedimint   - metrics
+     - proxmox - ingress             primary)
      - cloud   - dns
 ```
 
@@ -229,11 +229,13 @@ type), so every key is regenerable from the seed:
 - **Master identity** — the operator's brand, derived at account 0. Reputation accrues
   here. It signs an **operator manifest**: a replaceable, master-signed event listing
   the operational pubkeys that act on the brand's behalf (app-defined; no NIP fits).
-- **Operational key (per Box)** — derived at account = Box index >= 1 (account 0 is the
-  master, never a Box; M1's single key uses account 0 directly). Each Box signs its
-  Listings and receives/decrypts buyer NIP-17 DMs with its own operational key, so the
-  master key need not be hot on every Box. Buyers verify a Listing by checking the
-  master manifest covers its signing key.
+- **Operational key** — derived at account >= 1 (account 0 is the master, never a Box;
+  M1's single key uses account 0 directly). On a fleet (ADR-0010) the **control node**
+  holds a marketplace operational key that signs Listings and receives/decrypts buyer
+  NIP-17 order DMs, while each **hosting box** holds its own operational key that signs the
+  box's host security profile and authenticates it to the control node. The master key
+  stays cold. All operational keys are in the master manifest; buyers verify a Listing by
+  checking its signing key appears there. (M1a single-box: account-0 does both roles.)
 - **Payment backend secret** — the **Fedimint client root secret** (the primary backend,
   ADR-0012) derives from the same BIP39 seed at a dedicated path, distinct from the NIP-06
   Nostr paths. So **one seed backs up everything**: the brand + per-Box identity keys AND
@@ -305,8 +307,9 @@ on public relays is understood.
 
 ### 5.3 Listing authenticity (operator manifest)
 
-Listings are signed by a Box's **operational key**, so a Box self-publishes and edits
-its own Listings while the master identity stays cold (§4.6). A buyer verifies a
+Listings are signed by an **operational key** (on a fleet, the **control node's** marketplace
+operational key — ADR-0010; on single-box M1a, account-0), published while the master
+identity stays cold (§4.6). A buyer verifies a
 Listing belongs to a brand via the master-signed **operator manifest**:
 
 - **Operator manifest** — a parameterized-replaceable event signed by the master
@@ -470,7 +473,7 @@ The money/delivery path is fully persisted so a crash never strands a payment (A
 The PENDING subscription **is** the order, so a settlement always has a row to bind to.
 
 - **Correlation:** each invoice carries a unique `external_id` binding it to its
-  order/subscription; phoenixd's `createinvoice` takes it as `externalId` and returns it on
+  order/subscription; the backend's `create_invoice` takes it as `externalId` and returns it on
   settlement, so a settlement maps to exactly one invoice (`UNIQUE(external_id)`).
 - **Idempotent capture:** `UPDATE invoice SET status='PAID' WHERE id=? AND status='OPEN'`
   plus the `PENDING -> PROVISIONING` move in one transaction; a replayed settlement (ws
@@ -767,7 +770,7 @@ These never run in the serving path. They are how a human drives lnrent.
 
 - **lnrent-onboard** — given an existing box reachable over **SSH with sudo**,
   connect, install `lnrentd` (Nix on NixOS, apt+systemd on Debian), pick payment
-  backend (phoenixd or fedimint), pick compute backend, create or restore the
+  backend (Fedimint default, or phoenixd), pick compute backend, create or restore the
   operator **BIP39 seed** (deriving the master identity + this Box's operational key
   per NIP-06, §4.6) with a forced backup step, and set default relays.
 - **lnrent-recipe** — scaffold, edit, and test a service recipe; dry-run the
@@ -805,7 +808,7 @@ CREATE TABLE subscription (
 
 CREATE TABLE invoice (
   id TEXT PRIMARY KEY, subscription_id TEXT,
-  external_id TEXT UNIQUE,            -- unique per-invoice token; phoenixd externalId (ADR-0009)
+  external_id TEXT UNIQUE,            -- unique per-invoice token; backend externalId (ADR-0009)
   bolt11 TEXT, amount_sat INTEGER, status TEXT,   -- OPEN|PAID|EXPIRED
   issued_at INTEGER, settled_at INTEGER);
 
@@ -886,11 +889,11 @@ lnrent/
 
 - **M0 — Skeleton.** Repo, `lnrentd` skeleton, sqlite, recipe loader, and the
   subsystem traits (`ComputeBackend`, `NetworkBackend`, `PaymentBackend`) with
-  `host` compute, WireGuard network, and `phoenixd` payment stubs.
+  `host` compute, WireGuard network, and `Fedimint` payment stubs (phoenixd secondary, M3).
 - **M1a — Loop mechanics (handshake core).** Prove the order/payment/lifecycle handshake
   end to end with a trivial, instant recipe (a WireGuard peer or a dummy service), because
   the handshake is the product and the riskiest part, independent of any VM complexity:
-  publish NIP-99 listing -> NIP-17 `order.request` -> pre-flight + reservation -> phoenixd
+  publish NIP-99 listing -> NIP-17 `order.request` -> pre-flight + reservation -> Fedimint
   invoice (`externalId` = order) -> settlement **watch** -> idempotent capture -> provision
   -> NIP-17 `provision.ready` -> reconcile-loop renew/suspend/destroy, with capture-then-
   refund, the settled-but-expired auto-refund, and crash recovery for the
