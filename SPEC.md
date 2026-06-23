@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.13)
+# lnrent — Spec (draft v0.14)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -387,8 +387,9 @@ the first payment on settlement and provisions afterward rather than holding unt
 provision succeeds (ADR-0003). Two consequences:
 
 - **Pre-flight before the first invoice.** The daemon validates params and checks the
-  compute/network capacity a Recipe needs before issuing the bolt11. Most provision
-  failures are caught here, before any money moves.
+  compute/network capacity a Recipe needs before issuing the bolt11, and **reserves** that
+  capacity for the order (§9.3) so concurrent orders cannot race the last slot. Most
+  provision failures are caught here, before any money moves.
 - **Capture-then-refund on failure.** If `provision` still fails after capture, the
   daemon refunds. The buyer supplies a `refund_dest` in `order.request` (a BOLT12
   offer, preferred, or a Lightning address), which the daemon pushes to via phoenixd
@@ -641,6 +642,43 @@ ports, ingress, restrictions like blocked SMTP, max ports/VM) in their signed pr
 connect; VM isolation controls what a tenant can affect; disk/memory protection controls
 what the host can see. Separate domains; never conflate them in claims.
 
+### 9.3 VM rental: capacity, images, lifecycle (Tier 0, M1)
+
+**Capacity and reservation.** The Operator configures the host's rentable budget at
+onboard (total RAM, disk, vCPU for rentals; the public-port range). Scarce resources are
+RAM, disk, and published public ports (vCPU is oversubscribed). To kill the concurrent-
+order race, capacity is **reserved at order time**, not at payment:
+
+- Pre-flight (before issuing the invoice) checks `available >= requested` and, atomically
+  via the store actor (ADR-0001), creates a **reservation** held for the order with a TTL
+  = invoice expiry.
+- Invoice expires unpaid -> reservation released. Paid -> reservation is consumed by the
+  provisioned Instance.
+- SUSPENDED keeps the reservation (disk + ports held through retention); TERMINATED and
+  REFUND_DUE release it.
+
+`available = host budget - (active Instances + live reservations)`.
+
+**Images and sizing.** M1 offers a small **curated** image set (guidelines §19: signed,
+no default passwords, no embedded keys): Debian (default), Ubuntu LTS, and a NixOS cloud
+image. Sizes are **fixed tiers**, each a separate Listing: e.g. `s` (1 vCPU / 1 GB /
+20 GB), `m` (2 / 4 / 40), `l` (4 / 8 / 80). The order picks an offered image and supplies
+an SSH **public** key. Cloud-init injects only that key — never secrets, no metadata
+service (guidelines §20-21). Tenant-provided images are later (treated as hostile, need
+sandboxed conversion).
+
+**Lifecycle hooks (`vm` recipe, Incus backend):**
+- `provision` — create the VM from the chosen image at the size tier; inject the SSH
+  pubkey via cloud-init; attach the per-VM tap + generated firewall policy; bring up the
+  **Iroh** management endpoint (+ Tor fallback); map any declared published ports
+  (frp / rathole). Delivery payload: Iroh connection ticket + Tor fallback (+ published-
+  port mappings if any).
+- `suspend` — stop the VM; keep its disk and held reservation.
+- `resume` — start the VM; re-establish the management endpoint.
+- `destroy` — delete the VM + disk; release the reservation; tear down tap, firewall,
+  Iroh endpoint, and any Tor onion / published ports.
+- `healthcheck` — VM running and reachable over the management plane.
+
 ## 10. Claude skills (author-time and operator-time)
 
 These never run in the serving path. They are how a human drives lnrent.
@@ -690,6 +728,13 @@ CREATE TABLE invoice (
 
 CREATE TABLE event_log (             -- audit trail of every transition + payment
   id INTEGER PRIMARY KEY, subscription_id TEXT, kind TEXT, detail_json TEXT, at INTEGER);
+
+CREATE TABLE reservation (            -- capacity held for a PENDING order (§9.3)
+  id TEXT PRIMARY KEY, order_id TEXT,
+  resources_json TEXT,               -- {cpu, mem_mb, disk_gb}
+  ports_json TEXT,                   -- requested published ports
+  state TEXT,                        -- HELD|CONSUMED|RELEASED
+  expires_at INTEGER, created_at INTEGER);
 ```
 
 ## 12. Deployment
@@ -741,36 +786,38 @@ lnrent/
 - **M0 — Skeleton.** Repo, `lnrentd` skeleton, sqlite, recipe loader, and the
   subsystem traits (`ComputeBackend`, `NetworkBackend`, `PaymentBackend`) with
   `host` compute, WireGuard network, and `phoenixd` payment stubs.
-- **M1 — WireGuard proof-of-life (MVP).** Full loop on one box: publish NIP-99
-  listing -> NIP-17 `order.request` -> pre-flight -> phoenixd invoice -> pay
-  (capture) -> `provision` peer -> NIP-17 `provision.ready` -> renew/suspend/destroy
-  via the state machine, with capture-then-refund on provision failure (§6.4). Pin
-  the lnrent DM protocol schema here. Includes a minimal CLI buyer to drive the loop.
-- **M2 — Compute management.** Incus backend: create/start/stop/destroy VMs and
-  system containers, for the operator's own use and for rent (`vm` recipe, SSH-key
-  injection, delivery).
-- **M3 — More recipes.** Hermes and Fedimint guardian recipes; recipe-authoring
-  skill polish.
-- **M4 — Fedimint payment backend.** Receive via existing federation + gatewayd as
-  an alternative to phoenixd. Optional **LND backend** (native hold invoices) for
-  operators wanting true provision-then-capture atomicity (§6.4).
-- **M5 — Web buyer client + NixOS module + Debian packaging.**
-- **M6 — v2 hands-off:** NWC (NIP-47) pull subscriptions; reputation hooks.
-- **M7 — Manager breadth.** Networking (firewall, port allocation, ingress/reverse
-  proxy, DNS), storage (volumes, snapshots, backups), observability, multi-box
-  fleet, and provisioning the box itself (cloud API / nixos-anywhere). This is where
-  "do everything" lands; capabilities ship incrementally, not as one block.
-- **Security tier roadmap (VM rental).** VM Listings advertise an honest security
-  tier (ADR-0007, §9.1, docs/security/vm-deployment-guidelines.md). M1 ships **Tier 0**
-  (Basic VPS). Later tiers are their own milestones: Tier 1 (tenant-managed LUKS),
-  Tier 1.5 (the guidelines' "minimum viable secure launch": Secure Boot + TPM + per-VM
-  encryption + KMS-style key release + sVirt + remote audit logs + quarantine), Tier 2
-  (attested confidential VMs, SEV-SNP/TDX).
-- **Reachability roadmap (VM rental).** Per ADR-0008 / the networking addendum (§24
-  order): M1 ships the **private planes** (per-VM tap+firewall, no metadata, outbound-only
-  agent, **Iroh** host-control + tenant-management, **Tor** recovery fallback). Then
-  shared IPv4 published ports (frp/rathole), public IPv6, HTTP ingress (TLS passthrough),
-  zrok/OpenZiti adapters, WireGuard advanced mode, and dedicated IPv4 for premium hosts.
+- **M1a — Loop mechanics (handshake core).** Prove the order/payment/lifecycle handshake
+  end to end with a trivial, instant recipe (a WireGuard peer or a dummy service), because
+  the handshake is the product and the riskiest part, independent of any VM complexity:
+  publish NIP-99 listing -> NIP-17 `order.request` -> pre-flight + reservation -> phoenixd
+  invoice (`externalId` = order) -> settlement **watch** -> idempotent capture -> provision
+  -> NIP-17 `provision.ready` -> reconcile-loop renew/suspend/destroy, with capture-then-
+  refund, the settled-but-expired auto-refund, and crash recovery for the
+  settle->capture->provision sequence. Single key (account 0). Minimal CLI buyer. Pin the
+  lnrent DM schema.
+- **M1b — VM Tier-0 product.** Swap in the real `vm` recipe: Incus VM provisioning (curated
+  images, fixed sizes, §9.3), the three-plane networking (Iroh management + Tor fallback,
+  per-VM tap/firewall, no metadata, §9.2), capacity/reservation, and frp/rathole shared
+  public ports. Honest **Tier 0** Listing.
+- **M2 — More recipes + Tier 1.** Hermes and Fedimint-guardian recipes; **Tier 1**
+  (tenant-managed LUKS) for sensitive workloads; recipe-authoring skill polish.
+- **M3 — Fedimint payment backend.** Receive via existing federation + gatewayd as an
+  alternative to phoenixd. Optional **LND backend** (native hold invoices) for true
+  provision-then-capture atomicity (§6.4).
+- **M4 — Web buyer client + NixOS module + Debian packaging.**
+- **M5 — Pre-fleet hardening.** Per-box key split + operator manifest (ADR-0004/0006);
+  NWC (NIP-47) pull subscriptions; reputation hooks.
+- **M6 — Tier 1.5.** The guidelines' "minimum viable secure launch": Secure Boot + TPM +
+  per-VM encryption + KMS-style key release + sVirt + remote audit logs + quarantine.
+- **M7 — Manager breadth + Tier 2.** Storage (volumes/snapshots/backups), observability,
+  multi-box fleet, box self-provisioning (cloud API / nixos-anywhere), public IPv6 /
+  dedicated IPv4 / HTTP ingress / zrok / OpenZiti adapters, and **Tier 2** attested
+  confidential VMs (SEV-SNP/TDX). Capabilities ship incrementally, not as one block.
+
+The **security tier ladder** (Tier 0 -> 1 -> 1.5 -> 2; ADR-0007, §9.1) and the
+**reachability ladder** (Iroh+Tor private planes -> shared ports -> IPv6 -> ingress ->
+WireGuard advanced -> dedicated IPv4; ADR-0008, §9.2, guidelines §24) span the milestones
+above rather than landing in one.
 
 ## 16. Open questions
 
@@ -783,7 +830,11 @@ Resolved in v0.5: daemon is the sole writer of state; skills act only through th
 a master identity + per-Box operational keys, NIP-06 (ADR-0004, §4.6). Resolved in
 v0.9: prepaid-expiry subscriptions, renew before the date (ADR-0005, §6.2). Resolved
 in v0.10: listing authenticity via a master-signed operator manifest; Listings signed
-by operational keys (ADR-0006, §5.3).
+by operational keys (ADR-0006, §5.3). Resolved in v0.11-0.14: M1 wedge = VM rental;
+honest security-tier model with M1 = Tier 0 (ADR-0007, §9.1); three-plane Iroh-first
+reachability, WireGuard demoted (ADR-0008, §9.2); capacity reserved at order time (§9.3),
+settling resource allocation and the concurrent-order race (runtime per-Instance limits
+are enforced by the compute backend).
 
 Still open:
 
@@ -793,12 +844,13 @@ Still open:
 2. **Web client trust surface:** require a NIP-07 browser signer + WebLN wallet, or
    ship an embedded key + manual bolt11 copy as a fallback? Affects how "no backend"
    the web client truly is.
-3. **Resource enforcement:** per-Instance CPU/mem/disk and port allocation are in
-   the manifest but not yet enforced. Which limits does the daemon enforce vs
-   delegate to the compute backend?
-4. **Listing updates:** price or availability changes mean re-publishing the
+3. **Listing updates:** price or availability changes mean re-publishing the
    `30402` event. Define update/withdraw semantics (replaceable-event `d` tag
    handling, sold-out signaling).
+4. **Manifest revocation latency:** the operator manifest is cacheable (§5.3) but
+   replaceable events have no push invalidation or TTL, so a revoked operational key
+   keeps verifying against cached manifests until each buyer refetches. Define a
+   manifest TTL / version so "immediate" revocation has a bound.
 5. **Fleet topology:** central control node over SSH, one `lnrentd` per Box plus a
    coordinator, or a per-Box agent? (M7.)
 6. **Unified seed for payments:** can phoenixd (and the Fedimint client) be

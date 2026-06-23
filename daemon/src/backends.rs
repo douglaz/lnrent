@@ -30,6 +30,9 @@ pub trait PaymentBackend: Send + Sync {
     fn lookup(&self, id: &str) -> Result<PaymentStatus>;
     /// Outbound payment, used for refunds.
     fn pay(&self, dest: &str, amount_sat: u64) -> Result<()>;
+    /// Stream of settled payments (push). `Settlement.external_id` carries the order id
+    /// (SPEC §6.1). M1a wires this to the phoenixd websocket.
+    fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>>;
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +47,14 @@ pub enum PaymentStatus {
     Open,
     Paid,
     Expired,
+}
+
+/// A settled incoming payment; `external_id` correlates to the order (SPEC §6.1).
+#[derive(Debug, Clone)]
+pub struct Settlement {
+    pub invoice_id: String,
+    pub external_id: Option<String>,
+    pub amount_sat: u64,
 }
 
 /// `host` compute: runs directly on the Box, no isolation. SPEC.md §8.1.
@@ -97,5 +108,8 @@ impl PaymentBackend for PhoenixdPayment {
     }
     fn pay(&self, _dest: &str, _amount_sat: u64) -> Result<()> {
         bail!("phoenixd.pay not implemented (M0 stub)")
+    }
+    fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
+        bail!("phoenixd.watch not implemented (M0 stub)")
     }
 }
