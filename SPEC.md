@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.20)
+# lnrent — Spec (draft v0.21)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -176,8 +176,11 @@ Nostr + the buyer's wallet.
 - Buyer pays the first period invoice **before** provisioning. Operator provisions
   on confirmed payment. No escrow.
 - Operator reputation accrues to the **master operator identity** (§4.6), not to any
-  Box. v1 does not build a reputation system; it leaves the identity hook so one can
-  be layered on (e.g. NIP-32 labels, web-of-trust).
+  Box. M1a is blind-trust (a mechanics proof); before the marketplace is publicly
+  promoted, a minimal Nostr-native reputation primitive ships — buyer-signed **rental
+  attestations** (NIP-32 labels) to the master identity, web-of-trust-weighted, surfaced
+  in the web buyer (ADR-0011). Bonds/escrow are deferred; reputation rides on top of the
+  technical controls (ADR-0007/0008/0010), never replacing them.
 - Credentials are delivered only over NIP-17 gift-wrapped DMs (sender and recipient
   hidden from relays).
 
@@ -896,7 +899,9 @@ lnrent/
   provision-then-capture atomicity (§6.4).
 - **M4 — NixOS module + Debian packaging.** (The web WASM buyer is proven earlier, in M1a.)
 - **M5 — Pre-fleet hardening.** Per-box key split + operator manifest (ADR-0004/0006);
-  NWC (NIP-47) pull subscriptions; reputation hooks.
+  NWC (NIP-47) pull subscriptions; the **reputation primitive** (buyer-signed rental
+  attestations to the master identity, ADR-0011) — which gates promoting the marketplace
+  publicly (the web buyer is built/proven in M1a but not publicly launched until then).
 - **M6 — Tier 1.5.** The guidelines' "minimum viable secure launch": Secure Boot + TPM +
   per-VM encryption + KMS-style key release + sVirt + remote audit logs + quarantine.
 - **M7 — Manager breadth + Tier 2.** Storage (volumes/snapshots/backups), observability,

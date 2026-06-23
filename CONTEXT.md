@@ -60,6 +60,12 @@ A master-signed, replaceable Nostr event listing the Operational keys the Master
 identity vouches for. Buyers verify a Listing by checking its signing key appears
 here. _Avoid_: keylist, attestation.
 
+**Rental attestation**:
+A buyer-signed Nostr event (NIP-32 label) vouching that an Operator fulfilled a rental,
+accruing to that Operator's Master identity. The web buyer aggregates these,
+web-of-trust-weighted, as the reputation signal. (ADR-0011)
+_Avoid_: review, rating, feedback.
+
 ### Unit of sale
 
 **Service**:
