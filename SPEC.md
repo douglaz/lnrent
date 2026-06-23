@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.18)
+# lnrent — Spec (draft v0.19)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -92,7 +92,7 @@ Nostr/Lightning rental, and self-sovereign single-operator ownership.
   buyer's own wallet, with no lnrent backend between buyer and operator.
 - **Marketplace (long-term, two-sided):** emerges from many operators publishing to
   shared Nostr relays. No central party owns it. v1 ships the operator half well;
-  the buyer half is two reference clients (CLI + static web) plus the published
+  the buyer half is two reference clients (CLI + web WASM, over a shared buyer-core) plus the published
   listing and DM-protocol spec.
 
 ## 4. Architecture
@@ -162,10 +162,14 @@ directly is recipe files on disk (ADR-0001). This keeps the AI-free invariant
 enforceable: the LLM can request actions through a typed, audited surface but
 cannot silently mutate live state.
 
-Buyers use the lnrent **CLI** or **static web client**. Both connect directly to
-relays and to the buyer's own Lightning wallet, with no lnrent server in between.
-The web client is a static SPA: it signs with a NIP-07 browser extension (or a
-locally held key) and pays via WebLN or a copied bolt11.
+Buyers use the lnrent **CLI** or the **web (WASM) client**. Both are thin shells over a
+shared Rust **buyer-core** lib (the DM protocol, order flow, gift-wrap), so there is one
+protocol implementation, not two. Both connect directly to relays and to the buyer's own
+Lightning wallet, with no lnrent server in between. The web client is a static SPA: the
+buyer-core compiles to wasm32; it signs with a NIP-07 browser extension (or a locally held
+key), reaches relays over browser WebSockets, and pays via WebLN or a copied bolt11. Static
+hosting keeps the no-central-server property — the website is just a buyer front-end over
+Nostr + the buyer's wallet.
 
 ### 4.3 Trust model
 
@@ -835,8 +839,9 @@ lnrent/
   skills/                 # Claude skills (author/operator-time)
     lnrent-onboard/ lnrent-recipe/ lnrent-list/ lnrent-subs/ lnrent-doctor/
   clients/
-    cli/                  # Rust: lnrent buyer CLI
-    web/                  # static web client (SPA over relays + NIP-07 + WebLN)
+    core/                 # Rust buyer-core lib (DM protocol, order flow, gift-wrap; native + wasm32)
+    cli/                  # thin native CLI over buyer-core
+    web/                  # static WASM SPA over buyer-core (NIP-07 + WebLN + browser WS)
   nix/                    # flake + NixOS module
   packaging/debian/       # systemd unit + install script
   docs/                   # protocol notes, NIP mapping, ADRs
@@ -854,7 +859,8 @@ lnrent/
   invoice (`externalId` = order) -> settlement **watch** -> idempotent capture -> provision
   -> NIP-17 `provision.ready` -> reconcile-loop renew/suspend/destroy, with capture-then-
   refund, the settled-but-expired auto-refund, and crash recovery for the
-  settle->capture->provision sequence. Single key (account 0). Minimal CLI buyer. Pin the
+  settle->capture->provision sequence. Single key (account 0). Minimal CLI buyer, then a **web WASM buyer** (shared buyer-core)
+  proving the marketplace is browser-accessible via a headless-browser loop test. Pin the
   lnrent DM schema.
 - **M1b — VM Tier-0 core.** Swap in the real `vm` recipe: Incus VM provisioning (curated
   images, fixed sizes, §9.3), per-VM tap/firewall + no metadata, **private** reachability
@@ -868,7 +874,7 @@ lnrent/
 - **M3 — Fedimint payment backend.** Receive via existing federation + gatewayd as an
   alternative to phoenixd. Optional **LND backend** (native hold invoices) for true
   provision-then-capture atomicity (§6.4).
-- **M4 — Web buyer client + NixOS module + Debian packaging.**
+- **M4 — NixOS module + Debian packaging.** (The web WASM buyer is proven earlier, in M1a.)
 - **M5 — Pre-fleet hardening.** Per-box key split + operator manifest (ADR-0004/0006);
   NWC (NIP-47) pull subscriptions; reputation hooks.
 - **M6 — Tier 1.5.** The guidelines' "minimum viable secure launch": Secure Boot + TPM +
