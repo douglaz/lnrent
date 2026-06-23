@@ -26,22 +26,18 @@ label = "Your WireGuard public key"
 type = "string"
 required = true
 
-# Buyer-facing management operations (SPEC.md §7.4, ADR-0013). Dispatched by the daemon
-# to ops/<hook>; request-kind ops ride the op.request/op.result DM pair.
+# Buyer-facing management operations (SPEC.md §7.4, ADR-0013). `hook` is a bare name the
+# daemon resolves as ops/<hook>; request-kind ops ride the op.request/op.result DM pair.
+# M1a ships the minimal status/restart; the richer get-config / rotate-key land with the
+# real WireGuard recipe in M2 (declaring a stubbed op would advertise a broken op).
 [[operation]]
 name = "status"
 label = "Service status"
 kind = "request"
-hook = "ops/status"
+hook = "status"
 
 [[operation]]
 name = "restart"
 label = "Restart service"
 kind = "request"
-hook = "ops/restart"
-
-[[operation]]
-name = "get-config"
-label = "Download WireGuard config"
-kind = "request"
-hook = "ops/get-config"
+hook = "restart"

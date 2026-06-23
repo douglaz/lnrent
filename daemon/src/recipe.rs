@@ -81,8 +81,9 @@ pub struct Param {
 
 /// A buyer-facing management operation declared by a recipe (SPEC.md §7.4, ADR-0013).
 /// `kind` selects the transport: `request` rides the NIP-17 `op.request`/`op.result` DM
-/// pair; `interactive` rides the Iroh Native-connect session (§9.2). `hook` is the
-/// executable under the recipe's `ops/` dir that the daemon runs to service the operation.
+/// pair; `interactive` rides the Iroh Native-connect session (§9.2). `hook` is a **bare
+/// filename** (no path separators, no `..`) resolved as `<recipe-dir>/ops/<hook>`; the
+/// recipe runner (lnrent-7fp.6) rejects any non-bare hook to prevent path traversal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Operation {
     pub name: String,
@@ -92,6 +93,18 @@ pub struct Operation {
     pub hook: String,
     #[serde(default)]
     pub params: Vec<Param>,
+}
+
+impl Operation {
+    /// True if `hook` is a safe bare filename (no path separators, no `..`, non-empty).
+    /// `Recipe::validate()` (lnrent-7fp.6) enforces this before dispatch (§7.4).
+    pub fn hook_is_safe(&self) -> bool {
+        !self.hook.is_empty()
+            && !self.hook.contains('/')
+            && !self.hook.contains('\\')
+            && self.hook != ".."
+            && self.hook != "."
+    }
 }
 
 impl Recipe {
@@ -129,9 +142,11 @@ impl Recipe {
         self.operations.iter().find(|op| op.name == name)
     }
 
-    /// Absolute path to a management operation's hook executable (under `ops/`).
+    /// Absolute path to a management operation's hook executable, resolved as
+    /// `<recipe-dir>/ops/<hook>`. `hook` is a bare filename (validated by
+    /// `Operation::hook_is_safe` / the recipe runner) so this cannot escape `ops/`.
     pub fn op_hook(&self, op: &Operation) -> PathBuf {
-        self.dir.join(&op.hook)
+        self.dir.join("ops").join(&op.hook)
     }
 }
 
@@ -167,18 +182,44 @@ supports = ["nixos"]
 name = "get-config"
 label = "Download WireGuard config"
 kind = "request"
-hook = "ops/get-config"
+hook = "get-config"
 "#;
         let mut recipe: Recipe = toml::from_str(toml).expect("parse");
         recipe.dir = PathBuf::from("/recipes/wireguard");
         assert_eq!(recipe.operations.len(), 1);
         let op = recipe.operation("get-config").expect("operation present");
         assert_eq!(op.kind, "request");
+        // `hook` is a bare name resolved under ops/ (no traversal).
+        assert!(op.hook_is_safe());
         assert_eq!(
             recipe.op_hook(op),
             PathBuf::from("/recipes/wireguard/ops/get-config")
         );
         // A recipe with no [[operation]] blocks defaults to an empty op set.
         assert!(recipe.operation("nope").is_none());
+    }
+
+    // §7.4: a hook with a path separator or `..` must be rejected (no traversal out of ops/).
+    #[test]
+    fn unsafe_op_hooks_are_rejected() {
+        let bad = ["../escape", "ops/nested", "a/b", "..", ""];
+        for h in bad {
+            let op = Operation {
+                name: "x".into(),
+                label: "x".into(),
+                kind: "request".into(),
+                hook: h.to_string(),
+                params: vec![],
+            };
+            assert!(!op.hook_is_safe(), "expected {h:?} to be rejected");
+        }
+        let ok = Operation {
+            name: "status".into(),
+            label: "Status".into(),
+            kind: "request".into(),
+            hook: "status".into(),
+            params: vec![],
+        };
+        assert!(ok.hook_is_safe());
     }
 }

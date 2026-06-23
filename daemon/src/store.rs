@@ -95,6 +95,19 @@ CREATE TABLE IF NOT EXISTS outbox (   -- pending operator->buyer NIP-17 DMs (ADR
   created_at      INTEGER,
   sent_at         INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS op_invocation (  -- durable buyer management ops (§7.4, ADR-0013)
+  sender_pubkey   TEXT,
+  request_id      TEXT,    -- the op.request `id`
+  subscription_id TEXT,
+  op              TEXT,
+  state           TEXT,    -- RUNNING | DONE | ERROR
+  result_json     TEXT,    -- cached op.result data (resent verbatim on a duplicate)
+  error_json      TEXT,    -- cached op.result error { code, message, retryable }
+  created_at      INTEGER,
+  finished_at     INTEGER,
+  PRIMARY KEY (sender_pubkey, request_id)  -- idempotency: a dup never re-runs the hook
+);
 "#;
 
 /// Open the state database and ensure the schema exists.
@@ -119,6 +132,6 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 9);
+        assert_eq!(n, 10);
     }
 }

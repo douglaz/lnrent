@@ -298,8 +298,8 @@ NIP-17 private DM between the buyer and operator pubkeys:
 | `billing.refund`  | operator -> buyer | `subscription_id`, `amount_sat`, `status` (sent / failed) |
 | `renew.request`   | buyer -> operator | `subscription_id` (request a renewal invoice on demand) |
 | `sub.cancel`      | buyer -> operator | `subscription_id` |
-| `op.request`      | buyer -> operator | `subscription_id`, `op` (operation name), `params` (object) — invoke a recipe-declared management operation (§7.4) |
-| `op.result`       | operator -> buyer | `subscription_id`, `op`, `status` (ok / error), `data` (object: config / `url` / status fields) or `error` |
+| `op.request`      | buyer -> operator | `id` (unique request id), `subscription_id`, `op` (operation name), `params` (object) — invoke a recipe-declared management operation (§7.4) |
+| `op.result`       | operator -> buyer | `request_id` (= the `op.request` `id`), `subscription_id`, `op`, `status` (ok / error), `data` (object: config / `url` / status fields) on ok, or `error` `{ code, message, retryable }` |
 
 `op.request` / `op.result` are the request/response half of buyer service management
 (§7.4, ADR-0013): the buyer invokes a recipe-declared operation and the operator runs the
@@ -307,6 +307,19 @@ recipe's management hook and returns the result. The operator authorizes the req
 matching the DM's sender pubkey to the subscription's `buyer_pubkey`. Interactive/streaming
 operations (shell, console, `logs -f`, file copy) do not use these messages — they run over
 the Iroh Native-connect session (§9.2).
+
+**Durable, correlated, idempotent.** Each `op.request` carries a client-chosen unique `id`;
+the operator persists invocations in `op_invocation` (§11), keyed unique on
+`(sender_pubkey, request_id)`, with the op state and the cached result/error. Because a
+declared op may be **non-idempotent** (e.g. `restart`), a duplicate `op.request` (same
+sender + `id`) — whether a NIP-17 redelivery, a buyer retry after a dropped `op.result`, or
+a daemon restart mid-op — MUST resend the cached or in-flight result and MUST NOT re-run the
+hook. `op.result.request_id` lets the buyer correlate the reply to its request. On `error`,
+no `data` is returned; `code` distinguishes `unauthorized` / `unknown_op` / `invalid_params`
+/ `not_active` / `timeout` / `hook_failed`, `retryable` tells the client whether to retry,
+and the operator does not reveal whether an unknown `subscription_id` exists to a non-buyer
+sender (an `unauthorized` op on someone else's sub is indistinguishable from one on a
+nonexistent sub).
 
 Payment is settled out-of-band with the buyer's own Lightning wallet. lnrentd
 confirms settlement through its `PaymentBackend` (phoenixd/Fedimint), never by
@@ -347,6 +360,23 @@ re-publishes the manifest without a compromised Box's key; that Box's Listings s
 verifying once buyers refetch the manifest — bounded by a manifest TTL/version (§16), not
 instantaneous (replaceable events have no push invalidation). A Listing is also
 unverifiable while the manifest cannot be fetched (relay gap).
+
+### 5.4 Listing contents (NIP-99 30402)
+
+A Listing (kind `30402`) carries the standard NIP-99 fields (title, summary, price) plus
+lnrent-specific metadata the buyer needs to order AND to discover what the service can do:
+
+- the `operator` tag (§5.3) and the recipe id + version;
+- the order `params` schema (§7.1) the buyer must fill in the `order.request`;
+- the recipe's **published operation declarations** — a JSON array (carried in the event
+  `content`, under an `lnrent` object, with a schema `version`) of `{ name, label, kind,
+  params }` per operation (§7.4). The internal `hook` is **never** published. Buyers render
+  the `ops` interface from this (before and after ordering); the operator's recipe stays
+  authoritative at dispatch. Parsers tolerate unknown fields (forward-compat) and bound the
+  array size.
+
+The exact tag/content layout (and the schema `version`) is **pinned in M1a** when the wire
+codec (lnrent-7fp.19) lands, alongside the DM schema.
 
 ## 6. Payments and subscriptions
 
@@ -562,14 +592,15 @@ label = "Your WireGuard public key"
 type = "string"
 required = true
 
-# Buyer-facing management operations (§7.4, ADR-0013). The daemon dispatches each to
-# the named hook under ops/. `kind` selects the transport: request -> NIP-17 op.request /
-# op.result; interactive -> Iroh Native-connect session (§9.2).
+# Buyer-facing management operations (§7.4, ADR-0013). The daemon resolves each `hook` as
+# <recipe-dir>/ops/<hook> (bare filename only — no path separators, no ..). `kind` selects
+# the transport: request -> NIP-17 op.request / op.result; interactive -> Iroh Native-connect
+# session (§9.2). `hook` is operator-internal and is NOT published in the Listing (§5.4).
 [[operation]]
-name = "get-config"
-label = "Download WireGuard config"
+name = "status"
+label = "Service status"
 kind = "request"            # request | interactive
-hook = "ops/get-config"
+hook = "status"             # bare name -> ops/status
 # params = [ ... ]          # optional, same shape as [[params]]
 ```
 
@@ -600,30 +631,43 @@ A buyer manages a rented service through one interface, regardless of the servic
 recipe — not the client — declares what can be managed (ADR-0013).
 
 - **Declaration.** Each `[[operation]]` in the manifest declares `{ name, label, kind,
-  hook, params? }`. Common operations are conventional across recipes (`status`, `stop`,
-  `restart`, `get-credentials`); service-specific operations are recipe-defined (WireGuard
-  `get-config` / `rotate-key`; Fedimint `admin-url` / `dkg-status` / `dkg-step`; Hermes
-  `get-config` / `set-config` / `exec` / `logs`).
+  hook, params? }`. `hook` is a **bare filename** (no path separators, no `..`), resolved by
+  the daemon as `<recipe-dir>/ops/<hook>`; the daemon rejects any `hook` that is not a simple
+  name (no traversal, no absolute path, no symlink escaping the recipe dir). Common
+  operations are conventional across recipes (`status`, `stop`, `restart`,
+  `get-credentials`); service-specific operations are recipe-defined (WireGuard `get-config`
+  / `rotate-key`; Fedimint `admin-url` / `dkg-status` / `dkg-step`; Hermes `get-config` /
+  `set-config` / `exec` / `logs`).
 - **One interface.** The buyer client (CLI `lnrent-buyer ops <sub> list` / `<sub> <op>
   [params]`, and the web client) discovers the operation set for a subscription from the
-  Listing's published recipe metadata (the operation declarations are public — part of the
-  offer) and dispatches generically over buyer-core — no per-service client code.
+  Listing's published operation declarations (§5.4 — the public `{ name, label, kind, params }`
+  of each op; `hook` is operator-internal and never published) and dispatches generically
+  over buyer-core — no per-service client code. The published set is advisory for discovery;
+  the operator's recipe is authoritative at dispatch.
 - **Two transports, chosen by `kind`:**
   - `request` — request/response, carried by the §5.1 `op.request` / `op.result` DM pair.
     The daemon runs the recipe's `ops/<hook>` with the same input/output contract as a
-    lifecycle hook (§7.2) and returns its JSON as `op.result.data`.
+    lifecycle hook (§7.2) and returns its JSON as `op.result.data`; a hook timeout or
+    nonzero exit becomes an `op.result` `error` (§5.1), never a daemon stall.
   - `interactive` — streaming/bidirectional (shell, console, `logs -f`, file copy, a REPL),
     carried by the Iroh Native-connect session (§9.2). The operation hook is the session
-    target; no LLM mediates it.
+    target.
 - **Authorization.** A `request` op is authorized by matching the `op.request` DM sender to
   the subscription's `buyer_pubkey`; an `interactive` op is authorized by the Native-connect
-  ticket delivered for that subscription. Operations are refused on a suspended/terminated
-  subscription except those a recipe marks safe (recipe's choice).
-- **Security (AI-free, narrow surface).** An operation is the recipe's *declared* surface,
-  not arbitrary host access: Hermes `exec` is a scoped operation hook, not a host shell
-  (consistent with the §9 VM node-agent narrow-ops rule). Every operation runs a
-  deterministic recipe hook on the daemon; no operation invokes an LLM. Every invocation
-  (op, subscription, sender, result status) is recorded in `event_log` (§11) for audit.
+  ticket delivered for that subscription. Operations are refused unless the subscription is
+  **ACTIVE** (M1a); a future per-op `allowed_states` manifest field will permit specific ops
+  (e.g. `get-credentials`) while a subscription is suspended. A request that fails
+  authorization returns an `unauthorized` `op.result` without revealing whether the
+  subscription exists (§5.1).
+- **Security (narrow surface; AI-free by recipe discipline).** An operation is the recipe's
+  *declared* surface, not arbitrary host access: Hermes `exec` is a scoped operation that
+  targets the tenant workload with constrained params, NOT host command execution (consistent
+  with the §9 VM node-agent narrow-ops rule). The daemon enforces the *surface* — only
+  declared ops, validated params, the resolved `ops/<hook>`, timeouts and output caps — but
+  recipes are trusted, daemon-privileged, non-sandboxed code (ADR-0002), so "deterministic,
+  no LLM at runtime" is a **recipe-author invariant and review requirement**, not something
+  the daemon proves about a hook's internals. Every invocation (op, subscription, sender,
+  result status) is recorded durably in `op_invocation` (§11) for audit and idempotency.
 
 ## 8. Subsystems and backends
 
@@ -894,6 +938,14 @@ CREATE TABLE outbox (                -- pending operator->buyer NIP-17 DMs (ADR-
   msg_type TEXT, payload_json TEXT,
   state TEXT,                        -- PENDING|SENT
   attempts INTEGER, created_at INTEGER, sent_at INTEGER);
+
+CREATE TABLE op_invocation (         -- durable buyer management ops (§7.4, ADR-0013)
+  sender_pubkey TEXT, request_id TEXT,   -- the op.request `id`
+  subscription_id TEXT, op TEXT,
+  state TEXT,                        -- RUNNING|DONE|ERROR
+  result_json TEXT, error_json TEXT, -- cached op.result data / error (resent on duplicate)
+  created_at INTEGER, finished_at INTEGER,
+  PRIMARY KEY (sender_pubkey, request_id));  -- idempotency: a dup never re-runs the hook
 ```
 
 ## 12. Deployment
