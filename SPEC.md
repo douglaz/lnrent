@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.23)
+# lnrent — Spec (draft v0.24)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -166,10 +166,13 @@ Buyers use the lnrent **CLI** or the **web (WASM) client**. Both are thin shells
 shared Rust **buyer-core** lib (the DM protocol, order flow, gift-wrap), so there is one
 protocol implementation, not two. Both connect directly to relays and to the buyer's own
 Lightning wallet, with no lnrent server in between. The web client is a static SPA: the
-buyer-core compiles to wasm32; it signs with a NIP-07 browser extension (or a locally held
-key), reaches relays over browser WebSockets, and pays via WebLN or a copied bolt11. Static
-hosting keeps the no-central-server property — the website is just a buyer front-end over
-Nostr + the buyer's wallet.
+buyer-core compiles to wasm32 and reaches relays over browser WebSockets. It **detects
+capabilities and degrades gracefully**: signing prefers a NIP-07 extension, else an
+**embedded key** the SPA generates and persists (zero-install) — and since that key also
+decrypts delivered credentials, the SPA prompts to **export / back it up**; paying prefers
+WebLN, else **copy-bolt11 / QR** (pay from any wallet). So someone with nothing but a phone
+wallet can complete a rental. Static hosting keeps the no-central-server property — the
+website is just a buyer front-end over Nostr + the buyer's wallet.
 
 ### 4.3 Trust model
 
@@ -946,9 +949,9 @@ Still open:
 1. **DKG coordination UX:** how do peer guardians discover and authenticate each
    other for the federation-creation ceremony? Out-of-band exchange of setup codes
    in v1, or a Nostr-mediated rendezvous?
-2. **Web client trust surface:** require a NIP-07 browser signer + WebLN wallet, or
-   ship an embedded key + manual bolt11 copy as a fallback? Affects how "no backend"
-   the web client truly is.
+2. **Web client trust surface (RESOLVED v0.24):** graceful degradation — NIP-07/WebLN
+   when present, else an embedded key (with an export/backup prompt, since it decrypts
+   creds) + copy-bolt11/QR. A phone-wallet-only buyer can complete a rental (§4.2).
 3. **Listing updates:** price or availability changes mean re-publishing the
    `30402` event. Define update/withdraw semantics (replaceable-event `d` tag
    handling, sold-out signaling).
