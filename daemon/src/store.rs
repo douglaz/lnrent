@@ -56,6 +56,20 @@ CREATE TABLE IF NOT EXISTS event_log (
   detail_json     TEXT,
   at              INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS reservation (   -- capacity held for a PENDING order (§9.3)
+  id             TEXT PRIMARY KEY,
+  order_id       TEXT,
+  resources_json TEXT,
+  ports_json     TEXT,
+  state          TEXT,    -- HELD | CONSUMED | RELEASED
+  expires_at     INTEGER,
+  created_at     INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS daemon_state (  -- single row; heartbeat for downtime credit (§6.5)
+  last_heartbeat INTEGER
+);
 "#;
 
 /// Open the state database and ensure the schema exists.
@@ -80,6 +94,6 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 5);
+        assert_eq!(n, 7);
     }
 }

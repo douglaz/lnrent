@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.15)
+# lnrent — Spec (draft v0.16)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -201,7 +201,8 @@ type), so every key is regenerable from the seed:
 - **Master identity** — the operator's brand, derived at account 0. Reputation accrues
   here. It signs an **operator manifest**: a replaceable, master-signed event listing
   the operational pubkeys that act on the brand's behalf (app-defined; no NIP fits).
-- **Operational key (per Box)** — derived at account = Box index. Each Box signs its
+- **Operational key (per Box)** — derived at account = Box index >= 1 (account 0 is the
+  master, never a Box; M1's single key uses account 0 directly). Each Box signs its
   Listings and receives/decrypts buyer NIP-17 DMs with its own operational key, so the
   master key need not be hot on every Box. Buyers verify a Listing by checking the
   master manifest covers its signing key.
@@ -277,8 +278,10 @@ Listing belongs to a brand via the master-signed **operator manifest**:
 
 - **Operator manifest** — a parameterized-replaceable event signed by the master
   identity, listing the operational pubkeys it vouches for. App-defined kind in the
-  30000 range with a fixed `d` tag (exact kind pinned in M1). Replaceable, so the
-  master updates it to add or revoke Boxes.
+  30000 range with a fixed `d` tag (kind pinned when the manifest ships, in **M5**).
+  Replaceable, so the master updates it to add or revoke Boxes. **In M1, before the
+  manifest exists, Listings are signed by the single account-0 key and brand-authenticated
+  by that pubkey alone (no cross-Box manifest); cross-Box authenticity arrives in M5.**
 - Each Listing (kind `30402`) carries an `operator` tag naming the master pubkey.
 
 Buyer verification (CLI and web both run this):
@@ -351,6 +354,9 @@ e.g. 7d).
 - **PENDING** — pre-flight passed, first invoice issued, awaiting payment.
 - **PENDING -> EXPIRED** — invoice expires unpaid; the order is dead (a later payment
   is not silently resurrected).
+- **EXPIRED + late settlement -> REFUND_DUE** — if a payment settles after expiry (settle
+  racing expiry), the order is not resurrected and the funds are **auto-refunded** (§6.4),
+  never kept. The invoice carries the order id so this is detectable.
 - **PENDING -> PROVISIONING** — first payment settles and is captured. Run
   `provision`, retried with backoff.
 - **PROVISIONING -> ACTIVE** — provision succeeded; deliver credentials and set
@@ -591,7 +597,8 @@ Governing rules from the guidelines, load-bearing for the design:
   This matches the AI-free control plane and ADR-0001.
 - **Tenant-provided images are hostile**; their hooks never run on the host.
 - Each host publishes a **signed security profile** (guidelines §25; `host_id` is the
-  operator's Nostr key) that buyers read before renting.
+  operator's Nostr key — secp256k1; the deployment doc's `ed25519` profile example is
+  illustrative, lnrent standardizes on the Nostr key) that buyers read before renting.
 
 The full guidelines govern host onboarding, encryption, isolation, attestation, and
 the pre-launch test plan; they are the source of truth for VM security.
@@ -654,8 +661,9 @@ order race, capacity is **reserved at order time**, not at payment:
 - Pre-flight (before issuing the invoice) checks `available >= requested` and, atomically
   via the store actor (ADR-0001), creates a **reservation** held for the order with a TTL
   = invoice expiry.
-- Invoice expires unpaid -> reservation released. Paid -> reservation is consumed by the
-  provisioned Instance.
+- Invoice expires unpaid -> reservation released. Paid -> reservation stays **HELD**
+  through `PROVISIONING` and becomes **CONSUMED** only when the Instance reaches `ACTIVE`,
+  so a concurrent order cannot reuse the slot mid-provision.
 - SUSPENDED keeps the reservation (disk + ports held through retention); TERMINATED and
   REFUND_DUE release it.
 
