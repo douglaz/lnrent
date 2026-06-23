@@ -25,3 +25,23 @@ key = "pubkey"
 label = "Your WireGuard public key"
 type = "string"
 required = true
+
+# Buyer-facing management operations (SPEC.md §7.4, ADR-0013). Dispatched by the daemon
+# to ops/<hook>; request-kind ops ride the op.request/op.result DM pair.
+[[operation]]
+name = "status"
+label = "Service status"
+kind = "request"
+hook = "ops/status"
+
+[[operation]]
+name = "restart"
+label = "Restart service"
+kind = "request"
+hook = "ops/restart"
+
+[[operation]]
+name = "get-config"
+label = "Download WireGuard config"
+kind = "request"
+hook = "ops/get-config"

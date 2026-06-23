@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.25)
+# lnrent — Spec (draft v0.26)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -163,9 +163,13 @@ enforceable: the LLM can request actions through a typed, audited surface but
 cannot silently mutate live state.
 
 Buyers use the lnrent **CLI** or the **web (WASM) client**. Both are thin shells over a
-shared Rust **buyer-core** lib (the DM protocol, order flow, gift-wrap), so there is one
-protocol implementation, not two. Both connect directly to relays and to the buyer's own
-Lightning wallet, with no lnrent server in between. The web client is a static SPA: the
+shared Rust **buyer-core** lib (the DM protocol, order flow, gift-wrap, and the unified
+service-management `ops` interface — §7.4), so there is one protocol implementation, not
+two. Buyer-core is also where a rented service is managed after delivery: it discovers a
+subscription's recipe-declared operations and dispatches them (request/response over the DM
+protocol, interactive over Iroh — §7.4, ADR-0013), so the same client that rents a service
+also operates it. Both connect directly to relays and to the buyer's own Lightning wallet,
+with no lnrent server in between. The web client is a static SPA: the
 buyer-core compiles to wasm32 and reaches relays over browser WebSockets. It **detects
 capabilities and degrades gracefully**: signing prefers a NIP-07 extension, else an
 **embedded key** the SPA generates and persists (zero-install) — and since that key also
@@ -294,6 +298,15 @@ NIP-17 private DM between the buyer and operator pubkeys:
 | `billing.refund`  | operator -> buyer | `subscription_id`, `amount_sat`, `status` (sent / failed) |
 | `renew.request`   | buyer -> operator | `subscription_id` (request a renewal invoice on demand) |
 | `sub.cancel`      | buyer -> operator | `subscription_id` |
+| `op.request`      | buyer -> operator | `subscription_id`, `op` (operation name), `params` (object) — invoke a recipe-declared management operation (§7.4) |
+| `op.result`       | operator -> buyer | `subscription_id`, `op`, `status` (ok / error), `data` (object: config / `url` / status fields) or `error` |
+
+`op.request` / `op.result` are the request/response half of buyer service management
+(§7.4, ADR-0013): the buyer invokes a recipe-declared operation and the operator runs the
+recipe's management hook and returns the result. The operator authorizes the request by
+matching the DM's sender pubkey to the subscription's `buyer_pubkey`. Interactive/streaming
+operations (shell, console, `logs -f`, file copy) do not use these messages — they run over
+the Iroh Native-connect session (§9.2).
 
 Payment is settled out-of-band with the buyer's own Lightning wallet. lnrentd
 confirms settlement through its `PaymentBackend` (phoenixd/Fedimint), never by
@@ -512,6 +525,7 @@ recipes/wireguard/
   resume               # executable: start again
   destroy              # executable: purge Instance resources
   healthcheck          # executable: exit 0 if healthy
+  ops/                 # optional: buyer-facing management hooks, one per declared operation (§7.4)
   nixos/               # optional: declarative module fragments for NixOS hosts
   debian/              # optional: imperative install scripts for Debian hosts
 ```
@@ -547,6 +561,16 @@ key = "pubkey"
 label = "Your WireGuard public key"
 type = "string"
 required = true
+
+# Buyer-facing management operations (§7.4, ADR-0013). The daemon dispatches each to
+# the named hook under ops/. `kind` selects the transport: request -> NIP-17 op.request /
+# op.result; interactive -> Iroh Native-connect session (§9.2).
+[[operation]]
+name = "get-config"
+label = "Download WireGuard config"
+kind = "request"            # request | interactive
+hook = "ops/get-config"
+# params = [ ... ]          # optional, same shape as [[params]]
 ```
 
 ### 7.2 Hook contract
@@ -569,6 +593,37 @@ required = true
 - **Debian host:** imperative. `debian/` scripts use apt + systemd units.
 - The daemon exposes host facts so a single hook can branch, or the recipe can ship
   separate `nixos/` and `debian/` paths.
+
+### 7.4 Buyer-facing management operations
+
+A buyer manages a rented service through one interface, regardless of the service. The
+recipe — not the client — declares what can be managed (ADR-0013).
+
+- **Declaration.** Each `[[operation]]` in the manifest declares `{ name, label, kind,
+  hook, params? }`. Common operations are conventional across recipes (`status`, `stop`,
+  `restart`, `get-credentials`); service-specific operations are recipe-defined (WireGuard
+  `get-config` / `rotate-key`; Fedimint `admin-url` / `dkg-status` / `dkg-step`; Hermes
+  `get-config` / `set-config` / `exec` / `logs`).
+- **One interface.** The buyer client (CLI `lnrent-buyer ops <sub> list` / `<sub> <op>
+  [params]`, and the web client) discovers the operation set for a subscription from the
+  Listing's published recipe metadata (the operation declarations are public — part of the
+  offer) and dispatches generically over buyer-core — no per-service client code.
+- **Two transports, chosen by `kind`:**
+  - `request` — request/response, carried by the §5.1 `op.request` / `op.result` DM pair.
+    The daemon runs the recipe's `ops/<hook>` with the same input/output contract as a
+    lifecycle hook (§7.2) and returns its JSON as `op.result.data`.
+  - `interactive` — streaming/bidirectional (shell, console, `logs -f`, file copy, a REPL),
+    carried by the Iroh Native-connect session (§9.2). The operation hook is the session
+    target; no LLM mediates it.
+- **Authorization.** A `request` op is authorized by matching the `op.request` DM sender to
+  the subscription's `buyer_pubkey`; an `interactive` op is authorized by the Native-connect
+  ticket delivered for that subscription. Operations are refused on a suspended/terminated
+  subscription except those a recipe marks safe (recipe's choice).
+- **Security (AI-free, narrow surface).** An operation is the recipe's *declared* surface,
+  not arbitrary host access: Hermes `exec` is a scoped operation hook, not a host shell
+  (consistent with the §9 VM node-agent narrow-ops rule). Every operation runs a
+  deterministic recipe hook on the daemon; no operation invokes an LLM. Every invocation
+  (op, subscription, sender, result status) is recorded in `event_log` (§11) for audit.
 
 ## 8. Subsystems and backends
 
@@ -706,7 +761,10 @@ recovery). This is what makes home / CGNAT / NAT'd hosts first-class.
 unlock, file copy) over a marketplace-native **Iroh** session, with **Tor onion** fallback
 for SSH / rescue / unlock. Raw **WireGuard** is an advanced-optional L3 mode, not the
 default user-facing concept. So a VM's delivery payload is an Iroh connection ticket
-(+ Tor fallback), not a WireGuard config.
+(+ Tor fallback), not a WireGuard config. This Native-connect session is also the transport
+for any recipe's **`interactive` management operations** (§7.4) — shell, console, `logs -f`,
+file copy — not just VM SSH; the buyer-core `ops` interface opens it with the delivered
+ticket, which scopes authorization.
 
 **Public exposure = tenant-declared, per service.** None by default. The tenant declares
 published services; each maps via an exposure adapter: shared IPv4 published ports
@@ -898,17 +956,22 @@ lnrent/
   -> NIP-17 `provision.ready` -> reconcile-loop renew/suspend/destroy, with capture-then-
   refund, the settled-but-expired auto-refund, and crash recovery for the
   settle->capture->provision sequence. Single key (account 0). Minimal CLI buyer, then a **web WASM buyer** (shared buyer-core)
-  proving the marketplace is browser-accessible via a headless-browser loop test. Pin the
-  lnrent DM schema.
+  proving the marketplace is browser-accessible via a headless-browser loop test. Also prove
+  the **buyer service-management interface** (§7.4, ADR-0013) with a minimal recipe-declared
+  `request` operation (e.g. `status` / `restart`) over `op.request` / `op.result`. Pin the
+  lnrent DM schema (incl. `op.request` / `op.result`).
 - **M1b — VM Tier-0 core.** Swap in the real `vm` recipe: Incus VM provisioning (curated
   images, fixed sizes, §9.3), per-VM tap/firewall + no metadata, **private** reachability
-  (Iroh management + Tor fallback, §9.2), and capacity/reservation. Honest **Tier 0**
-  Listing, private-only.
+  (Iroh management + Tor fallback, §9.2), and capacity/reservation. The VM's SSH/console
+  over the Native-connect session is the first **`interactive`** management operation (§7.4),
+  proving that transport. Honest **Tier 0** Listing, private-only.
 - **M1c — Public exposure.** Tenant-declared published services: shared IPv4 ports via
   frp/rathole, with the capacity accounting that ports imply (§9.2/§9.3).
 - **M2 — More recipes + Tier 1.** Hermes and Fedimint-guardian recipes, **gated behind
   >= Tier 1** (tenant-managed LUKS) since they are sensitive workloads (guidelines §26);
-  recipe-authoring skill polish.
+  recipe-authoring skill polish. These bring the **rich per-service management operations**
+  (§7.4): WireGuard `get-config` / `rotate-key`, Fedimint `admin-url` / `dkg-status` /
+  `dkg-step`, Hermes `get-config` / `set-config` / `exec` / `logs`.
 - **M3 — Secondary payment backends.** **phoenixd** (self-custodial, for standalone
   operators with their own liquidity / higher-value payments) and an optional **LND**
   backend (native hold invoices) for true provision-then-capture atomicity (§6.4).

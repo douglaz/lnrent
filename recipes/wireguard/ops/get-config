@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# WireGuard `get-config` management operation (request-kind). SPEC.md §7.4, ADR-0013.
+# Input: JSON on stdin. Output: op.result.data JSON on stdout (the client .conf).
+# M0 stub. M1: re-emit the buyer's WireGuard client config (same payload as provision).
+set -euo pipefail
+echo '{"error":"wireguard get-config op not implemented (M0 stub)"}'
+exit 1

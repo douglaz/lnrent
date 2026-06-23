@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# WireGuard `restart` management operation (request-kind). SPEC.md §7.4, ADR-0013.
+# Input: JSON on stdin. Output: op.result.data JSON on stdout.
+# M0 stub. M1a: bounce the peer/interface and report the new state.
+set -euo pipefail
+echo '{"error":"wireguard restart op not implemented (M0 stub)"}'
+exit 1

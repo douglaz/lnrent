@@ -13,6 +13,9 @@ pub struct Recipe {
     pub os: Os,
     #[serde(default)]
     pub params: Vec<Param>,
+    /// Buyer-facing management operations (SPEC.md §7.4, ADR-0013). Empty = none declared.
+    #[serde(default, rename = "operation")]
+    pub operations: Vec<Operation>,
     #[serde(skip)]
     pub dir: PathBuf,
 }
@@ -76,6 +79,21 @@ pub struct Param {
     pub required: bool,
 }
 
+/// A buyer-facing management operation declared by a recipe (SPEC.md §7.4, ADR-0013).
+/// `kind` selects the transport: `request` rides the NIP-17 `op.request`/`op.result` DM
+/// pair; `interactive` rides the Iroh Native-connect session (§9.2). `hook` is the
+/// executable under the recipe's `ops/` dir that the daemon runs to service the operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Operation {
+    pub name: String,
+    pub label: String,
+    /// "request" | "interactive" (validated by the recipe runner, lnrent-7fp.6).
+    pub kind: String,
+    pub hook: String,
+    #[serde(default)]
+    pub params: Vec<Param>,
+}
+
 impl Recipe {
     /// Load a recipe from a directory containing `recipe.toml`.
     pub fn load(dir: impl AsRef<Path>) -> Result<Recipe> {
@@ -104,5 +122,63 @@ impl Recipe {
     /// Absolute path to a lifecycle hook executable in this recipe.
     pub fn hook(&self, name: &str) -> PathBuf {
         self.dir.join(name)
+    }
+
+    /// Look up a declared management operation by name (SPEC.md §7.4).
+    pub fn operation(&self, name: &str) -> Option<&Operation> {
+        self.operations.iter().find(|op| op.name == name)
+    }
+
+    /// Absolute path to a management operation's hook executable (under `ops/`).
+    pub fn op_hook(&self, op: &Operation) -> PathBuf {
+        self.dir.join(&op.hook)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // SPEC.md §7.4 / ADR-0013: `[[operation]]` blocks parse into `operations`, and the
+    // `ops/<hook>` path resolves under the recipe dir.
+    #[test]
+    fn manifest_operations_parse() {
+        let toml = r#"
+[service]
+id = "wireguard"
+name = "WireGuard VPN"
+summary = "x"
+version = "0.1.0"
+
+[pricing]
+amount_sat = 5000
+period = "30d"
+renew_lead = "7d"
+retention = "7d"
+
+[provisioning]
+backend = "host"
+isolation = "none"
+
+[os]
+supports = ["nixos"]
+
+[[operation]]
+name = "get-config"
+label = "Download WireGuard config"
+kind = "request"
+hook = "ops/get-config"
+"#;
+        let mut recipe: Recipe = toml::from_str(toml).expect("parse");
+        recipe.dir = PathBuf::from("/recipes/wireguard");
+        assert_eq!(recipe.operations.len(), 1);
+        let op = recipe.operation("get-config").expect("operation present");
+        assert_eq!(op.kind, "request");
+        assert_eq!(
+            recipe.op_hook(op),
+            PathBuf::from("/recipes/wireguard/ops/get-config")
+        );
+        // A recipe with no [[operation]] blocks defaults to an empty op set.
+        assert!(recipe.operation("nope").is_none());
     }
 }

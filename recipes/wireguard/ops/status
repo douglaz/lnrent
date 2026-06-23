@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# WireGuard `status` management operation (request-kind). SPEC.md §7.4, ADR-0013.
+# Input: JSON on stdin (subscription, instance, validated op params, host facts).
+# Output: op.result.data JSON on stdout.
+# M0 stub. M1a: report the peer's up/down + last-handshake from `wg show`.
+set -euo pipefail
+echo '{"error":"wireguard status op not implemented (M0 stub)"}'
+exit 1
