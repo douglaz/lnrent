@@ -2,6 +2,8 @@
 
 Status: draft
 
+> Reachability note: this document's host-control-plane / WireGuard networking recommendations (e.g. §12) are SUPERSEDED for lnrent by the networking addendum (vm-networking-reachability-guidelines.md) and ADR-0008 — reachability is three-plane and Iroh-first; WireGuard is an advanced-optional mode, not the control substrate.
+
 Audience: marketplace developers, node operators, security reviewers, and tenants running services on rented VMs
 
 Goal: define a practical, very safe VM deployment model for an open source marketplace where independent hosts rent VM capacity for sats.

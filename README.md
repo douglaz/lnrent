@@ -14,12 +14,14 @@ recipes, so the set is open-ended.
 
 ## Status
 
-Spec-stage, building toward **M1** (the WireGuard rental loop). **M0 (skeleton)** is in:
-core domain types, subsystem traits (`ComputeBackend`/`NetworkBackend`/`PaymentBackend`)
-with `host`/WireGuard/phoenixd stubs, the recipe loader, and the sqlite schema.
+Spec-stage, M0 skeleton in. Building toward **M1a** — the durable payment/order handshake
+(the riskiest part), proven with a trivial recipe, then a **web WASM buyer** for browser
+marketplace access. MVP wedge is thin VM rental (M1a handshake -> M1b VM Tier-0 -> M1c
+public exposure). **M0 (skeleton)** is in: domain types, subsystem traits
+(`ComputeBackend`/`NetworkBackend`/`PaymentBackend`), recipe loader, sqlite schema.
 
-Design: [SPEC.md](./SPEC.md) · glossary: [CONTEXT.md](./CONTEXT.md) · decisions:
-[docs/adr/](./docs/adr/) (0001–0006).
+Design: [SPEC.md](./SPEC.md) (v0.19) · glossary: [CONTEXT.md](./CONTEXT.md) · decisions:
+[docs/adr/](./docs/adr/) (0001-0009) · M1a work graph: `.beads/` (br, epic lnrent-7fp).
 
 ## Build
 
@@ -33,5 +35,7 @@ cargo run --bin lnrent -- recipes
 ## Layout
 
 - `daemon/` — Rust: `lnrentd` (control plane) + `lnrent` (operator CLI)
+- `clients/` — `core` (buyer-core lib) + `cli` (native buyer) + `web` (WASM SPA)
 - `recipes/` — service recipes (`wireguard/` so far: manifest + lifecycle hook stubs)
-- `docs/adr/` — architecture decision records
+- `docs/adr/` — ADRs (0001-0009); `docs/security/` — VM deployment + networking guidelines
+- `.beads/` — M1a work graph (br)
