@@ -106,9 +106,22 @@ _Avoid_: security level, privacy mode.
 
 **Host security profile**:
 A signed record a Host publishes (its `host_id` = the Operator's Nostr key) declaring
-its tier, hardware, boot integrity, encryption, and operations posture, so Buyers can
-verify what they are trusting.
+its tier, hardware, boot integrity, encryption, operations posture, and network
+capabilities, so Buyers can verify what they are trusting.
 _Avoid_: host manifest (that is the operator manifest), attestation.
+
+**Reachability plane**:
+One of three independent VM networking planes — host control (marketplace<->agent),
+tenant management (tenant<->VM), public service (internet<->app) — each private by
+default with its own primitive, never collapsed into one tunnel. See
+docs/security/vm-networking-reachability-guidelines.md.
+_Avoid_: network mode, tunnel.
+
+**Native connect**:
+The marketplace-native private session a Buyer uses to manage their VM (SSH, console,
+unlock): Iroh-first, Tor onion fallback. WireGuard is an advanced-optional mode, not
+this.
+_Avoid_: VPN, the tunnel.
 
 ## Example dialogue
 

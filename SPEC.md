@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.12)
+# lnrent — Spec (draft v0.13)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -593,36 +593,53 @@ Governing rules from the guidelines, load-bearing for the design:
 The full guidelines govern host onboarding, encryption, isolation, attestation, and
 the pre-launch test plan; they are the source of truth for VM security.
 
-### 9.2 VM rental networking
+### 9.2 VM rental networking and reachability
 
-Per the guidelines (§12) and ADR-0007. Default posture: no public exposure; the tenant
-opts into reachability. WireGuard does double duty here, so the WireGuard provisioning
-machinery is reused as the VM access layer and control-plane transport.
+Per [docs/security/vm-networking-reachability-guidelines.md](docs/security/vm-networking-reachability-guidelines.md)
+(ADR-0008). This **supersedes the WireGuard-default stance of earlier drafts.** Principle:
+VMs are private by default, host control is outbound-only, and public exposure is explicit,
+per-service, and reversible. Reachability is **pluggable**, not one tunnel.
 
-**Per-VM network:**
-- Per-VM tap interface, private VM IP, default-deny inbound, anti-spoofing.
-- No VM-to-VM traffic unless explicitly declared (moot at 1 subscription -> 1 Instance;
-  matters only for a multi-VM tenant network, later).
-- No tenant access to host management; no EC2-style metadata service.
+**Three planes** (never collapsed into one tunnel):
 
-**Control plane (operator / agent):**
-- The host agent, KMS, payment, reputation, and control surfaces are reachable **only
-  over WireGuard**. No public admin API.
+| Plane | Who | Default | M1 primitive |
+|--|--|--|--|
+| Host control (marketplace <-> host agent) | operator / agent | private, outbound-only | **Iroh** (Tor fallback) |
+| Tenant management (tenant <-> VM: SSH, console, unlock) | buyer | private | **Iroh** session (Tor fallback); WireGuard advanced-optional |
+| Public service (internet <-> tenant app) | public | opt-in per service | shared IPv4 published ports (frp / rathole); public IPv6 when the host has it |
 
-**Tenant access to their VM (M1 default = WireGuard):**
-- Default: the tenant reaches their VM over a **tenant WireGuard** peer (delivered with
-  the VM access details). No public SSH port; reuses the WireGuard machinery.
-- Opt-in: SSH via an explicitly **published management port** (a host public port DNAT'd
-  to the VM), for tenants who want plain SSH.
-- Console / recovery only through the authenticated control plane. Deferred past M1;
-  the tenant uses WireGuard + SSH in the meantime.
+**Per-VM baseline:** per-VM tap, private VM IP, default-deny inbound, anti-spoofing, no
+VM-to-VM by default, no host-management access from the VM, **no metadata service**.
+Policy is generated from a declarative per-VM network spec.
 
-**Public exposure (tenant-declared):**
-- None by default. The tenant declares published services; M1 maps each via
-  **port-forward** (allocate a host public port -> VM private IP:port). Routed dedicated
-  IPs and an ingress / reverse-proxy (hostname routing) come later (§8.2, M7).
-- Published ports are a scarce host resource, so they count toward capacity and are
-  reserved on a PENDING order (§6.4 pre-flight + reservation).
+**Host control plane = outbound-only.** The host agent never needs a public inbound port:
+no public SSH, no public libvirt/admin API. It opens an outbound authenticated connection
+to the marketplace (Iroh-first; OpenZiti a serious alternative; Tor onion fallback for
+recovery). This is what makes home / CGNAT / NAT'd hosts first-class.
+
+**Tenant management = private by default.** The buyer reaches their VM (SSH, console,
+unlock, file copy) over a marketplace-native **Iroh** session, with **Tor onion** fallback
+for SSH / rescue / unlock. Raw **WireGuard** is an advanced-optional L3 mode, not the
+default user-facing concept. So a VM's delivery payload is an Iroh connection ticket
+(+ Tor fallback), not a WireGuard config.
+
+**Public exposure = tenant-declared, per service.** None by default. The tenant declares
+published services; each maps via an exposure adapter: shared IPv4 published ports
+(frp / rathole) for the MVP, public IPv6 / dedicated IPv4 when the host has them, HTTP
+ingress with TLS passthrough for web, Tor onion for privacy mode, Cloudflare-Tunnel-like
+only as an optional adapter. Published ports / services are scarce host resources, so they
+count toward capacity and are reserved on a PENDING order (§6.4).
+
+**Tenant-facing question** is "how should this VM be reachable?" (private admin / public
+web / public BTC-LN-Fedimint service / advanced network), not "WireGuard or public IP?".
+
+**Hosts advertise network capabilities** (Iroh, Tor, public IPv6, dedicated IPv4, shared
+ports, ingress, restrictions like blocked SMTP, max ports/VM) in their signed profile
+(§9.1, guidelines §23), so a buyer picks a Listing whose reachability fits.
+
+**Reachability != isolation != confidentiality.** Network reachability controls who can
+connect; VM isolation controls what a tenant can affect; disk/memory protection controls
+what the host can see. Separate domains; never conflate them in claims.
 
 ## 10. Claude skills (author-time and operator-time)
 
@@ -749,6 +766,11 @@ lnrent/
   Tier 1.5 (the guidelines' "minimum viable secure launch": Secure Boot + TPM + per-VM
   encryption + KMS-style key release + sVirt + remote audit logs + quarantine), Tier 2
   (attested confidential VMs, SEV-SNP/TDX).
+- **Reachability roadmap (VM rental).** Per ADR-0008 / the networking addendum (§24
+  order): M1 ships the **private planes** (per-VM tap+firewall, no metadata, outbound-only
+  agent, **Iroh** host-control + tenant-management, **Tor** recovery fallback). Then
+  shared IPv4 published ports (frp/rathole), public IPv6, HTTP ingress (TLS passthrough),
+  zrok/OpenZiti adapters, WireGuard advanced mode, and dedicated IPv4 for premium hosts.
 
 ## 16. Open questions
 
