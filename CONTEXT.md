@@ -43,8 +43,9 @@ _Avoid_: tenant box, worker, node.
 ### Identity
 
 **Operator seed**:
-The single BIP39 mnemonic an Operator backs up. Every operator key derives from it
-(NIP-06). _Avoid_: wallet, private key.
+The single BIP39 mnemonic an Operator backs up. Every operator key derives from it: the
+Nostr identity keys (NIP-06) and the Fedimint client root secret (a dedicated path), so
+one backup covers identity AND ecash funds. _Avoid_: wallet, private key.
 
 **Master identity**:
 The Operator's brand, a Nostr key derived from the Operator seed at account 0.

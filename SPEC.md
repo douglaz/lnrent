@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.22)
+# lnrent — Spec (draft v0.23)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -231,9 +231,12 @@ type), so every key is regenerable from the seed:
   Listings and receives/decrypts buyer NIP-17 DMs with its own operational key, so the
   master key need not be hot on every Box. Buyers verify a Listing by checking the
   master manifest covers its signing key.
-- **Payment backend seed** — ideally also derived from the same BIP39 seed so one
-  backup covers funds. Whether phoenixd accepts an imported seed is unverified (§16);
-  if not, its seed is backed up separately in v1.
+- **Payment backend secret** — the **Fedimint client root secret** (the primary backend,
+  ADR-0012) derives from the same BIP39 seed at a dedicated path, distinct from the NIP-06
+  Nostr paths. So **one seed backs up everything**: the brand + per-Box identity keys AND
+  the Fedimint client, whose ecash position is recoverable from the federation by the same
+  seed. (phoenixd, the secondary backend, keeps its own channel-state seed, backed up
+  separately.)
 
 Custody and rotation:
 - The **seed and master key stay off the Boxes** where practical (generated on the
@@ -955,9 +958,10 @@ Still open:
    manifest TTL / version so "immediate" revocation has a bound.
 5. **Fleet topology (RESOLVED v0.20):** control node (value/identity/marketplace) +
    hosting boxes (disposable compute), driven over Iroh — ADR-0010, §4.5.
-6. **Unified seed for payments:** can phoenixd (and the Fedimint client) be
-   initialized from the operator's BIP39 seed so one backup covers funds too? If not,
-   payment seeds are backed up separately in v1. (Verify, §4.6.)
+6. **Unified seed for payments (RESOLVED v0.23):** the Fedimint client root secret (the
+   primary backend) derives from the operator BIP39 seed at a dedicated path, so one seed
+   backs up identity + ecash funds (§4.6, ADR-0004/0012). phoenixd (secondary) keeps a
+   separate channel-state seed.
 
 ## 17. Out of scope (v1)
 

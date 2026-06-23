@@ -25,8 +25,10 @@ the master revokes by re-issuing the manifest.
 - Buyers verify Listings against a master-signed **operator manifest**: an app-defined
   replaceable Nostr event listing the operational pubkeys (no NIP fits, so it is an
   explicit app-level event, consistent with the §5 approach).
-- Goal: derive the payment-backend seed from the same BIP39 seed so one backup covers
-  funds too. Whether phoenixd accepts an imported seed is unverified; if not, its seed
-  is backed up separately in v1.
+- The **Fedimint client root secret** (the primary receive backend, ADR-0012) derives
+  from the same BIP39 seed at a dedicated path (distinct from the NIP-06 Nostr paths), so
+  one seed backs up identity AND ecash funds — the ecash position is recoverable from the
+  federation by the seed. phoenixd (secondary) keeps its own channel-state seed, backed up
+  separately.
 - v1 single-box operators may keep the seed on the box, accepting that a box
   compromise is then a seed compromise. Onboard forces an explicit backup.
