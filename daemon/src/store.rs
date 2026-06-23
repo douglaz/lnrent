@@ -42,10 +42,10 @@ CREATE TABLE IF NOT EXISTS subscription (
 CREATE TABLE IF NOT EXISTS invoice (
   id              TEXT PRIMARY KEY,
   subscription_id TEXT,
-  external_id     TEXT,    -- = order/subscription id; phoenixd externalId (ADR-0009)
+  external_id     TEXT UNIQUE, -- unique per-invoice token; phoenixd externalId (ADR-0009)
   bolt11          TEXT,
   amount_sat      INTEGER,
-  status          TEXT,    -- OPEN | PAID | CAPTURED | EXPIRED
+  status          TEXT,    -- OPEN | PAID | EXPIRED
   issued_at       INTEGER,
   settled_at      INTEGER
 );

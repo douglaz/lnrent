@@ -23,6 +23,7 @@ pub enum SubState {
     /// Buyer cancelled.
     Cancelled,
     /// Provision failed after capture; refund owed.
+    #[serde(rename = "REFUND_DUE")]
     RefundDue,
     /// Refund paid back to the buyer.
     Refunded,
@@ -67,4 +68,24 @@ pub struct Subscription {
     pub soft_date: Option<i64>,
     /// Reconcile-loop cursor. SPEC.md §6.5.
     pub next_deadline: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// State strings must match the spec's sqlite values exactly (SPEC.md §6.3/§11).
+    /// Guards the REFUND_DUE rename: `rename_all = "UPPERCASE"` alone yields REFUNDDUE.
+    #[test]
+    fn substate_serializes_to_spec_values() {
+        let cases = [
+            (SubState::Pending, "\"PENDING\""),
+            (SubState::Provisioning, "\"PROVISIONING\""),
+            (SubState::RefundDue, "\"REFUND_DUE\""),
+            (SubState::Refunded, "\"REFUNDED\""),
+        ];
+        for (state, want) in cases {
+            assert_eq!(serde_json::to_string(&state).unwrap(), want);
+        }
+    }
 }

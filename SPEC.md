@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.17)
+# lnrent — Spec (draft v0.18)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -297,9 +297,10 @@ Buyer verification (CLI and web both run this):
 This binds a Listing to a brand without the master key being hot: an attacker can put
 `M` in an `operator` tag, but cannot get their key into `M`'s manifest. Reputation
 attaches to `M`, so buyers compare brands, not Boxes. **Revocation:** the master
-re-publishes the manifest without a compromised Box's key, and that Box's Listings
-immediately stop verifying. The manifest is cacheable per operator; a Listing is
-unverifiable only while the manifest cannot be fetched (relay gap).
+re-publishes the manifest without a compromised Box's key; that Box's Listings stop
+verifying once buyers refetch the manifest — bounded by a manifest TTL/version (§16), not
+instantaneous (replaceable events have no push invalidation). A Listing is also
+unverifiable while the manifest cannot be fetched (relay gap).
 
 ## 6. Payments and subscriptions
 
@@ -313,6 +314,7 @@ trait PaymentBackend {
     fn watch(&self) -> PaymentStream;            // stream of settled payments
     fn lookup(&self, id: &InvoiceId) -> PaymentStatus;
     fn pay(&self, dest: &RefundDest, amount_sat: u64) -> PayResult;   // outbound, for refunds
+    fn payment_status(&self, payment_id: &PayId) -> PaymentStatus;    // outbound refund status (ADR-0009)
 }
 ```
 
@@ -430,8 +432,9 @@ reminders are otherwise best-effort.
 The money/delivery path is fully persisted so a crash never strands a payment (ADR-0009).
 The PENDING subscription **is** the order, so a settlement always has a row to bind to.
 
-- **Correlation:** each invoice carries `external_id = subscription_id`; phoenixd's
-  `createinvoice` takes it as `externalId` and returns it on settlement.
+- **Correlation:** each invoice carries a unique `external_id` binding it to its
+  order/subscription; phoenixd's `createinvoice` takes it as `externalId` and returns it on
+  settlement, so a settlement maps to exactly one invoice (`UNIQUE(external_id)`).
 - **Idempotent capture:** `UPDATE invoice SET status='PAID' WHERE id=? AND status='OPEN'`
   plus the `PENDING -> PROVISIONING` move in one transaction; a replayed settlement (ws
   reconnect) affects 0 rows and is a no-op, so `paid_through` can't double-extend.
@@ -449,6 +452,7 @@ Crash-recovery (step -> durable record in one txn -> restart action):
 | settlement | invoice PAID + sub PROVISIONING | replay no-ops (status guard) |
 | provision ok | sub ACTIVE + outbox row | unsent outbox -> resend |
 | provision fail | sub REFUND_DUE + refund_attempt | retry `pay()` |
+| late settle on EXPIRED | refund_attempt | retry `pay()` (order not resurrected) |
 
 Provision hooks are idempotent and re-run if the Box crashes mid-`PROVISIONING`.
 
@@ -491,6 +495,7 @@ retention = "7d"
 [provisioning]
 backend = "host"            # host | incus | libvirt | proxmox | cloud-hetzner ...
 isolation = "none"          # none | container | vm
+tier = "0"                  # honest security tier: 0 | 1 | 1.5 | 2 (ADR-0007, §9.1)
 resources = { cpu = 0, mem_mb = 0, disk_gb = 0 }
 
 [os]
@@ -591,8 +596,8 @@ it sits cleanly inside the AI-free invariant. Trait stub in v1.
 |--|--|--|--|
 | **wireguard** | host | add a peer, allocate IP | `.conf` / QR |
 | **vm** (flagship) | vm (incus) | create VM, inject SSH key | host, port, user (+ security `tier`, §9.1) |
-| **hermes** | vm or container | create instance, run hermes install script, buyer brings LLM keys | SSH + `hermes` usage note |
-| **fedimint** | vm | run a `fedimintd` **guardian**, ready for the DKG setup ceremony with peer guardians | guardian admin URL + setup/connection code |
+| **hermes** (>= Tier 1) | vm or container | create instance, run hermes install script, buyer brings LLM keys | SSH + `hermes` usage note |
+| **fedimint** (>= Tier 1) | vm | run a `fedimintd` **guardian**, ready for the DKG setup ceremony with peer guardians | guardian admin URL + setup/connection code |
 
 Notes:
 - **hermes** = NousResearch/hermes-agent: Python 3.11+/Node, installed via its
@@ -763,8 +768,8 @@ CREATE TABLE subscription (
 
 CREATE TABLE invoice (
   id TEXT PRIMARY KEY, subscription_id TEXT,
-  external_id TEXT,                  -- = order/subscription id; phoenixd externalId (ADR-0009)
-  bolt11 TEXT, amount_sat INTEGER, status TEXT,   -- OPEN|PAID|CAPTURED|EXPIRED
+  external_id TEXT UNIQUE,            -- unique per-invoice token; phoenixd externalId (ADR-0009)
+  bolt11 TEXT, amount_sat INTEGER, status TEXT,   -- OPEN|PAID|EXPIRED
   issued_at INTEGER, settled_at INTEGER);
 
 CREATE TABLE event_log (             -- audit trail of every transition + payment

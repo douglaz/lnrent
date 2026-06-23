@@ -40,6 +40,9 @@ pub struct Provisioning {
     /// Compute backend selector: host | incus | libvirt | proxmox | cloud-* (SPEC.md §8.1).
     pub backend: String,
     pub isolation: String,
+    /// Honest security tier the Listing advertises: "0" | "1" | "1.5" | "2" (ADR-0007, §9.1).
+    #[serde(default)]
+    pub tier: String,
     #[serde(default)]
     pub resources: Resources,
 }

@@ -6,9 +6,10 @@ recovery are specified exactly before M1a code. The PENDING subscription **is** 
 
 ## Correlation and idempotent capture
 
-- Each invoice carries `external_id = subscription_id` (the order). phoenixd's
-  `createinvoice` takes this `externalId`, and the settlement event / `lookup` returns it,
-  so a settlement maps to exactly one invoice / subscription.
+- Each invoice carries a unique `external_id` (a per-invoice token, e.g. the invoice id)
+  that binds the settlement to its order/subscription. phoenixd's `createinvoice` takes this
+  `externalId`, and the settlement event / `lookup` returns it, so a settlement maps to
+  exactly one invoice — enforced by `UNIQUE(external_id)`.
 - Capture is idempotent on the **payment**, not the transition: the daemon runs
   `UPDATE invoice SET status='PAID', settled_at=? WHERE id=? AND status='OPEN'` and, in the
   SAME sqlite transaction, advances the subscription `PENDING -> PROVISIONING` and journals

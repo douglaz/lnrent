@@ -14,6 +14,7 @@ retention = "7d"
 [provisioning]
 backend = "host"
 isolation = "none"
+tier = "0"
 resources = { cpu = 0, mem_mb = 0, disk_gb = 0 }
 
 [os]
