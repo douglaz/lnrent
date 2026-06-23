@@ -97,15 +97,17 @@ CREATE TABLE IF NOT EXISTS outbox (   -- pending operator->buyer NIP-17 DMs (ADR
 );
 
 CREATE TABLE IF NOT EXISTS op_invocation (  -- durable buyer management ops (§7.4, ADR-0013)
-  sender_pubkey   TEXT,
-  request_id      TEXT,    -- the op.request `id`
+  sender_pubkey   TEXT NOT NULL,
+  request_id      TEXT NOT NULL,    -- the op.request `id`
   subscription_id TEXT,
   op              TEXT,
-  state           TEXT,    -- RUNNING | DONE | ERROR
+  state           TEXT NOT NULL CHECK (state IN ('RUNNING','DONE','ERROR')),
   result_json     TEXT,    -- cached op.result data (resent verbatim on a duplicate)
   error_json      TEXT,    -- cached op.result error { code, message, retryable }
   created_at      INTEGER,
   finished_at     INTEGER,
+  -- startup recovery: an orphaned RUNNING row (daemon restart mid-op) -> ERROR
+  -- {code:"interrupted", retryable:false} without re-running the hook (§5.1, lnrent-7fp.20)
   PRIMARY KEY (sender_pubkey, request_id)  -- idempotency: a dup never re-runs the hook
 );
 "#;

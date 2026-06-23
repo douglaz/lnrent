@@ -312,9 +312,14 @@ the Iroh Native-connect session (§9.2).
 the operator persists invocations in `op_invocation` (§11), keyed unique on
 `(sender_pubkey, request_id)`, with the op state and the cached result/error. Because a
 declared op may be **non-idempotent** (e.g. `restart`), a duplicate `op.request` (same
-sender + `id`) — whether a NIP-17 redelivery, a buyer retry after a dropped `op.result`, or
-a daemon restart mid-op — MUST resend the cached or in-flight result and MUST NOT re-run the
-hook. `op.result.request_id` lets the buyer correlate the reply to its request. On `error`,
+sender + `id`) MUST NOT re-run the hook. Resolution by the persisted state:
+`DONE`/`ERROR` resends the cached result; `RUNNING` in the *same* daemon lifetime attaches
+to the in-flight invocation and returns its result when it finishes. A `RUNNING` row with no
+live task — an invocation **orphaned by a daemon restart mid-op** — is recovered at startup
+to a terminal `error { code: "interrupted", retryable: false }` (the hook's effect is
+unknown, so it is neither re-run nor reported as success); a later duplicate then resends
+that cached `interrupted` error, and the buyer decides whether to reissue under a **new**
+`id`. `op.result.request_id` lets the buyer correlate the reply to its request. On `error`,
 no `data` is returned; `code` distinguishes `unauthorized` / `unknown_op` / `invalid_params`
 / `not_active` / `timeout` / `hook_failed`, `retryable` tells the client whether to retry,
 and the operator does not reveal whether an unknown `subscription_id` exists to a non-buyer
@@ -631,13 +636,15 @@ A buyer manages a rented service through one interface, regardless of the servic
 recipe — not the client — declares what can be managed (ADR-0013).
 
 - **Declaration.** Each `[[operation]]` in the manifest declares `{ name, label, kind,
-  hook, params? }`. `hook` is a **bare filename** (no path separators, no `..`), resolved by
-  the daemon as `<recipe-dir>/ops/<hook>`; the daemon rejects any `hook` that is not a simple
-  name (no traversal, no absolute path, no symlink escaping the recipe dir). Common
-  operations are conventional across recipes (`status`, `stop`, `restart`,
-  `get-credentials`); service-specific operations are recipe-defined (WireGuard `get-config`
-  / `rotate-key`; Fedimint `admin-url` / `dkg-status` / `dkg-step`; Hermes `get-config` /
-  `set-config` / `exec` / `logs`).
+  hook, params? }`. `hook` is a **bare filename** (no path separators, no `..`, no absolute
+  path) — the daemon rejects a non-bare `hook` at validation (`Operation::hook_is_safe`) —
+  resolved as `<recipe-dir>/ops/<hook>`. As defense-in-depth (recipes are trusted code,
+  ADR-0002, but a stray symlink in `ops/` could still mislead), the recipe runner's
+  `validate()` additionally canonicalizes the resolved path and rejects it if it escapes the
+  recipe's `ops/` dir. Common operations are conventional across recipes (`status`, `stop`,
+  `restart`, `get-credentials`); service-specific operations are recipe-defined (WireGuard
+  `get-config` / `rotate-key`; Fedimint `admin-url` / `dkg-status` / `dkg-step`; Hermes
+  `get-config` / `set-config` / `exec` / `logs`).
 - **One interface.** The buyer client (CLI `lnrent-buyer ops <sub> list` / `<sub> <op>
   [params]`, and the web client) discovers the operation set for a subscription from the
   Listing's published operation declarations (§5.4 — the public `{ name, label, kind, params }`
@@ -940,12 +947,13 @@ CREATE TABLE outbox (                -- pending operator->buyer NIP-17 DMs (ADR-
   attempts INTEGER, created_at INTEGER, sent_at INTEGER);
 
 CREATE TABLE op_invocation (         -- durable buyer management ops (§7.4, ADR-0013)
-  sender_pubkey TEXT, request_id TEXT,   -- the op.request `id`
+  sender_pubkey TEXT NOT NULL, request_id TEXT NOT NULL,   -- the op.request `id`
   subscription_id TEXT, op TEXT,
-  state TEXT,                        -- RUNNING|DONE|ERROR
+  state TEXT NOT NULL CHECK (state IN ('RUNNING','DONE','ERROR')),
   result_json TEXT, error_json TEXT, -- cached op.result data / error (resent on duplicate)
   created_at INTEGER, finished_at INTEGER,
   PRIMARY KEY (sender_pubkey, request_id));  -- idempotency: a dup never re-runs the hook
+  -- startup recovery: orphaned RUNNING rows -> ERROR {code:"interrupted"} (§5.1)
 ```
 
 ## 12. Deployment
