@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.14)
+# lnrent — Spec (draft v0.15)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -408,11 +408,13 @@ at `paid_through`, `destroy` at retention end), recomputing `next_deadline` each
 Transitions are idempotent and journaled to `event_log`, so a crash mid-hook cannot
 double-run or wedge.
 
-Because all dates are absolute wall-clock timestamps, the loop is **downtime-safe**:
-if the Box was off across a deadline, the transition fires on restart. The buyer is
-expected to renew before `paid_through` (nudged early from `soft_date`), so suspension
-at the hard date is the agreed outcome regardless of operator uptime. Reminders are
-best-effort; the buyer can also request a renewal invoice on demand (`renew.request`).
+Because all dates are absolute wall-clock timestamps, the loop is **downtime-safe**: a
+transition missed while the Box was off fires on restart. But suspension is **credited
+for operator downtime** (ADR-0005): the daemon persists a heartbeat, and on restart it
+shifts any renewal/suspend deadline that fell inside its downtime window forward by the
+outage length and re-sends the reminder, so a buyer is never suspended for the operator's
+outage. The buyer can also request a renewal invoice on demand (`renew.request`);
+reminders are otherwise best-effort.
 
 ## 7. Service recipe spec
 
@@ -735,6 +737,9 @@ CREATE TABLE reservation (            -- capacity held for a PENDING order (§9.
   ports_json TEXT,                   -- requested published ports
   state TEXT,                        -- HELD|CONSUMED|RELEASED
   expires_at INTEGER, created_at INTEGER);
+
+CREATE TABLE daemon_state (          -- single row; heartbeat for downtime credit (§6.5)
+  last_heartbeat INTEGER);
 ```
 
 ## 12. Deployment

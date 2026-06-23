@@ -25,3 +25,15 @@ simply fires on restart.
 - NWC pull (v2) auto-renews before the soft date, making the subscription hands-off.
 - Reminders are best-effort; correctness does not depend on them, because the buyer
   can always request an invoice and renew.
+
+## Revision — credit operator downtime (v0.15)
+
+Wall-clock suspension is downtime-safe for the operator but unfair to the buyer: if the
+operator was down during a subscription's renewal window (`soft_date -> paid_through`),
+the buyer could not renew (no invoice issued, no reminders) yet would be suspended the
+moment the operator returns. Home-lab boxes reboot, lose power, and sleep, so this is a
+real churn/dispute generator. Fix: the daemon persists a heartbeat, and on restart it
+**credits its own downtime** — any renewal/suspend deadline that fell inside the downtime
+window is shifted forward by the outage length and its reminder re-sent, so every buyer
+gets their full `renew_lead` window of actual operator availability before suspension. A
+buyer is never suspended for the operator's outage.
