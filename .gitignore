@@ -3,3 +3,11 @@
 /data
 *.sqlite
 *.sqlite-*
+
+# bv (beads viewer) local config and caches
+.bv/
+
+# beads local db (issues.jsonl is the tracked source)
+.beads/*.db
+.beads/*.db-wal
+.beads/*.db-shm
