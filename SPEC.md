@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.16)
+# lnrent — Spec (draft v0.17)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -10,7 +10,10 @@ reachable over SSH with sudo and manages everything on it from one control plane
 virtual machines and containers, networking, storage, and the services running on
 top. On top of management, lnrent can **rent any managed service to others**,
 settled in Bitcoin Lightning and discovered over a Nostr marketplace. No central
-marketplace server, no central payment custodian.
+marketplace server, no central payment custodian. "Marketplace" means the decentralized
+**Nostr** (discovery, listings, ordering) plus **Iroh/relay** (management transport)
+fabric, not a service lnrent runs: relays are public or operator-run, and any KMS /
+registry referenced by the VM guidelines is operator-run, never a central party.
 
 Renting is one capability, not the whole product. A managed service is either:
 
@@ -306,7 +309,7 @@ A `PaymentBackend` trait abstracts receiving:
 
 ```rust
 trait PaymentBackend {
-    fn create_invoice(&self, amount_sat: u64, memo: &str, expiry_s: u32) -> Invoice;
+    fn create_invoice(&self, amount_sat: u64, memo: &str, expiry_s: u32, external_id: &str) -> Invoice;  // externalId binds settlement -> order (ADR-0009)
     fn watch(&self) -> PaymentStream;            // stream of settled payments
     fn lookup(&self, id: &InvoiceId) -> PaymentStatus;
     fn pay(&self, dest: &RefundDest, amount_sat: u64) -> PayResult;   // outbound, for refunds
@@ -421,6 +424,33 @@ shifts any renewal/suspend deadline that fell inside its downtime window forward
 outage length and re-sends the reminder, so a buyer is never suspended for the operator's
 outage. The buyer can also request a renewal invoice on demand (`renew.request`);
 reminders are otherwise best-effort.
+
+### 6.6 Durable handshake and crash recovery (M1a)
+
+The money/delivery path is fully persisted so a crash never strands a payment (ADR-0009).
+The PENDING subscription **is** the order, so a settlement always has a row to bind to.
+
+- **Correlation:** each invoice carries `external_id = subscription_id`; phoenixd's
+  `createinvoice` takes it as `externalId` and returns it on settlement.
+- **Idempotent capture:** `UPDATE invoice SET status='PAID' WHERE id=? AND status='OPEN'`
+  plus the `PENDING -> PROVISIONING` move in one transaction; a replayed settlement (ws
+  reconnect) affects 0 rows and is a no-op, so `paid_through` can't double-extend.
+- **Delivery outbox:** `provision.ready` is written to an `outbox` row in the same
+  transaction as `-> ACTIVE`; a sender drains it and retries until sent, so a crash after
+  ACTIVE but before the DM cannot strand a paid buyer (also the dropped-DM resync answer).
+- **Refund ledger:** a `refund_attempt` row records dest, amount, the `backend_payment_id`
+  from `pay`, status, and attempts, so refunds never double-pay and stuck ones alert.
+
+Crash-recovery (step -> durable record in one txn -> restart action):
+
+| Step | Durable record | On restart |
+|--|--|--|
+| order placed | sub PENDING + invoice OPEN (external_id) | expired-invoice PENDING -> EXPIRED |
+| settlement | invoice PAID + sub PROVISIONING | replay no-ops (status guard) |
+| provision ok | sub ACTIVE + outbox row | unsent outbox -> resend |
+| provision fail | sub REFUND_DUE + refund_attempt | retry `pay()` |
+
+Provision hooks are idempotent and re-run if the Box crashes mid-`PROVISIONING`.
 
 ## 7. Service recipe spec
 
@@ -733,7 +763,8 @@ CREATE TABLE subscription (
 
 CREATE TABLE invoice (
   id TEXT PRIMARY KEY, subscription_id TEXT,
-  bolt11 TEXT, amount_sat INTEGER, status TEXT,   -- OPEN|PAID|EXPIRED
+  external_id TEXT,                  -- = order/subscription id; phoenixd externalId (ADR-0009)
+  bolt11 TEXT, amount_sat INTEGER, status TEXT,   -- OPEN|PAID|CAPTURED|EXPIRED
   issued_at INTEGER, settled_at INTEGER);
 
 CREATE TABLE event_log (             -- audit trail of every transition + payment
@@ -748,6 +779,18 @@ CREATE TABLE reservation (            -- capacity held for a PENDING order (§9.
 
 CREATE TABLE daemon_state (          -- single row; heartbeat for downtime credit (§6.5)
   last_heartbeat INTEGER);
+
+CREATE TABLE refund_attempt (        -- durable refund ledger (ADR-0009)
+  id TEXT PRIMARY KEY, subscription_id TEXT, dest TEXT, amount_sat INTEGER,
+  backend_payment_id TEXT,           -- from PaymentBackend::pay, for status/dedup
+  status TEXT,                       -- PENDING|SENT|FAILED
+  attempts INTEGER, created_at INTEGER, updated_at INTEGER);
+
+CREATE TABLE outbox (                -- pending operator->buyer NIP-17 DMs (ADR-0009)
+  id TEXT PRIMARY KEY, recipient TEXT, subscription_id TEXT,
+  msg_type TEXT, payload_json TEXT,
+  state TEXT,                        -- PENDING|SENT
+  attempts INTEGER, created_at INTEGER, sent_at INTEGER);
 ```
 
 ## 12. Deployment
@@ -808,12 +851,15 @@ lnrent/
   refund, the settled-but-expired auto-refund, and crash recovery for the
   settle->capture->provision sequence. Single key (account 0). Minimal CLI buyer. Pin the
   lnrent DM schema.
-- **M1b — VM Tier-0 product.** Swap in the real `vm` recipe: Incus VM provisioning (curated
-  images, fixed sizes, §9.3), the three-plane networking (Iroh management + Tor fallback,
-  per-VM tap/firewall, no metadata, §9.2), capacity/reservation, and frp/rathole shared
-  public ports. Honest **Tier 0** Listing.
-- **M2 — More recipes + Tier 1.** Hermes and Fedimint-guardian recipes; **Tier 1**
-  (tenant-managed LUKS) for sensitive workloads; recipe-authoring skill polish.
+- **M1b — VM Tier-0 core.** Swap in the real `vm` recipe: Incus VM provisioning (curated
+  images, fixed sizes, §9.3), per-VM tap/firewall + no metadata, **private** reachability
+  (Iroh management + Tor fallback, §9.2), and capacity/reservation. Honest **Tier 0**
+  Listing, private-only.
+- **M1c — Public exposure.** Tenant-declared published services: shared IPv4 ports via
+  frp/rathole, with the capacity accounting that ports imply (§9.2/§9.3).
+- **M2 — More recipes + Tier 1.** Hermes and Fedimint-guardian recipes, **gated behind
+  >= Tier 1** (tenant-managed LUKS) since they are sensitive workloads (guidelines §26);
+  recipe-authoring skill polish.
 - **M3 — Fedimint payment backend.** Receive via existing federation + gatewayd as an
   alternative to phoenixd. Optional **LND backend** (native hold invoices) for true
   provision-then-capture atomicity (§6.4).

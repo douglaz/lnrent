@@ -1,0 +1,53 @@
+# 0009 — Durable order→delivery state machine (M1a)
+
+The payment handshake is the product and the riskiest part, so its persistence and crash
+recovery are specified exactly before M1a code. The PENDING subscription **is** the order
+(persisted at order time), so there is always a row to correlate a settlement to.
+
+## Correlation and idempotent capture
+
+- Each invoice carries `external_id = subscription_id` (the order). phoenixd's
+  `createinvoice` takes this `externalId`, and the settlement event / `lookup` returns it,
+  so a settlement maps to exactly one invoice / subscription.
+- Capture is idempotent on the **payment**, not the transition: the daemon runs
+  `UPDATE invoice SET status='PAID', settled_at=? WHERE id=? AND status='OPEN'` and, in the
+  SAME sqlite transaction, advances the subscription `PENDING -> PROVISIONING` and journals
+  the event. A replayed settlement (phoenixd ws reconnect) affects 0 rows and is a no-op,
+  so `paid_through` can never be double-extended.
+
+## Crash recovery (settle -> capture -> provision -> deliver)
+
+Every step writes a durable record before its side effect; the reconcile loop re-drives any
+in-flight state on restart:
+
+| Step | Durable record (one txn) | On restart |
+|--|--|--|
+| order placed | subscription PENDING + invoice OPEN (external_id) | expired-invoice PENDING -> EXPIRED |
+| settlement | invoice -> PAID + sub -> PROVISIONING | replayed settlement no-ops (status guard) |
+| provision ok | sub -> ACTIVE + `outbox` row for `provision.ready` | unsent outbox -> resend |
+| provision fail | sub -> REFUND_DUE + `refund_attempt` PENDING | refund_attempt PENDING -> retry `pay()` |
+| late settle on expired | `refund_attempt` PENDING | as above |
+
+Provision hooks are idempotent and re-run if a Box crashes mid-`PROVISIONING`.
+
+## Delivery outbox (a paid buyer always gets credentials)
+
+`provision.ready` (and other operator->buyer DMs) are written to an **outbox** table in the
+same transaction that moves the subscription to ACTIVE; a sender task then publishes the
+NIP-17 DM and marks it SENT, retrying until sent. A crash after ACTIVE but before the DM is
+sent cannot strand a paying buyer — the message is resent on restart. The outbox also
+answers dropped-DM resync: it keeps retrying, and the buyer can `renew.request` to prompt
+redelivery.
+
+## Refund ledger
+
+Refunds are a durable `refund_attempt` ledger: dest, amount, the `backend_payment_id`
+returned by `PaymentBackend::pay`, status, and an attempt count. The payment id lets the
+daemon check status and never double-pay; after N failed attempts the subscription stays
+REFUND_DUE and the operator is alerted (ADR-0003).
+
+## Consequences
+
+- `PaymentBackend::create_invoice` takes an `external_id`; `pay` returns a payment id.
+- §11 gains `invoice.external_id`, and `refund_attempt` + `outbox` tables.
+- This is the gate codex flagged before M1a code; M1a implements exactly this.

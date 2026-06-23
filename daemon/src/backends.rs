@@ -26,10 +26,16 @@ pub trait NetworkBackend: Send + Sync {
 /// Receiving and refunding Lightning. SPEC.md §6.1. No hold invoices on the v1
 /// backends, so `pay` exists for capture-then-refund (ADR-0003).
 pub trait PaymentBackend: Send + Sync {
-    fn create_invoice(&self, amount_sat: u64, memo: &str, expiry_s: u32) -> Result<Invoice>;
+    fn create_invoice(
+        &self,
+        amount_sat: u64,
+        memo: &str,
+        expiry_s: u32,
+        external_id: &str, // binds settlement -> order (ADR-0009)
+    ) -> Result<Invoice>;
     fn lookup(&self, id: &str) -> Result<PaymentStatus>;
-    /// Outbound payment, used for refunds.
-    fn pay(&self, dest: &str, amount_sat: u64) -> Result<()>;
+    /// Outbound payment, used for refunds. Returns a backend payment id for status/dedup.
+    fn pay(&self, dest: &str, amount_sat: u64) -> Result<String>;
     /// Stream of settled payments (push). `Settlement.external_id` carries the order id
     /// (SPEC §6.1). M1a wires this to the phoenixd websocket.
     fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>>;
@@ -38,6 +44,7 @@ pub trait PaymentBackend: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct Invoice {
     pub id: String,
+    pub external_id: String, // = order/subscription id (ADR-0009)
     pub bolt11: String,
     pub amount_sat: u64,
 }
@@ -100,16 +107,35 @@ impl NetworkBackend for WireguardNetwork {
 pub struct PhoenixdPayment;
 
 impl PaymentBackend for PhoenixdPayment {
-    fn create_invoice(&self, _amount_sat: u64, _memo: &str, _expiry_s: u32) -> Result<Invoice> {
+    fn create_invoice(
+        &self,
+        _amount_sat: u64,
+        _memo: &str,
+        _expiry_s: u32,
+        _external_id: &str,
+    ) -> Result<Invoice> {
         bail!("phoenixd.create_invoice not implemented (M0 stub)")
     }
     fn lookup(&self, _id: &str) -> Result<PaymentStatus> {
         bail!("phoenixd.lookup not implemented (M0 stub)")
     }
-    fn pay(&self, _dest: &str, _amount_sat: u64) -> Result<()> {
+    fn pay(&self, _dest: &str, _amount_sat: u64) -> Result<String> {
         bail!("phoenixd.pay not implemented (M0 stub)")
     }
     fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
         bail!("phoenixd.watch not implemented (M0 stub)")
     }
+}
+
+/// Storage subsystem. SPEC.md §8.3 (phased, M7) — trait stub.
+pub trait StorageBackend: Send + Sync {
+    fn create_volume(&self, spec: &Value) -> Result<Value>;
+    fn snapshot(&self, handle: &Value) -> Result<Value>;
+    fn destroy_volume(&self, handle: &Value) -> Result<()>;
+}
+
+/// Observability subsystem, read-only. SPEC.md §8.4 (phased, M7) — trait stub.
+pub trait Observability: Send + Sync {
+    fn status(&self, instance: &Value) -> Result<Value>;
+    fn logs(&self, instance: &Value, lines: u32) -> Result<String>;
 }

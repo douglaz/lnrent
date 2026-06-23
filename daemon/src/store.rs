@@ -42,9 +42,10 @@ CREATE TABLE IF NOT EXISTS subscription (
 CREATE TABLE IF NOT EXISTS invoice (
   id              TEXT PRIMARY KEY,
   subscription_id TEXT,
+  external_id     TEXT,    -- = order/subscription id; phoenixd externalId (ADR-0009)
   bolt11          TEXT,
   amount_sat      INTEGER,
-  status          TEXT,    -- OPEN | PAID | EXPIRED
+  status          TEXT,    -- OPEN | PAID | CAPTURED | EXPIRED
   issued_at       INTEGER,
   settled_at      INTEGER
 );
@@ -70,6 +71,30 @@ CREATE TABLE IF NOT EXISTS reservation (   -- capacity held for a PENDING order 
 CREATE TABLE IF NOT EXISTS daemon_state (  -- single row; heartbeat for downtime credit (§6.5)
   last_heartbeat INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS refund_attempt (  -- durable refund ledger (ADR-0009)
+  id                 TEXT PRIMARY KEY,
+  subscription_id    TEXT,
+  dest               TEXT,
+  amount_sat         INTEGER,
+  backend_payment_id TEXT,    -- from PaymentBackend::pay, for status/dedup
+  status             TEXT,    -- PENDING | SENT | FAILED
+  attempts           INTEGER,
+  created_at         INTEGER,
+  updated_at         INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS outbox (   -- pending operator->buyer NIP-17 DMs (ADR-0009)
+  id              TEXT PRIMARY KEY,
+  recipient       TEXT,
+  subscription_id TEXT,
+  msg_type        TEXT,
+  payload_json    TEXT,
+  state           TEXT,    -- PENDING | SENT
+  attempts        INTEGER,
+  created_at      INTEGER,
+  sent_at         INTEGER
+);
 "#;
 
 /// Open the state database and ensure the schema exists.
@@ -94,6 +119,6 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 7);
+        assert_eq!(n, 9);
     }
 }
