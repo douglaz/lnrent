@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.21)
+# lnrent — Spec (draft v0.22)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -342,17 +342,23 @@ trait PaymentBackend {
 }
 ```
 
-- **phoenixd (default):** self-custodial, HTTP API + websocket for settled events,
-  auto-manages channel liquidity. Best fit for a solo operator. Runs on the **control
-  node**, never on a tenant-hosting box (ADR-0010).
-- **fedimint:** connect to an **existing federation** and route through an
-  **existing gatewayd**. Receives to ecash; invoices are gateway-issued bolt11.
-  Reuses the operator's federation membership rather than running a guardian.
-- Neither phoenixd nor Fedimint supports **hold invoices**, so v1 captures on
-  settlement and refunds on failure (§6.4, ADR-0003). An **LND** backend (native
-  holds) is a later option for operators who want provision-then-capture.
+- **fedimint (default for low-value rentals, ADR-0012):** connect to an **existing
+  federation** and route through an **existing gatewayd**; payments settle into **ecash**
+  with **no per-payment inbound-liquidity cost** (the federation's gateway eats the LN
+  side). The economic fit for the small-sat rentals lnrent leads with. Reuses the
+  operator's federation membership; does not run a guardian. Runs on the **control node**.
+- **phoenixd (secondary, standalone / higher-value):** self-custodial, HTTP API +
+  websocket, auto-manages channel liquidity. But **receiving needs inbound liquidity**: a
+  fresh operator's first payment triggers an on-the-fly channel open (service + on-chain
+  fee) that can exceed a small rental — so phoenixd fits operators with their own liquidity
+  and larger / longer-prepay payments, not 5k-sat one-offs. Control node only (ADR-0010).
+- **Inbound-liquidity reality:** to *receive*, you need inbound capacity. Fedimint
+  sidesteps it; phoenixd pays for it per above. Price periods above the receive overhead,
+  offer longer prepay, and treat tiny amounts as Fedimint territory.
+- Neither supports **hold invoices**, so v1 captures on settlement and refunds on failure
+  (§6.4, ADR-0003); an **LND** backend (native holds) is a later option.
 
-Operator picks one backend per box in config. All expose the same trait.
+Operator picks one backend per control node. All expose the same trait.
 
 ### 6.2 Subscription model: prepaid expiry, renew before the date (v1)
 
@@ -894,9 +900,10 @@ lnrent/
 - **M2 — More recipes + Tier 1.** Hermes and Fedimint-guardian recipes, **gated behind
   >= Tier 1** (tenant-managed LUKS) since they are sensitive workloads (guidelines §26);
   recipe-authoring skill polish.
-- **M3 — Fedimint payment backend.** Receive via existing federation + gatewayd as an
-  alternative to phoenixd. Optional **LND backend** (native hold invoices) for true
-  provision-then-capture atomicity (§6.4).
+- **M3 — Secondary payment backends.** **phoenixd** (self-custodial, for standalone
+  operators with their own liquidity / higher-value payments) and an optional **LND**
+  backend (native hold invoices) for true provision-then-capture atomicity (§6.4).
+  Fedimint ecash is the primary backend, implemented in M1a (ADR-0012).
 - **M4 — NixOS module + Debian packaging.** (The web WASM buyer is proven earlier, in M1a.)
 - **M5 — Pre-fleet hardening.** Per-box key split + operator manifest (ADR-0004/0006);
   NWC (NIP-47) pull subscriptions; the **reputation primitive** (buyer-signed rental
