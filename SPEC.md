@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.19)
+# lnrent — Spec (draft v0.20)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -190,14 +190,29 @@ one Subscription for rented), its Box, and its state. Recipes produce Instances;
 direct manager operations also produce them. Settings applied to a Box or an Instance
 (a firewall rule, a DNS record) are configuration, not Instances.
 
-### 4.5 Fleet topology
+### 4.5 Topology: value plane vs hosting plane (ADR-0010)
 
-- **v1:** one `lnrentd` runs locally on the single Box it manages. Skills and the
-  `lnrent` CLI target that daemon.
-- **Fleet (M7):** an Operator manages several Boxes. The aggregation topology (a
-  central control node driving boxes over SSH, vs one `lnrentd` per Box plus a
-  coordinator, vs a per-Box agent) is an open decision, see §16. Whatever wins,
-  lnrent manages a fleet but does not cluster boxes under one scheduler (§17).
+lnrent splits into two planes so the operator's value never sits on a box that hosts
+untrusted tenants:
+
+- **Control node (value / identity / marketplace plane):** holds the phoenixd/Fedimint
+  wallet, the BIP39 seed + master key, and the marketplace control — the Nostr engine
+  (listings + order DMs), the subscription store + billing/reconcile, and manifest
+  signing. The operator's brain + wallet.
+- **Hosting box (hosting plane):** runs the provisioning backend (Incus) + tenant VMs;
+  holds only a revocable per-box **operational key** (ADR-0004) to authenticate to the
+  control node and sign its host security profile. No funds, no seed.
+
+The control node drives hosting boxes over the **Iroh** control plane (ADR-0008,
+outbound-only from the box). A hosting-box compromise loses only that box's operational
+key and its tenants — not the money or the brand; the master revokes the box by
+re-issuing the manifest.
+
+- **M1a (and self-use / no-untrusted-tenants):** the control node and the one hosting
+  function may be the **same box** (the all-in-one exception). The split is **mandatory
+  once a box runs untrusted tenant VMs** (M1b+).
+- lnrent manages a fleet of hosting boxes from the control node, but does not cluster
+  them under one scheduler (§17).
 
 ### 4.6 Identity and key management
 
@@ -222,8 +237,10 @@ Custody and rotation:
   operator's machine; only the derived operational key is deployed to a Box). A Box
   compromise then leaks only that Box's operational key, which the master revokes by
   re-issuing the manifest; the seed and reputation survive.
-- v1 single-Box operators may keep the seed on the Box for convenience, accepting that
-  a Box compromise is then a seed compromise. Onboard makes the backup explicit.
+- The seed + master key + the receiving wallet live on the **control node**, never on a
+  box that hosts untrusted tenants (ADR-0010). An all-in-one box is allowed only for
+  M1a / self-use / no-untrusted-tenants; there a box compromise is a seed compromise.
+  Onboard makes the backup explicit.
 - Losing the seed without a backup loses the identity and its reputation. Onboard
   forces a backup step.
 
@@ -323,7 +340,8 @@ trait PaymentBackend {
 ```
 
 - **phoenixd (default):** self-custodial, HTTP API + websocket for settled events,
-  auto-manages channel liquidity. Best fit for a solo operator.
+  auto-manages channel liquidity. Best fit for a solo operator. Runs on the **control
+  node**, never on a tenant-hosting box (ADR-0010).
 - **fedimint:** connect to an **existing federation** and route through an
   **existing gatewayd**. Receives to ecash; invoices are gateway-issued bolt11.
   Reuses the operator's federation membership rather than running a guardian.
@@ -813,8 +831,10 @@ CREATE TABLE outbox (                -- pending operator->buyer NIP-17 DMs (ADR-
 ## 13. Security
 
 - The operator **BIP39 seed** and derived keys, plus payment-backend credentials,
-  live in the data dir with tight perms; never in recipe output or logs. The seed and
-  master key stay off Boxes where practical (§4.6).
+  live in the data dir with tight perms; never in recipe output or logs.
+- **Value plane is separated from the hosting plane (ADR-0010):** the wallet, seed, and
+  master key live on the control node, never on a box hosting untrusted tenant VMs, so a
+  tenant escape or box compromise cannot drain funds or steal the seed.
 - Tenant isolation is the provisioning backend's job; the `host` backend (no
   isolation) is only for services that are safe to run unsandboxed (WireGuard).
 - Hooks run with least privilege; the daemon passes secrets via stdin JSON, not
@@ -921,8 +941,8 @@ Still open:
    replaceable events have no push invalidation or TTL, so a revoked operational key
    keeps verifying against cached manifests until each buyer refetches. Define a
    manifest TTL / version so "immediate" revocation has a bound.
-5. **Fleet topology:** central control node over SSH, one `lnrentd` per Box plus a
-   coordinator, or a per-Box agent? (M7.)
+5. **Fleet topology (RESOLVED v0.20):** control node (value/identity/marketplace) +
+   hosting boxes (disposable compute), driven over Iroh — ADR-0010, §4.5.
 6. **Unified seed for payments:** can phoenixd (and the Fedimint client) be
    initialized from the operator's BIP39 seed so one backup covers funds too? If not,
    payment seeds are backed up separately in v1. (Verify, §4.6.)

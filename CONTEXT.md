@@ -10,8 +10,9 @@ the domain language. It is a glossary, not a spec; see SPEC.md for design.
 ### Actors
 
 **Operator**:
-The person who owns a box, installs Recipes, publishes Listings, and receives
-payment. One Operator identity per box (revisit if this changes).
+The person who owns one or more Boxes, installs Recipes, publishes Listings, and
+receives payment. One Operator has a single brand (Master identity); each Box uses a
+derived Operational key (see Identity), all from one Operator seed.
 _Avoid_: seller, host, provider, vendor
 
 **Buyer**:
@@ -23,8 +24,21 @@ _Avoid_: customer, client, user, tenant
 
 **Box**:
 A machine lnrent manages, reachable over SSH with sudo (a rented VPS or a home-lab
-host). An Operator may manage several Boxes (a fleet). Instances live on a Box.
+host). An Operator may manage several Boxes (a fleet). Instances live on a Box. A Box
+plays one of two roles (ADR-0010): the Control node or a Hosting box.
 _Avoid_: server, host, node, machine
+
+**Control node**:
+The Operator's value/identity/marketplace plane: holds the receiving wallet, the Operator
+seed + Master identity, and the marketplace control (listings, order DMs, billing). Never
+hosts untrusted tenant Instances. (ADR-0010)
+_Avoid_: coordinator, server.
+
+**Hosting box**:
+A Box that runs tenant Instances. Holds only a revocable Operational key (to authenticate
+to the Control node and sign its Host security profile) — no funds, no seed. Disposable
+compute. (ADR-0010)
+_Avoid_: tenant box, worker, node.
 
 ### Identity
 
@@ -70,10 +84,11 @@ first invoice is not paid. An Order becomes a Subscription on first settlement.
 _Avoid_: cart, checkout, request, job
 
 **Subscription**:
-The durable paid relationship between a Buyer and a Listing. Carries the lifecycle
-state (active, due, grace, suspended, terminated). One Subscription owns one
-Instance (v1).
-_Avoid_: plan, contract, lease, membership
+The durable paid relationship between a Buyer and a Listing. Prepaid to a Paid-through
+date and renewed before it. Carries the lifecycle state (pending, provisioning, active,
+suspended, terminated, plus expired, cancelled, refund-due, refunded; SPEC §6.3). One
+Subscription owns one Instance (v1).
+_Avoid_: plan, contract, lease, membership; the removed `due`/`grace` states
 
 **Instance**:
 The actual provisioned resource lnrent manages: a WireGuard peer, a VM, a container
