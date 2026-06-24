@@ -10,7 +10,7 @@
 use core::fmt;
 use core::marker::PhantomData;
 
-use nostr::{Event, EventBuilder, Kind, Tag, TagKind};
+use nostr::{Event, EventBuilder, Kind, PublicKey, Tag, TagKind};
 use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
@@ -235,6 +235,18 @@ fn validate_listing(listing: &Listing) -> Result<(), Error> {
             supported: SCHEMA_VERSION,
         });
     }
+    // The `d` tag is half the addressable coordinate `30402:<pubkey>:<d>` — an empty `d` yields a
+    // malformed coordinate, so reject it (codex review).
+    if listing.d.is_empty() {
+        return Err(Error::Missing("d"));
+    }
+    // `operator` is a master pubkey (§5.4); reject anything that isn't a valid public key so a
+    // consumer never trusts a bogus operator field.
+    if PublicKey::from_hex(&listing.operator).is_err() {
+        return Err(Error::InvalidOperator {
+            found: listing.operator.clone(),
+        });
+    }
     if listing.params.len() > MAX_PARAMS {
         return Err(Error::TooMany {
             field: "params",
@@ -309,6 +321,11 @@ pub fn parse_listing(event: &Event) -> Result<ParsedListing, Error> {
     }
 
     let d = d.ok_or(Error::Missing("d"))?;
+    // A present-but-empty `d` makes a malformed coordinate `30402:<pubkey>:` — reject it like a
+    // missing one (codex review).
+    if d.is_empty() {
+        return Err(Error::Missing("d"));
+    }
     // The operation/params arrays are bounded as they deserialize (`de_operations` /
     // `de_params`), so an oversized listing surfaces here as `Error::Json` (SPEC.md §5.4).
     let content: Content = serde_json::from_str(&event.content)?;
@@ -320,8 +337,14 @@ pub fn parse_listing(event: &Event) -> Result<ParsedListing, Error> {
         });
     }
 
+    let operator = operator.ok_or(Error::Missing("operator"))?;
+    // The operator tag is a master pubkey (§5.4); reject a non-pubkey before any consumer trusts
+    // it (codex review). The listing_id is still derived from event.pubkey, not this field.
+    if PublicKey::from_hex(&operator).is_err() {
+        return Err(Error::InvalidOperator { found: operator });
+    }
     let listing = Listing {
-        operator: operator.ok_or(Error::Missing("operator"))?,
+        operator,
         recipe_id: meta.recipe.id,
         recipe_version: meta.recipe.version,
         title: title.ok_or(Error::Missing("title"))?,

@@ -208,6 +208,26 @@ async fn gift_unwrap_rejects_a_non_dm_rumor() {
     );
 }
 
+#[tokio::test]
+async fn gift_unwrap_rejects_a_tampered_outer_wrap() {
+    let sender = Keys::generate();
+    let recipient = Keys::generate();
+    let msg = Msg::SubCancel(SubCancel {
+        subscription_id: "sub-1".into(),
+    });
+    let mut wrapped = gift_wrap(&sender, &recipient.public_key(), &msg)
+        .await
+        .expect("gift_wrap");
+    // Tamper with the outer envelope so its id no longer matches its content: gift_unwrap must
+    // verify the outer kind-1059 event and reject it, not decrypt a forged/copied wrap.
+    wrapped.content.push('x');
+    let err = gift_unwrap(&recipient, &wrapped).await.unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidEvent(_)),
+        "a tampered outer wrap must be rejected, got {err:?}"
+    );
+}
+
 #[test]
 fn op_result_request_id_correlates_to_op_request_id() {
     let req = Msg::OpRequest(OpRequest {
@@ -864,6 +884,27 @@ fn listing_parse_bounds_the_params_arrays() {
     assert!(
         matches!(parse_listing(&event), Err(Error::Json(_))),
         "an over-bound operation params array must be rejected"
+    );
+}
+
+#[test]
+fn listing_build_rejects_an_empty_d() {
+    let keys = Keys::generate();
+    let mut listing = sample_listing(&keys.public_key().to_hex());
+    listing.d = String::new();
+    assert!(
+        matches!(build_listing(&listing), Err(Error::Missing("d"))),
+        "an empty d yields a malformed coordinate and must be rejected"
+    );
+}
+
+#[test]
+fn listing_build_rejects_a_non_pubkey_operator() {
+    let mut listing = sample_listing("not-a-real-pubkey");
+    listing.d = "wg-1".into();
+    assert!(
+        matches!(build_listing(&listing), Err(Error::InvalidOperator { ref found }) if found == "not-a-real-pubkey"),
+        "operator must be a valid public key"
     );
 }
 

@@ -30,6 +30,9 @@ pub enum Error {
     InvalidPriceAmount { found: String },
     /// The listing's NIP-99 price currency was not `SAT` (SPEC.md §5.4 fixes this unit).
     InvalidPriceCurrency { found: String },
+    /// The listing's `operator` tag was not a valid Nostr public key (SPEC.md §5.4 / §4.6 —
+    /// the operator is a master pubkey).
+    InvalidOperator { found: String },
 }
 
 impl fmt::Display for Error {
@@ -61,6 +64,9 @@ impl fmt::Display for Error {
             }
             Error::InvalidPriceCurrency { found } => {
                 write!(f, "listing price currency must be SAT, got {found}")
+            }
+            Error::InvalidOperator { found } => {
+                write!(f, "listing operator is not a valid public key: {found}")
             }
         }
     }

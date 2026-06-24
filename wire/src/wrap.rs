@@ -44,6 +44,14 @@ pub async fn gift_unwrap<S>(recipient: &S, wrap: &Event) -> Result<Unwrapped, Er
 where
     S: NostrSigner,
 {
+    // Verify the OUTER envelope before decrypting: it must be a kind-1059 gift wrap whose id and
+    // signature check out. The inner seal still authenticates the sender, but verifying the outer
+    // event stops a tampered/forged envelope from being trusted as a unit — important because a
+    // consumer may use the outer `Event.id` as a relay-duplicate key (codex review).
+    if wrap.kind != Kind::GiftWrap {
+        return Err(Error::NotGiftWrap);
+    }
+    wrap.verify().map_err(|e| Error::InvalidEvent(e.to_string()))?;
     let gift = nip59::extract_rumor(recipient, wrap)
         .await
         .map_err(|e| match e {
