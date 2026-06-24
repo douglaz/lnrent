@@ -29,8 +29,8 @@ CREATE TABLE IF NOT EXISTS subscription (
   state                TEXT,    -- SubState; SPEC.md §6.3
   params_json          TEXT,
   refund_dest          TEXT,    -- BOLT12 offer or Lightning address
-  instance_handle_json TEXT,
-  period_s             INTEGER,
+  -- backend handles live on `instance` (instance_id), not duplicated here
+  period_s             INTEGER, -- copied from the listing at order time
   renew_lead_s         INTEGER,
   retention_s          INTEGER,
   paid_through         INTEGER, -- hard expiry
@@ -151,12 +151,14 @@ CREATE TABLE IF NOT EXISTS instance (  -- a provisioned unit of work (§4.4)
 CREATE TABLE IF NOT EXISTS listing (  -- one Recipe -> many Listings (CONTEXT glossary)
   id         TEXT PRIMARY KEY,      -- NIP-99 coordinate "30402:<pubkey>:<d>" (§5.4)
   recipe_id  TEXT,
-  d_tag      TEXT,                  -- the replaceable-event d tag
-  event_id   TEXT,                  -- latest published event id
-  amount_sat INTEGER,
-  period_s   INTEGER,
-  state      TEXT,                  -- ACTIVE | WITHDRAWN
-  updated_at INTEGER
+  d_tag        TEXT,                -- the replaceable-event d tag
+  event_id     TEXT,                -- latest published event id
+  amount_sat   INTEGER,
+  period_s     INTEGER,             -- per-Listing timers (§6.3); copied to the subscription at order time
+  renew_lead_s INTEGER,
+  retention_s  INTEGER,
+  state        TEXT,                -- ACTIVE | WITHDRAWN
+  updated_at   INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS native_connect_session (  -- interactive-op tickets (§7.4/§9.2; M1b+)

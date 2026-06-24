@@ -29,9 +29,11 @@ plays one of two roles (ADR-0010): the Control node or a Hosting box.
 _Avoid_: server, host, node, machine
 
 **Control node**:
-The Operator's value/identity/marketplace plane: holds the receiving wallet, the Operator
-seed + Master identity, and the marketplace control (listings, order DMs, billing). Never
-hosts untrusted tenant Instances. (ADR-0010)
+The Operator's value/identity/marketplace plane: holds the receiving wallet + the hot
+marketplace Operational key, and the marketplace control (listings, order DMs, billing). The
+Operator seed + Master identity stay cold/offline (used only to issue the manifest) — except
+the M1a all-in-one box, where the seed is on the box. Never hosts untrusted tenant Instances.
+(ADR-0010)
 _Avoid_: coordinator, server.
 
 **Hosting box**:
@@ -44,8 +46,10 @@ _Avoid_: tenant box, worker, node.
 
 **Operator seed**:
 The single BIP39 mnemonic an Operator backs up. Every operator key derives from it: the
-Nostr identity keys (NIP-06) and the Fedimint client root secret (a dedicated path), so
-one backup covers identity AND ecash funds. _Avoid_: wallet, private key.
+Nostr identity keys (NIP-06) and the Fedimint client root secret (HKDF domain
+`lnrent:fedimint:v1`, §4.6). One backup covers identity AND the ecash client — but restoring
+the ecash position also needs the federation invite/config (the seed alone is not enough), so
+backup must include it. _Avoid_: wallet, private key.
 
 **Master identity**:
 The Operator's brand, a Nostr key derived from the Operator seed at account 0.
@@ -127,9 +131,10 @@ docs/security/vm-deployment-guidelines.md.
 _Avoid_: security level, privacy mode.
 
 **Host security profile**:
-A signed record a Host publishes (its `host_id` = the Operator's Nostr key) declaring
-its tier, hardware, boot integrity, encryption, operations posture, and network
-capabilities, so Buyers can verify what they are trusting.
+A signed record a Host publishes — signed by its `host_op_pubkey` and naming the
+`operator_master_pubkey` it belongs to (§9.1) — declaring its tier, hardware, boot integrity,
+encryption, operations posture, and network capabilities, so Buyers can verify what they are
+trusting.
 _Avoid_: host manifest (that is the operator manifest), attestation.
 
 **Reachability plane**:

@@ -27,9 +27,11 @@ re-issuing the manifest.
   replaceable Nostr event listing the operational pubkeys (no NIP fits, so it is an
   explicit app-level event, consistent with the §5 approach).
 - The **Fedimint client root secret** (the primary receive backend, ADR-0012) derives
-  from the same BIP39 seed at a dedicated path (distinct from the NIP-06 Nostr paths), so
-  one seed backs up identity AND ecash funds — the ecash position is recoverable from the
-  federation by the seed. phoenixd (secondary) keeps its own channel-state seed, backed up
+  from the same BIP39 seed via a dedicated HKDF domain (`lnrent:fedimint:v1`, distinct from
+  the NIP-06 Nostr paths), so one seed regenerates identity AND the ecash client. The ecash
+  position is recoverable from the federation — but **the seed alone is not a full backup**:
+  restore also needs the federation invite/config (which federation to rejoin), so onboard's
+  backup must include it. phoenixd (secondary) keeps its own channel-state seed, backed up
   separately.
 - v1 single-box operators may keep the seed on the box, accepting that a box
   compromise is then a seed compromise. Onboard forces an explicit backup.

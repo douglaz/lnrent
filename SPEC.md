@@ -270,10 +270,11 @@ Custody and rotation:
   operator's machine; only the derived operational key is deployed to a Box). A Box
   compromise then leaks only that Box's operational key, which the master revokes by
   re-issuing the manifest; the seed and reputation survive.
-- The seed + master key + the receiving wallet live on the **control node**, never on a
-  box that hosts untrusted tenants (ADR-0010). An all-in-one box is allowed only for
-  M1a / self-use / no-untrusted-tenants; there a box compromise is a seed compromise.
-  Onboard makes the backup explicit.
+- The receiving **wallet** + the hot **marketplace operational key** live on the **control
+  node**; the **seed + master key stay cold/offline** (brought online only to issue/update the
+  manifest), never on a box that hosts untrusted tenants (ADR-0010). An all-in-one box is
+  allowed only for M1a / self-use / no-untrusted-tenants; there the seed IS on the box, so a
+  box compromise is a seed compromise. Onboard makes the backup explicit.
 - Losing the seed without a backup loses the identity and its reputation. Onboard
   forces a backup step.
 
@@ -386,7 +387,12 @@ inbound request in `inbound_request` (§11), keyed unique on `(sender_pubkey, re
 caching the response it sent (`order.invoice` / `order.error` / `billing.invoice`). A
 duplicate request (retry, relay redelivery, crash-restart) **resends the cached response and
 never creates a second reservation, order, or invoice**. The response carries `request_id` so
-the buyer correlates it before any `order_id`/`subscription_id` exists. `sub.cancel` and
+the buyer correlates it before any `order_id`/`subscription_id` exists. The `inbound_request`
+row is written in the **same store transaction** as the order's PENDING-sub + OPEN-invoice (or
+the renewal invoice), so there is **no in-flight gap**: either the response is durably cached
+(a retry resends it) or the order was never created (a retry redoes it cleanly). A reservation
+taken before that commit but orphaned by a crash is released on its TTL (§9.3), so a clean
+retry never leaks capacity. `sub.cancel` and
 `delivery.resend.request` are naturally idempotent (they act on existing subscription state),
 so they need no request id.
 
@@ -471,10 +477,15 @@ trait PaymentBackend {
     fn watch(&self) -> PaymentStream;            // stream of settled payments
     fn lookup(&self, id: &InvoiceId) -> PaymentStatus;
     fn pay(&self, dest: &RefundDest, amount_sat: u64, idempotency_key: &str) -> PayResult;  // outbound refund; key dedups
-    fn payment_status_by_key(&self, idempotency_key: &str) -> PaymentStatus;  // resolve a SUBMITTED-but-unconfirmed pay after a crash
-    fn payment_status(&self, payment_id: &PayId) -> PaymentStatus;            // outbound refund status (ADR-0009)
+    fn payment_status_by_key(&self, idempotency_key: &str) -> PayStatus;  // resolve a SUBMITTED-but-unconfirmed pay after a crash
+    fn payment_status(&self, payment_id: &PayId) -> PayStatus;           // outbound refund status (ADR-0009)
 }
 ```
+
+`PaymentStatus` (`Open` / `Paid` / `Expired`) describes an inbound **invoice**; an **outbound**
+refund uses the distinct `PayStatus` (`Unknown` / `Pending` / `Succeeded` / `Failed`) — they
+are not the same enum. `Unknown` is the honest answer when a `SUBMITTED` refund can be neither
+confirmed nor refuted (it stays `SUBMITTED` for operator reconciliation, never blindly retried).
 
 `pay` is **idempotent on `idempotency_key`**: calling it twice with the same key never sends
 twice. The daemon persists the `refund_attempt` (with its key) and marks it `SUBMITTED`
@@ -580,6 +591,13 @@ re-based to `settled_at`):
   funds are **auto-refunded** via a detached `refund_attempt -> REFUND_DUE`, never kept and
   never resurrecting the order (the invoice's `external_id` makes this detectable).
 
+**Totality (catch-all).** The transitions above are exhaustive for the events that change a
+subscription. Any `(state, event)` pair not listed is a **logged no-op** — the event is
+ignored, the state is unchanged — with exactly one exception: an **inbound settlement** is
+never dropped. A settlement is always either *captured* (the matching `PENDING` order) or
+*auto-refunded* (every other state, per the rule above). So money has a defined outcome in
+every state, and every other stray event is inert.
+
 ### 6.4 Provisioning atomicity and refunds
 
 phoenixd and Fedimint cannot hold an invoice (accept-but-not-settle), so v1 captures
@@ -605,9 +623,12 @@ not v1.
 A single periodic **reconcile loop** advances subscriptions: it scans those whose
 `next_deadline <= now` and fires the due transition (remind at `soft_date`, `suspend`
 at `paid_through`, `destroy` at retention end), recomputing `next_deadline` each time.
-Transitions are journaled to `event_log` and guarded by a durable per-`(subscription,
-deadline)` record; combined with the idempotent-hook requirement (§7.2), a crash mid-hook
-re-runs the transition at most once and cannot double-run or wedge.
+Each transition is a **conditional (compare-and-swap) UPDATE**: it commits only if the
+subscription row still matches the expected `(state, next_deadline)`, so a concurrent or
+replayed attempt affects 0 rows — the **subscription row itself is the guard**, no separate
+guard table (the same status-guard pattern as idempotent capture, §6.6). Combined with the
+idempotent-hook requirement (§7.2) and the `event_log` journal, a crash mid-hook re-runs the
+transition at most once and cannot double-run or wedge.
 
 Because all dates are absolute wall-clock timestamps, the loop is **downtime-safe**: a
 transition missed while the Box was off fires on restart. But suspension is **credited
@@ -730,8 +751,8 @@ hook = "status"             # bare name -> ops/status
   records (container id, peer index) for later hooks.
 - Exit non-zero = failure; the daemon does not advance state and alerts the operator.
 - **Lifecycle hooks (provision/suspend/resume/destroy) MUST be idempotent (re-run safe).**
-  The daemon guards each transition durably (§6.5) but may re-run a hook after a crash, so a
-  non-idempotent lifecycle hook is a recipe bug. (Management-op hooks are not assumed
+  The daemon guards each transition with a compare-and-swap on `(state, next_deadline)` (§6.5)
+  but may re-run a hook after a crash, so a non-idempotent lifecycle hook is a recipe bug. (Management-op hooks are not assumed
   idempotent — that is handled at dispatch via `op_invocation`, §7.4.)
 
 ### 7.3 OS awareness
@@ -1035,8 +1056,8 @@ CREATE TABLE subscription (
   state TEXT,                        -- see §6.3 (PENDING|PROVISIONING|ACTIVE|SUSPENDED|TERMINATED|EXPIRED|CANCELLED|REFUND_DUE|REFUNDED)
   params_json TEXT,                  -- validated buyer params
   refund_dest TEXT,                  -- BOLT12 offer or Lightning address, for refunds
-  instance_handle_json TEXT,         -- backend handles for later hooks
-  period_s INTEGER, renew_lead_s INTEGER, retention_s INTEGER,
+  -- backend handles live on `instance` (instance_id), not duplicated here
+  period_s INTEGER, renew_lead_s INTEGER, retention_s INTEGER,   -- copied from the listing at order time
   paid_through INTEGER,              -- hard expiry; service interrupted after this
   soft_date INTEGER,                 -- paid_through - renew_lead_s; renewal recommended from here
   next_deadline INTEGER,             -- reconcile-loop cursor
@@ -1115,7 +1136,8 @@ CREATE TABLE listing (               -- one Recipe -> many Listings (CONTEXT glo
   id TEXT PRIMARY KEY,               -- NIP-99 addressable coordinate "30402:<pubkey>:<d>" (§5.4)
   recipe_id TEXT, d_tag TEXT,        -- the replaceable-event d tag
   event_id TEXT,                     -- latest published event id
-  amount_sat INTEGER, period_s INTEGER,
+  amount_sat INTEGER,
+  period_s INTEGER, renew_lead_s INTEGER, retention_s INTEGER,   -- the per-Listing timers (§6.3); copied to the subscription at order time
   state TEXT,                        -- ACTIVE|WITHDRAWN
   updated_at INTEGER);
 

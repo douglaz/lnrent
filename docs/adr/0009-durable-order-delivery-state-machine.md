@@ -26,8 +26,8 @@ in-flight state on restart:
 | order placed | subscription PENDING + invoice OPEN (external_id) | expired-invoice PENDING -> EXPIRED |
 | settlement | invoice -> PAID + sub -> PROVISIONING | replayed settlement no-ops (status guard) |
 | provision ok | sub -> ACTIVE + `outbox` row for `provision.ready` | unsent outbox -> resend |
-| provision fail | sub -> REFUND_DUE + `refund_attempt` PENDING | refund_attempt PENDING -> retry `pay()` |
-| late settle on expired | `refund_attempt` PENDING | as above |
+| provision fail | best-effort `destroy` + sub -> REFUND_DUE + `refund_attempt` SUBMITTED (idempotency_key) | resolve via `payment_status_by_key`; pay only if not yet submitted |
+| late settle on terminal sub | detached `refund_attempt` SUBMITTED | as above (order not resurrected) |
 
 Provision hooks are idempotent and re-run if a Box crashes mid-`PROVISIONING`.
 
@@ -42,10 +42,14 @@ answers dropped-DM resync: it keeps retrying, and the buyer can send `delivery.r
 
 ## Refund ledger
 
-Refunds are a durable `refund_attempt` ledger: dest, amount, the `backend_payment_id`
-returned by `PaymentBackend::pay`, status, and an attempt count. The payment id lets the
-daemon check status and never double-pay; after N failed attempts the subscription stays
-REFUND_DUE and the operator is alerted (ADR-0003).
+Refunds are a durable `refund_attempt` ledger: dest, amount, a durable `idempotency_key`,
+the `backend_payment_id` (once known), status (`SUBMITTED` | `SENT` | `FAILED`), and an
+attempt count. The row is persisted `SUBMITTED` **before** `PaymentBackend::pay(dest, amount,
+idempotency_key)`, which is idempotent on the key; a crash after pay-success but before
+recording the payment id resolves the outcome via `payment_status_by_key` rather than
+re-paying, so the daemon **never double-pays**. After N failed attempts the subscription stays
+REFUND_DUE and the operator is alerted (ADR-0003). (Outbound `PayStatus` is distinct from the
+inbound-invoice `PaymentStatus` — §6.1.)
 
 ## Consequences
 

@@ -38,10 +38,10 @@ pub trait PaymentBackend: Send + Sync {
     /// with the same key never pays twice (ADR-0009, SPEC §6.6). Returns a backend payment id.
     fn pay(&self, dest: &str, amount_sat: u64, idempotency_key: &str) -> Result<String>;
     /// Status of an outbound payment by its backend id (ADR-0009 refund ledger).
-    fn payment_status(&self, payment_id: &str) -> Result<PaymentStatus>;
+    fn payment_status(&self, payment_id: &str) -> Result<PayStatus>;
     /// Resolve a SUBMITTED-but-unconfirmed refund after a crash, by its idempotency key
     /// (SPEC §6.6) — so restart never blindly re-pays.
-    fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PaymentStatus>;
+    fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus>;
     /// Stream of settled payments (push). `Settlement.external_id` carries the order id
     /// (SPEC §6.1). M1a wires this to the Fedimint client settlement stream.
     fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>>;
@@ -55,11 +55,22 @@ pub struct Invoice {
     pub amount_sat: u64,
 }
 
+/// Status of one of OUR inbound invoices (receiving). SPEC.md §6.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaymentStatus {
     Open,
     Paid,
     Expired,
+}
+
+/// Status of an OUTBOUND payment (a refund), distinct from invoice status (§6.6). `Unknown`
+/// is the crash-recovery answer when a SUBMITTED refund can be neither confirmed nor refuted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayStatus {
+    Unknown,
+    Pending,
+    Succeeded,
+    Failed,
 }
 
 /// A settled incoming payment for one of OUR invoices. The backend filters out any
@@ -131,10 +142,10 @@ impl PaymentBackend for FedimintPayment {
     fn pay(&self, _dest: &str, _amount_sat: u64, _idempotency_key: &str) -> Result<String> {
         bail!("fedimint.pay not implemented (M0 stub)")
     }
-    fn payment_status(&self, _payment_id: &str) -> Result<PaymentStatus> {
+    fn payment_status(&self, _payment_id: &str) -> Result<PayStatus> {
         bail!("fedimint.payment_status not implemented (M0 stub)")
     }
-    fn payment_status_by_key(&self, _idempotency_key: &str) -> Result<PaymentStatus> {
+    fn payment_status_by_key(&self, _idempotency_key: &str) -> Result<PayStatus> {
         bail!("fedimint.payment_status_by_key not implemented (M0 stub)")
     }
     fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {

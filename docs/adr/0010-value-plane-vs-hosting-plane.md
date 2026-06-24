@@ -11,9 +11,11 @@ Rule: once a box hosts untrusted tenant VMs, the operator's funds and seed do NO
 it. lnrent splits into two planes:
 
 - **Value / identity / marketplace plane (the control node):** holds the phoenixd/Fedimint
-  wallet, the BIP39 seed + master key, and the marketplace control — the Nostr engine
-  (publish listings, handle order DMs), the subscription store + billing/reconcile, and
-  manifest signing. The operator's brain + wallet.
+  wallet + the hot **marketplace operational key**, and the marketplace control — the Nostr
+  engine (publish listings, handle order DMs), the subscription store + billing/reconcile. The
+  **BIP39 seed + master key stay cold/offline** (used only to issue/update the manifest), not
+  hot on the control node — except the M1a all-in-one box, where the seed lives on the box. The
+  operator's brain + wallet.
 - **Hosting plane (hosting boxes):** run the provisioning backend (Incus) and tenant VMs.
   A hosting box holds only a per-box **operational key** (revocable via the operator
   manifest, ADR-0004) used to authenticate to the control node and sign its host security
