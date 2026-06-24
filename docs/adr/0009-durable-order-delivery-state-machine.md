@@ -37,8 +37,8 @@ Provision hooks are idempotent and re-run if a Box crashes mid-`PROVISIONING`.
 same transaction that moves the subscription to ACTIVE; a sender task then publishes the
 NIP-17 DM and marks it SENT, retrying until sent. A crash after ACTIVE but before the DM is
 sent cannot strand a paying buyer — the message is resent on restart. The outbox also
-answers dropped-DM resync: it keeps retrying, and the buyer can `renew.request` to prompt
-redelivery.
+answers dropped-DM resync: it keeps retrying, and the buyer can send `delivery.resend.request`
+(§5.1) to prompt redelivery of the latest `provision.ready`.
 
 ## Refund ledger
 

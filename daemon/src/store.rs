@@ -14,16 +14,17 @@ CREATE TABLE IF NOT EXISTS operator (
   relays          TEXT
 );
 
-CREATE TABLE IF NOT EXISTS recipe (
+CREATE TABLE IF NOT EXISTS recipe (   -- listings are their own table (one recipe -> many)
   id               TEXT PRIMARY KEY,
   version          TEXT,
-  manifest_json    TEXT,
-  listing_event_id TEXT
+  manifest_json    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS subscription (
   id                   TEXT PRIMARY KEY,
   recipe_id            TEXT,
+  listing_id           TEXT,
+  instance_id          TEXT,
   buyer_pubkey         TEXT,
   state                TEXT,    -- SubState; SPEC.md §6.3
   params_json          TEXT,
@@ -40,14 +41,19 @@ CREATE TABLE IF NOT EXISTS subscription (
 );
 
 CREATE TABLE IF NOT EXISTS invoice (
-  id              TEXT PRIMARY KEY,
-  subscription_id TEXT,
-  external_id     TEXT UNIQUE, -- unique per-invoice token; phoenixd externalId (ADR-0009)
-  bolt11          TEXT,
-  amount_sat      INTEGER,
-  status          TEXT,    -- OPEN | PAID | EXPIRED
-  issued_at       INTEGER,
-  settled_at      INTEGER
+  id                 TEXT PRIMARY KEY,
+  subscription_id    TEXT,
+  external_id        TEXT UNIQUE, -- unique per-invoice token; backend externalId (ADR-0009)
+  backend_invoice_id TEXT,        -- the backend's own invoice id
+  payment_hash       TEXT,
+  kind               TEXT,    -- order | renewal
+  bolt11             TEXT,
+  amount_sat         INTEGER,
+  status             TEXT,    -- OPEN | PAID | EXPIRED
+  expires_at         INTEGER, -- bolt11 expiry; order reservation released at this
+  applied_at         INTEGER, -- when settlement was captured/applied (durable applied marker)
+  issued_at          INTEGER,
+  settled_at         INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS event_log (
@@ -72,13 +78,14 @@ CREATE TABLE IF NOT EXISTS daemon_state (  -- single row; heartbeat for downtime
   last_heartbeat INTEGER
 );
 
-CREATE TABLE IF NOT EXISTS refund_attempt (  -- durable refund ledger (ADR-0009)
+CREATE TABLE IF NOT EXISTS refund_attempt (  -- durable refund ledger (ADR-0009, §6.6)
   id                 TEXT PRIMARY KEY,
   subscription_id    TEXT,
   dest               TEXT,
   amount_sat         INTEGER,
-  backend_payment_id TEXT,    -- from PaymentBackend::pay, for status/dedup
-  status             TEXT,    -- PENDING | SENT | FAILED
+  idempotency_key    TEXT NOT NULL,  -- passed to PaymentBackend::pay; dedups the outbound payment
+  backend_payment_id TEXT,           -- from pay(), once known
+  status             TEXT NOT NULL,  -- SUBMITTED (pay called, outcome unknown -> resolve by key) | SENT | FAILED
   attempts           INTEGER,
   created_at         INTEGER,
   updated_at         INTEGER
@@ -110,6 +117,57 @@ CREATE TABLE IF NOT EXISTS op_invocation (  -- durable buyer management ops (§7
   -- {code:"interrupted", retryable:false} without re-running the hook (§5.1, lnrent-7fp.20)
   PRIMARY KEY (sender_pubkey, request_id)  -- idempotency: a dup never re-runs the hook
 );
+
+CREATE TABLE IF NOT EXISTS inbound_request (  -- idempotency for order/renew request DMs (§5.1)
+  sender_pubkey     TEXT NOT NULL,
+  request_id        TEXT NOT NULL,
+  kind              TEXT NOT NULL,    -- order | renew
+  response_msg_type TEXT,
+  response_json     TEXT,             -- cached reply, resent on a duplicate
+  created_at        INTEGER,
+  PRIMARY KEY (sender_pubkey, request_id)  -- a dup never creates a 2nd reservation/order/invoice
+);
+
+CREATE TABLE IF NOT EXISTS box (   -- a hosting box managed by this control node (§4.5, §9.3)
+  id             TEXT PRIMARY KEY,
+  host_op_pubkey TEXT,             -- the box's operational key (ADR-0004/0010)
+  profile_json   TEXT,             -- the signed host security profile (§9.1)
+  capacity_json  TEXT,             -- total {cpu, mem_mb, disk_gb, ports}
+  state          TEXT,             -- ONLINE | OFFLINE | DRAINING
+  last_seen      INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS instance (  -- a provisioned unit of work (§4.4)
+  id              TEXT PRIMARY KEY,
+  subscription_id TEXT,
+  box_id          TEXT,
+  kind            TEXT,            -- the recipe service id
+  handles_json    TEXT,            -- backend handles (container id, peer index, ...)
+  state           TEXT,            -- CREATING | RUNNING | STOPPED | DESTROYED
+  created_at      INTEGER,
+  updated_at      INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS listing (  -- one Recipe -> many Listings (CONTEXT glossary)
+  id         TEXT PRIMARY KEY,      -- NIP-99 coordinate "30402:<pubkey>:<d>" (§5.4)
+  recipe_id  TEXT,
+  d_tag      TEXT,                  -- the replaceable-event d tag
+  event_id   TEXT,                  -- latest published event id
+  amount_sat INTEGER,
+  period_s   INTEGER,
+  state      TEXT,                  -- ACTIVE | WITHDRAWN
+  updated_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS native_connect_session (  -- interactive-op tickets (§7.4/§9.2; M1b+)
+  id              TEXT PRIMARY KEY,
+  subscription_id TEXT,
+  scope           TEXT,            -- which interactive ops the ticket authorizes
+  ticket_json     TEXT,            -- the Iroh connection ticket delivered to the buyer
+  state           TEXT,            -- ACTIVE | REVOKED  (revoked on suspend/cancel/destroy)
+  expires_at      INTEGER,
+  created_at      INTEGER
+);
 "#;
 
 /// Open the state database and ensure the schema exists.
@@ -134,6 +192,6 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 10);
+        assert_eq!(n, 15);
     }
 }

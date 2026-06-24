@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.27)
+# lnrent — Spec (draft v0.28)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -99,7 +99,8 @@ Nostr/Lightning rental, and self-sovereign single-operator ownership.
 
 ### 4.1 Hard invariant: AI-free control plane
 
-The runtime path is **pure Rust/bash with no LLM in the loop**:
+The **daemon** runtime path is **pure Rust/bash with no LLM in the loop**, enforced by
+construction (the daemon links no model client):
 
 ```
 payment watch -> invoice issue -> provision -> lifecycle -> Nostr delivery
@@ -107,7 +108,10 @@ payment watch -> invoice issue -> provision -> lifecycle -> Nostr delivery
 
 Claude skills are **author-time and operator-time only**: onboard a box, scaffold
 and debug a recipe, publish a listing, inspect subscriptions. Nothing the daemon
-does at runtime calls an LLM.
+does at runtime calls an LLM. **Recipe hooks** are trusted code (ADR-0002); "no LLM at
+runtime" *inside a hook* is an authoring + review invariant the daemon does not itself prove
+(§7.4) — shipped/vetted recipes carry it, and v1 runs no third-party recipes (§17). So the
+hard guarantee is: the daemon + shipped recipes are LLM-free at runtime.
 
 Resolution of the obvious irony: one of the services we *sell* is an AI agent
 (Hermes). That agent runs as a **tenant workload** inside a provisioned, isolated
@@ -213,9 +217,13 @@ lnrent splits into two planes so the operator's value never sits on a box that h
 untrusted tenants:
 
 - **Control node (value / identity / marketplace plane):** holds the phoenixd/Fedimint
-  wallet, the BIP39 seed + master key, and the marketplace control — the Nostr engine
-  (listings + order DMs), the subscription store + billing/reconcile, and manifest
-  signing. The operator's brain + wallet.
+  wallet, the **marketplace operational key** (hot — signs Listings, receives order DMs) and
+  the Fedimint client secret, plus the marketplace control (Nostr engine, subscription store,
+  billing/reconcile). The **BIP39 seed + master key stay cold** — backed up offline, brought
+  online only to issue/update the operator manifest (ADR-0006), so a control-node compromise
+  does not leak the master/seed. (**M1a all-in-one exception:** on a single box the seed lives
+  on the box, so a box compromise is then a seed compromise — accepted for M1a / self-use,
+  §4.6.)
 - **Hosting box (hosting plane):** runs the provisioning backend (Incus) + tenant VMs;
   holds only a revocable per-box **operational key** (ADR-0004) to authenticate to the
   control node and sign its host security profile. No funds, no seed.
@@ -248,10 +256,13 @@ type), so every key is regenerable from the seed:
   stays cold. All operational keys are in the master manifest; buyers verify a Listing by
   checking its signing key appears there. (M1a single-box: account-0 does both roles.)
 - **Payment backend secret** — the **Fedimint client root secret** (the primary backend,
-  ADR-0012) derives from the same BIP39 seed at a dedicated path, distinct from the NIP-06
-  Nostr paths. So **one seed backs up everything**: the brand + per-Box identity keys AND
-  the Fedimint client, whose ecash position is recoverable from the federation by the same
-  seed. (phoenixd, the secondary backend, keeps its own channel-state seed, backed up
+  ADR-0012) derives from the BIP39 seed at a **dedicated domain disjoint from the NIP-06
+  Nostr paths**: HKDF-SHA256 over the seed with the fixed info string `"lnrent:fedimint:v1"`
+  (pinned in M1a alongside the test vector), so the Nostr and Fedimint key spaces can never
+  collide. The seed regenerates the client secret, but **the seed alone is not a full backup**
+  — restoring an ecash position also needs the **federation invite/config** (to know which
+  federation to rejoin); the daemon stores that in its data dir and onboard's backup step must
+  include it. (phoenixd, the secondary backend, keeps its own channel-state seed, backed up
   separately.)
 
 Custody and rotation:
@@ -331,14 +342,15 @@ NIP-17 private DM between the buyer and operator pubkeys:
 
 | type | direction | payload |
 |--|--|--|
-| `order.request`   | buyer -> operator | `listing_id`, validated `params`, `refund_dest` (BOLT12 offer or Lightning address) |
-| `order.invoice`   | operator -> buyer | `order_id`, `bolt11`, `amount_sat`, `period`, `expires_at` |
-| `order.error`     | operator -> buyer | `order_id`, `error` `{ code, message, retryable }` with `code` in `capacity_full` / `params_invalid` / `price_changed` / `unavailable` / `rejected` — same nested `error` shape as `op.result`, so a buyer agent branches uniformly |
+| `order.request`   | buyer -> operator | `id` (unique request id), `listing_id`, validated `params`, `refund_dest` (BOLT12 offer or Lightning address) |
+| `order.invoice`   | operator -> buyer | `request_id` (= the `order.request` `id`), `order_id`, `bolt11`, `amount_sat`, `period`, `expires_at` |
+| `order.error`     | operator -> buyer | `request_id`, `order_id` (optional — absent for a pre-order validation failure), `error` `{ code, message, retryable }` with `code` in `capacity_full` / `params_invalid` / `price_changed` / `unavailable` / `rejected` — same nested `error` shape as `op.result`, so a buyer agent branches uniformly |
 | `provision.ready` | operator -> buyer | `subscription_id`, `payload` (the credentials) |
-| `billing.invoice` | operator -> buyer | `subscription_id`, `bolt11`, `amount_sat`, `due_at` |
+| `delivery.resend.request` | buyer -> operator | `subscription_id` — re-send the latest `provision.ready` (dropped-DM resync; replaces the old overload of `renew.request` for this) |
+| `billing.invoice` | operator -> buyer | `subscription_id`, `request_id` (when answering a `renew.request`), `bolt11`, `amount_sat`, `due_at`, `expires_at` |
 | `billing.notice`  | operator -> buyer | `subscription_id`, `state`, `message` (renewal reminder / suspend / terminate) |
 | `billing.refund`  | operator -> buyer | `subscription_id`, `amount_sat`, `status` (sent / failed) |
-| `renew.request`   | buyer -> operator | `subscription_id` (request a renewal invoice on demand) |
+| `renew.request`   | buyer -> operator | `id` (unique request id), `subscription_id` (request a renewal invoice on demand) |
 | `sub.cancel`      | buyer -> operator | `subscription_id` |
 | `op.request`      | buyer -> operator | `id` (unique request id), `subscription_id`, `op` (operation name), `params` (object) — invoke a recipe-declared management operation (§7.4) |
 | `op.result`       | operator -> buyer | `request_id` (= the `op.request` `id`), `subscription_id`, `op`, `status` (ok / error), `data` (object: config / `url` / status fields) on ok, or `error` `{ code, message, retryable }` |
@@ -367,6 +379,16 @@ no `data` is returned; `code` distinguishes `unauthorized` / `unknown_op` / `inv
 and the operator does not reveal whether an unknown `subscription_id` exists to a non-buyer
 sender (an `unauthorized` op on someone else's sub is indistinguishable from one on a
 nonexistent sub).
+
+**Order/renew idempotency.** `order.request` and `renew.request` likewise carry a
+client-chosen unique `id`. NIP-17 has no delivery guarantee, so the operator persists every
+inbound request in `inbound_request` (§11), keyed unique on `(sender_pubkey, request_id)`,
+caching the response it sent (`order.invoice` / `order.error` / `billing.invoice`). A
+duplicate request (retry, relay redelivery, crash-restart) **resends the cached response and
+never creates a second reservation, order, or invoice**. The response carries `request_id` so
+the buyer correlates it before any `order_id`/`subscription_id` exists. `sub.cancel` and
+`delivery.resend.request` are naturally idempotent (they act on existing subscription state),
+so they need no request id.
 
 Payment is settled out-of-band with the buyer's own Lightning wallet. lnrentd
 confirms settlement through its `PaymentBackend` (phoenixd/Fedimint), never by
@@ -428,8 +450,14 @@ lnrent-specific metadata the buyer needs to order AND to discover what the servi
   authoritative at dispatch. Parsers tolerate unknown fields (forward-compat) and bound the
   array size.
 
-The exact tag/content layout (and the schema `version`) is **pinned in M1a** when the wire
-codec (lnrent-7fp.19) lands, alongside the DM schema.
+A **`listing_id` is the NIP-99 addressable coordinate** `30402:<operator_pubkey>:<d>` (the
+replaceable-event coordinate — stable across edits, since editing a Listing republishes the
+same `(kind, pubkey, d)`), and that is what `order.request.listing_id` references. Because a
+coordinate is stable across price edits, the operator detects a **stale-price order** by
+comparing the order against the current Listing (price/version) and, on mismatch, replies
+`order.error { code: "price_changed" }` rather than honoring a stale price. The exact
+tag/content layout (and the schema `version`) is pinned in M1a when the wire codec
+(lnrent-7fp.19) lands, alongside the DM schema.
 
 ## 6. Payments and subscriptions
 
@@ -442,10 +470,19 @@ trait PaymentBackend {
     fn create_invoice(&self, amount_sat: u64, memo: &str, expiry_s: u32, external_id: &str) -> Invoice;  // externalId binds settlement -> order (ADR-0009)
     fn watch(&self) -> PaymentStream;            // stream of settled payments
     fn lookup(&self, id: &InvoiceId) -> PaymentStatus;
-    fn pay(&self, dest: &RefundDest, amount_sat: u64) -> PayResult;   // outbound, for refunds
-    fn payment_status(&self, payment_id: &PayId) -> PaymentStatus;    // outbound refund status (ADR-0009)
+    fn pay(&self, dest: &RefundDest, amount_sat: u64, idempotency_key: &str) -> PayResult;  // outbound refund; key dedups
+    fn payment_status_by_key(&self, idempotency_key: &str) -> PaymentStatus;  // resolve a SUBMITTED-but-unconfirmed pay after a crash
+    fn payment_status(&self, payment_id: &PayId) -> PaymentStatus;            // outbound refund status (ADR-0009)
 }
 ```
+
+`pay` is **idempotent on `idempotency_key`**: calling it twice with the same key never sends
+twice. The daemon persists the `refund_attempt` (with its key) and marks it `SUBMITTED`
+*before* calling `pay`; if it crashes after `pay` succeeds but before recording
+`backend_payment_id`, restart resolves the outcome via `payment_status_by_key(key)` instead of
+blindly re-paying (§6.6). Backends that cannot natively dedup an outbound payment must persist
+a key->payment map; a backend that can do neither leaves the attempt `SUBMITTED` for operator
+reconciliation rather than risk a double-refund.
 
 - **fedimint (default for low-value rentals, ADR-0012):** connect to an **existing
   federation** and route through an **existing gatewayd**; payments settle into **ecash**
@@ -501,8 +538,11 @@ e.g. 7d).
 - **PENDING -> PROVISIONING** — first payment settles and is captured. Run
   `provision`, retried with backoff.
 - **PROVISIONING -> ACTIVE** — provision succeeded; deliver credentials and set
-  `paid_through = now + period`.
-- **PROVISIONING -> REFUND_DUE** — provision failed permanently after retries.
+  `paid_through = settled_at + period`.
+- **PROVISIONING -> REFUND_DUE** — provision failed permanently after retries. Before
+  entering `REFUND_DUE` the daemon runs a **best-effort `destroy`** to purge any
+  partially-created resources (VM / network / volume), so a refunded order leaves nothing
+  behind; a destroy failure is logged + alerted but does not block the refund.
 
 **Refund path** (§6.4):
 - **REFUND_DUE -> REFUNDED** — auto-refund to the buyer's `refund_dest` succeeded
@@ -510,22 +550,35 @@ e.g. 7d).
 - **REFUND_DUE (stuck)** — the refund payment itself failed (payer offline, no
   liquidity); operator alerted, manual resolution. Funds never silently vanish.
 
-**Renewal** (prepaid, renew before the date, §6.2):
-- While **ACTIVE**, the Instance runs until `paid_through`. A renewal payment extends
-  `paid_through` by `period`; early renewals stack, so renewing early never wastes
-  time.
+**Renewal** (prepaid, renew before the date, §6.2). Every renewal settlement sets
+`paid_through = max(paid_through, settled_at) + period` — so early renewals **stack** (the
+date is already in the future) and late renewals **never land in the past** (the date is
+re-based to `settled_at`):
+- While **ACTIVE**, the Instance runs until `paid_through`; a renewal applies the formula above.
 - At `soft_date` (= `paid_through - renew_lead`) the daemon starts NIP-17 renewal
   reminders and makes a renewal invoice available. This is a recommendation; the
   service is not interrupted.
+- A **renewal invoice that expires unpaid** changes only the invoice (`OPEN -> EXPIRED`); the
+  subscription stays in its current state and its `paid_through` timeline (reminder / suspend
+  / destroy) governs. Renewal-invoice expiry is not a subscription transition.
 - **ACTIVE -> SUSPENDED** — `paid_through` reached unpaid; run `suspend` (service
   interrupted, data kept).
-- **SUSPENDED -> ACTIVE** — late renewal within retention; run `resume`; extend
-  `paid_through`.
+- **SUSPENDED -> ACTIVE** — late renewal within retention; run `resume`; apply the
+  `paid_through` formula above.
 - **SUSPENDED -> TERMINATED** — retention ended; run `destroy` (purge data).
 
 **Buyer-initiated:**
-- **ACTIVE/SUSPENDED -> CANCELLED** — buyer cancels; run `suspend`, then `destroy`
-  after retention. Remaining prepaid time is not refunded.
+- **ACTIVE/SUSPENDED -> CANCELLED** — buyer cancels; run `suspend`. Remaining prepaid time is
+  not refunded.
+- **CANCELLED -> TERMINATED** — after the post-cancel retention `destroy` completes (resources
+  purged), the subscription is `TERMINATED`. `CANCELLED` is the wind-down intent; `TERMINATED`
+  is the single finalized terminal state both the cancel path and the expiry path converge to.
+
+**Late / terminal settlement (never resurrect, never keep):**
+- A settlement that arrives once the subscription is already terminal (`EXPIRED`, `CANCELLED`,
+  `TERMINATED`, `REFUNDED`) or after retention does NOT change the subscription state — the
+  funds are **auto-refunded** via a detached `refund_attempt -> REFUND_DUE`, never kept and
+  never resurrecting the order (the invoice's `external_id` makes this detectable).
 
 ### 6.4 Provisioning atomicity and refunds
 
@@ -552,8 +605,9 @@ not v1.
 A single periodic **reconcile loop** advances subscriptions: it scans those whose
 `next_deadline <= now` and fires the due transition (remind at `soft_date`, `suspend`
 at `paid_through`, `destroy` at retention end), recomputing `next_deadline` each time.
-Transitions are idempotent and journaled to `event_log`, so a crash mid-hook cannot
-double-run or wedge.
+Transitions are journaled to `event_log` and guarded by a durable per-`(subscription,
+deadline)` record; combined with the idempotent-hook requirement (§7.2), a crash mid-hook
+re-runs the transition at most once and cannot double-run or wedge.
 
 Because all dates are absolute wall-clock timestamps, the loop is **downtime-safe**: a
 transition missed while the Box was off fires on restart. But suspension is **credited
@@ -577,8 +631,13 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
 - **Delivery outbox:** `provision.ready` is written to an `outbox` row in the same
   transaction as `-> ACTIVE`; a sender drains it and retries until sent, so a crash after
   ACTIVE but before the DM cannot strand a paid buyer (also the dropped-DM resync answer).
-- **Refund ledger:** a `refund_attempt` row records dest, amount, the `backend_payment_id`
-  from `pay`, status, and attempts, so refunds never double-pay and stuck ones alert.
+- **Refund ledger:** a `refund_attempt` row (dest, amount, a durable `idempotency_key`,
+  status, attempts) is persisted as **`SUBMITTED` BEFORE** calling `pay(dest, amount, key)`,
+  which is idempotent on `key`. If the daemon dies after `pay` succeeds but before recording
+  `backend_payment_id`, restart resolves the outcome with `payment_status_by_key(key)` rather
+  than re-paying — so a crash cannot **double-refund**. A genuinely unresolvable `SUBMITTED`
+  (backend can neither confirm nor dedup) is left for operator reconciliation, never silently
+  retried.
 
 Crash-recovery (step -> durable record in one txn -> restart action):
 
@@ -587,10 +646,13 @@ Crash-recovery (step -> durable record in one txn -> restart action):
 | order placed | sub PENDING + invoice OPEN (external_id) | expired-invoice PENDING -> EXPIRED |
 | settlement | invoice PAID + sub PROVISIONING | replay no-ops (status guard) |
 | provision ok | sub ACTIVE + outbox row | unsent outbox -> resend |
-| provision fail | sub REFUND_DUE + refund_attempt | retry `pay()` |
-| late settle on EXPIRED | refund_attempt | retry `pay()` (order not resurrected) |
+| provision fail | best-effort `destroy` + sub REFUND_DUE + refund_attempt SUBMITTED | resolve by `payment_status_by_key`; pay only if not yet submitted |
+| late settle on terminal sub | detached refund_attempt SUBMITTED | resolve by key, then pay (order not resurrected) |
 
-Provision hooks are idempotent and re-run if the Box crashes mid-`PROVISIONING`.
+Lifecycle hooks (provision / suspend / resume / destroy) **must be idempotent** (§7.2): each
+transition is guarded by a durable record (the `event_log` entry + a state/deadline guard), so
+a hook re-run after a crash mid-`PROVISIONING` (or any transition) is safe and runs its effect
+at most once.
 
 ## 7. Service recipe spec
 
@@ -667,7 +729,10 @@ hook = "status"             # bare name -> ops/status
   DM'd to the buyer, e.g. a WireGuard config) plus internal handles the daemon
   records (container id, peer index) for later hooks.
 - Exit non-zero = failure; the daemon does not advance state and alerts the operator.
-- Hooks must be idempotent where possible (re-run safe).
+- **Lifecycle hooks (provision/suspend/resume/destroy) MUST be idempotent (re-run safe).**
+  The daemon guards each transition durably (§6.5) but may re-run a hook after a crash, so a
+  non-idempotent lifecycle hook is a recipe bug. (Management-op hooks are not assumed
+  idempotent — that is handled at dispatch via `op_invocation`, §7.4.)
 
 ### 7.3 OS awareness
 
@@ -706,7 +771,11 @@ recipe — not the client — declares what can be managed (ADR-0013).
     nonzero exit becomes an `op.result` `error` (§5.1), never a daemon stall.
   - `interactive` — streaming/bidirectional (shell, console, `logs -f`, file copy, a REPL),
     carried by the Iroh Native-connect session (§9.2). The operation hook is the session
-    target.
+    target, authorized by a **Native-connect session ticket** (`native_connect_session`, §11):
+    a scoped, expiring Iroh connection ticket delivered to the buyer. The daemon **revokes**
+    the ticket on suspend / cancel / destroy, so interactive access dies with the subscription.
+    (Interactive ops + this session model arrive with reachability in M1b; M1a is request-kind
+    only.)
 - **Authorization.** A `request` op is authorized by matching the `op.request` DM sender to
   the subscription's `buyer_pubkey`; an `interactive` op is authorized by the Native-connect
   ticket delivered for that subscription. Operations are refused unless the subscription is
@@ -748,6 +817,12 @@ trait ComputeBackend {
     fn exec(&self, h: &InstanceHandle, cmd: &[&str]) -> ExecResult;
 }
 ```
+
+`exec` is a **local, internal** backend call the daemon makes to run a fixed command inside an
+Instance it controls (e.g. inject the buyer's SSH key during `provision`). It is **not** a
+host-control RPC and **not** a buyer-facing operation: the host-control surface stays the
+narrow typed op set (§9.1), and buyer access to a guest is via recipe-declared `interactive`
+ops over Native-connect (§7.4), never this `exec`.
 
 - **host:** no isolation; runs directly on the Box (WireGuard peer, simple daemons).
 - **incus (default for isolated Instances):** system containers and KVM VMs from one
@@ -825,9 +900,12 @@ Governing rules from the guidelines, load-bearing for the design:
   reboot/snapshot/rotate-key/health), never arbitrary shell or libvirt/QEMU args.
   This matches the AI-free control plane and ADR-0001.
 - **Tenant-provided images are hostile**; their hooks never run on the host.
-- Each host publishes a **signed security profile** (guidelines §25; `host_id` is the
-  operator's Nostr key — secp256k1; the deployment doc's `ed25519` profile example is
-  illustrative, lnrent standardizes on the Nostr key) that buyers read before renting.
+- Each host publishes a **signed host security profile** (guidelines §25) carrying:
+  `operator_master_pubkey` (the brand the box belongs to), `host_op_pubkey` (the hosting box's
+  operational key, ADR-0004/0010, which **signs** the profile), and the tier/capability fields.
+  From M5 it also carries the **manifest proof** binding `host_op_pubkey` to the master
+  (ADR-0006). All keys are secp256k1 Nostr keys (the deployment doc's `ed25519` example is
+  illustrative; lnrent standardizes on the Nostr key). Buyers read it before renting.
 
 The full guidelines govern host onboarding, encryption, isolation, attestation, and
 the pre-launch test plan; they are the source of truth for VM security.
@@ -877,7 +955,8 @@ web / public BTC-LN-Fedimint service / advanced network), not "WireGuard or publ
 
 **Hosts advertise network capabilities** (Iroh, Tor, public IPv6, dedicated IPv4, shared
 ports, ingress, restrictions like blocked SMTP, max ports/VM) in their signed profile
-(§9.1, guidelines §23), so a buyer picks a Listing whose reachability fits.
+(§9.1, `vm-networking-reachability-guidelines.md` §23 — host capability profile), so a buyer
+picks a Listing whose reachability fits.
 
 **Reachability != isolation != confidentiality.** Network reachability controls who can
 connect; VM isolation controls what a tenant can affect; disk/memory protection controls
@@ -948,11 +1027,11 @@ CREATE TABLE operator (              -- single row, this Box's identity (seed li
   payment_backend TEXT, compute_backend TEXT, relays TEXT);
 
 CREATE TABLE recipe (                -- mirror of on-disk recipes for fast lookup
-  id TEXT PRIMARY KEY, version TEXT, manifest_json TEXT, listing_event_id TEXT);
+  id TEXT PRIMARY KEY, version TEXT, manifest_json TEXT);   -- listings are their own table (one recipe -> many)
 
 CREATE TABLE subscription (
   id TEXT PRIMARY KEY,
-  recipe_id TEXT, buyer_pubkey TEXT,
+  recipe_id TEXT, listing_id TEXT, instance_id TEXT, buyer_pubkey TEXT,
   state TEXT,                        -- see §6.3 (PENDING|PROVISIONING|ACTIVE|SUSPENDED|TERMINATED|EXPIRED|CANCELLED|REFUND_DUE|REFUNDED)
   params_json TEXT,                  -- validated buyer params
   refund_dest TEXT,                  -- BOLT12 offer or Lightning address, for refunds
@@ -966,7 +1045,12 @@ CREATE TABLE subscription (
 CREATE TABLE invoice (
   id TEXT PRIMARY KEY, subscription_id TEXT,
   external_id TEXT UNIQUE,            -- unique per-invoice token; backend externalId (ADR-0009)
+  backend_invoice_id TEXT,           -- the backend's own invoice id
+  payment_hash TEXT,
+  kind TEXT,                         -- order | renewal
   bolt11 TEXT, amount_sat INTEGER, status TEXT,   -- OPEN|PAID|EXPIRED
+  expires_at INTEGER,                -- bolt11 expiry; the order reservation is released at this
+  applied_at INTEGER,                -- when settlement was captured/applied (durable applied marker)
   issued_at INTEGER, settled_at INTEGER);
 
 CREATE TABLE event_log (             -- audit trail of every transition + payment
@@ -982,10 +1066,11 @@ CREATE TABLE reservation (            -- capacity held for a PENDING order (§9.
 CREATE TABLE daemon_state (          -- single row; heartbeat for downtime credit (§6.5)
   last_heartbeat INTEGER);
 
-CREATE TABLE refund_attempt (        -- durable refund ledger (ADR-0009)
+CREATE TABLE refund_attempt (        -- durable refund ledger (ADR-0009, §6.6)
   id TEXT PRIMARY KEY, subscription_id TEXT, dest TEXT, amount_sat INTEGER,
-  backend_payment_id TEXT,           -- from PaymentBackend::pay, for status/dedup
-  status TEXT,                       -- PENDING|SENT|FAILED
+  idempotency_key TEXT NOT NULL,     -- passed to PaymentBackend::pay; dedups the outbound payment
+  backend_payment_id TEXT,           -- from pay(), once known
+  status TEXT NOT NULL,              -- SUBMITTED (pay called, outcome unknown -> resolve by key) | SENT | FAILED
   attempts INTEGER, created_at INTEGER, updated_at INTEGER);
 
 CREATE TABLE outbox (                -- pending operator->buyer NIP-17 DMs (ADR-0009)
@@ -1002,6 +1087,44 @@ CREATE TABLE op_invocation (         -- durable buyer management ops (§7.4, ADR
   created_at INTEGER, finished_at INTEGER,
   PRIMARY KEY (sender_pubkey, request_id));  -- idempotency: a dup never re-runs the hook
   -- startup recovery: orphaned RUNNING rows -> ERROR {code:"interrupted"} (§5.1)
+
+CREATE TABLE inbound_request (        -- idempotency for buyer->operator request DMs (order/renew, §5.1)
+  sender_pubkey TEXT NOT NULL, request_id TEXT NOT NULL,
+  kind TEXT NOT NULL,                -- order | renew
+  response_msg_type TEXT, response_json TEXT,   -- cached reply (order.invoice|order.error|billing.invoice), resent on a dup
+  created_at INTEGER,
+  PRIMARY KEY (sender_pubkey, request_id));  -- a dup never creates a 2nd reservation/order/invoice
+
+CREATE TABLE box (                   -- a hosting box managed by this control node (§4.5, §9.3)
+  id TEXT PRIMARY KEY,
+  host_op_pubkey TEXT,               -- the box's operational key (ADR-0004/0010)
+  profile_json TEXT,                 -- the signed host security profile (§9.1)
+  capacity_json TEXT,                -- total {cpu, mem_mb, disk_gb, ports}
+  state TEXT,                        -- ONLINE|OFFLINE|DRAINING
+  last_seen INTEGER);
+
+CREATE TABLE instance (              -- a provisioned unit of work (§4.4); one per provisioned subscription
+  id TEXT PRIMARY KEY,
+  subscription_id TEXT, box_id TEXT,
+  kind TEXT,                         -- the recipe service id
+  handles_json TEXT,                 -- backend handles (container id, peer index, ...)
+  state TEXT,                        -- CREATING|RUNNING|STOPPED|DESTROYED
+  created_at INTEGER, updated_at INTEGER);
+
+CREATE TABLE listing (               -- one Recipe -> many Listings (CONTEXT glossary)
+  id TEXT PRIMARY KEY,               -- NIP-99 addressable coordinate "30402:<pubkey>:<d>" (§5.4)
+  recipe_id TEXT, d_tag TEXT,        -- the replaceable-event d tag
+  event_id TEXT,                     -- latest published event id
+  amount_sat INTEGER, period_s INTEGER,
+  state TEXT,                        -- ACTIVE|WITHDRAWN
+  updated_at INTEGER);
+
+CREATE TABLE native_connect_session ( -- interactive-op authorization tickets (§7.4/§9.2; used from M1b)
+  id TEXT PRIMARY KEY, subscription_id TEXT,
+  scope TEXT,                        -- which interactive ops the ticket authorizes
+  ticket_json TEXT,                  -- the Iroh connection ticket delivered to the buyer
+  state TEXT,                        -- ACTIVE|REVOKED  (revoked on suspend/cancel/destroy)
+  expires_at INTEGER, created_at INTEGER);
 ```
 
 ## 12. Deployment
@@ -1100,9 +1223,15 @@ lnrent/
   client never pays); the full headless agent-loop proof is M1d.
 - **M1b — VM Tier-0 core.** Swap in the real `vm` recipe: Incus VM provisioning (curated
   images, fixed sizes, §9.3), per-VM tap/firewall + no metadata, **private** reachability
-  (Iroh management + Tor fallback, §9.2), and capacity/reservation. The VM's SSH/console
-  over the Native-connect session is the first **`interactive`** management operation (§7.4),
-  proving that transport. Honest **Tier 0** Listing, private-only.
+  (Iroh management + Tor fallback, §9.2), and **VM-specific capacity dimensions + ports** on
+  top of M1a's generic reservation (§9.3). **The minimal value/hosting split (ADR-0010, §4.5)
+  MUST land here**, because M1b runs *rented, untrusted-tenant* VMs: the wallet + seed +
+  marketplace key live on the **control node**, and the hosting box runs VMs holding only a
+  revocable **hosting operational key** + outbound **Iroh host-control** — no funds, no seed,
+  so a tenant escape cannot reach the value plane. (Full per-box-manifest verification + the
+  multi-box fleet machinery stay M5/M7; M1b needs only the two-role separation.) The VM's
+  SSH/console over the Native-connect session is the first **`interactive`** management
+  operation (§7.4), proving that transport. Honest **Tier 0** Listing, private-only.
 - **M1c — Public exposure.** Tenant-declared published services: shared IPv4 ports via
   frp/rathole, with the capacity accounting that ports imply (§9.2/§9.3).
 - **M1d — Agent-native hardening (ADR-0014).** A **fully-headless agent loop** test: an
@@ -1164,9 +1293,11 @@ Still open:
 2. **Web client trust surface (RESOLVED v0.24):** graceful degradation — NIP-07/WebLN
    when present, else an embedded key (with an export/backup prompt, since it decrypts
    creds) + copy-bolt11/QR. A phone-wallet-only buyer can complete a rental (§4.2).
-3. **Listing updates:** price or availability changes mean re-publishing the
-   `30402` event. Define update/withdraw semantics (replaceable-event `d` tag
-   handling, sold-out signaling).
+3. **Listing updates (PARTIALLY RESOLVED v0.28):** `listing_id` is the addressable
+   coordinate `30402:<pubkey>:<d>` (§5.4); a price/availability change re-publishes the same
+   coordinate (`listing.state`/`amount_sat` updated), and a stale-price order is rejected with
+   `order.error{price_changed}`. Still open: sold-out/withdraw signaling encoding (a
+   `state`-tag value vs NIP-09 delete) and how long buyers cache a coordinate.
 4. **Manifest revocation latency:** the operator manifest is cacheable (§5.3) but
    replaceable events have no push invalidation or TTL, so a revoked operational key
    keeps verifying against cached manifests until each buyer refetches. Define a

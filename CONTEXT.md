@@ -154,7 +154,9 @@ same Recipe.
 **Dev:** So when they pay, what gets created?
 **Operator:** Their Order turns into a Subscription the moment the first invoice
 settles. The Subscription then provisions one Instance: an actual WireGuard peer
-with their key. They keep paying to keep that Subscription out of grace.
+with their key. They keep paying to keep that Subscription **current** (paid through the
+date); there is no grace period — past the hard date it suspends, then is destroyed after
+retention.
 **Dev:** And if they stop paying?
 **Operator:** The Subscription walks its state machine to suspended, then the
 Instance is destroyed at the end of retention. The Listing and Recipe are

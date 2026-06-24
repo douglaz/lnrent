@@ -34,10 +34,14 @@ pub trait PaymentBackend: Send + Sync {
         external_id: &str, // binds settlement -> order (ADR-0009)
     ) -> Result<Invoice>;
     fn lookup(&self, id: &str) -> Result<PaymentStatus>;
-    /// Outbound payment, used for refunds. Returns a backend payment id for status/dedup.
-    fn pay(&self, dest: &str, amount_sat: u64) -> Result<String>;
-    /// Status of an outbound payment by its id (ADR-0009 refund ledger).
+    /// Outbound payment, used for refunds. **Idempotent on `idempotency_key`**: calling twice
+    /// with the same key never pays twice (ADR-0009, SPEC §6.6). Returns a backend payment id.
+    fn pay(&self, dest: &str, amount_sat: u64, idempotency_key: &str) -> Result<String>;
+    /// Status of an outbound payment by its backend id (ADR-0009 refund ledger).
     fn payment_status(&self, payment_id: &str) -> Result<PaymentStatus>;
+    /// Resolve a SUBMITTED-but-unconfirmed refund after a crash, by its idempotency key
+    /// (SPEC §6.6) — so restart never blindly re-pays.
+    fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PaymentStatus>;
     /// Stream of settled payments (push). `Settlement.external_id` carries the order id
     /// (SPEC §6.1). M1a wires this to the Fedimint client settlement stream.
     fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>>;
@@ -124,11 +128,14 @@ impl PaymentBackend for FedimintPayment {
     fn lookup(&self, _id: &str) -> Result<PaymentStatus> {
         bail!("fedimint.lookup not implemented (M0 stub)")
     }
-    fn pay(&self, _dest: &str, _amount_sat: u64) -> Result<String> {
+    fn pay(&self, _dest: &str, _amount_sat: u64, _idempotency_key: &str) -> Result<String> {
         bail!("fedimint.pay not implemented (M0 stub)")
     }
     fn payment_status(&self, _payment_id: &str) -> Result<PaymentStatus> {
         bail!("fedimint.payment_status not implemented (M0 stub)")
+    }
+    fn payment_status_by_key(&self, _idempotency_key: &str) -> Result<PaymentStatus> {
+        bail!("fedimint.payment_status_by_key not implemented (M0 stub)")
     }
     fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
         bail!("fedimint.watch not implemented (M0 stub)")
