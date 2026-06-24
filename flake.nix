@@ -48,6 +48,12 @@
           # bindgen (librocksdb-sys, secp256k1) needs to find libclang
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
+          # secp256k1-sys compiles bundled C to wasm via cc-rs. The nix cc-wrapper injects host
+          # hardening flags (e.g. -fzero-call-used-regs) that clang rejects for wasm32, so point
+          # cc-rs at an UNWRAPPED clang/llvm-ar for the wasm target (the wrapper itself advises this).
+          CC_wasm32_unknown_unknown = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
+          AR_wasm32_unknown_unknown = "${pkgs.llvmPackages.llvm}/bin/llvm-ar";
+
           shellHook = ''
             echo "lnrent devshell · $(rustc --version)"
             echo "targets: native (x86_64-gnu) + wasm32-unknown-unknown"
