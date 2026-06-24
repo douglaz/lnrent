@@ -4,5 +4,6 @@ pub mod backends;
 pub mod clock;
 pub mod domain;
 pub mod recipe;
+pub mod reservation;
 pub mod runner;
 pub mod store;
