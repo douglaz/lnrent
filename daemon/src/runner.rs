@@ -37,19 +37,28 @@ pub async fn run_hook(hook: &Path, input: &Value, timeout: Duration) -> Result<H
         .spawn()
         .with_context(|| format!("spawning hook {}", hook.display()))?;
 
-    // Feed the JSON document on stdin, then close it so the hook sees EOF.
-    if let Some(mut si) = child.stdin.take() {
-        let bytes = serde_json::to_vec(input)?;
-        si.write_all(&bytes).await.ok();
-        si.shutdown().await.ok();
-    }
-
+    let mut si = child.stdin.take();
+    let input_bytes = serde_json::to_vec(input)?;
     let out = child.stdout.take().context("hook stdout missing")?;
     let err = child.stderr.take().context("hook stderr missing")?;
 
+    // Feed stdin CONCURRENTLY with reading the outputs, all under the one `timeout`: a hook that
+    // never drains stdin + a large payload would otherwise block `write_all` on a full pipe
+    // buffer forever, *before* the timeout could apply (codex re-review). A hook that closes
+    // stdin early yields BrokenPipe here, which is fine — best-effort feed.
+    let feed = async move {
+        if let Some(si) = si.as_mut() {
+            let _ = si.write_all(&input_bytes).await;
+            let _ = si.shutdown().await;
+        }
+    };
     // Read both pipes concurrently, each bounded by OUTPUT_CAP — a cap breach on EITHER pipe
-    // returns Err *immediately* (no draining, no hang), the whole thing under `timeout`.
-    let read = async { tokio::try_join!(read_capped(out, OUTPUT_CAP), read_capped(err, OUTPUT_CAP)) };
+    // returns Err *immediately* (no draining, no hang).
+    let read = async {
+        let reads = async { tokio::try_join!(read_capped(out, OUTPUT_CAP), read_capped(err, OUTPUT_CAP)) };
+        let (_, r) = tokio::join!(feed, reads);
+        r
+    };
     let (out_buf, err_buf) = match tokio::time::timeout(timeout, read).await {
         Err(_) => {
             reap(&mut child).await;
@@ -155,6 +164,17 @@ mod tests {
         let hook = write_hook("slow", "#!/usr/bin/env bash\nsleep 5\necho '{}'\n");
         let err = run_hook(&hook, &json!({}), Duration::from_millis(200)).await.unwrap_err();
         assert!(err.to_string().contains("timed out"));
+    }
+
+    // A hook that never drains stdin + a payload larger than the pipe buffer must still hit the
+    // timeout — the stdin write must not block BEFORE the timeout applies (codex re-review).
+    // Under the pre-fix code this test would hang forever instead of failing.
+    #[tokio::test]
+    async fn large_stdin_to_a_nonreading_hook_times_out() {
+        let hook = write_hook("ignore-stdin", "#!/usr/bin/env bash\nsleep 5\n");
+        let big = json!({ "blob": "x".repeat(256 * 1024) }); // >> the ~64 KiB pipe buffer
+        let err = run_hook(&hook, &big, Duration::from_millis(300)).await.unwrap_err();
+        assert!(err.to_string().contains("timed out"), "got: {err}");
     }
 
     // §15/§7.2: the trivial M1a recipe validates, provisions returning a delivery payload, and

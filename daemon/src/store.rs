@@ -255,16 +255,25 @@ impl Store {
         .await
     }
 
-    /// Run `f` for **queries only** — `f` gets `&Connection` and MUST NOT mutate (all writes go
-    /// through `transaction()`, which is atomic + journaled). Like every access it runs on the
-    /// actor thread, so reads serialize with writes (fine for M1a's low read concurrency; a
-    /// separate read-only WAL connection is a later optimization, not the sole-writer guarantee).
+    /// Run `f` for **queries only** — `f` gets `&Connection`; all writes go through
+    /// `transaction()` (atomic + journaled). The read-only invariant is structural, not just a
+    /// doc promise: `f` runs inside a DEFERRED transaction we ALWAYS roll back, so even a stray
+    /// mutation cannot persist (codex re-review). DEFERRED takes no write lock for a pure read.
+    /// Like every access it runs on the actor thread, so reads serialize with writes (fine for
+    /// M1a's low read concurrency; a separate read-only WAL connection is a later optimization,
+    /// not the sole-writer guarantee).
     pub async fn read<T, F>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        self.run(move |conn| f(&*conn)).await
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let out = f(&tx)?;
+            tx.rollback()?;
+            Ok(out)
+        })
+        .await
     }
 
     async fn run<T, F>(&self, f: F) -> Result<T>
@@ -468,6 +477,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, N, "every increment landed (serialized, no lost update)");
+    }
+
+    // read() is structurally read-only: a stray write inside it is visible within the closure
+    // but rolled back, so it never persists (codex re-review — not just a doc promise).
+    #[tokio::test]
+    async fn read_rolls_back_stray_mutations() {
+        let s = mem_store();
+        s.transaction(|tx| {
+            tx.execute("INSERT INTO daemon_state (last_heartbeat) VALUES (7)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        // A read whose closure mistakenly writes: the write is seen WITHIN the read txn...
+        let seen: i64 = s
+            .read(|c| {
+                c.execute("UPDATE daemon_state SET last_heartbeat = 999", [])?;
+                Ok(c.query_row("SELECT last_heartbeat FROM daemon_state", [], |r| r.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(seen, 999, "the stray write is visible inside the read's own txn");
+        // ...but it was rolled back, so the durable value is untouched.
+        let after: i64 = s
+            .read(|c| Ok(c.query_row("SELECT last_heartbeat FROM daemon_state", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(after, 7, "the stray write did NOT persist — read() is structurally read-only");
     }
 
     // The two idempotency keys (op_invocation, inbound_request) + refund_attempt UNIQUE:

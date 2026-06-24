@@ -9,6 +9,7 @@
 use crate::recipe::{Recipe, Resources};
 use crate::store::Store;
 use anyhow::{bail, Result};
+use rusqlite::OptionalExtension;
 use serde_json::{Map, Value};
 
 /// The operator-configured rentable budget for a host (set at onboard, §9.3).
@@ -81,7 +82,28 @@ pub async fn reserve(
 
     store
         .transaction(move |tx| {
-            let (uc, um, ud, up) = live_usage(tx, now)?;
+            // reserve() is idempotent per order_id, but a re-reserve must never resurrect a
+            // reservation that has already moved past HELD (codex re-review).
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM reservation WHERE order_id=?1",
+                    rusqlite::params![oid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match existing.as_deref() {
+                // The capacity is already held by an ACTIVE Instance — idempotent success, and
+                // crucially we do NOT downgrade CONSUMED back to HELD.
+                Some("CONSUMED") => return Ok(Reserve::Reserved),
+                // A terminal reservation is never re-held: renewals get a fresh order_id, so a
+                // re-reserve of a RELEASED order is a caller bug, surfaced rather than silently
+                // re-holding capacity.
+                Some("RELEASED") => bail!("reserve: order `{oid}` reservation is already RELEASED"),
+                _ => {} // None (new) or HELD (legit pre-commit retry) fall through.
+            }
+            // Capacity check EXCLUDES this order's own live hold, so a HELD retry on a full host
+            // can't reject itself as CapacityFull (it already accounts for that capacity).
+            let (uc, um, ud, up) = live_usage(tx, now, &oid)?;
             if uc + req.resources.cpu > budget.cpu
                 || um + req.resources.mem_mb > budget.mem_mb
                 || ud + req.resources.disk_gb > budget.disk_gb
@@ -89,14 +111,15 @@ pub async fn reserve(
             {
                 return Ok(Reserve::CapacityFull);
             }
-            // Idempotent per order: a retry (same order_id, e.g. after a pre-commit crash)
-            // refreshes the existing reservation rather than creating a duplicate hold.
+            // Insert a new HELD hold, or refresh the existing HELD retry's TTL/resources. The
+            // CONSUMED/RELEASED cases were handled above, so the only conflict reaching here is a
+            // HELD row.
             tx.execute(
                 "INSERT INTO reservation (id, order_id, resources_json, ports_json, state, expires_at, created_at)
                  VALUES (?1, ?2, ?3, ?4, 'HELD', ?5, ?6)
                  ON CONFLICT(order_id) DO UPDATE SET
                    resources_json=excluded.resources_json, ports_json=excluded.ports_json,
-                   state='HELD', expires_at=excluded.expires_at",
+                   expires_at=excluded.expires_at",
                 rusqlite::params![rid, oid, resources_json, ports_json, expires_at, now],
             )?;
             journal(tx, &oid, "reserve", &resources_json, now)?;
@@ -155,10 +178,11 @@ fn journal(tx: &rusqlite::Transaction, order_id: &str, kind: &str, detail_json: 
 
 /// Sum of live usage = every CONSUMED reservation (each is an active Instance's hold) + every
 /// HELD reservation still within its TTL (an expired-but-not-yet-released HELD must not block
-/// new orders). With one reservation per order (`UNIQUE(order_id)`) and checked `consume`,
+/// new orders), EXCLUDING `exclude_order_id` (so a re-reserve doesn't count its own hold and
+/// reject itself). With one reservation per order (`UNIQUE(order_id)`) and checked `consume`,
 /// CONSUMED reservations ARE the active Instances, so this equals the spec's
 /// `budget - (active Instances + live reservations)` (§9.3). Uses sqlite's JSON1.
-fn live_usage(tx: &rusqlite::Transaction, now: i64) -> rusqlite::Result<(u32, u32, u32, u32)> {
+fn live_usage(tx: &rusqlite::Transaction, now: i64, exclude_order_id: &str) -> rusqlite::Result<(u32, u32, u32, u32)> {
     tx.query_row(
         "SELECT
             COALESCE(SUM(json_extract(resources_json,'$.cpu')),0),
@@ -166,8 +190,9 @@ fn live_usage(tx: &rusqlite::Transaction, now: i64) -> rusqlite::Result<(u32, u3
             COALESCE(SUM(json_extract(resources_json,'$.disk_gb')),0),
             COALESCE(SUM(json_extract(ports_json,'$.count')),0)
          FROM reservation
-         WHERE state='CONSUMED' OR (state='HELD' AND expires_at > ?1)",
-        rusqlite::params![now],
+         WHERE (state='CONSUMED' OR (state='HELD' AND expires_at > ?1))
+           AND order_id <> ?2",
+        rusqlite::params![now, exclude_order_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )
 }
@@ -245,6 +270,61 @@ mod tests {
         assert!(consume(&s, "nope", 1).await.is_err(), "no HELD reservation for a wrong order");
         consume(&s, "o1", 1).await.unwrap();
         assert!(consume(&s, "o1", 2).await.is_err(), "already CONSUMED -> error, not silent");
+    }
+
+    // A re-reserve of the SAME order on a host the order already fills must stay Reserved — it
+    // must not count its own hold and reject itself as CapacityFull (codex re-review).
+    #[tokio::test]
+    async fn reserve_is_idempotent_when_order_already_fills_the_host() {
+        let s = mem_store();
+        // o1 takes the whole single-slot budget.
+        assert_eq!(
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0).await.unwrap(),
+            Reserve::Reserved
+        );
+        // Re-reserving o1 (crash-retry) on the now-full host is still Reserved, not CapacityFull.
+        assert_eq!(
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 2_000, 10).await.unwrap(),
+            Reserve::Reserved
+        );
+        // Still exactly one HELD row (refreshed, not duplicated); TTL bumped to 2000.
+        let (held, ttl): (i64, i64) = s
+            .read(|c| Ok(c.query_row(
+                "SELECT count(*), COALESCE(MAX(expires_at),0) FROM reservation WHERE state='HELD'",
+                [], |r| Ok((r.get(0)?, r.get(1)?)))?))
+            .await
+            .unwrap();
+        assert_eq!(held, 1);
+        assert_eq!(ttl, 2_000, "the HELD retry refreshed the TTL");
+    }
+
+    // A re-reserve must never resurrect a CONSUMED (active) or RELEASED (terminal) reservation.
+    #[tokio::test]
+    async fn reserve_never_resurrects_consumed_or_released() {
+        let s = mem_store();
+        let state = |s: &Store| {
+            let s = s.clone();
+            async move {
+                s.read(|c| Ok(c.query_row("SELECT state FROM reservation WHERE order_id='o1'", [], |r| r.get::<_, String>(0))?))
+                    .await
+                    .unwrap()
+            }
+        };
+        // CONSUMED: a re-reserve is idempotent success but stays CONSUMED (not downgraded).
+        reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0).await.unwrap();
+        consume(&s, "o1", 1).await.unwrap();
+        assert_eq!(
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 2_000, 2).await.unwrap(),
+            Reserve::Reserved
+        );
+        assert_eq!(state(&s).await, "CONSUMED", "re-reserve must not downgrade CONSUMED to HELD");
+        // RELEASED: a re-reserve is refused outright (renewals get a fresh order_id).
+        release(&s, "o1", 3).await.unwrap();
+        assert!(
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 4_000, 4).await.is_err(),
+            "re-reserving a RELEASED order is a caller bug, surfaced not resurrected"
+        );
+        assert_eq!(state(&s).await, "RELEASED", "the terminal reservation is untouched");
     }
 
     // An expired HELD reservation must not block a new order (it's no longer live).
