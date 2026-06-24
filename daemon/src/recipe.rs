@@ -132,13 +132,19 @@ impl Recipe {
         Ok(recipe)
     }
 
-    /// Load every recipe directory under `root` (one level deep).
+    /// Load every recipe directory under `root` (one level deep). A recipe that fails to PARSE
+    /// is skipped (logged), not fatal — one bad manifest must not blank the whole catalog
+    /// (codex #5). Callers should still `validate()` each before using it.
     pub fn load_all(root: impl AsRef<Path>) -> Result<Vec<Recipe>> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(root)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() && entry.path().join("recipe.toml").exists() {
-                out.push(Recipe::load(entry.path())?);
+            let path = entry.path();
+            if entry.file_type()?.is_dir() && path.join("recipe.toml").exists() {
+                match Recipe::load(&path) {
+                    Ok(r) => out.push(r),
+                    Err(e) => tracing::warn!(dir = %path.display(), error = %e, "skipping unparseable recipe"),
+                }
             }
         }
         Ok(out)

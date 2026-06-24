@@ -52,10 +52,13 @@ pub trait PaymentBackend: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct Invoice {
-    pub id: String,
-    pub external_id: String, // unique per-invoice token binding settlement->order (ADR-0009)
+    pub id: String,                 // our local invoice id (§11 invoice.id)
+    pub external_id: String,        // unique per-invoice token binding settlement->order (ADR-0009)
+    pub backend_invoice_id: String, // the backend's own invoice id (§11 invoice.backend_invoice_id)
+    pub payment_hash: String,       // bolt11 payment hash (§11 invoice.payment_hash)
     pub bolt11: String,
     pub amount_sat: u64,
+    pub expires_at: i64, // bolt11 expiry (unix secs); the order reservation is released at this (§9.3)
 }
 
 /// Status of one of OUR inbound invoices (receiving). SPEC.md §6.1.
@@ -85,6 +88,8 @@ pub struct Settlement {
     pub invoice_id: String,
     pub external_id: String,
     pub amount_sat: u64,
+    pub settled_at: i64, // when the backend observed settlement (unix secs); capture sets
+                         // paid_through = settled_at + period (§6.3), so it must come from here
 }
 
 /// `host` compute: runs directly on the Box, no isolation. SPEC.md §8.1.

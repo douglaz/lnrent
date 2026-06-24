@@ -26,20 +26,14 @@ pub struct HookOutput {
 }
 
 /// Run `hook` (an absolute path) with `input` on stdin, bounded by `timeout` and `OUTPUT_CAP`.
+/// A timeout, a cap breach on EITHER pipe, a non-zero exit, or non-JSON stdout is a failure —
+/// and the child is explicitly killed + reaped (not left to best-effort drop cleanup).
 pub async fn run_hook(hook: &Path, input: &Value, timeout: Duration) -> Result<HookOutput> {
-    match tokio::time::timeout(timeout, run_inner(hook, input)).await {
-        Ok(res) => res,
-        // The future is dropped on timeout; `kill_on_drop` reaps the child.
-        Err(_) => bail!("hook {} timed out after {timeout:?}", hook.display()),
-    }
-}
-
-async fn run_inner(hook: &Path, input: &Value) -> Result<HookOutput> {
     let mut child = Command::new(hook)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true) // backstop; we also reap explicitly below
         .spawn()
         .with_context(|| format!("spawning hook {}", hook.display()))?;
 
@@ -50,22 +44,33 @@ async fn run_inner(hook: &Path, input: &Value) -> Result<HookOutput> {
         si.shutdown().await.ok();
     }
 
-    // Read stdout + stderr CONCURRENTLY (so a full pipe can't deadlock the child), each
-    // capped at OUTPUT_CAP bytes — anything beyond the cap is truncated, not buffered.
     let out = child.stdout.take().context("hook stdout missing")?;
     let err = child.stderr.take().context("hook stderr missing")?;
-    // Drain BOTH pipes fully (so the child never blocks on a full pipe -> no deadlock) while
-    // RETAINING only the first OUTPUT_CAP bytes of each (so memory stays bounded).
-    let ((out_buf, out_trunc), (err_buf, _err_trunc)) =
-        tokio::try_join!(read_capped(out, OUTPUT_CAP), read_capped(err, OUTPUT_CAP))
-            .context("reading hook output")?;
 
-    if out_trunc {
-        let _ = child.start_kill();
-        bail!("hook {} stdout exceeded the {OUTPUT_CAP}-byte cap", hook.display());
-    }
+    // Read both pipes concurrently, each bounded by OUTPUT_CAP — a cap breach on EITHER pipe
+    // returns Err *immediately* (no draining, no hang), the whole thing under `timeout`.
+    let read = async { tokio::try_join!(read_capped(out, OUTPUT_CAP), read_capped(err, OUTPUT_CAP)) };
+    let (out_buf, err_buf) = match tokio::time::timeout(timeout, read).await {
+        Err(_) => {
+            reap(&mut child).await;
+            bail!("hook {} timed out after {timeout:?}", hook.display());
+        }
+        Ok(Err(e)) => {
+            // cap breach or read error -> kill the (possibly still-writing) child and fail
+            reap(&mut child).await;
+            return Err(anyhow!("hook {}: {e}", hook.display()));
+        }
+        Ok(Ok(bufs)) => bufs,
+    };
 
-    let status = child.wait().await.context("waiting on hook")?;
+    // Both pipes hit EOF -> the child has closed its outputs; wait for exit (bounded).
+    let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(s) => s.context("waiting on hook")?,
+        Err(_) => {
+            reap(&mut child).await;
+            bail!("hook {} did not exit after closing its output", hook.display());
+        }
+    };
     if !status.success() {
         bail!(
             "hook {} failed (exit {:?}): {}",
@@ -80,29 +85,31 @@ async fn run_inner(hook: &Path, input: &Value) -> Result<HookOutput> {
     Ok(HookOutput { stdout_json })
 }
 
-/// Read `r` to EOF (draining it so the writer never blocks on a full pipe), retaining only
-/// the first `cap` bytes. Returns the (bounded) bytes and whether anything was truncated.
-async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
-    mut r: R,
-    cap: usize,
-) -> std::io::Result<(Vec<u8>, bool)> {
+/// Explicitly kill the child and reap it (bounded), so a timed-out/over-producing hook leaves
+/// no zombie — `kill_on_drop` is only a backstop.
+async fn reap(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+}
+
+/// Read `r` to EOF, retaining the bytes, but return an error the moment the total would exceed
+/// `cap` — so an over-producing hook fails FAST (memory- and time-bounded), not after draining.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
-    let mut truncated = false;
     loop {
         let n = r.read(&mut chunk).await?;
         if n == 0 {
             break;
         }
-        if buf.len() < cap {
-            let take = (cap - buf.len()).min(n);
-            buf.extend_from_slice(&chunk[..take]);
-            truncated |= take < n;
-        } else {
-            truncated = true; // keep draining, just stop retaining
+        if buf.len() + n > cap {
+            return Err(std::io::Error::other(format!(
+                "output exceeded the {cap}-byte cap"
+            )));
         }
+        buf.extend_from_slice(&chunk[..n]);
     }
-    Ok((buf, truncated))
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -177,14 +184,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_stdout_is_truncated_not_unbounded() {
-        // Emit far more than the cap; the read must stop at OUTPUT_CAP, not buffer it all.
+    async fn oversized_stdout_fails_fast_on_cap() {
+        // Emit far more than the cap; must fail FAST on the cap (not buffer it, not wait out
+        // the timeout) — note the SHORT timeout: a draining impl would hang to it.
         let hook = write_hook(
-            "flood",
+            "flood-out",
             "#!/usr/bin/env bash\nhead -c 5000000 /dev/zero | tr '\\0' 'a'\n",
         );
-        // Must fail FAST on the cap (not buffer it all, not wait out the timeout).
-        let err = run_hook(&hook, &json!({}), Duration::from_secs(10)).await.unwrap_err();
+        let err = run_hook(&hook, &json!({}), Duration::from_millis(800)).await.unwrap_err();
+        assert!(err.to_string().contains("exceeded the"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn oversized_stderr_fails_fast_on_cap() {
+        // A cap breach on STDERR (not stdout) must also fail fast (codex #2).
+        let hook = write_hook(
+            "flood-err",
+            "#!/usr/bin/env bash\nhead -c 5000000 /dev/zero | tr '\\0' 'a' >&2\necho '{}'\n",
+        );
+        let err = run_hook(&hook, &json!({}), Duration::from_millis(800)).await.unwrap_err();
         assert!(err.to_string().contains("exceeded the"), "got: {err}");
     }
 }

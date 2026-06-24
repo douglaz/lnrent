@@ -89,46 +89,75 @@ pub async fn reserve(
             {
                 return Ok(Reserve::CapacityFull);
             }
+            // Idempotent per order: a retry (same order_id, e.g. after a pre-commit crash)
+            // refreshes the existing reservation rather than creating a duplicate hold.
             tx.execute(
                 "INSERT INTO reservation (id, order_id, resources_json, ports_json, state, expires_at, created_at)
-                 VALUES (?1, ?2, ?3, ?4, 'HELD', ?5, ?6)",
+                 VALUES (?1, ?2, ?3, ?4, 'HELD', ?5, ?6)
+                 ON CONFLICT(order_id) DO UPDATE SET
+                   resources_json=excluded.resources_json, ports_json=excluded.ports_json,
+                   state='HELD', expires_at=excluded.expires_at",
                 rusqlite::params![rid, oid, resources_json, ports_json, expires_at, now],
             )?;
+            journal(tx, &oid, "reserve", &resources_json, now)?;
             Ok(Reserve::Reserved)
         })
         .await
 }
 
-/// HELD -> CONSUMED, when the Instance reaches `ACTIVE` (§9.3).
-pub async fn consume(store: &Store, order_id: &str) -> Result<()> {
+/// HELD -> CONSUMED, when the Instance reaches `ACTIVE` (§9.3). A CONSUMED reservation IS the
+/// active Instance's capacity hold. Requires exactly one matching HELD reservation — a wrong
+/// `order_id` or a non-HELD state is an error, not a silent no-op (codex #7).
+pub async fn consume(store: &Store, order_id: &str, now: i64) -> Result<()> {
     let oid = order_id.to_string();
     store
         .transaction(move |tx| {
-            tx.execute(
+            let n = tx.execute(
                 "UPDATE reservation SET state='CONSUMED' WHERE order_id=?1 AND state='HELD'",
                 rusqlite::params![oid],
             )?;
+            if n != 1 {
+                bail!("consume: no HELD reservation for order `{oid}` (affected {n})");
+            }
+            journal(tx, &oid, "reserve_consume", "{}", now)?;
             Ok(())
         })
         .await
 }
 
-/// -> RELEASED, on invoice expiry / refund / terminate (§9.3).
-pub async fn release(store: &Store, order_id: &str) -> Result<()> {
+/// -> RELEASED, on invoice expiry / refund / terminate (§9.3). Idempotent: returns whether a
+/// HELD/CONSUMED reservation was actually released (false = nothing live to release).
+pub async fn release(store: &Store, order_id: &str, now: i64) -> Result<bool> {
     let oid = order_id.to_string();
     store
         .transaction(move |tx| {
-            tx.execute(
+            let n = tx.execute(
                 "UPDATE reservation SET state='RELEASED' WHERE order_id=?1 AND state IN ('HELD','CONSUMED')",
                 rusqlite::params![oid],
             )?;
-            Ok(())
+            if n > 0 {
+                journal(tx, &oid, "reserve_release", "{}", now)?;
+            }
+            Ok(n > 0)
         })
         .await
 }
 
-/// Sum of live usage: every CONSUMED reservation + every HELD reservation still within its
-/// TTL (an expired-but-not-yet-released HELD must not block new orders). Uses sqlite's JSON1.
+/// Journal a capacity mutation to `event_log` in the same txn (every mutation is journaled,
+/// ADR-0001/§6.5). `subscription_id` carries the order id.
+fn journal(tx: &rusqlite::Transaction, order_id: &str, kind: &str, detail_json: &str, now: i64) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO event_log (subscription_id, kind, detail_json, at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![order_id, kind, detail_json, now],
+    )?;
+    Ok(())
+}
+
+/// Sum of live usage = every CONSUMED reservation (each is an active Instance's hold) + every
+/// HELD reservation still within its TTL (an expired-but-not-yet-released HELD must not block
+/// new orders). With one reservation per order (`UNIQUE(order_id)`) and checked `consume`,
+/// CONSUMED reservations ARE the active Instances, so this equals the spec's
+/// `budget - (active Instances + live reservations)` (§9.3). Uses sqlite's JSON1.
 fn live_usage(tx: &rusqlite::Transaction, now: i64) -> rusqlite::Result<(u32, u32, u32, u32)> {
     tx.query_row(
         "SELECT
@@ -200,10 +229,22 @@ mod tests {
             }
         };
         assert_eq!(state(&s).await, "HELD");
-        consume(&s, "o1").await.unwrap();
+        consume(&s, "o1", 1).await.unwrap();
         assert_eq!(state(&s).await, "CONSUMED");
-        release(&s, "o1").await.unwrap();
+        assert!(release(&s, "o1", 2).await.unwrap(), "released a live reservation");
         assert_eq!(state(&s).await, "RELEASED");
+        // releasing again is a no-op that returns false (idempotent)
+        assert!(!release(&s, "o1", 3).await.unwrap());
+    }
+
+    // consume on a wrong/absent order_id is an error, not a silent no-op (codex #7).
+    #[tokio::test]
+    async fn consume_requires_a_held_reservation() {
+        let s = mem_store();
+        reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0).await.unwrap();
+        assert!(consume(&s, "nope", 1).await.is_err(), "no HELD reservation for a wrong order");
+        consume(&s, "o1", 1).await.unwrap();
+        assert!(consume(&s, "o1", 2).await.is_err(), "already CONSUMED -> error, not silent");
     }
 
     // An expired HELD reservation must not block a new order (it's no longer live).

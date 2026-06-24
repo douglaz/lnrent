@@ -4,7 +4,7 @@
 //! This is the OPERATOR's agent surface: every reply is structured JSON (so an operator agent
 //! drives it), and it is never network-reachable (a UDS with owner-only perms, no HTTP/MCP).
 
-use crate::clock::{Clock, SystemClock};
+use crate::clock::Clock;
 use crate::recipe::Recipe;
 use crate::store::Store;
 use anyhow::{Context, Result};
@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 /// A request from the CLI to the daemon. One JSON object per line.
@@ -33,6 +33,7 @@ pub enum Request {
 pub struct IpcError {
     pub code: String,
     pub message: String,
+    pub retryable: bool, // §5.1/§4.7 structured-error taxonomy
 }
 
 /// The daemon's reply. One JSON object per line: `{ok, data?}` or `{ok:false, error}`.
@@ -50,13 +51,26 @@ impl Reply {
         Reply { ok: true, data: Some(data), error: None }
     }
     pub fn err(code: &str, message: impl Into<String>) -> Reply {
-        Reply { ok: false, data: None, error: Some(IpcError { code: code.into(), message: message.into() }) }
+        Reply {
+            ok: false,
+            data: None,
+            error: Some(IpcError { code: code.into(), message: message.into(), retryable: false }),
+        }
     }
 }
 
+/// Max bytes for one request frame; an over-long line is rejected (a same-user process must
+/// not be able to memory-DoS the daemon, codex #9). Requests are tiny JSON.
+const MAX_REQUEST_BYTES: u64 = 1 << 18; // 256 KiB
+
 /// Serve IPC on `path` until the listener errors. Each connection is one request -> one reply.
 /// The socket is created owner-only and is removed-then-rebound to clear a stale socket.
-pub async fn serve(store: Store, recipes: Arc<Vec<Recipe>>, path: impl AsRef<Path>) -> Result<()> {
+pub async fn serve(
+    store: Store,
+    recipes: Arc<Vec<Recipe>>,
+    clock: Arc<dyn Clock>,
+    path: impl AsRef<Path>,
+) -> Result<()> {
     let path = path.as_ref();
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
@@ -65,23 +79,34 @@ pub async fn serve(store: Store, recipes: Arc<Vec<Recipe>>, path: impl AsRef<Pat
     tracing::info!(socket = %path.display(), "ipc serving");
     loop {
         let (stream, _addr) = listener.accept().await?;
-        let (store, recipes) = (store.clone(), recipes.clone());
+        let (store, recipes, clock) = (store.clone(), recipes.clone(), clock.clone());
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, store, recipes).await {
+            if let Err(e) = handle_conn(stream, store, recipes, clock).await {
                 tracing::warn!(error = %e, "ipc connection error");
             }
         });
     }
 }
 
-async fn handle_conn(stream: UnixStream, store: Store, recipes: Arc<Vec<Recipe>>) -> Result<()> {
+async fn handle_conn(
+    stream: UnixStream,
+    store: Store,
+    recipes: Arc<Vec<Recipe>>,
+    clock: Arc<dyn Clock>,
+) -> Result<()> {
     let (rd, mut wr) = stream.into_split();
-    let mut rd = BufReader::new(rd);
+    // Bounded read: cap the request frame so an over-long line can't exhaust memory.
+    let mut rd = BufReader::new(rd.take(MAX_REQUEST_BYTES));
     let mut line = String::new();
     rd.read_line(&mut line).await?;
-    let reply = match serde_json::from_str::<Request>(line.trim()) {
-        Ok(req) => dispatch(req, &store, &recipes).await,
-        Err(e) => Reply::err("bad_request", format!("invalid request: {e}")),
+    let reply = if !line.ends_with('\n') {
+        // hit the byte cap without a line terminator -> over-long / malformed frame
+        Reply::err("bad_request", "request too large or unterminated")
+    } else {
+        match serde_json::from_str::<Request>(line.trim()) {
+            Ok(req) => dispatch(req, &store, &recipes, &clock).await,
+            Err(e) => Reply::err("bad_request", format!("invalid request: {e}")),
+        }
     };
     let mut out = serde_json::to_vec(&reply)?;
     out.push(b'\n');
@@ -91,7 +116,7 @@ async fn handle_conn(stream: UnixStream, store: Store, recipes: Arc<Vec<Recipe>>
 }
 
 /// Route a request to the store actor (reads) / a journaled transaction (admin mutations).
-pub async fn dispatch(req: Request, store: &Store, recipes: &Arc<Vec<Recipe>>) -> Reply {
+pub async fn dispatch(req: Request, store: &Store, recipes: &Arc<Vec<Recipe>>, clock: &Arc<dyn Clock>) -> Reply {
     match req {
         Request::Status => match store
             .read(|c| Ok(c.query_row("SELECT count(*) FROM subscription", [], |r| r.get::<_, i64>(0))?))
@@ -123,19 +148,18 @@ pub async fn dispatch(req: Request, store: &Store, recipes: &Arc<Vec<Recipe>>) -
             }
         }
 
-        Request::AdminSuspend { id } => admin_transition(store, &id, &["ACTIVE"], "SUSPENDED", "admin_suspend").await,
-        Request::AdminResume { id } => admin_transition(store, &id, &["SUSPENDED"], "ACTIVE", "admin_resume").await,
+        Request::AdminSuspend { id } => admin_transition(store, &id, &["ACTIVE"], "SUSPENDED", "admin_suspend", clock.now()).await,
+        Request::AdminResume { id } => admin_transition(store, &id, &["SUSPENDED"], "ACTIVE", "admin_resume", clock.now()).await,
     }
 }
 
 /// An admin force-transition: CAS the subscription state from one of `from` to `to`, journaled
 /// to `event_log`, all in one store transaction (sole writer, ADR-0001). The reconcile/provision
 /// integration runs the actual lifecycle hooks; this is the operator override of the state.
-async fn admin_transition(store: &Store, id: &str, from: &[&str], to: &str, kind: &str) -> Reply {
+async fn admin_transition(store: &Store, id: &str, from: &[&str], to: &str, kind: &str, now: i64) -> Reply {
     let id = id.to_string();
     let to = to.to_string();
     let from: Vec<String> = from.iter().map(|s| s.to_string()).collect();
-    let now = SystemClock.now();
     let res: Result<bool> = store
         .transaction({
             let (id, to, kind, from) = (id.clone(), to.clone(), kind.to_string(), from.clone());
@@ -200,9 +224,14 @@ fn query_sub(c: &rusqlite::Connection, id: &str) -> Result<Option<Value>> {
                     "soft_date": r.get::<_, Option<i64>>(5)?,
                 }))
             },
-        )
-        .ok();
-    Ok(v)
+        );
+    // Only "no such row" is None; a real error (corruption, type mismatch) must propagate,
+    // not masquerade as not_found (codex #10).
+    match v {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// CLIENT: connect to the daemon socket, send `req`, return its `Reply`.
@@ -245,8 +274,9 @@ mod tests {
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
         let sock = std::env::temp_dir().join(format!("lnrent-ipc-{}-{n}.sock", std::process::id()));
         let (s2, sock2) = (store.clone(), sock.clone());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
         tokio::spawn(async move {
-            let _ = serve(s2, recipes, &sock2).await;
+            let _ = serve(s2, recipes, clock, &sock2).await;
         });
         // wait for bind
         for _ in 0..50 {

@@ -1119,10 +1119,10 @@ CREATE TABLE event_log (             -- audit trail of every transition + paymen
   id INTEGER PRIMARY KEY, subscription_id TEXT, kind TEXT, detail_json TEXT, at INTEGER);
 
 CREATE TABLE reservation (            -- capacity held for a PENDING order (§9.3)
-  id TEXT PRIMARY KEY, order_id TEXT,
+  id TEXT PRIMARY KEY, order_id TEXT NOT NULL UNIQUE,  -- one reservation per order
   resources_json TEXT,               -- {cpu, mem_mb, disk_gb}
   ports_json TEXT,                   -- requested published ports
-  state TEXT,                        -- HELD|CONSUMED|RELEASED
+  state TEXT,                        -- HELD|CONSUMED|RELEASED  (CONSUMED = an active Instance's hold)
   expires_at INTEGER, created_at INTEGER);
 
 CREATE TABLE daemon_state (          -- single row; heartbeat for downtime credit (§6.5)

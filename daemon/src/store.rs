@@ -72,10 +72,10 @@ CREATE TABLE IF NOT EXISTS event_log (
 
 CREATE TABLE IF NOT EXISTS reservation (   -- capacity held for a PENDING order (§9.3)
   id             TEXT PRIMARY KEY,
-  order_id       TEXT,
+  order_id       TEXT NOT NULL UNIQUE,  -- one reservation per order (idempotent re-reserve)
   resources_json TEXT,
   ports_json     TEXT,
-  state          TEXT,    -- HELD | CONSUMED | RELEASED
+  state          TEXT,    -- HELD | CONSUMED | RELEASED  (CONSUMED = an active Instance's hold)
   expires_at     INTEGER,
   created_at     INTEGER
 );
@@ -199,7 +199,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Open the state database, enable WAL (so reads don't block the single writer, §11), and run
+/// Open the state database, enable WAL (durability + headroom for a future read-only connection;
+/// in this actor all access still runs on one connection thread — §11), and run
 /// migrations up to the current `SCHEMA_VERSION`.
 pub fn open(path: impl AsRef<Path>) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -254,7 +255,10 @@ impl Store {
         .await
     }
 
-    /// Run `f` against the connection (reads / non-transactional work).
+    /// Run `f` for **queries only** — `f` gets `&Connection` and MUST NOT mutate (all writes go
+    /// through `transaction()`, which is atomic + journaled). Like every access it runs on the
+    /// actor thread, so reads serialize with writes (fine for M1a's low read concurrency; a
+    /// separate read-only WAL connection is a later optimization, not the sole-writer guarantee).
     pub async fn read<T, F>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
@@ -498,7 +502,7 @@ mod tests {
         }
     }
 
-    // WAL is enabled on a real file DB (so reads don't block the writer, §11).
+    // WAL is enabled on a real file DB (durability + a future RO read path; §11).
     #[tokio::test]
     async fn wal_is_enabled() {
         let path = std::env::temp_dir().join(format!("lnrent-store-{}.sqlite", std::process::id()));

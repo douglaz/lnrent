@@ -63,9 +63,10 @@ async fn main() -> ExitCode {
     match ipc::call(&sock, req).await {
         Ok(reply) => render(reply, cli.json),
         Err(e) => {
-            // The daemon isn't reachable — a structured, deterministic failure.
+            // The daemon isn't reachable — a structured, deterministic failure (retryable:
+            // the daemon may come up). Errors go to stderr so `--json` stdout stays clean.
             if cli.json {
-                println!("{}", serde_json::json!({"ok": false, "error": {"code": "ipc", "message": e.to_string()}}));
+                eprintln!("{}", serde_json::json!({"ok": false, "error": {"code": "ipc", "message": e.to_string(), "retryable": true}}));
             } else {
                 eprintln!("lnrent: cannot reach lnrentd at {sock}: {e}");
             }
@@ -76,8 +77,14 @@ async fn main() -> ExitCode {
 
 fn render(reply: Reply, as_json: bool) -> ExitCode {
     if as_json {
-        // Print the full reply object so agents get a stable shape on success AND failure.
-        println!("{}", serde_json::to_string(&reply).unwrap());
+        // Stable shape on success AND failure; errors go to stderr so piped `--json` stdout
+        // stays clean for `| jq` (§4.7).
+        let s = serde_json::to_string(&reply).unwrap();
+        if reply.ok {
+            println!("{s}");
+        } else {
+            eprintln!("{s}");
+        }
     } else if reply.ok {
         match reply.data {
             Some(serde_json::Value::Null) | None => println!("ok"),
