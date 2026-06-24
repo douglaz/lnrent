@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS subscription (
 CREATE TABLE IF NOT EXISTS invoice (
   id                 TEXT PRIMARY KEY,
   subscription_id    TEXT,
-  external_id        TEXT UNIQUE, -- unique per-invoice token; backend externalId (ADR-0009)
+  external_id        TEXT NOT NULL UNIQUE, -- unique per-invoice token; backend externalId (ADR-0009)
   backend_invoice_id TEXT,        -- the backend's own invoice id
   payment_hash       TEXT,
   kind               TEXT,    -- order | renewal

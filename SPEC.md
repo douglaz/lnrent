@@ -597,12 +597,20 @@ re-based to `settled_at`):
   funds are **auto-refunded** via a detached `refund_attempt -> REFUND_DUE`, never kept and
   never resurrecting the order (the invoice's `external_id` makes this detectable).
 
-**Totality (catch-all).** The transitions above are exhaustive for the events that change a
-subscription. Any `(state, event)` pair not listed is a **logged no-op** — the event is
-ignored, the state is unchanged — with exactly one exception: an **inbound settlement** is
-never dropped. A settlement is always either *captured* (the matching `PENDING` order) or
-*auto-refunded* (every other state, per the rule above). So money has a defined outcome in
-every state, and every other stray event is inert.
+**Totality (catch-all).** The transitions above are exhaustive. Any **non-settlement**
+`(state, event)` pair not listed is a **logged no-op**. An **inbound settlement** is never
+dropped and is resolved **invoice-status-first** (by the settled invoice, not the subscription
+state alone), so it has a defined outcome in every case:
+- invoice already `PAID` / applied -> **no-op** (a backend redelivery or replay);
+- `OPEN` **order** invoice (sub `PENDING`) -> **capture** -> provision;
+- `OPEN` **renewal** invoice (sub `ACTIVE` / `SUSPENDED`) -> **extend / resume** (the renewal
+  `max(paid_through, settled_at) + period` formula);
+- `EXPIRED`, terminal, or otherwise unmatched invoice -> exactly **one** auto-refund
+  (settled-but-terminal), keyed by a deterministic refund idempotency key (§6.6) so a
+  redelivered settlement cannot create a second refund.
+
+So money is never dropped, never double-applied, and never double-refunded; every other stray
+event is inert.
 
 ### 6.4 Provisioning atomicity and refunds
 
@@ -651,11 +659,20 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
 
 - **Correlation:** each invoice carries a unique `external_id` binding it to its
   order/subscription; the backend's `create_invoice` takes it as `externalId` and returns it on
-  settlement, so a settlement maps to exactly one invoice (`UNIQUE(external_id)`).
+  settlement, so a settlement maps to exactly one invoice (`UNIQUE(external_id)`). `external_id`
+  is **deterministic per invoice class** so a retry regenerates the same id (and `create_invoice`
+  is idempotent on it):
+  - order: `order:<sender_pubkey>:<request_id>`
+  - buyer-requested renewal: `renew:req:<sender_pubkey>:<request_id>`
+  - daemon soft-date auto-renewal (no buyer request): `renew:auto:<subscription_id>:<cycle_anchor>`
+    where `cycle_anchor` is the `paid_through` being renewed, so one cycle yields one invoice.
+
+  A **settled-but-terminal refund** likewise uses a deterministic refund key (e.g.
+  `refund:<external_id>`) so a redelivered settlement creates exactly one `refund_attempt`.
 - **Issuance ordering (the `bolt11` comes from the backend, so it can't be cached before the
-  call):** the daemon derives `external_id` **deterministically from `(sender_pubkey,
-  request_id)`**, calls `create_invoice(external_id)` (which the backend makes **idempotent on
-  `external_id`** — a re-call returns the same invoice), THEN writes in one txn the PENDING sub
+  call):** the daemon derives `external_id` per the class above, calls
+  `create_invoice(external_id)` (which the backend makes **idempotent on `external_id`** — a
+  re-call returns the same invoice), THEN writes in one txn the PENDING sub
   + the invoice row (with `bolt11` + backend ids) + the cached `inbound_request` response, and
   sends the DM only after commit. A crash after `create_invoice` but before that commit leaves
   an orphaned backend invoice that is never bound to a committed order and simply expires
@@ -1082,7 +1099,7 @@ CREATE TABLE subscription (
 
 CREATE TABLE invoice (
   id TEXT PRIMARY KEY, subscription_id TEXT,
-  external_id TEXT UNIQUE,            -- unique per-invoice token; backend externalId (ADR-0009)
+  external_id TEXT NOT NULL UNIQUE,   -- unique per-invoice token; backend externalId (ADR-0009)
   backend_invoice_id TEXT,           -- the backend's own invoice id
   payment_hash TEXT,
   kind TEXT,                         -- order | renewal

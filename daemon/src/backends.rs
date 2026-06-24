@@ -26,12 +26,15 @@ pub trait NetworkBackend: Send + Sync {
 /// Receiving and refunding Lightning. SPEC.md §6.1. No hold invoices on the v1
 /// backends, so `pay` exists for capture-then-refund (ADR-0003).
 pub trait PaymentBackend: Send + Sync {
+    /// Create (or return the existing) invoice. **Idempotent on `external_id`**: a repeated
+    /// call with the same `external_id` MUST return the same invoice, not a duplicate — so a
+    /// retry after a crash regenerates the same `external_id` and reuses the invoice (§6.6).
     fn create_invoice(
         &self,
         amount_sat: u64,
         memo: &str,
         expiry_s: u32,
-        external_id: &str, // binds settlement -> order (ADR-0009)
+        external_id: &str, // binds settlement -> order (ADR-0009); deterministic per invoice class (§6.6)
     ) -> Result<Invoice>;
     fn lookup(&self, id: &str) -> Result<PaymentStatus>;
     /// Outbound payment, used for refunds. **Idempotent on `idempotency_key`**: calling twice
