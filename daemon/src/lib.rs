@@ -3,6 +3,7 @@
 pub mod backends;
 pub mod clock;
 pub mod domain;
+pub mod ipc;
 pub mod recipe;
 pub mod reservation;
 pub mod runner;

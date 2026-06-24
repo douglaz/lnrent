@@ -114,7 +114,10 @@ mod tests {
 
     // Write an executable script into a unique temp dir and return its path.
     fn write_hook(name: &str, body: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lnrent-runner-{}-{name}", std::process::id()));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("lnrent-runner-{}-{seq}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
         std::fs::write(&path, body).unwrap();
