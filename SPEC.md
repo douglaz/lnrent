@@ -549,9 +549,11 @@ e.g. 7d).
 - **PENDING** — pre-flight passed, first invoice issued, awaiting payment.
 - **PENDING -> EXPIRED** — invoice expires unpaid; the order is dead (a later payment
   is not silently resurrected).
-- **EXPIRED + late settlement -> REFUND_DUE** — if a payment settles after expiry (settle
-  racing expiry), the order is not resurrected and the funds are **auto-refunded** (§6.4),
-  never kept. The invoice carries the order id so this is detectable.
+- **EXPIRED + late settlement -> detached refund** — if a payment settles after expiry (settle
+  racing expiry), the order is not resurrected and the subscription **stays `EXPIRED`**; the
+  funds are **auto-refunded** via a **detached `refund_attempt`** (§6.4), never kept. The sub
+  does NOT enter `REFUND_DUE` — that state is reserved for a *captured* order whose provision
+  failed (below). The invoice's `external_id` makes the late settlement detectable.
 - **PENDING -> PROVISIONING** — first payment settles and is captured. Run
   `provision`, retried with backoff.
 - **PROVISIONING -> ACTIVE** — provision succeeded; deliver credentials and set
@@ -594,8 +596,10 @@ re-based to `settled_at`):
 **Late / terminal settlement (never resurrect, never keep):**
 - A settlement that arrives once the subscription is already terminal (`EXPIRED`, `CANCELLED`,
   `TERMINATED`, `REFUNDED`) or after retention does NOT change the subscription state — the
-  funds are **auto-refunded** via a detached `refund_attempt -> REFUND_DUE`, never kept and
-  never resurrecting the order (the invoice's `external_id` makes this detectable).
+  funds are **auto-refunded** via a **detached `refund_attempt`** (the sub stays terminal; it
+  does NOT enter `REFUND_DUE`, which is only for a captured order whose provision failed),
+  never kept and never resurrecting the order (the invoice's `external_id` makes this
+  detectable).
 
 **Totality (catch-all).** The transitions above are exhaustive. Any **non-settlement**
 `(state, event)` pair not listed is a **logged no-op**. An **inbound settlement** is never
@@ -1201,8 +1205,9 @@ CREATE TABLE native_connect_session ( -- interactive-op authorization tickets (�
 - **Value plane is separated from the hosting plane (ADR-0010):** the wallet + the hot
   marketplace operational key live on the control node (the seed + master key stay cold/offline,
   §4.6), never on a box hosting untrusted tenant VMs, so a tenant escape or box compromise
-  cannot drain funds or reach the seed/master. (M1a all-in-one keeps the seed on the box —
-  accepted for self-use only.)
+  cannot drain funds or reach the seed/master. (The M1a all-in-one box keeps the seed on the
+  box — accepted for M1a mechanics / self-use / no-untrusted-tenant deployments, §4.5; the
+  split becomes mandatory at M1b's rented VMs.)
 - Tenant isolation is the provisioning backend's job; the `host` backend (no
   isolation) is only for services that are safe to run unsandboxed (WireGuard).
 - Hooks run with least privilege; the daemon passes secrets via stdin JSON, not
