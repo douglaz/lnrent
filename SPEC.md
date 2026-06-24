@@ -276,11 +276,14 @@ operator agents that offer and manage services, buyer agents that rent and contr
 with humans still first-class (call it ~51% agent / ~49% human). The agent surface is a
 **complete CLI**, nothing more exotic:
 
-- **No MCP, no HTTP server.** A complete CLI is sufficient for any agent. We deliberately do
-  NOT ship an MCP server or a local HTTP API — both reintroduce a server, auth, lifecycle,
-  and a schema surface a good CLI already covers, and an HTTP API on the buyer side would
-  break the static no-central-server web property (§1). Anyone wanting HTTP can wrap the
-  `--json` CLI themselves.
+- **No MCP, no shipped/required HTTP server.** A complete CLI is sufficient for any agent. We
+  deliberately do NOT ship an MCP server or a central/required HTTP API — both reintroduce a
+  server, auth, lifecycle, and a schema surface a good CLI already covers, and a required API
+  would break the no-central-server property (§1). **Backlog exception:** an *optional,
+  self-hostable* HTTP **bridge/gateway** — a thin shim anyone runs over *their own* `--json`
+  CLI, for callers that can only reach things over web services — is allowed and backlogged.
+  It maps endpoints 1:1 to CLI verbs, holds no business logic, returns invoices but never pays
+  (§4.7 payment rule), and adds no central dependency because the bridge operator hosts it.
 - **CLI-completeness contract** (both the operator `lnrent` CLI and the buyer CLI):
   - every operation is reachable from the CLI (no web-only or prompt-only action);
   - **`--json`** machine-readable output on every command, with stable field names;
@@ -1185,3 +1188,5 @@ Still open:
   but does not cluster them under one scheduler.
 - Any LLM/AI in the control plane (permanent rule, not just v1).
 - SLAs, autoscaling, bin-packing guarantees.
+- An MCP server, or a central/required HTTP API. (An *optional, self-hostable* HTTP
+  bridge over the `--json` CLI is **backlogged**, not v1 — §4.7, ADR-0014.)

@@ -46,9 +46,13 @@ boundaries.
 
 - **MCP server / agent SDK.** Rejected — a server + protocol + schema-maintenance surface
   that a complete CLI already covers; the operating stance is "a CLI is enough for any agent."
-- **Local HTTP API on the buyer / web side.** Rejected — reintroduces a server (the thing the
-  CLI avoids) and breaks the static no-central-server web property (§1). Wrapping the CLI in
-  HTTP is a trivial external concern if ever needed.
+- **A core / required / lnrent-hosted HTTP API.** Rejected as a *shipped, depended-on*
+  surface — it reintroduces a central server (the thing the CLI avoids) and would break the
+  static no-central-server property (§1). NOTE: this rejects a *central/required* API, not an
+  **optional, self-hostable bridge**. A thin HTTP gateway that anyone runs over *their own*
+  `--json` CLI — no business logic, no extra trust, payment still out of scope — is permitted
+  and **backlogged** (for callers that can only reach things over web services); it adds no
+  central dependency because the bridge operator hosts it themselves. See the backlog bead.
 - **Embed an LLM to "understand" requests.** Rejected — violates the AI-free invariant and
   opens prompt injection into the value / hosting plane.
 
@@ -62,5 +66,8 @@ boundaries.
   M1d proves a fully-headless agent loop where the buyer agent's own wallet pays — no payer in
   the client, no MCP, no server.
 - The web buyer (lnrent-7fp.18) is explicitly the human surface; it is not an agent API.
+- An **optional, self-hostable HTTP bridge** over the `--json` CLI (a thin gateway anyone runs
+  over their own CLI/keys, for HTTP-only callers) is **backlogged** — it mirrors the CLI 1:1,
+  holds no business logic, returns invoices but never pays, and adds no central dependency.
 - The dual-side injection threat model is recorded in §13; buyer-core enforces
   signed / structured-vs-prose separation.
