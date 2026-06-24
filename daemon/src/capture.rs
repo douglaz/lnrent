@@ -161,10 +161,12 @@ fn apply_paid(tx: &Transaction, kind: Option<&str>, sub_id: Option<&str>, s: &Se
         (Some("renewal"), st @ ("ACTIVE" | "SUSPENDED")) => {
             // Reconcile is periodic, so a sub can still read ACTIVE/SUSPENDED past its retention
             // end (paid_through + retention_s) before the TERMINATED flip lands. A settlement that
-            // arrives after retention is too late: the Instance is destroyed (or about to be), so
-            // refund rather than resurrect service. The retention window IS the late-renewal grace.
+            // arrives at or after retention end is too late: the Instance is destroyed (or due to
+            // be — reconcile fires `destroy` at `now >= retention end`, §6.5), so refund rather
+            // than resurrect service. The boundary is INCLUSIVE-terminal to match that `>=`; the
+            // retention window `[paid_through, paid_through + retention_s)` IS the late-renewal grace.
             if let Some(pt) = paid_through {
-                if s.settled_at > pt + retention_s {
+                if s.settled_at >= pt + retention_s {
                     refund_intent(tx, Some(sub_id), refund_dest.as_deref(), s, now)?;
                     journal(tx, Some(sub_id), "settle_terminal_refund", s, now)?;
                     return Ok(Capture::RefundDue);
@@ -401,6 +403,28 @@ mod tests {
             assert_eq!(inv_status(&s, "rext").await.0, "PAID");
             assert_eq!(refund_count(&s).await, 1, "{state}: one refund for the late renewal");
         }
+    }
+
+    // The retention boundary is inclusive-terminal: a renewal at exactly paid_through+retention_s
+    // refunds (reconcile fires `destroy` at `now >= retention end`), one second earlier renews.
+    #[tokio::test]
+    async fn retention_boundary_is_inclusive_terminal() {
+        // paid_through=100, retention=50 -> retention end at 150.
+        let at_boundary = mem_store();
+        seed(&at_boundary, "o1", "ACTIVE", Some(100), 100, 10, 50, Some("d"), "renewal", "OPEN", "rext").await;
+        assert_eq!(
+            capture(&at_boundary, settlement("rext", 150), 1).await.unwrap(),
+            Capture::RefundDue,
+            "settling exactly at retention end is too late -> refund"
+        );
+
+        let just_inside = mem_store();
+        seed(&just_inside, "o2", "ACTIVE", Some(100), 100, 10, 50, Some("d"), "renewal", "OPEN", "rin").await;
+        assert_eq!(
+            capture(&just_inside, settlement("rin", 149), 1).await.unwrap(),
+            Capture::Renewed,
+            "one second inside the window still renews"
+        );
     }
 
     // A settlement on an invoice with NULL/unknown kind is NOT assumed to be an order: it must not
