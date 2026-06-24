@@ -174,8 +174,9 @@ service-management `ops` interface — §7.4), so there is one protocol implemen
 two. Buyer-core is also where a rented service is managed after delivery: it discovers a
 subscription's recipe-declared operations and dispatches them (request/response over the DM
 protocol, interactive over Iroh — §7.4, ADR-0013), so the same client that rents a service
-also operates it. Both connect directly to relays and to the buyer's own Lightning wallet,
-with no lnrent server in between. The web client is a static SPA: the
+also operates it. Both connect directly to relays, with no lnrent server in between. Neither
+client is a wallet: they **surface the invoice** and the buyer pays it from their own wallet
+out-of-band (§4.7) — the client never holds funds. The web client is a static SPA: the
 buyer-core compiles to wasm32 and reaches relays over browser WebSockets. It **detects
 capabilities and degrades gracefully**: signing prefers a NIP-07 extension, else an
 **embedded key** the SPA generates and persists (zero-install) — and since that key also
@@ -290,11 +291,13 @@ with humans still first-class (call it ~51% agent / ~49% human). The agent surfa
     emit JSON an agent can branch on.
 - **The web client stays the human surface.** The static SPA (NIP-07 / WebLN / QR, §4.2) is
   for the ~49%; it is not an agent API. Agents use the CLI; both ride the same buyer-core.
-- **Payment is a pluggable payer seam, not a wallet in the CLI.** A buyer (human or agent)
-  needs a wallet to move sats. Headless payment is just a **non-interactive payer backend**
-  behind buyer-core's payer seam — a local wallet command, an embedded wallet, or NWC
-  (NIP-47), selected via the CLI (`--pay-with …`). NWC is one option, not a requirement; the
-  human WebLN / QR path is another implementation of the same seam.
+- **Payment is out of scope for the client.** The CLI / buyer-core is a protocol client, not
+  a wallet: it **returns the invoice** (bolt11 + amount + expiry, as `--json`) and never holds
+  funds or pays. Paying is the buyer's wallet's job, **out-of-band** — a human pays from their
+  wallet, an agent pays with its own payment logic — after which the operator confirms
+  settlement (§6.1) and the flow resumes (the client polls / awaits `provision.ready`). The
+  web SPA may offer a human WebLN / QR hand-off, but that is the user's wallet paying, not the
+  client.
 - **Agents read untrusted content** (listings, DMs, op / provision payloads) — see the
   dual-side injection threat model in §13.
 
@@ -1073,9 +1076,9 @@ lnrent/
   `request` operation (e.g. `status` / `restart`) over `op.request` / `op.result`. Pin the
   lnrent DM schema (incl. `op.request` / `op.result`). Build both the buyer and operator CLIs
   **agent-grade from the start** (§4.7, ADR-0014): `--json` on every command, non-interactive,
-  deterministic exit codes + structured errors (incl. the structured `order.error`). The
-  buyer payer seam admits a non-interactive backend; the concrete headless payer + full
-  agent-loop proof is M1d.
+  deterministic exit codes + structured errors (incl. the structured `order.error`). The CLI
+  **returns** the invoice (the buyer pays it out-of-band from their own wallet, §4.7 — the
+  client never pays); the full headless agent-loop proof is M1d.
 - **M1b — VM Tier-0 core.** Swap in the real `vm` recipe: Incus VM provisioning (curated
   images, fixed sizes, §9.3), per-VM tap/firewall + no metadata, **private** reachability
   (Iroh management + Tor fallback, §9.2), and capacity/reservation. The VM's SSH/console
@@ -1083,11 +1086,11 @@ lnrent/
   proving that transport. Honest **Tier 0** Listing, private-only.
 - **M1c — Public exposure.** Tenant-declared published services: shared IPv4 ports via
   frp/rathole, with the capacity accounting that ports imply (§9.2/§9.3).
-- **M1d — Agent-native hardening (ADR-0014).** A concrete **non-interactive payer backend**
-  for the buyer CLI (a local-wallet command and/or an NWC connection) so a buyer agent pays
-  without a human; a **fully-headless agent loop** test (an operator agent offers + a buyer
-  agent rents, pays, manages via `ops`, and cancels — all through the CLIs, no prompts); and
-  the **injection-safe client discipline** (§13) verified against a hostile-prose listing
+- **M1d — Agent-native hardening (ADR-0014).** A **fully-headless agent loop** test: an
+  operator agent offers, a buyer agent rents — the CLI **returns** the invoice and the agent's
+  **own wallet** pays it out-of-band (payment is not in the client, §4.7) — then the buyer
+  agent manages via `ops` and cancels, all through the CLIs with no prompts; plus the
+  **injection-safe client discipline** (§13) verified against a hostile-prose listing
   (buyer-core acts only on signed/structured fields). Proves the ~51% agent path end to end.
 - **M2 — More recipes + Tier 1.** Hermes and Fedimint-guardian recipes, **gated behind
   >= Tier 1** (tenant-managed LUKS) since they are sensitive workloads (guidelines §26);
@@ -1100,8 +1103,9 @@ lnrent/
   Fedimint ecash is the primary backend, implemented in M1a (ADR-0012).
 - **M4 — NixOS module + Debian packaging.** (The web WASM buyer is proven earlier, in M1a.)
 - **M5 — Pre-fleet hardening.** Per-box key split + operator manifest (ADR-0004/0006);
-  NWC (NIP-47) **pull subscriptions** (recurring auto-renew authorization — distinct from the
-  M1d one-shot NWC payer); the **reputation primitive** (buyer-signed rental
+  NWC (NIP-47) **pull subscriptions** (a recurring auto-renew authorization the buyer grants
+  from their own wallet — still the wallet paying, not the client, §4.7); the **reputation
+  primitive** (buyer-signed rental
   attestations to the master identity, ADR-0011) — which gates promoting the marketplace
   publicly (the web buyer is built/proven in M1a but not publicly launched until then).
 - **M6 — Tier 1.5.** The guidelines' "minimum viable secure launch": Secure Boot + TPM +

@@ -24,10 +24,12 @@ boundaries.
   never a *required* prompt); deterministic exit codes + structured errors; scriptable
   discovery (`list` / `describe` emit JSON). The web client stays the HUMAN surface (static
   SPA: NIP-07 / WebLN / QR), not an agent API.
-- **Payment is a pluggable payer seam, not a wallet in the CLI.** Headless payment needs a
-  non-interactive payer backend behind buyer-core's payer seam — a local wallet command, an
-  embedded wallet, or NWC (NIP-47) — selected via the CLI. NWC is one option, not a
-  requirement; the human WebLN / QR path is just another implementation of the same seam.
+- **Payment is out of scope for the client.** The CLI / buyer-core is a protocol client, not
+  a wallet: it **returns the invoice** (bolt11 + amount + expiry, as structured output) and
+  never holds funds or pays. Paying is the buyer's wallet's job, out-of-band — a human pays
+  from their wallet, an agent pays with its own payment logic — after which the operator
+  confirms settlement and the flow resumes. The web SPA may offer a human WebLN / QR hand-off,
+  but that is the user's wallet paying, not the client.
 - **Dual-side injection threat model.** In an agent-mediated marketplace, untrusted content
   flows *into* the client agents: a buyer agent reads listings, DMs, and op.result / provision
   payloads; an operator agent reads order / op params and DM content. The operator side is
@@ -52,8 +54,9 @@ boundaries.
   to retrofit): buyer CLI (lnrent-7fp.13), operator CLI ↔ daemon surface (lnrent-7fp.12),
   operator bootstrap (lnrent-7fp.16).
 - `order.error` gains a structured `code` (like `op.result`), so agents branch on outcomes.
-- The buyer payer seam documents a headless backend contract; a concrete NWC / local-wallet
-  payer is a fast-follow after the M1a handshake.
+- The client never pays: it returns the invoice and the buyer's wallet settles it out-of-band.
+  M1d proves a fully-headless agent loop where the buyer agent's own wallet pays — no payer in
+  the client, no MCP, no server.
 - The web buyer (lnrent-7fp.18) is explicitly the human surface; it is not an agent API.
 - The dual-side injection threat model is recorded in §13; buyer-core enforces
   signed / structured-vs-prose separation.
