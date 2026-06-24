@@ -178,10 +178,28 @@ CREATE TABLE IF NOT EXISTS native_connect_session (  -- interactive-op tickets (
 );
 "#;
 
+/// Migration 2 (lnrent-7fp.5): the transport-level inbound-DM dedup table. The Nostr engine
+/// keys it on the OUTER NIP-17 gift-wrap event id (unique per delivered DM) and writes a row only
+/// AFTER a handler durably commits, so a relay redelivery — or a daemon restart — never re-routes a
+/// *completed* inbound DM (§5.1). It is best-effort by design: a crash mid-handling leaves no row,
+/// so the wrap is reprocessed and the authoritative business idempotency on `(sender, request_id)`
+/// in `inbound_request` / `op_invocation` makes that re-run safe. Appended as a new migration —
+/// never edit a shipped one.
+const M2_SEEN_MESSAGE: &str = r#"
+CREATE TABLE IF NOT EXISTS seen_message (  -- transport dedup of inbound gift wraps (§5.1, lnrent-7fp.5)
+  event_id  TEXT PRIMARY KEY,  -- the kind-1059 gift-wrap OUTER event id (stable per delivered DM)
+  sender    TEXT,              -- decoded sender pubkey (audit)
+  msg_type  TEXT,              -- the lnrent DM `type` (audit)
+  seen_at   INTEGER NOT NULL   -- when first routed (audit; unix secs)
+);
+CREATE INDEX IF NOT EXISTS seen_message_seen_at_idx ON seen_message(seen_at);
+"#;
+
 /// Ordered migrations (lnrent-7fp.3): index `i` upgrades the DB from schema version `i` to
-/// `i+1`. Version 1 is the current §11 schema. A future schema change appends a new entry of
-/// `ALTER`/`CREATE` statements; **never edit a shipped migration**.
-const MIGRATIONS: &[&str] = &[SCHEMA];
+/// `i+1`. Version 1 is the §11 schema; version 2 adds `seen_message` (lnrent-7fp.5). A future
+/// schema change appends a new entry of `ALTER`/`CREATE` statements; **never edit a shipped
+/// migration**.
+const MIGRATIONS: &[&str] = &[SCHEMA, M2_SEEN_MESSAGE];
 
 /// The target schema version this binary expects (= number of migrations).
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -289,7 +307,8 @@ impl Store {
             .send(job)
             .await
             .map_err(|_| anyhow!("store actor stopped"))?;
-        rrx.await.map_err(|_| anyhow!("store actor dropped the reply"))?
+        rrx.await
+            .map_err(|_| anyhow!("store actor dropped the reply"))?
     }
 }
 
@@ -312,10 +331,12 @@ mod tests {
     }
 
     #[test]
-    fn migrate_fresh_sets_v1_and_applies_schema() {
+    fn migrate_fresh_applies_all_migrations() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
         let n: i64 = conn
             .query_row(
@@ -324,33 +345,62 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 15);
+        // The §11 schema (15 tables) plus `seen_message` from migration 2 (lnrent-7fp.5).
+        assert_eq!(n, 16);
     }
 
     #[test]
     fn migrate_is_idempotent_on_current_db() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        conn.execute("INSERT INTO recipe (id, version) VALUES ('r','1')", []).unwrap();
+        conn.execute("INSERT INTO recipe (id, version) VALUES ('r','1')", [])
+            .unwrap();
         migrate(&conn).unwrap(); // no-op
-        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        let n: i64 = conn.query_row("SELECT count(*) FROM recipe", [], |r| r.get(0)).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM recipe", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 1, "re-migrating a current db is a no-op (no data loss)");
     }
 
     // A simulated legacy (v0) DB — schema applied but user_version never set, with data — must
-    // migrate to v1 without losing data.
+    // migrate to the current version without losing data, and gain the later tables.
     #[test]
-    fn simulated_v0_db_migrates_to_v1_without_data_loss() {
+    fn simulated_v0_db_migrates_to_current_without_data_loss() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
-        conn.execute("INSERT INTO recipe (id, version) VALUES ('legacy','1')", []).unwrap();
-        assert_eq!(conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0)).unwrap(), 0);
+        conn.execute("INSERT INTO recipe (id, version) VALUES ('legacy','1')", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap(),
+            0
+        );
         migrate(&conn).unwrap();
-        assert_eq!(conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0)).unwrap(), 1);
-        let id: String = conn.query_row("SELECT id FROM recipe WHERE id='legacy'", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let id: String = conn
+            .query_row("SELECT id FROM recipe WHERE id='legacy'", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(id, "legacy", "data preserved across migration");
+        // Migration 2 (lnrent-7fp.5) reached this legacy DB too — `seen_message` now exists.
+        let seen: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='seen_message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            seen, 1,
+            "the later migration created seen_message on the legacy DB"
+        );
     }
 
     fn mem_store() -> Store {
@@ -410,34 +460,56 @@ mod tests {
         // A capture that fails partway must leave BOTH rows unchanged.
         let res: Result<()> = s
             .transaction(|tx| {
-                tx.execute("UPDATE invoice SET status='PAID' WHERE id='i1' AND status='OPEN'", [])?;
-                tx.execute("UPDATE subscription SET state='PROVISIONING' WHERE id='s1'", [])?;
+                tx.execute(
+                    "UPDATE invoice SET status='PAID' WHERE id='i1' AND status='OPEN'",
+                    [],
+                )?;
+                tx.execute(
+                    "UPDATE subscription SET state='PROVISIONING' WHERE id='s1'",
+                    [],
+                )?;
                 Err(anyhow!("crash mid-capture"))
             })
             .await;
         assert!(res.is_err());
         let (inv, sub): (String, String) = s
             .read(|c| {
-                let inv = c.query_row("SELECT status FROM invoice WHERE id='i1'", [], |r| r.get(0))?;
-                let sub = c.query_row("SELECT state FROM subscription WHERE id='s1'", [], |r| r.get(0))?;
+                let inv =
+                    c.query_row("SELECT status FROM invoice WHERE id='i1'", [], |r| r.get(0))?;
+                let sub = c.query_row("SELECT state FROM subscription WHERE id='s1'", [], |r| {
+                    r.get(0)
+                })?;
                 Ok((inv, sub))
             })
             .await
             .unwrap();
-        assert_eq!((inv.as_str(), sub.as_str()), ("OPEN", "PENDING"), "capture rolled back atomically");
+        assert_eq!(
+            (inv.as_str(), sub.as_str()),
+            ("OPEN", "PENDING"),
+            "capture rolled back atomically"
+        );
 
         // The successful capture commits both.
         s.transaction(|tx| {
-            tx.execute("UPDATE invoice SET status='PAID' WHERE id='i1' AND status='OPEN'", [])?;
-            tx.execute("UPDATE subscription SET state='PROVISIONING' WHERE id='s1'", [])?;
+            tx.execute(
+                "UPDATE invoice SET status='PAID' WHERE id='i1' AND status='OPEN'",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE subscription SET state='PROVISIONING' WHERE id='s1'",
+                [],
+            )?;
             Ok(())
         })
         .await
         .unwrap();
         let (inv, sub): (String, String) = s
             .read(|c| {
-                let inv = c.query_row("SELECT status FROM invoice WHERE id='i1'", [], |r| r.get(0))?;
-                let sub = c.query_row("SELECT state FROM subscription WHERE id='s1'", [], |r| r.get(0))?;
+                let inv =
+                    c.query_row("SELECT status FROM invoice WHERE id='i1'", [], |r| r.get(0))?;
+                let sub = c.query_row("SELECT state FROM subscription WHERE id='s1'", [], |r| {
+                    r.get(0)
+                })?;
                 Ok((inv, sub))
             })
             .await
@@ -462,7 +534,10 @@ mod tests {
             let s = s.clone();
             handles.push(tokio::spawn(async move {
                 s.transaction(|tx| {
-                    tx.execute("UPDATE daemon_state SET last_heartbeat = last_heartbeat + 1", [])?;
+                    tx.execute(
+                        "UPDATE daemon_state SET last_heartbeat = last_heartbeat + 1",
+                        [],
+                    )?;
                     Ok(())
                 })
                 .await
@@ -476,7 +551,10 @@ mod tests {
             .read(|c| Ok(c.query_row("SELECT last_heartbeat FROM daemon_state", [], |r| r.get(0))?))
             .await
             .unwrap();
-        assert_eq!(total, N, "every increment landed (serialized, no lost update)");
+        assert_eq!(
+            total, N,
+            "every increment landed (serialized, no lost update)"
+        );
     }
 
     // read() is structurally read-only: a stray write inside it is visible within the closure
@@ -498,13 +576,19 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(seen, 999, "the stray write is visible inside the read's own txn");
+        assert_eq!(
+            seen, 999,
+            "the stray write is visible inside the read's own txn"
+        );
         // ...but it was rolled back, so the durable value is untouched.
         let after: i64 = s
             .read(|c| Ok(c.query_row("SELECT last_heartbeat FROM daemon_state", [], |r| r.get(0))?))
             .await
             .unwrap();
-        assert_eq!(after, 7, "the stray write did NOT persist — read() is structurally read-only");
+        assert_eq!(
+            after, 7,
+            "the stray write did NOT persist — read() is structurally read-only"
+        );
     }
 
     // The two idempotency keys (op_invocation, inbound_request) + refund_attempt UNIQUE:
@@ -535,7 +619,10 @@ mod tests {
                 .read(move |c| Ok(c.query_row(&q, [], |r| r.get(0))?))
                 .await
                 .unwrap();
-            assert_eq!(n, 1, "{table}: duplicate insert must not create a second row");
+            assert_eq!(
+                n, 1,
+                "{table}: duplicate insert must not create a second row"
+            );
         }
     }
 

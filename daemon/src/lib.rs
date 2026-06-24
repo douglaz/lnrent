@@ -5,6 +5,7 @@ pub mod capture;
 pub mod clock;
 pub mod domain;
 pub mod ipc;
+pub mod nostr_engine;
 pub mod recipe;
 pub mod reservation;
 pub mod runner;

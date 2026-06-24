@@ -22,3 +22,16 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util", "net"] }
+# The shared wire codec (lnrent-7fp.19): DM types, gift-wrap, 30402 listings. The Nostr engine
+# is built ON it and must NOT re-implement those.
+lnrent-wire = { path = "../wire" }
+# rust-nostr high-level client for relay publish/subscribe. Pinned to the SAME nostr 0.44 the
+# wire crate uses, so `Keys`/`Event`/`Msg` types unify across the codec and the transport.
+nostr-sdk = "0.44"
+# `async fn` in the injected handler/outbound trait objects (object-safe via this macro).
+async-trait = "0.1"
+
+[dev-dependencies]
+# In-process local relay for the Nostr-engine integration tests (publish/subscribe round-trips
+# over a real relay, no public relay). Pinned to the same nostr 0.44.
+nostr-relay-builder = "0.44"
