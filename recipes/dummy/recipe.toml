@@ -1,0 +1,36 @@
+# Trivial, instant "echo-creds" recipe — the M1a handshake test target (lnrent-7fp.6, §15).
+# It provisions instantly and returns a dummy credential payload; no real resources, no
+# networking. The real WireGuard/VM/Hermes/Fedimint recipes are M1b+.
+[service]
+id = "dummy"
+name = "Dummy echo-creds service"
+summary = "Instant test service: provisions immediately and returns a dummy credential."
+version = "0.1.0"
+category = ["test"]
+
+[pricing]
+amount_sat = 100
+period = "30d"
+renew_lead = "7d"
+retention = "7d"
+
+[provisioning]
+backend = "host"
+isolation = "none"
+tier = "0"
+resources = { cpu = 0, mem_mb = 0, disk_gb = 0 }
+
+[os]
+supports = ["nixos", "debian"]
+
+[[operation]]
+name = "status"
+label = "Service status"
+kind = "request"
+hook = "status"
+
+[[operation]]
+name = "restart"
+label = "Restart service"
+kind = "request"
+hook = "restart"

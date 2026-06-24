@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+set -euo pipefail; cat >/dev/null; echo '{"state":"running","uptime_s":42}'

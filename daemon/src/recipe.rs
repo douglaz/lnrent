@@ -1,8 +1,20 @@
 //! Recipe manifest and loader. SPEC.md §7. Recipes are trusted code (ADR-0002).
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+/// Lifecycle hooks every recipe must ship (SPEC.md §7, §7.2).
+const LIFECYCLE_HOOKS: [&str; 5] = ["provision", "suspend", "resume", "destroy", "healthcheck"];
+
+/// True if `path` exists and is an executable regular file (any exec bit set).
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
 
 /// A parsed `recipe.toml` plus the directory it came from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +160,79 @@ impl Recipe {
     pub fn op_hook(&self, op: &Operation) -> PathBuf {
         self.dir.join("ops").join(&op.hook)
     }
+
+    /// Validate a recipe before it is used (lnrent-7fp.6, SPEC.md §7.2/§7.4/§9.1):
+    /// the lifecycle hooks exist and are executable, the backend/isolation/tier/OS are known,
+    /// and every declared management operation is well-formed (valid kind, safe bare hook,
+    /// request-kind hook present + executable + contained in `ops/`, unique names).
+    pub fn validate(&self) -> Result<()> {
+        // Lifecycle hooks present + executable.
+        for name in LIFECYCLE_HOOKS {
+            let h = self.hook(name);
+            if !is_executable(&h) {
+                bail!("recipe `{}`: lifecycle hook `{name}` missing or not executable ({})",
+                    self.service.id, h.display());
+            }
+        }
+
+        // Backend / isolation / tier / OS (§8.1, §9.1, ADR-0007).
+        let backend = &self.provisioning.backend;
+        let backend_ok = matches!(backend.as_str(), "host" | "incus" | "libvirt" | "proxmox")
+            || backend.starts_with("cloud-");
+        if !backend_ok {
+            bail!("recipe `{}`: unknown compute backend `{backend}`", self.service.id);
+        }
+        if !matches!(self.provisioning.isolation.as_str(), "none" | "container" | "vm") {
+            bail!("recipe `{}`: unknown isolation `{}`", self.service.id, self.provisioning.isolation);
+        }
+        if !matches!(self.provisioning.tier.as_str(), "0" | "1" | "1.5" | "2") {
+            bail!("recipe `{}`: invalid security tier `{}` (must be 0|1|1.5|2)",
+                self.service.id, self.provisioning.tier);
+        }
+        if self.os.supports.is_empty() {
+            bail!("recipe `{}`: os.supports is empty", self.service.id);
+        }
+        for os in &self.os.supports {
+            if !matches!(os.as_str(), "nixos" | "debian") {
+                bail!("recipe `{}`: unsupported OS `{os}` (nixos|debian)", self.service.id);
+            }
+        }
+
+        // Management operations (§7.4, ADR-0013).
+        let mut seen = HashSet::new();
+        for op in &self.operations {
+            if !seen.insert(op.name.as_str()) {
+                bail!("recipe `{}`: duplicate operation name `{}`", self.service.id, op.name);
+            }
+            if !matches!(op.kind.as_str(), "request" | "interactive") {
+                bail!("recipe `{}`: operation `{}` has unknown kind `{}` (request|interactive)",
+                    self.service.id, op.name, op.kind);
+            }
+            if !op.hook_is_safe() {
+                bail!("recipe `{}`: operation `{}` has unsafe hook `{}` (bare filename only)",
+                    self.service.id, op.name, op.hook);
+            }
+            // request-kind ops run on dispatch, so their hook must exist + be executable now;
+            // interactive ops bind a session target (M1b) and are not executed here.
+            if op.kind == "request" {
+                let h = self.op_hook(op);
+                if !is_executable(&h) {
+                    bail!("recipe `{}`: operation `{}` hook missing or not executable ({})",
+                        self.service.id, op.name, h.display());
+                }
+                // Defense-in-depth: the canonicalized hook must stay inside `ops/` (no symlink escape).
+                let ops_dir = self.dir.join("ops");
+                let (canon_ops, canon_hook) = (ops_dir.canonicalize(), h.canonicalize());
+                if let (Ok(co), Ok(ch)) = (canon_ops, canon_hook) {
+                    if !ch.starts_with(&co) {
+                        bail!("recipe `{}`: operation `{}` hook escapes ops/ ({})",
+                            self.service.id, op.name, ch.display());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -221,5 +306,70 @@ hook = "get-config"
             params: vec![],
         };
         assert!(ok.hook_is_safe());
+    }
+
+    fn wireguard() -> Recipe {
+        let dir = format!("{}/../recipes/wireguard", env!("CARGO_MANIFEST_DIR"));
+        Recipe::load(&dir).expect("load wireguard recipe")
+    }
+
+    // §7.2/§7.4/§9.1: the shipped wireguard recipe passes validation (lifecycle hooks +
+    // request-op hooks exist and are executable, backend/tier/os/ops are well-formed).
+    #[test]
+    fn wireguard_recipe_validates() {
+        wireguard().validate().expect("wireguard recipe should validate");
+    }
+
+    #[test]
+    fn validate_rejects_unknown_backend_isolation_tier_os() {
+        for mutate in [
+            (|r: &mut Recipe| r.provisioning.backend = "bogus".into()) as fn(&mut Recipe),
+            |r: &mut Recipe| r.provisioning.isolation = "weird".into(),
+            |r: &mut Recipe| r.provisioning.tier = "9".into(),
+            |r: &mut Recipe| r.os.supports = vec!["windows".into()],
+            |r: &mut Recipe| r.os.supports.clear(),
+        ] {
+            let mut r = wireguard();
+            mutate(&mut r);
+            assert!(r.validate().is_err(), "expected validation failure");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_missing_lifecycle_hook() {
+        let mut r = wireguard();
+        r.dir = PathBuf::from("/nonexistent-recipe-dir");
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_bad_operation() {
+        // unknown kind
+        let mut r = wireguard();
+        r.operations.push(Operation {
+            name: "weird".into(),
+            label: "w".into(),
+            kind: "telepathy".into(),
+            hook: "weird".into(),
+            params: vec![],
+        });
+        assert!(r.validate().is_err());
+
+        // duplicate op name
+        let mut r = wireguard();
+        let dup = r.operations[0].clone();
+        r.operations.push(dup);
+        assert!(r.validate().is_err());
+
+        // request-kind hook that doesn't exist under ops/
+        let mut r = wireguard();
+        r.operations.push(Operation {
+            name: "ghost".into(),
+            label: "g".into(),
+            kind: "request".into(),
+            hook: "ghost".into(),
+            params: vec![],
+        });
+        assert!(r.validate().is_err());
     }
 }

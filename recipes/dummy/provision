@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Trivial provision: return a dummy delivery payload (the "credentials" the buyer receives)
+# plus internal handles the daemon records. Instant, no real resources. SPEC.md §7.2.
+set -euo pipefail
+cat >/dev/null   # consume the stdin JSON (subscription/instance/params/host facts)
+echo '{"payload":{"credential":"dummy-secret-token","note":"M1a echo-creds"},"handles":{"instance":"dummy-1"}}'

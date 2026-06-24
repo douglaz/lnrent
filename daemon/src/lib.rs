@@ -4,4 +4,5 @@ pub mod backends;
 pub mod clock;
 pub mod domain;
 pub mod recipe;
+pub mod runner;
 pub mod store;
