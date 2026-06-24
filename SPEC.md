@@ -1,4 +1,4 @@
-# lnrent — Spec (draft v0.28)
+# lnrent — Spec (draft v0.29)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
@@ -1195,8 +1195,14 @@ CREATE TABLE native_connect_session ( -- interactive-op authorization tickets (�
 - **NixOS:** ship a flake exposing a `lnrentd` package and a NixOS module
   (`services.lnrentd.enable = true` with options for backends, relays, key path).
   Recipes' `nixos/` fragments compose declaratively.
-- **Debian:** ship a static-ish Rust binary + a systemd unit + an install script.
-- Both store state under a single data dir (sqlite, operator key, recipe checkout).
+- **Debian:** ship a **glibc-dynamic** Rust binary + a systemd unit + an install script.
+  (Fully-static musl is dropped — the Fedimint client's RocksDB backend is C++ and painful to
+  static-link on musl; ADR-0015. A custom sqlite fedimint backend, the path to musl-static, is
+  a possible later optimization.)
+- The data dir holds: the **sqlite** state (§11), the operator **key/seed**, the **recipe**
+  checkout, AND — for the Fedimint backend — the client's **RocksDB** dir + the **federation
+  invite/config** (a second DB engine the fedimint client owns, ADR-0012/0015). Backup covers
+  all of these (lnrent-7fp.14).
 
 ## 13. Security
 
