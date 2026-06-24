@@ -4,6 +4,9 @@
 
 use anyhow::{bail, Result};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+use tokio::sync::mpsc;
 
 /// Where a workload runs. SPEC.md §8.1 (was `ProvisionBackend` in early drafts).
 pub trait ComputeBackend: Send + Sync {
@@ -159,6 +162,117 @@ impl PaymentBackend for FedimintPayment {
     }
     fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
         bail!("fedimint.watch not implemented (M0 stub)")
+    }
+}
+
+/// Deterministic in-memory PaymentBackend — the M1a money-path FIXTURE (the operator chose a
+/// mock over a live federation for now). It issues fake bolt11s (idempotent on `external_id`),
+/// treats every refund `pay` as an immediate success (idempotent on the key), and lets a
+/// driver/test push settlements via `settle()` (also delivered on the `watch()` stream). This is
+/// NOT the real Fedimint backend (lnrent-7fp.4) — that stays a deferred follow-up; this lets the
+/// capture/refund/reconcile money path be built and proven without a federation.
+#[derive(Default)]
+pub struct MockPayment {
+    state: Mutex<MockState>,
+}
+
+#[derive(Default)]
+struct MockState {
+    invoices: HashMap<String, Invoice>, // external_id -> Invoice (idempotency anchor)
+    paid: HashSet<String>,              // external_ids observed settled
+    payments: HashMap<String, String>,  // refund idempotency_key -> backend payment id
+    seq: u64,
+    settle_tx: Option<mpsc::Sender<Settlement>>,
+}
+
+impl MockPayment {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drive a settlement for a previously-created invoice (by `external_id`): mark it paid and,
+    /// if a `watch()` stream is open, push the `Settlement`. Returns the Settlement so a caller
+    /// can also hand it straight to capture. Errors if no such invoice was created.
+    pub fn settle(&self, external_id: &str, settled_at: i64) -> Result<Settlement> {
+        let mut st = self.state.lock().unwrap();
+        let inv = st
+            .invoices
+            .get(external_id)
+            .ok_or_else(|| anyhow::anyhow!("mock: no invoice for external_id {external_id}"))?
+            .clone();
+        st.paid.insert(external_id.to_string());
+        let s = Settlement {
+            invoice_id: inv.id,
+            external_id: external_id.to_string(),
+            amount_sat: inv.amount_sat,
+            settled_at,
+        };
+        if let Some(tx) = &st.settle_tx {
+            let _ = tx.try_send(s.clone());
+        }
+        Ok(s)
+    }
+}
+
+impl PaymentBackend for MockPayment {
+    fn create_invoice(&self, amount_sat: u64, _memo: &str, expiry_s: u32, external_id: &str) -> Result<Invoice> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(inv) = st.invoices.get(external_id) {
+            return Ok(inv.clone()); // idempotent on external_id (a crash-retry reuses the invoice)
+        }
+        let n = st.seq;
+        st.seq += 1;
+        let inv = Invoice {
+            id: format!("mock-inv-{n}"),
+            external_id: external_id.to_string(),
+            backend_invoice_id: format!("mock-bk-{n}"),
+            payment_hash: format!("{n:064x}"),
+            bolt11: format!("lnbcmock1{external_id}"),
+            amount_sat,
+            expires_at: i64::from(expiry_s), // relative placeholder; deterministic for the mock
+        };
+        st.invoices.insert(external_id.to_string(), inv.clone());
+        Ok(inv)
+    }
+    fn lookup(&self, id: &str) -> Result<PaymentStatus> {
+        let st = self.state.lock().unwrap();
+        match st.invoices.values().find(|inv| inv.id == id) {
+            Some(inv) if st.paid.contains(&inv.external_id) => Ok(PaymentStatus::Paid),
+            Some(_) => Ok(PaymentStatus::Open),
+            None => Ok(PaymentStatus::Expired), // unknown id -> gone
+        }
+    }
+    fn pay(&self, _dest: &str, _amount_sat: u64, idempotency_key: &str) -> Result<String> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(pid) = st.payments.get(idempotency_key) {
+            return Ok(pid.clone()); // idempotent on key -> never pays twice
+        }
+        let n = st.seq;
+        st.seq += 1;
+        let pid = format!("mock-pay-{n}");
+        st.payments.insert(idempotency_key.to_string(), pid.clone());
+        Ok(pid)
+    }
+    fn payment_status(&self, payment_id: &str) -> Result<PayStatus> {
+        let st = self.state.lock().unwrap();
+        Ok(if st.payments.values().any(|p| p == payment_id) {
+            PayStatus::Succeeded
+        } else {
+            PayStatus::Unknown
+        })
+    }
+    fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus> {
+        let st = self.state.lock().unwrap();
+        Ok(if st.payments.contains_key(idempotency_key) {
+            PayStatus::Succeeded
+        } else {
+            PayStatus::Unknown
+        })
+    }
+    fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+        let (tx, rx) = mpsc::channel(64);
+        self.state.lock().unwrap().settle_tx = Some(tx);
+        Ok(rx)
     }
 }
 
