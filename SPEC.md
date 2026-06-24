@@ -667,8 +667,11 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
   - daemon soft-date auto-renewal (no buyer request): `renew:auto:<subscription_id>:<cycle_anchor>`
     where `cycle_anchor` is the `paid_through` being renewed, so one cycle yields one invoice.
 
-  A **settled-but-terminal refund** likewise uses a deterministic refund key (e.g.
-  `refund:<external_id>`) so a redelivered settlement creates exactly one `refund_attempt`.
+  A **settled-but-terminal refund** likewise uses a deterministic refund key
+  (`refund:<external_id>`) stored in `refund_attempt.idempotency_key` (**`UNIQUE`**); the
+  settlement transaction does `INSERT ... ON CONFLICT(idempotency_key) DO NOTHING`, so a
+  redelivered settlement creates **exactly one** `refund_attempt` row (the key dedups both the
+  outbound `pay` AND the ledger row).
 - **Issuance ordering (the `bolt11` comes from the backend, so it can't be cached before the
   call):** the daemon derives `external_id` per the class above, calls
   `create_invoice(external_id)` (which the backend makes **idempotent on `external_id`** — a
@@ -1123,7 +1126,7 @@ CREATE TABLE daemon_state (          -- single row; heartbeat for downtime credi
 
 CREATE TABLE refund_attempt (        -- durable refund ledger (ADR-0009, §6.6)
   id TEXT PRIMARY KEY, subscription_id TEXT, dest TEXT, amount_sat INTEGER,
-  idempotency_key TEXT NOT NULL,     -- passed to PaymentBackend::pay; dedups the outbound payment
+  idempotency_key TEXT NOT NULL UNIQUE,  -- `refund:<external_id>`; dedups the outbound pay AND the ledger row (§6.6)
   backend_payment_id TEXT,           -- from pay(), once known
   status TEXT NOT NULL,              -- PENDING (durable intent; retry pay(key) safely on restart) | SENT | FAILED
   attempts INTEGER, created_at INTEGER, updated_at INTEGER);

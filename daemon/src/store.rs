@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS refund_attempt (  -- durable refund ledger (ADR-0009,
   subscription_id    TEXT,
   dest               TEXT,
   amount_sat         INTEGER,
-  idempotency_key    TEXT NOT NULL,  -- passed to PaymentBackend::pay; dedups the outbound payment
+  idempotency_key    TEXT NOT NULL UNIQUE,  -- dedups outbound pay AND the ledger row (refund:<external_id>); INSERT ON CONFLICT DO NOTHING (§6.6)
   backend_payment_id TEXT,           -- from pay(), once known
   status             TEXT NOT NULL,  -- PENDING (durable intent; retry pay(key) safely on restart) | SENT | FAILED
   attempts           INTEGER,
