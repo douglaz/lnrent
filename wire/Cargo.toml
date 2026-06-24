@@ -1,0 +1,20 @@
+[package]
+name = "lnrent-wire"
+version = "0.1.0"
+edition = "2021"
+description = "lnrent on-wire protocol codec: NIP-17 DM messages, NIP-59 gift-wrap, and NIP-99 30402 listings (shared by the operator engine and buyer-core)"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# rust-nostr: NIP-44 v2 + NIP-59 gift wrap (for the NIP-17 DM transport). std stays on
+# (default), pulling secp256k1's rand/global-context. No relay/signer features — pure codec.
+nostr = { version = "0.44", features = ["nip44", "nip59"] }
+
+# secp256k1-sys (via nostr) pulls getrandom; the wasm32 target needs its `js` backend so the
+# browser CSPRNG is used (built in the nix devshell, which also provides CC_wasm32_*). §5.1, .19.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
