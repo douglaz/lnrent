@@ -182,12 +182,20 @@ struct MockState {
     paid: HashSet<String>,              // external_ids observed settled
     payments: HashMap<String, String>,  // refund idempotency_key -> backend payment id
     seq: u64,
+    now: i64, // mock wall clock; create_invoice stamps absolute expiry, lookup honors it
     settle_tx: Option<mpsc::Sender<Settlement>>,
 }
 
 impl MockPayment {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Advance the mock's clock (unix secs). `create_invoice` stamps `expires_at = now + expiry`,
+    /// and `lookup` returns `Expired` once `now` passes it — so expiry/reconcile tests exercise a
+    /// realistic backend instead of an invoice that never expires.
+    pub fn set_now(&self, now: i64) {
+        self.state.lock().unwrap().now = now;
     }
 
     /// Drive a settlement for a previously-created invoice (by `external_id`): mark it paid and,
@@ -229,7 +237,7 @@ impl PaymentBackend for MockPayment {
             payment_hash: format!("{n:064x}"),
             bolt11: format!("lnbcmock1{external_id}"),
             amount_sat,
-            expires_at: i64::from(expiry_s), // relative placeholder; deterministic for the mock
+            expires_at: st.now + i64::from(expiry_s), // absolute unix secs (matches the field's doc)
         };
         st.invoices.insert(external_id.to_string(), inv.clone());
         Ok(inv)
@@ -238,6 +246,7 @@ impl PaymentBackend for MockPayment {
         let st = self.state.lock().unwrap();
         match st.invoices.values().find(|inv| inv.id == id) {
             Some(inv) if st.paid.contains(&inv.external_id) => Ok(PaymentStatus::Paid),
+            Some(inv) if st.now >= inv.expires_at => Ok(PaymentStatus::Expired), // past its expiry
             Some(_) => Ok(PaymentStatus::Open),
             None => Ok(PaymentStatus::Expired), // unknown id -> gone
         }
@@ -287,4 +296,61 @@ pub trait StorageBackend: Send + Sync {
 pub trait Observability: Send + Sync {
     fn status(&self, instance: &Value) -> Result<Value>;
     fn logs(&self, instance: &Value, lines: u32) -> Result<String>;
+}
+
+#[cfg(test)]
+mod mock_payment_tests {
+    use super::*;
+
+    #[test]
+    fn create_invoice_is_idempotent_on_external_id() {
+        let m = MockPayment::new();
+        let a = m.create_invoice(1000, "memo", 3600, "ext1").unwrap();
+        let b = m.create_invoice(9999, "other", 60, "ext1").unwrap();
+        assert_eq!(a.id, b.id, "same external_id -> same invoice, never a duplicate");
+        assert_eq!(b.amount_sat, 1000, "the original invoice is returned unchanged");
+    }
+
+    #[test]
+    fn lookup_honors_absolute_expiry() {
+        let m = MockPayment::new();
+        m.set_now(1_000);
+        let inv = m.create_invoice(1000, "memo", 60, "ext1").unwrap();
+        assert_eq!(inv.expires_at, 1_060, "absolute expiry = now + expiry_s");
+        assert_eq!(m.lookup(&inv.id).unwrap(), PaymentStatus::Open);
+        m.set_now(1_100); // past expiry
+        assert_eq!(m.lookup(&inv.id).unwrap(), PaymentStatus::Expired);
+    }
+
+    #[test]
+    fn settle_flips_lookup_to_paid_even_past_expiry() {
+        let m = MockPayment::new();
+        let inv = m.create_invoice(1000, "memo", 60, "ext1").unwrap();
+        m.settle("ext1", 30).unwrap();
+        m.set_now(10_000); // a paid invoice stays Paid regardless of the clock
+        assert_eq!(m.lookup(&inv.id).unwrap(), PaymentStatus::Paid);
+    }
+
+    #[test]
+    fn pay_is_idempotent_on_key() {
+        let m = MockPayment::new();
+        let p1 = m.pay("dest", 500, "refund:x").unwrap();
+        let p2 = m.pay("dest", 500, "refund:x").unwrap();
+        assert_eq!(p1, p2, "same key -> same payment id, never pays twice");
+        assert_eq!(m.payment_status_by_key("refund:x").unwrap(), PayStatus::Succeeded);
+        assert_eq!(m.payment_status_by_key("refund:never").unwrap(), PayStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn settle_pushes_on_the_watch_stream() {
+        let m = MockPayment::new();
+        m.create_invoice(1000, "memo", 60, "ext1").unwrap();
+        let mut rx = m.watch().unwrap();
+        let pushed = m.settle("ext1", 42).unwrap();
+        let got = rx.recv().await.expect("a settlement arrives on watch()");
+        assert_eq!(got.external_id, "ext1");
+        assert_eq!(got.amount_sat, 1000);
+        assert_eq!(got.settled_at, 42);
+        assert_eq!(pushed.external_id, got.external_id);
+    }
 }

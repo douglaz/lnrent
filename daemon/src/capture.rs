@@ -51,8 +51,11 @@ fn capture_txn(tx: &Transaction, s: &Settlement, now: i64) -> Result<Capture> {
         // Unmatched settlement: the backend should pre-filter these, but if one slips through we
         // record a single refund intent (sub/dest unknown) rather than swallow money.
         None => {
-            refund_intent(tx, None, None, s, now)?;
-            journal(tx, None, "settle_unmatched_refund", s, now)?;
+            // Journal only when the refund intent is actually NEW, so a redelivered unmatched
+            // settlement is a true no-op (no audit-row spam) — the UNIQUE key already dedups it.
+            if refund_intent(tx, None, None, s, now)? {
+                journal(tx, None, "settle_unmatched_refund", s, now)?;
+            }
             return Ok(Capture::RefundDue);
         }
         Some(v) => v,
@@ -74,26 +77,30 @@ fn capture_txn(tx: &Transaction, s: &Settlement, now: i64) -> Result<Capture> {
             apply_paid(tx, kind.as_deref(), sub_id.as_deref(), s, now)
         }
         // EXPIRED or any other terminal invoice status: funds arrived too late -> refund. Stamp
-        // settled_at for audit, keep the terminal status, write exactly one refund intent.
+        // settled_at for audit, keep the terminal status, write exactly one refund intent. Journal
+        // only when something actually changed so a redelivery doesn't append duplicate audit rows.
         _ => {
-            tx.execute(
+            let stamped = tx.execute(
                 "UPDATE invoice SET settled_at=?2 WHERE id=?1 AND settled_at IS NULL",
                 params![inv_id, s.settled_at],
             )?;
             let dest = sub_refund_dest(tx, sub_id.as_deref())?;
-            refund_intent(tx, sub_id.as_deref(), dest.as_deref(), s, now)?;
-            journal(tx, sub_id.as_deref(), "settle_terminal_refund", s, now)?;
+            let refunded = refund_intent(tx, sub_id.as_deref(), dest.as_deref(), s, now)?;
+            if stamped > 0 || refunded {
+                journal(tx, sub_id.as_deref(), "settle_terminal_refund", s, now)?;
+            }
             Ok(Capture::RefundDue)
         }
     }
 }
 
-/// The subscription fields capture needs to route a paid invoice (`period_s`/`renew_lead_s`
-/// defaulted to 0 when NULL).
+/// The subscription fields capture needs to route a paid invoice (`period_s`/`renew_lead_s`/
+/// `retention_s` defaulted to 0 when NULL).
 struct SubRow {
     state: String,
     period_s: i64,
     renew_lead_s: i64,
+    retention_s: i64,
     paid_through: Option<i64>,
     refund_dest: Option<String>,
 }
@@ -112,20 +119,22 @@ fn apply_paid(tx: &Transaction, kind: Option<&str>, sub_id: Option<&str>, s: &Se
     };
     let sub: Option<SubRow> = tx
         .query_row(
-            "SELECT state, period_s, renew_lead_s, paid_through, refund_dest FROM subscription WHERE id = ?1",
+            "SELECT state, period_s, renew_lead_s, retention_s, paid_through, refund_dest
+             FROM subscription WHERE id = ?1",
             params![sub_id],
             |r| {
                 Ok(SubRow {
                     state: r.get(0)?,
                     period_s: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
                     renew_lead_s: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                    paid_through: r.get(3)?,
-                    refund_dest: r.get(4)?,
+                    retention_s: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    paid_through: r.get(4)?,
+                    refund_dest: r.get(5)?,
                 })
             },
         )
         .optional()?;
-    let SubRow { state, period_s, renew_lead_s, paid_through, refund_dest } = match sub {
+    let SubRow { state, period_s, renew_lead_s, retention_s, paid_through, refund_dest } = match sub {
         Some(v) => v,
         None => {
             refund_intent(tx, Some(sub_id), None, s, now)?;
@@ -134,9 +143,11 @@ fn apply_paid(tx: &Transaction, kind: Option<&str>, sub_id: Option<&str>, s: &Se
         }
     };
 
-    match (kind.unwrap_or("order"), state.as_str()) {
+    // Route by the invoice CLASS (Some("order")/Some("renewal")) — a missing/unknown kind is NOT
+    // assumed to be an order; it falls through to refund rather than silently capturing.
+    match (kind, state.as_str()) {
         // First capture: PENDING -> PROVISIONING. paid_through is set later, at ACTIVE (lnrent-7fp.10).
-        ("order", "PENDING") => {
+        (Some("order"), "PENDING") => {
             tx.execute(
                 "UPDATE subscription SET state='PROVISIONING', updated_at=?2 WHERE id=?1",
                 params![sub_id, now],
@@ -147,7 +158,18 @@ fn apply_paid(tx: &Transaction, kind: Option<&str>, sub_id: Option<&str>, s: &Se
         // Renewal on a live (or resumable) sub: extend, and resume if it had lapsed to SUSPENDED.
         // paid_through = max(paid_through, settled_at) + period — early renewals stack, a late one
         // never lands in the past (§6.3).
-        ("renewal", st @ ("ACTIVE" | "SUSPENDED")) => {
+        (Some("renewal"), st @ ("ACTIVE" | "SUSPENDED")) => {
+            // Reconcile is periodic, so a sub can still read ACTIVE/SUSPENDED past its retention
+            // end (paid_through + retention_s) before the TERMINATED flip lands. A settlement that
+            // arrives after retention is too late: the Instance is destroyed (or about to be), so
+            // refund rather than resurrect service. The retention window IS the late-renewal grace.
+            if let Some(pt) = paid_through {
+                if s.settled_at > pt + retention_s {
+                    refund_intent(tx, Some(sub_id), refund_dest.as_deref(), s, now)?;
+                    journal(tx, Some(sub_id), "settle_terminal_refund", s, now)?;
+                    return Ok(Capture::RefundDue);
+                }
+            }
             let new_paid_through = paid_through.unwrap_or(s.settled_at).max(s.settled_at) + period_s;
             let soft = new_paid_through - renew_lead_s;
             tx.execute(
@@ -182,9 +204,10 @@ fn sub_refund_dest(tx: &Transaction, sub_id: Option<&str>) -> Result<Option<Stri
 
 /// Write the durable refund INTENT as a single `PENDING` row keyed by `refund:<external_id>`
 /// (UNIQUE). `ON CONFLICT DO NOTHING` => a redelivered terminal settlement contributes exactly one
-/// refund row (§6.6). Execution is lnrent-7fp.11's job.
-fn refund_intent(tx: &Transaction, sub_id: Option<&str>, dest: Option<&str>, s: &Settlement, now: i64) -> Result<()> {
-    tx.execute(
+/// refund row (§6.6). Returns `true` iff a NEW row was inserted (so callers can skip a redundant
+/// journal entry on replay). Execution is lnrent-7fp.11's job.
+fn refund_intent(tx: &Transaction, sub_id: Option<&str>, dest: Option<&str>, s: &Settlement, now: i64) -> Result<bool> {
+    let n = tx.execute(
         "INSERT INTO refund_attempt
             (id, subscription_id, dest, amount_sat, idempotency_key, status, attempts, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, 'PENDING', 0, ?6, ?6)
@@ -198,7 +221,7 @@ fn refund_intent(tx: &Transaction, sub_id: Option<&str>, dest: Option<&str>, s: 
             now
         ],
     )?;
-    Ok(())
+    Ok(n > 0)
 }
 
 /// Journal a settlement event to `event_log` in the same txn (every mutation is journaled,
@@ -239,6 +262,7 @@ mod tests {
         paid_through: Option<i64>,
         period_s: i64,
         renew_lead_s: i64,
+        retention_s: i64,
         refund_dest: Option<&str>,
         inv_kind: &str,
         inv_status: &str,
@@ -255,8 +279,8 @@ mod tests {
         s.transaction(move |tx| {
             tx.execute(
                 "INSERT INTO subscription (id, state, period_s, renew_lead_s, retention_s, paid_through, refund_dest, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, 0, 0)",
-                params![sub_id, sub_state, period_s, renew_lead_s, paid_through, refund_dest],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0)",
+                params![sub_id, sub_state, period_s, renew_lead_s, retention_s, paid_through, refund_dest],
             )?;
             tx.execute(
                 "INSERT INTO invoice (id, subscription_id, external_id, kind, amount_sat, status, issued_at)
@@ -298,7 +322,7 @@ mod tests {
     #[tokio::test]
     async fn order_capture_moves_pending_to_provisioning() {
         let s = mem_store();
-        seed(&s, "o1", "PENDING", None, 100, 10, None, "order", "OPEN", "ext1").await;
+        seed(&s, "o1", "PENDING", None, 100, 10, 0, None, "order", "OPEN", "ext1").await;
         assert_eq!(capture(&s, settlement("ext1", 500), 1).await.unwrap(), Capture::Captured);
         assert_eq!(sub_state(&s, "o1").await, "PROVISIONING");
         let (st, applied) = inv_status(&s, "ext1").await;
@@ -310,7 +334,7 @@ mod tests {
     #[tokio::test]
     async fn replayed_settlement_is_a_noop() {
         let s = mem_store();
-        seed(&s, "o1", "PENDING", None, 100, 10, None, "order", "OPEN", "ext1").await;
+        seed(&s, "o1", "PENDING", None, 100, 10, 0, None, "order", "OPEN", "ext1").await;
         capture(&s, settlement("ext1", 500), 1).await.unwrap();
         // A redelivery of the same settlement changes nothing.
         assert_eq!(capture(&s, settlement("ext1", 999), 2).await.unwrap(), Capture::NoOp);
@@ -323,7 +347,7 @@ mod tests {
     async fn renewal_extends_paid_through_with_max_formula() {
         let s = mem_store();
         // ACTIVE, paid_through=1000, period=100. An EARLY renewal (settled_at < paid_through).
-        seed(&s, "o1", "ACTIVE", Some(1000), 100, 10, None, "renewal", "OPEN", "rext").await;
+        seed(&s, "o1", "ACTIVE", Some(1000), 100, 10, 1000, None, "renewal", "OPEN", "rext").await;
         assert_eq!(capture(&s, settlement("rext", 500), 1).await.unwrap(), Capture::Renewed);
         let pt: i64 = {
             let id = "o1".to_string();
@@ -339,7 +363,7 @@ mod tests {
     async fn late_renewal_never_lands_in_the_past() {
         let s = mem_store();
         // paid_through already lapsed (100) but the sub is still ACTIVE; settled_at=1000 is later.
-        seed(&s, "o1", "ACTIVE", Some(100), 100, 10, None, "renewal", "OPEN", "rext").await;
+        seed(&s, "o1", "ACTIVE", Some(100), 100, 10, 2000, None, "renewal", "OPEN", "rext").await;
         capture(&s, settlement("rext", 1000), 1).await.unwrap();
         let pt: i64 = {
             let id = "o1".to_string();
@@ -353,15 +377,61 @@ mod tests {
     #[tokio::test]
     async fn renewal_resumes_a_suspended_sub() {
         let s = mem_store();
-        seed(&s, "o1", "SUSPENDED", Some(100), 100, 10, None, "renewal", "OPEN", "rext").await;
+        seed(&s, "o1", "SUSPENDED", Some(100), 100, 10, 2000, None, "renewal", "OPEN", "rext").await;
         assert_eq!(capture(&s, settlement("rext", 1000), 1).await.unwrap(), Capture::Resumed);
         assert_eq!(sub_state(&s, "o1").await, "ACTIVE", "a paid renewal resumes a suspended sub");
+    }
+
+    // A renewal that lands AFTER retention (paid_through + retention_s) must refund, not resurrect
+    // — even while the row still reads ACTIVE/SUSPENDED because reconcile hasn't flipped it to
+    // TERMINATED yet (codex re-review: the after-retention renewal gate).
+    #[tokio::test]
+    async fn renewal_past_retention_refunds_not_resurrects() {
+        for state in ["ACTIVE", "SUSPENDED"] {
+            let s = mem_store();
+            // paid_through=100, retention=50 -> retention ends at 150; settlement at 200 is too late.
+            seed(&s, "o1", state, Some(100), 100, 10, 50, Some("lnaddr@x"), "renewal", "OPEN", "rext").await;
+            assert_eq!(
+                capture(&s, settlement("rext", 200), 1).await.unwrap(),
+                Capture::RefundDue,
+                "{state}: a past-retention renewal refunds"
+            );
+            assert_eq!(sub_state(&s, "o1").await, state, "{state}: the sub is NOT resurrected to ACTIVE");
+            // Invoice still flipped PAID (funds arrived) and exactly one refund recorded.
+            assert_eq!(inv_status(&s, "rext").await.0, "PAID");
+            assert_eq!(refund_count(&s).await, 1, "{state}: one refund for the late renewal");
+        }
+    }
+
+    // A settlement on an invoice with NULL/unknown kind is NOT assumed to be an order: it must not
+    // capture/provision — it refunds (codex re-review: route by explicit invoice class).
+    #[tokio::test]
+    async fn null_kind_invoice_does_not_capture() {
+        let s = mem_store();
+        s.transaction(|tx| {
+            tx.execute(
+                "INSERT INTO subscription (id, state, period_s, renew_lead_s, retention_s, created_at, updated_at)
+                 VALUES ('o1', 'PENDING', 100, 10, 0, 0, 0)",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO invoice (id, subscription_id, external_id, kind, amount_sat, status, issued_at)
+                 VALUES ('inv-ext1', 'o1', 'ext1', NULL, 1000, 'OPEN', 0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(capture(&s, settlement("ext1", 500), 1).await.unwrap(), Capture::RefundDue);
+        assert_eq!(sub_state(&s, "o1").await, "PENDING", "a null-kind invoice never captures the order");
+        assert_eq!(refund_count(&s).await, 1);
     }
 
     #[tokio::test]
     async fn settlement_on_an_expired_invoice_refunds_once() {
         let s = mem_store();
-        seed(&s, "o1", "PENDING", None, 100, 10, Some("lnaddr@x"), "order", "EXPIRED", "ext1").await;
+        seed(&s, "o1", "PENDING", None, 100, 10, 0, Some("lnaddr@x"), "order", "EXPIRED", "ext1").await;
         assert_eq!(capture(&s, settlement("ext1", 500), 1).await.unwrap(), Capture::RefundDue);
         // Invoice stays EXPIRED (not flipped to PAID) but is stamped for audit.
         let (st, _) = inv_status(&s, "ext1").await;
@@ -390,7 +460,7 @@ mod tests {
     async fn settlement_on_a_terminal_sub_pays_invoice_then_refunds() {
         let s = mem_store();
         // An OPEN order invoice whose sub already TERMINATED.
-        seed(&s, "o1", "TERMINATED", None, 100, 10, Some("lnaddr@x"), "order", "OPEN", "ext1").await;
+        seed(&s, "o1", "TERMINATED", None, 100, 10, 0, Some("lnaddr@x"), "order", "OPEN", "ext1").await;
         assert_eq!(capture(&s, settlement("ext1", 500), 1).await.unwrap(), Capture::RefundDue);
         let (st, _) = inv_status(&s, "ext1").await;
         assert_eq!(st, "PAID", "funds arrived, so the invoice is PAID...");
