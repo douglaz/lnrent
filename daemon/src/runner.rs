@@ -29,36 +29,28 @@ pub struct HookOutput {
 /// A timeout, a cap breach on EITHER pipe, a non-zero exit, or non-JSON stdout is a failure —
 /// and the child is explicitly killed + reaped (not left to best-effort drop cleanup).
 pub async fn run_hook(hook: &Path, input: &Value, timeout: Duration) -> Result<HookOutput> {
-    let mut child = Command::new(hook)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true) // backstop; we also reap explicitly below
-        .spawn()
-        .with_context(|| format!("spawning hook {}", hook.display()))?;
+    let mut child = spawn_hook(hook).await?;
 
-    let mut si = child.stdin.take();
+    let si = child.stdin.take();
     let input_bytes = serde_json::to_vec(input)?;
     let out = child.stdout.take().context("hook stdout missing")?;
     let err = child.stderr.take().context("hook stderr missing")?;
 
-    // Feed stdin CONCURRENTLY with reading the outputs, all under the one `timeout`: a hook that
-    // never drains stdin + a large payload would otherwise block `write_all` on a full pipe
-    // buffer forever, *before* the timeout could apply (codex re-review). A hook that closes
-    // stdin early yields BrokenPipe here, which is fine — best-effort feed.
-    let feed = async move {
-        if let Some(si) = si.as_mut() {
+    // Feed stdin on a DETACHED task so it never gates the result: a hook that never drains stdin
+    // + a large payload would block `write_all` on a full pipe buffer, so it must not run inline
+    // before the timeout (unbounded hang) NOR be join!ed with the reads (a cap breach would still
+    // wait on the stuck feed) — codex re-review. The reads alone decide success/cap/timeout; on
+    // any exit path `reap()` kills the child, which closes stdin and lets this task finish
+    // (BrokenPipe). A hook that closes stdin early yields BrokenPipe too — best-effort feed.
+    let feed = tokio::spawn(async move {
+        if let Some(mut si) = si {
             let _ = si.write_all(&input_bytes).await;
             let _ = si.shutdown().await;
         }
-    };
+    });
     // Read both pipes concurrently, each bounded by OUTPUT_CAP — a cap breach on EITHER pipe
-    // returns Err *immediately* (no draining, no hang).
-    let read = async {
-        let reads = async { tokio::try_join!(read_capped(out, OUTPUT_CAP), read_capped(err, OUTPUT_CAP)) };
-        let (_, r) = tokio::join!(feed, reads);
-        r
-    };
+    // returns Err *immediately* (no draining, no hang), independent of the stdin feed.
+    let read = async { tokio::try_join!(read_capped(out, OUTPUT_CAP), read_capped(err, OUTPUT_CAP)) };
     let (out_buf, err_buf) = match tokio::time::timeout(timeout, read).await {
         Err(_) => {
             reap(&mut child).await;
@@ -71,6 +63,8 @@ pub async fn run_hook(hook: &Path, input: &Value, timeout: Duration) -> Result<H
         }
         Ok(Ok(bufs)) => bufs,
     };
+    // Reads are done; the stdin feed (normally already finished) is no longer needed.
+    feed.abort();
 
     // Both pipes hit EOF -> the child has closed its outputs; wait for exit (bounded).
     let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
@@ -92,6 +86,32 @@ pub async fn run_hook(hook: &Path, input: &Value, timeout: Duration) -> Result<H
     let stdout_json: Value = serde_json::from_slice(&out_buf)
         .map_err(|e| anyhow!("hook {} stdout is not JSON: {e}", hook.display()))?;
     Ok(HookOutput { stdout_json })
+}
+
+/// Spawn the hook, retrying briefly on TRANSIENT spawn failures: ETXTBSY (a just-written hook can
+/// still be momentarily open-for-write — and a parallel fork/exec can race the same way) and
+/// EAGAIN (fork hitting a transient resource limit under load). A real ENOENT/EACCES/etc. is NOT
+/// retried — a missing or non-executable hook fails fast. Worst-case added delay ~150ms.
+async fn spawn_hook(hook: &Path) -> Result<tokio::process::Child> {
+    const ETXTBSY: i32 = 26; // "Text file busy"
+    const EAGAIN: i32 = 11; // fork: resource temporarily unavailable
+    let mut attempt = 0u32;
+    loop {
+        match Command::new(hook)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true) // backstop; we also reap explicitly
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(e) if attempt < 5 && matches!(e.raw_os_error(), Some(ETXTBSY) | Some(EAGAIN)) => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(10 * attempt as u64)).await;
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("spawning hook {}", hook.display()))),
+        }
+    }
 }
 
 /// Explicitly kill the child and reap it (bounded), so a timed-out/over-producing hook leaves
@@ -156,7 +176,7 @@ mod tests {
     async fn nonzero_exit_is_failure() {
         let hook = write_hook("fail", "#!/usr/bin/env bash\necho '{}' ; exit 1\n");
         let err = run_hook(&hook, &json!({}), DEFAULT_TIMEOUT).await.unwrap_err();
-        assert!(err.to_string().contains("failed (exit"));
+        assert!(err.to_string().contains("failed (exit"), "got: {err}");
     }
 
     #[tokio::test]
@@ -212,6 +232,21 @@ mod tests {
             "#!/usr/bin/env bash\nhead -c 5000000 /dev/zero | tr '\\0' 'a'\n",
         );
         let err = run_hook(&hook, &json!({}), Duration::from_millis(800)).await.unwrap_err();
+        assert!(err.to_string().contains("exceeded the"), "got: {err}");
+    }
+
+    // A hook that BOTH ignores a large stdin AND overproduces stdout must still fail FAST on the
+    // cap — the stuck stdin feed must not gate the cap result (codex re-review). The SHORT timeout
+    // is far longer than a fast-cap fail but far shorter than draining 5 MB at pipe speed, so a
+    // "wait on the stuck feed" impl would surface as a timeout, not a cap error.
+    #[tokio::test]
+    async fn oversized_stdout_with_undrained_stdin_still_fails_fast_on_cap() {
+        let hook = write_hook(
+            "flood-out-ignore-stdin",
+            "#!/usr/bin/env bash\nhead -c 5000000 /dev/zero | tr '\\0' 'a'\nsleep 5\n",
+        );
+        let big = json!({ "blob": "x".repeat(256 * 1024) }); // >> the pipe buffer; never drained
+        let err = run_hook(&hook, &big, Duration::from_millis(800)).await.unwrap_err();
         assert!(err.to_string().contains("exceeded the"), "got: {err}");
     }
 
