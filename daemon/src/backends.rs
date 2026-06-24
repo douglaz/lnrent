@@ -39,8 +39,8 @@ pub trait PaymentBackend: Send + Sync {
     fn pay(&self, dest: &str, amount_sat: u64, idempotency_key: &str) -> Result<String>;
     /// Status of an outbound payment by its backend id (ADR-0009 refund ledger).
     fn payment_status(&self, payment_id: &str) -> Result<PayStatus>;
-    /// Resolve a SUBMITTED-but-unconfirmed refund after a crash, by its idempotency key
-    /// (SPEC §6.6) — so restart never blindly re-pays.
+    /// Check an in-flight refund by its idempotency key after a crash (SPEC §6.6). An
+    /// optimization only — retrying `pay(key)` is always safe (the key dedups).
     fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus>;
     /// Stream of settled payments (push). `Settlement.external_id` carries the order id
     /// (SPEC §6.1). M1a wires this to the Fedimint client settlement stream.
@@ -64,7 +64,8 @@ pub enum PaymentStatus {
 }
 
 /// Status of an OUTBOUND payment (a refund), distinct from invoice status (§6.6). `Unknown`
-/// is the crash-recovery answer when a SUBMITTED refund can be neither confirmed nor refuted.
+/// is the honest answer when an in-flight refund can be neither confirmed nor refuted;
+/// recovery retries `pay(key)` regardless (the key dedups), so `Unknown` never strands a refund.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayStatus {
     Unknown,

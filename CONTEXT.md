@@ -56,9 +56,12 @@ The Operator's brand, a Nostr key derived from the Operator seed at account 0.
 Reputation accrues here, not to any Box. _Avoid_: root key, operator key.
 
 **Operational key**:
-A per-Box Nostr key derived from the Operator seed; signs that Box's Listings and
-handles its buyer DMs. Linked to the Master identity by a master-signed operator
-manifest. _Avoid_: box key, device key.
+A Nostr key derived from the Operator seed (account >= 1), in one of two roles (ADR-0010):
+the **marketplace** operational key (on the Control node) signs Listings and handles buyer
+DMs; a **hosting-box** operational key signs that box's Host security profile and
+authenticates it to the Control node. Both are linked to the Master identity by a
+master-signed operator manifest. (M1a single-box: account-0 plays all roles.) _Avoid_: box
+key, device key.
 
 **Operator manifest**:
 A master-signed, replaceable Nostr event listing the Operational keys the Master

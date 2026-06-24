@@ -26,8 +26,8 @@ in-flight state on restart:
 | order placed | subscription PENDING + invoice OPEN (external_id) | expired-invoice PENDING -> EXPIRED |
 | settlement | invoice -> PAID + sub -> PROVISIONING | replayed settlement no-ops (status guard) |
 | provision ok | sub -> ACTIVE + `outbox` row for `provision.ready` | unsent outbox -> resend |
-| provision fail | best-effort `destroy` + sub -> REFUND_DUE + `refund_attempt` SUBMITTED (idempotency_key) | resolve via `payment_status_by_key`; pay only if not yet submitted |
-| late settle on terminal sub | detached `refund_attempt` SUBMITTED | as above (order not resurrected) |
+| provision fail | best-effort `destroy` + sub -> REFUND_DUE + `refund_attempt` PENDING (idempotency_key) | retry `pay(key)` — idempotent, safe before or after a prior call |
+| late settle on terminal sub | detached `refund_attempt` PENDING | retry `pay(key)` (order not resurrected) |
 
 Provision hooks are idempotent and re-run if a Box crashes mid-`PROVISIONING`.
 
@@ -43,13 +43,15 @@ answers dropped-DM resync: it keeps retrying, and the buyer can send `delivery.r
 ## Refund ledger
 
 Refunds are a durable `refund_attempt` ledger: dest, amount, a durable `idempotency_key`,
-the `backend_payment_id` (once known), status (`SUBMITTED` | `SENT` | `FAILED`), and an
-attempt count. The row is persisted `SUBMITTED` **before** `PaymentBackend::pay(dest, amount,
-idempotency_key)`, which is idempotent on the key; a crash after pay-success but before
-recording the payment id resolves the outcome via `payment_status_by_key` rather than
-re-paying, so the daemon **never double-pays**. After N failed attempts the subscription stays
-REFUND_DUE and the operator is alerted (ADR-0003). (Outbound `PayStatus` is distinct from the
-inbound-invoice `PaymentStatus` — §6.1.)
+the `backend_payment_id` (once known), status (`PENDING` | `SENT` | `FAILED`), and an attempt
+count. The row is persisted `PENDING` (durable intent) **before** `PaymentBackend::pay(dest,
+amount, idempotency_key)`, which is idempotent on the key. Recovery is to **retry `pay(key)`**
+for any non-terminal refund — safe whether the crash was before or after a prior call, because
+the key dedups (no double-pay) and the durable `PENDING` row is always there to retry;
+`payment_status_by_key` only lets restart skip a redundant call once a prior attempt
+`Succeeded`. After N failed attempts the subscription stays REFUND_DUE and the operator is
+alerted (ADR-0003). (Outbound `PayStatus` is distinct from the inbound-invoice `PaymentStatus`
+— §6.1.)
 
 ## Consequences
 

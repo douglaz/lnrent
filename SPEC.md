@@ -477,23 +477,29 @@ trait PaymentBackend {
     fn watch(&self) -> PaymentStream;            // stream of settled payments
     fn lookup(&self, id: &InvoiceId) -> PaymentStatus;
     fn pay(&self, dest: &RefundDest, amount_sat: u64, idempotency_key: &str) -> PayResult;  // outbound refund; key dedups
-    fn payment_status_by_key(&self, idempotency_key: &str) -> PayStatus;  // resolve a SUBMITTED-but-unconfirmed pay after a crash
+    fn payment_status_by_key(&self, idempotency_key: &str) -> PayStatus;  // check an in-flight pay by key after a crash (retry pay(key) is always safe)
     fn payment_status(&self, payment_id: &PayId) -> PayStatus;           // outbound refund status (ADR-0009)
 }
 ```
 
 `PaymentStatus` (`Open` / `Paid` / `Expired`) describes an inbound **invoice**; an **outbound**
 refund uses the distinct `PayStatus` (`Unknown` / `Pending` / `Succeeded` / `Failed`) — they
-are not the same enum. `Unknown` is the honest answer when a `SUBMITTED` refund can be neither
-confirmed nor refuted (it stays `SUBMITTED` for operator reconciliation, never blindly retried).
+are not the same enum. Because `pay` is **idempotent on `idempotency_key`**, the daemon can
+safely **retry `pay(key)`** after a crash at ANY point (the backend dedups, so a retry never
+double-refunds); `payment_status_by_key` is only an optimization to skip a redundant call when
+the prior attempt already `Succeeded`. This requires a backend that dedups `pay` on the key —
+natively or via a durable key->payment map — which the v1 Fedimint backend must provide; a
+backend offering neither cannot do safe automatic refunds and falls back to operator
+reconciliation.
 
 `pay` is **idempotent on `idempotency_key`**: calling it twice with the same key never sends
-twice. The daemon persists the `refund_attempt` (with its key) and marks it `SUBMITTED`
-*before* calling `pay`; if it crashes after `pay` succeeds but before recording
-`backend_payment_id`, restart resolves the outcome via `payment_status_by_key(key)` instead of
-blindly re-paying (§6.6). Backends that cannot natively dedup an outbound payment must persist
-a key->payment map; a backend that can do neither leaves the attempt `SUBMITTED` for operator
-reconciliation rather than risk a double-refund.
+twice. The daemon persists the `refund_attempt` (with its key) as `PENDING` *before* calling
+`pay`; on restart it simply **retries `pay(key)`** for any non-terminal refund — safe whether
+the crash was before or after a prior call, because the key dedups (§6.6). `payment_status_by_key`
+only skips a redundant `pay` once a prior attempt `Succeeded`. Backends that cannot natively
+dedup an outbound payment must persist a key->payment map; a backend that can do neither cannot
+do safe automatic refunds and leaves the attempt for operator reconciliation rather than risk a
+double-refund.
 
 - **fedimint (default for low-value rentals, ADR-0012):** connect to an **existing
   federation** and route through an **existing gatewayd**; payments settle into **ecash**
@@ -646,6 +652,15 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
 - **Correlation:** each invoice carries a unique `external_id` binding it to its
   order/subscription; the backend's `create_invoice` takes it as `externalId` and returns it on
   settlement, so a settlement maps to exactly one invoice (`UNIQUE(external_id)`).
+- **Issuance ordering (the `bolt11` comes from the backend, so it can't be cached before the
+  call):** the daemon derives `external_id` **deterministically from `(sender_pubkey,
+  request_id)`**, calls `create_invoice(external_id)` (which the backend makes **idempotent on
+  `external_id`** — a re-call returns the same invoice), THEN writes in one txn the PENDING sub
+  + the invoice row (with `bolt11` + backend ids) + the cached `inbound_request` response, and
+  sends the DM only after commit. A crash after `create_invoice` but before that commit leaves
+  an orphaned backend invoice that is never bound to a committed order and simply expires
+  unpaid; a retry regenerates the same `external_id`, so `create_invoice` returns that same
+  invoice (no duplicate).
 - **Idempotent capture:** `UPDATE invoice SET status='PAID' WHERE id=? AND status='OPEN'`
   plus the `PENDING -> PROVISIONING` move in one transaction; a replayed settlement (ws
   reconnect) affects 0 rows and is a no-op, so `paid_through` can't double-extend.
@@ -653,12 +668,14 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
   transaction as `-> ACTIVE`; a sender drains it and retries until sent, so a crash after
   ACTIVE but before the DM cannot strand a paid buyer (also the dropped-DM resync answer).
 - **Refund ledger:** a `refund_attempt` row (dest, amount, a durable `idempotency_key`,
-  status, attempts) is persisted as **`SUBMITTED` BEFORE** calling `pay(dest, amount, key)`,
-  which is idempotent on `key`. If the daemon dies after `pay` succeeds but before recording
-  `backend_payment_id`, restart resolves the outcome with `payment_status_by_key(key)` rather
-  than re-paying — so a crash cannot **double-refund**. A genuinely unresolvable `SUBMITTED`
-  (backend can neither confirm nor dedup) is left for operator reconciliation, never silently
-  retried.
+  status `PENDING` / `SENT` / `FAILED`, attempts) is persisted **`PENDING` (durable intent)
+  BEFORE** calling `pay(dest, amount, key)`. Because `pay` is idempotent on `key`, recovery is
+  simply to **retry `pay(key)`** for any non-terminal refund on restart — a crash *before* or
+  *after* the call is equally safe: the key dedups (no double-refund) and no crash point can
+  strand the intent (the durable `PENDING` row is always there to retry). `payment_status_by_key`
+  lets restart skip a redundant `pay` when the prior one already `Succeeded`. After N failed
+  attempts the sub stays `REFUND_DUE` and the operator is alerted; funds never vanish and never
+  double-pay.
 
 Crash-recovery (step -> durable record in one txn -> restart action):
 
@@ -667,8 +684,8 @@ Crash-recovery (step -> durable record in one txn -> restart action):
 | order placed | sub PENDING + invoice OPEN (external_id) | expired-invoice PENDING -> EXPIRED |
 | settlement | invoice PAID + sub PROVISIONING | replay no-ops (status guard) |
 | provision ok | sub ACTIVE + outbox row | unsent outbox -> resend |
-| provision fail | best-effort `destroy` + sub REFUND_DUE + refund_attempt SUBMITTED | resolve by `payment_status_by_key`; pay only if not yet submitted |
-| late settle on terminal sub | detached refund_attempt SUBMITTED | resolve by key, then pay (order not resurrected) |
+| provision fail | best-effort `destroy` + sub REFUND_DUE + refund_attempt PENDING | retry `pay(key)` — idempotent, safe before or after a prior call |
+| late settle on terminal sub | detached refund_attempt PENDING | retry `pay(key)` (order not resurrected) |
 
 Lifecycle hooks (provision / suspend / resume / destroy) **must be idempotent** (§7.2): each
 transition is guarded by a durable record (the `event_log` entry + a state/deadline guard), so
@@ -1091,7 +1108,7 @@ CREATE TABLE refund_attempt (        -- durable refund ledger (ADR-0009, §6.6)
   id TEXT PRIMARY KEY, subscription_id TEXT, dest TEXT, amount_sat INTEGER,
   idempotency_key TEXT NOT NULL,     -- passed to PaymentBackend::pay; dedups the outbound payment
   backend_payment_id TEXT,           -- from pay(), once known
-  status TEXT NOT NULL,              -- SUBMITTED (pay called, outcome unknown -> resolve by key) | SENT | FAILED
+  status TEXT NOT NULL,              -- PENDING (durable intent; retry pay(key) safely on restart) | SENT | FAILED
   attempts INTEGER, created_at INTEGER, updated_at INTEGER);
 
 CREATE TABLE outbox (                -- pending operator->buyer NIP-17 DMs (ADR-0009)
@@ -1161,9 +1178,11 @@ CREATE TABLE native_connect_session ( -- interactive-op authorization tickets (�
 
 - The operator **BIP39 seed** and derived keys, plus payment-backend credentials,
   live in the data dir with tight perms; never in recipe output or logs.
-- **Value plane is separated from the hosting plane (ADR-0010):** the wallet, seed, and
-  master key live on the control node, never on a box hosting untrusted tenant VMs, so a
-  tenant escape or box compromise cannot drain funds or steal the seed.
+- **Value plane is separated from the hosting plane (ADR-0010):** the wallet + the hot
+  marketplace operational key live on the control node (the seed + master key stay cold/offline,
+  §4.6), never on a box hosting untrusted tenant VMs, so a tenant escape or box compromise
+  cannot drain funds or reach the seed/master. (M1a all-in-one keeps the seed on the box —
+  accepted for self-use only.)
 - Tenant isolation is the provisioning backend's job; the `host` backend (no
   isolation) is only for services that are safe to run unsandboxed (WireGuard).
 - Hooks run with least privilege; the daemon passes secrets via stdin JSON, not
