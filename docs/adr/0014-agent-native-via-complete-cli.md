@@ -34,9 +34,13 @@ boundaries.
   flows *into* the client agents: a buyer agent reads listings, DMs, and op.result / provision
   payloads; an operator agent reads order / op params and DM content. The operator side is
   already protected by the AI-free plane (deterministic validators, never an LLM). The buyer
-  side applies the mirror discipline: agents act ONLY on signed / structured fields (verified
-  per ADR-0006 listing authenticity / ADR-0011 attestations); free-text (title, summary,
-  messages) is display-only and never an instruction. buyer-core surfaces the two distinctly.
+  side applies two disciplines (§13): **provenance** — act only on signature-verified fields,
+  verified milestone-aware (M1a: the operator's account-0 signature only; M5+: operator
+  manifest ADR-0006 + attestations ADR-0011); and **taint** — a signature proves provenance,
+  NOT safety, so operator-produced payloads (`provision.ready.payload`, hook delivery output,
+  `op.result.data`) are untrusted as instructions: buyer-core separates typed known fields
+  from opaque/display-only blobs and free-text, and never auto-executes a URL or command from
+  any payload.
 
 ## Considered options
 
