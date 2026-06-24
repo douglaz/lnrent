@@ -178,12 +178,33 @@ CREATE TABLE IF NOT EXISTS native_connect_session (  -- interactive-op tickets (
 );
 "#;
 
-/// Open the state database, enable WAL (so reads don't block the single writer, §11), and
-/// ensure the schema exists.
+/// Ordered migrations (lnrent-7fp.3): index `i` upgrades the DB from schema version `i` to
+/// `i+1`. Version 1 is the current §11 schema. A future schema change appends a new entry of
+/// `ALTER`/`CREATE` statements; **never edit a shipped migration**.
+const MIGRATIONS: &[&str] = &[SCHEMA];
+
+/// The target schema version this binary expects (= number of migrations).
+pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
+/// Apply any pending migrations, keyed on `PRAGMA user_version`. Idempotent: opening a
+/// current DB is a no-op; opening a v0 DB applies the §11 schema and sets `user_version=1`.
+pub fn migrate(conn: &Connection) -> Result<()> {
+    let mut current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    while (current as usize) < MIGRATIONS.len() {
+        conn.execute_batch(MIGRATIONS[current as usize])?;
+        // user_version can't be a bound parameter; the value is an internal counter, not input.
+        conn.execute_batch(&format!("PRAGMA user_version = {}", current + 1))?;
+        current += 1;
+    }
+    Ok(())
+}
+
+/// Open the state database, enable WAL (so reads don't block the single writer, §11), and run
+/// migrations up to the current `SCHEMA_VERSION`.
 pub fn open(path: impl AsRef<Path>) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-    conn.execute_batch(SCHEMA)?;
+    migrate(&conn)?;
     Ok(conn)
 }
 
@@ -275,6 +296,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 15);
+    }
+
+    #[test]
+    fn migrate_fresh_sets_v1_and_applies_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 15);
+    }
+
+    #[test]
+    fn migrate_is_idempotent_on_current_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute("INSERT INTO recipe (id, version) VALUES ('r','1')", []).unwrap();
+        migrate(&conn).unwrap(); // no-op
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let n: i64 = conn.query_row("SELECT count(*) FROM recipe", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "re-migrating a current db is a no-op (no data loss)");
+    }
+
+    // A simulated legacy (v0) DB — schema applied but user_version never set, with data — must
+    // migrate to v1 without losing data.
+    #[test]
+    fn simulated_v0_db_migrates_to_v1_without_data_loss() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute("INSERT INTO recipe (id, version) VALUES ('legacy','1')", []).unwrap();
+        assert_eq!(conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0)).unwrap(), 0);
+        migrate(&conn).unwrap();
+        assert_eq!(conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0)).unwrap(), 1);
+        let id: String = conn.query_row("SELECT id FROM recipe WHERE id='legacy'", [], |r| r.get(0)).unwrap();
+        assert_eq!(id, "legacy", "data preserved across migration");
     }
 
     fn mem_store() -> Store {
