@@ -223,7 +223,13 @@ impl MockPayment {
 }
 
 impl PaymentBackend for MockPayment {
-    fn create_invoice(&self, amount_sat: u64, _memo: &str, expiry_s: u32, external_id: &str) -> Result<Invoice> {
+    fn create_invoice(
+        &self,
+        amount_sat: u64,
+        _memo: &str,
+        expiry_s: u32,
+        external_id: &str,
+    ) -> Result<Invoice> {
         let mut st = self.state.lock().unwrap();
         if let Some(inv) = st.invoices.get(external_id) {
             return Ok(inv.clone()); // idempotent on external_id (a crash-retry reuses the invoice)
@@ -307,8 +313,14 @@ mod mock_payment_tests {
         let m = MockPayment::new();
         let a = m.create_invoice(1000, "memo", 3600, "ext1").unwrap();
         let b = m.create_invoice(9999, "other", 60, "ext1").unwrap();
-        assert_eq!(a.id, b.id, "same external_id -> same invoice, never a duplicate");
-        assert_eq!(b.amount_sat, 1000, "the original invoice is returned unchanged");
+        assert_eq!(
+            a.id, b.id,
+            "same external_id -> same invoice, never a duplicate"
+        );
+        assert_eq!(
+            b.amount_sat, 1000,
+            "the original invoice is returned unchanged"
+        );
     }
 
     #[test]
@@ -337,8 +349,14 @@ mod mock_payment_tests {
         let p1 = m.pay("dest", 500, "refund:x").unwrap();
         let p2 = m.pay("dest", 500, "refund:x").unwrap();
         assert_eq!(p1, p2, "same key -> same payment id, never pays twice");
-        assert_eq!(m.payment_status_by_key("refund:x").unwrap(), PayStatus::Succeeded);
-        assert_eq!(m.payment_status_by_key("refund:never").unwrap(), PayStatus::Unknown);
+        assert_eq!(
+            m.payment_status_by_key("refund:x").unwrap(),
+            PayStatus::Succeeded
+        );
+        assert_eq!(
+            m.payment_status_by_key("refund:never").unwrap(),
+            PayStatus::Unknown
+        );
     }
 
     #[tokio::test]

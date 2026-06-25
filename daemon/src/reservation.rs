@@ -168,7 +168,13 @@ pub async fn release(store: &Store, order_id: &str, now: i64) -> Result<bool> {
 
 /// Journal a capacity mutation to `event_log` in the same txn (every mutation is journaled,
 /// ADR-0001/§6.5). `subscription_id` carries the order id.
-fn journal(tx: &rusqlite::Transaction, order_id: &str, kind: &str, detail_json: &str, now: i64) -> rusqlite::Result<()> {
+fn journal(
+    tx: &rusqlite::Transaction,
+    order_id: &str,
+    kind: &str,
+    detail_json: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
     tx.execute(
         "INSERT INTO event_log (subscription_id, kind, detail_json, at) VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![order_id, kind, detail_json, now],
@@ -182,7 +188,11 @@ fn journal(tx: &rusqlite::Transaction, order_id: &str, kind: &str, detail_json: 
 /// reject itself). With one reservation per order (`UNIQUE(order_id)`) and checked `consume`,
 /// CONSUMED reservations ARE the active Instances, so this equals the spec's
 /// `budget - (active Instances + live reservations)` (§9.3). Uses sqlite's JSON1.
-fn live_usage(tx: &rusqlite::Transaction, now: i64, exclude_order_id: &str) -> rusqlite::Result<(u32, u32, u32, u32)> {
+fn live_usage(
+    tx: &rusqlite::Transaction,
+    now: i64,
+    exclude_order_id: &str,
+) -> rusqlite::Result<(u32, u32, u32, u32)> {
     tx.query_row(
         "SELECT
             COALESCE(SUM(json_extract(resources_json,'$.cpu')),0),
@@ -211,10 +221,22 @@ mod tests {
     }
 
     fn budget_one() -> Budget {
-        Budget { cpu: 1, mem_mb: 1024, disk_gb: 20, ports: 1 }
+        Budget {
+            cpu: 1,
+            mem_mb: 1024,
+            disk_gb: 20,
+            ports: 1,
+        }
     }
     fn req_one() -> Request {
-        Request { resources: Resources { cpu: 1, mem_mb: 1024, disk_gb: 20 }, ports: 1 }
+        Request {
+            resources: Resources {
+                cpu: 1,
+                mem_mb: 1024,
+                disk_gb: 20,
+            },
+            ports: 1,
+        }
     }
 
     // Two concurrent orders for the last slot: exactly one HELD, the other CapacityFull.
@@ -223,16 +245,26 @@ mod tests {
         let s = mem_store();
         let (a, b) = (s.clone(), s.clone());
         let ta = tokio::spawn(async move {
-            reserve(&a, "res-a", "order-a", req_one(), budget_one(), 1_000, 0).await.unwrap()
+            reserve(&a, "res-a", "order-a", req_one(), budget_one(), 1_000, 0)
+                .await
+                .unwrap()
         });
         let tb = tokio::spawn(async move {
-            reserve(&b, "res-b", "order-b", req_one(), budget_one(), 1_000, 0).await.unwrap()
+            reserve(&b, "res-b", "order-b", req_one(), budget_one(), 1_000, 0)
+                .await
+                .unwrap()
         });
         let (ra, rb) = (ta.await.unwrap(), tb.await.unwrap());
         // exactly one Reserved, one CapacityFull
         assert_ne!(ra, rb, "the two orders must get different outcomes");
         let held: i64 = s
-            .read(|c| Ok(c.query_row("SELECT count(*) FROM reservation WHERE state='HELD'", [], |r| r.get(0))?))
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT count(*) FROM reservation WHERE state='HELD'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
             .await
             .unwrap();
         assert_eq!(held, 1, "exactly one reservation is HELD");
@@ -242,21 +274,32 @@ mod tests {
     async fn reserve_consume_release_lifecycle() {
         let s = mem_store();
         assert_eq!(
-            reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0).await.unwrap(),
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0)
+                .await
+                .unwrap(),
             Reserve::Reserved
         );
         let state = |s: &Store| {
             let s = s.clone();
             async move {
-                s.read(|c| Ok(c.query_row("SELECT state FROM reservation WHERE id='r1'", [], |r| r.get::<_, String>(0))?))
-                    .await
-                    .unwrap()
+                s.read(|c| {
+                    Ok(
+                        c.query_row("SELECT state FROM reservation WHERE id='r1'", [], |r| {
+                            r.get::<_, String>(0)
+                        })?,
+                    )
+                })
+                .await
+                .unwrap()
             }
         };
         assert_eq!(state(&s).await, "HELD");
         consume(&s, "o1", 1).await.unwrap();
         assert_eq!(state(&s).await, "CONSUMED");
-        assert!(release(&s, "o1", 2).await.unwrap(), "released a live reservation");
+        assert!(
+            release(&s, "o1", 2).await.unwrap(),
+            "released a live reservation"
+        );
         assert_eq!(state(&s).await, "RELEASED");
         // releasing again is a no-op that returns false (idempotent)
         assert!(!release(&s, "o1", 3).await.unwrap());
@@ -266,10 +309,18 @@ mod tests {
     #[tokio::test]
     async fn consume_requires_a_held_reservation() {
         let s = mem_store();
-        reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0).await.unwrap();
-        assert!(consume(&s, "nope", 1).await.is_err(), "no HELD reservation for a wrong order");
+        reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0)
+            .await
+            .unwrap();
+        assert!(
+            consume(&s, "nope", 1).await.is_err(),
+            "no HELD reservation for a wrong order"
+        );
         consume(&s, "o1", 1).await.unwrap();
-        assert!(consume(&s, "o1", 2).await.is_err(), "already CONSUMED -> error, not silent");
+        assert!(
+            consume(&s, "o1", 2).await.is_err(),
+            "already CONSUMED -> error, not silent"
+        );
     }
 
     // A re-reserve of the SAME order on a host the order already fills must stay Reserved — it
@@ -279,19 +330,25 @@ mod tests {
         let s = mem_store();
         // o1 takes the whole single-slot budget.
         assert_eq!(
-            reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0).await.unwrap(),
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0)
+                .await
+                .unwrap(),
             Reserve::Reserved
         );
         // Re-reserving o1 (crash-retry) on the now-full host is still Reserved, not CapacityFull.
         assert_eq!(
-            reserve(&s, "r1", "o1", req_one(), budget_one(), 2_000, 10).await.unwrap(),
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 2_000, 10)
+                .await
+                .unwrap(),
             Reserve::Reserved
         );
         // Still exactly one HELD row (refreshed, not duplicated); TTL bumped to 2000.
         let (held, ttl): (i64, i64) = s
-            .read(|c| Ok(c.query_row(
+            .read(|c| {
+                Ok(c.query_row(
                 "SELECT count(*), COALESCE(MAX(expires_at),0) FROM reservation WHERE state='HELD'",
-                [], |r| Ok((r.get(0)?, r.get(1)?)))?))
+                [], |r| Ok((r.get(0)?, r.get(1)?)))?)
+            })
             .await
             .unwrap();
         assert_eq!(held, 1);
@@ -305,26 +362,46 @@ mod tests {
         let state = |s: &Store| {
             let s = s.clone();
             async move {
-                s.read(|c| Ok(c.query_row("SELECT state FROM reservation WHERE order_id='o1'", [], |r| r.get::<_, String>(0))?))
-                    .await
-                    .unwrap()
+                s.read(|c| {
+                    Ok(c.query_row(
+                        "SELECT state FROM reservation WHERE order_id='o1'",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    )?)
+                })
+                .await
+                .unwrap()
             }
         };
         // CONSUMED: a re-reserve is idempotent success but stays CONSUMED (not downgraded).
-        reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0).await.unwrap();
+        reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0)
+            .await
+            .unwrap();
         consume(&s, "o1", 1).await.unwrap();
         assert_eq!(
-            reserve(&s, "r1", "o1", req_one(), budget_one(), 2_000, 2).await.unwrap(),
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 2_000, 2)
+                .await
+                .unwrap(),
             Reserve::Reserved
         );
-        assert_eq!(state(&s).await, "CONSUMED", "re-reserve must not downgrade CONSUMED to HELD");
+        assert_eq!(
+            state(&s).await,
+            "CONSUMED",
+            "re-reserve must not downgrade CONSUMED to HELD"
+        );
         // RELEASED: a re-reserve is refused outright (renewals get a fresh order_id).
         release(&s, "o1", 3).await.unwrap();
         assert!(
-            reserve(&s, "r1", "o1", req_one(), budget_one(), 4_000, 4).await.is_err(),
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 4_000, 4)
+                .await
+                .is_err(),
             "re-reserving a RELEASED order is a caller bug, surfaced not resurrected"
         );
-        assert_eq!(state(&s).await, "RELEASED", "the terminal reservation is untouched");
+        assert_eq!(
+            state(&s).await,
+            "RELEASED",
+            "the terminal reservation is untouched"
+        );
     }
 
     // An expired HELD reservation must not block a new order (it's no longer live).
@@ -333,17 +410,23 @@ mod tests {
         let s = mem_store();
         // r1 HELD with TTL=100.
         assert_eq!(
-            reserve(&s, "r1", "o1", req_one(), budget_one(), 100, 0).await.unwrap(),
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 100, 0)
+                .await
+                .unwrap(),
             Reserve::Reserved
         );
         // At now=50 the slot is still taken.
         assert_eq!(
-            reserve(&s, "r2", "o2", req_one(), budget_one(), 200, 50).await.unwrap(),
+            reserve(&s, "r2", "o2", req_one(), budget_one(), 200, 50)
+                .await
+                .unwrap(),
             Reserve::CapacityFull
         );
         // At now=150 (past r1's TTL) the slot is free again.
         assert_eq!(
-            reserve(&s, "r3", "o3", req_one(), budget_one(), 300, 150).await.unwrap(),
+            reserve(&s, "r3", "o3", req_one(), budget_one(), 300, 150)
+                .await
+                .unwrap(),
             Reserve::Reserved
         );
     }
@@ -357,9 +440,15 @@ mod tests {
         validate_params(&r, &ok).expect("valid params accepted");
 
         let missing = json!({}).as_object().unwrap().clone();
-        assert!(validate_params(&r, &missing).is_err(), "missing required param rejected");
+        assert!(
+            validate_params(&r, &missing).is_err(),
+            "missing required param rejected"
+        );
 
         let wrong_type = json!({"pubkey": 123}).as_object().unwrap().clone();
-        assert!(validate_params(&r, &wrong_type).is_err(), "wrong-type param rejected");
+        assert!(
+            validate_params(&r, &wrong_type).is_err(),
+            "wrong-type param rejected"
+        );
     }
 }

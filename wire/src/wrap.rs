@@ -51,7 +51,8 @@ where
     if wrap.kind != Kind::GiftWrap {
         return Err(Error::NotGiftWrap);
     }
-    wrap.verify().map_err(|e| Error::InvalidEvent(e.to_string()))?;
+    wrap.verify()
+        .map_err(|e| Error::InvalidEvent(e.to_string()))?;
     let gift = nip59::extract_rumor(recipient, wrap)
         .await
         .map_err(|e| match e {

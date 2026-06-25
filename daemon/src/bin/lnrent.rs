@@ -8,7 +8,10 @@ use lnrentd::ipc::{self, Reply, Request};
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(name = "lnrent", about = "lnrent operator CLI (agent-grade; talks to lnrentd over a unix socket)")]
+#[command(
+    name = "lnrent",
+    about = "lnrent operator CLI (agent-grade; talks to lnrentd over a unix socket)"
+)]
 struct Cli {
     /// Emit machine-readable JSON (stable fields) instead of human text.
     #[arg(long, global = true)]
@@ -66,7 +69,10 @@ async fn main() -> ExitCode {
             // The daemon isn't reachable — a structured, deterministic failure (retryable:
             // the daemon may come up). Errors go to stderr so `--json` stdout stays clean.
             if cli.json {
-                eprintln!("{}", serde_json::json!({"ok": false, "error": {"code": "ipc", "message": e.to_string(), "retryable": true}}));
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"ok": false, "error": {"code": "ipc", "message": e.to_string(), "retryable": true}})
+                );
             } else {
                 eprintln!("lnrent: cannot reach lnrentd at {sock}: {e}");
             }

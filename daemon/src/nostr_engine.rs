@@ -1413,7 +1413,10 @@ mod tests {
                 }
             }
         }
-        panic!("local clamped relay failed after retries: {}", last_err.unwrap());
+        panic!(
+            "local clamped relay failed after retries: {}",
+            last_err.unwrap()
+        );
     }
 
     async fn buyer_client(url: &str, keys: Keys) -> Client {

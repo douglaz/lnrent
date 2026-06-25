@@ -48,13 +48,21 @@ pub struct Reply {
 
 impl Reply {
     pub fn ok(data: Value) -> Reply {
-        Reply { ok: true, data: Some(data), error: None }
+        Reply {
+            ok: true,
+            data: Some(data),
+            error: None,
+        }
     }
     pub fn err(code: &str, message: impl Into<String>) -> Reply {
         Reply {
             ok: false,
             data: None,
-            error: Some(IpcError { code: code.into(), message: message.into(), retryable: false }),
+            error: Some(IpcError {
+                code: code.into(),
+                message: message.into(),
+                retryable: false,
+            }),
         }
     }
 }
@@ -73,7 +81,8 @@ pub async fn serve(
 ) -> Result<()> {
     let path = path.as_ref();
     let _ = std::fs::remove_file(path);
-    let listener = UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    let listener =
+        UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("perms on {}", path.display()))?;
     tracing::info!(socket = %path.display(), "ipc serving");
@@ -116,13 +125,24 @@ async fn handle_conn(
 }
 
 /// Route a request to the store actor (reads) / a journaled transaction (admin mutations).
-pub async fn dispatch(req: Request, store: &Store, recipes: &Arc<Vec<Recipe>>, clock: &Arc<dyn Clock>) -> Reply {
+pub async fn dispatch(
+    req: Request,
+    store: &Store,
+    recipes: &Arc<Vec<Recipe>>,
+    clock: &Arc<dyn Clock>,
+) -> Reply {
     match req {
         Request::Status => match store
-            .read(|c| Ok(c.query_row("SELECT count(*) FROM subscription", [], |r| r.get::<_, i64>(0))?))
+            .read(|c| {
+                Ok(c.query_row("SELECT count(*) FROM subscription", [], |r| {
+                    r.get::<_, i64>(0)
+                })?)
+            })
             .await
         {
-            Ok(n) => Reply::ok(json!({"daemon": "ok", "recipes": recipes.len(), "subscriptions": n})),
+            Ok(n) => {
+                Reply::ok(json!({"daemon": "ok", "recipes": recipes.len(), "subscriptions": n}))
+            }
             Err(e) => Reply::err("internal", e.to_string()),
         },
 
@@ -148,15 +168,42 @@ pub async fn dispatch(req: Request, store: &Store, recipes: &Arc<Vec<Recipe>>, c
             }
         }
 
-        Request::AdminSuspend { id } => admin_transition(store, &id, &["ACTIVE"], "SUSPENDED", "admin_suspend", clock.now()).await,
-        Request::AdminResume { id } => admin_transition(store, &id, &["SUSPENDED"], "ACTIVE", "admin_resume", clock.now()).await,
+        Request::AdminSuspend { id } => {
+            admin_transition(
+                store,
+                &id,
+                &["ACTIVE"],
+                "SUSPENDED",
+                "admin_suspend",
+                clock.now(),
+            )
+            .await
+        }
+        Request::AdminResume { id } => {
+            admin_transition(
+                store,
+                &id,
+                &["SUSPENDED"],
+                "ACTIVE",
+                "admin_resume",
+                clock.now(),
+            )
+            .await
+        }
     }
 }
 
 /// An admin force-transition: CAS the subscription state from one of `from` to `to`, journaled
 /// to `event_log`, all in one store transaction (sole writer, ADR-0001). The reconcile/provision
 /// integration runs the actual lifecycle hooks; this is the operator override of the state.
-async fn admin_transition(store: &Store, id: &str, from: &[&str], to: &str, kind: &str, now: i64) -> Reply {
+async fn admin_transition(
+    store: &Store,
+    id: &str,
+    from: &[&str],
+    to: &str,
+    kind: &str,
+    now: i64,
+) -> Reply {
     let id = id.to_string();
     let to = to.to_string();
     let from: Vec<String> = from.iter().map(|s| s.to_string()).collect();
@@ -186,7 +233,10 @@ async fn admin_transition(store: &Store, id: &str, from: &[&str], to: &str, kind
         .await;
     match res {
         Ok(true) => Reply::ok(json!({"id": id, "state": to})),
-        Ok(false) => Reply::err("invalid_state", format!("subscription `{id}` not in {from:?}")),
+        Ok(false) => Reply::err(
+            "invalid_state",
+            format!("subscription `{id}` not in {from:?}"),
+        ),
         Err(e) => Reply::err("internal", e.to_string()),
     }
 }
@@ -297,7 +347,16 @@ mod tests {
         assert_eq!(st.data.unwrap()["subscriptions"], json!(1));
 
         let rs = call(&sock, Request::Recipes).await.unwrap();
-        assert!(rs.ok && rs.data.unwrap().as_array().unwrap().iter().any(|r| r["id"] == "dummy"));
+        assert!(
+            rs.ok
+                && rs
+                    .data
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["id"] == "dummy")
+        );
 
         let subs = call(&sock, Request::Subs).await.unwrap();
         let arr = subs.data.unwrap();
@@ -309,7 +368,9 @@ mod tests {
     async fn admin_suspend_routes_through_store_and_journals() {
         let (store, sock) = serve_temp().await;
 
-        let r = call(&sock, Request::AdminSuspend { id: "s1".into() }).await.unwrap();
+        let r = call(&sock, Request::AdminSuspend { id: "s1".into() })
+            .await
+            .unwrap();
         assert!(r.ok);
         assert_eq!(r.data.unwrap()["state"], "SUSPENDED");
 
@@ -326,7 +387,9 @@ mod tests {
         assert_eq!(events, 1, "the admin action was journaled to event_log");
 
         // resume back
-        let r = call(&sock, Request::AdminResume { id: "s1".into() }).await.unwrap();
+        let r = call(&sock, Request::AdminResume { id: "s1".into() })
+            .await
+            .unwrap();
         assert_eq!(r.data.unwrap()["state"], "ACTIVE");
     }
 
@@ -334,12 +397,16 @@ mod tests {
     async fn structured_errors_for_missing_and_bad_state() {
         let (_store, sock) = serve_temp().await;
 
-        let nf = call(&sock, Request::Sub { id: "nope".into() }).await.unwrap();
+        let nf = call(&sock, Request::Sub { id: "nope".into() })
+            .await
+            .unwrap();
         assert!(!nf.ok);
         assert_eq!(nf.error.unwrap().code, "not_found");
 
         // s1 is ACTIVE, so resume (SUSPENDED->ACTIVE) is an invalid transition.
-        let bad = call(&sock, Request::AdminResume { id: "s1".into() }).await.unwrap();
+        let bad = call(&sock, Request::AdminResume { id: "s1".into() })
+            .await
+            .unwrap();
         assert!(!bad.ok);
         assert_eq!(bad.error.unwrap().code, "invalid_state");
     }

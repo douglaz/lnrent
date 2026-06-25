@@ -50,7 +50,8 @@ pub async fn run_hook(hook: &Path, input: &Value, timeout: Duration) -> Result<H
     });
     // Read both pipes concurrently, each bounded by OUTPUT_CAP — a cap breach on EITHER pipe
     // returns Err *immediately* (no draining, no hang), independent of the stdin feed.
-    let read = async { tokio::try_join!(read_capped(out, OUTPUT_CAP), read_capped(err, OUTPUT_CAP)) };
+    let read =
+        async { tokio::try_join!(read_capped(out, OUTPUT_CAP), read_capped(err, OUTPUT_CAP)) };
     let (out_buf, err_buf) = match tokio::time::timeout(timeout, read).await {
         Err(_) => {
             reap(&mut child).await;
@@ -71,7 +72,10 @@ pub async fn run_hook(hook: &Path, input: &Value, timeout: Duration) -> Result<H
         Ok(s) => s.context("waiting on hook")?,
         Err(_) => {
             reap(&mut child).await;
-            bail!("hook {} did not exit after closing its output", hook.display());
+            bail!(
+                "hook {} did not exit after closing its output",
+                hook.display()
+            );
         }
     };
     if !status.success() {
@@ -109,7 +113,11 @@ async fn spawn_hook(hook: &Path) -> Result<tokio::process::Child> {
                 attempt += 1;
                 tokio::time::sleep(Duration::from_millis(10 * attempt as u64)).await;
             }
-            Err(e) => return Err(anyhow::Error::new(e).context(format!("spawning hook {}", hook.display()))),
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("spawning hook {}", hook.display()))
+                )
+            }
         }
     }
 }
@@ -123,7 +131,10 @@ async fn reap(child: &mut tokio::process::Child) {
 
 /// Read `r` to EOF, retaining the bytes, but return an error the moment the total would exceed
 /// `cap` — so an over-producing hook fails FAST (memory- and time-bounded), not after draining.
-async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: usize) -> std::io::Result<Vec<u8>> {
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    mut r: R,
+    cap: usize,
+) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -153,7 +164,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("lnrent-runner-{}-{seq}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("lnrent-runner-{}-{seq}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
         std::fs::write(&path, body).unwrap();
@@ -168,21 +180,27 @@ mod tests {
             "echo",
             "#!/usr/bin/env bash\nread -r line\necho '{\"ok\":true}'\n",
         );
-        let out = run_hook(&hook, &json!({"x": 1}), DEFAULT_TIMEOUT).await.unwrap();
+        let out = run_hook(&hook, &json!({"x": 1}), DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
         assert_eq!(out.stdout_json, json!({"ok": true}));
     }
 
     #[tokio::test]
     async fn nonzero_exit_is_failure() {
         let hook = write_hook("fail", "#!/usr/bin/env bash\necho '{}' ; exit 1\n");
-        let err = run_hook(&hook, &json!({}), DEFAULT_TIMEOUT).await.unwrap_err();
+        let err = run_hook(&hook, &json!({}), DEFAULT_TIMEOUT)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("failed (exit"), "got: {err}");
     }
 
     #[tokio::test]
     async fn timeout_kills_and_fails() {
         let hook = write_hook("slow", "#!/usr/bin/env bash\nsleep 5\necho '{}'\n");
-        let err = run_hook(&hook, &json!({}), Duration::from_millis(200)).await.unwrap_err();
+        let err = run_hook(&hook, &json!({}), Duration::from_millis(200))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("timed out"));
     }
 
@@ -193,7 +211,9 @@ mod tests {
     async fn large_stdin_to_a_nonreading_hook_times_out() {
         let hook = write_hook("ignore-stdin", "#!/usr/bin/env bash\nsleep 5\n");
         let big = json!({ "blob": "x".repeat(256 * 1024) }); // >> the ~64 KiB pipe buffer
-        let err = run_hook(&hook, &big, Duration::from_millis(300)).await.unwrap_err();
+        let err = run_hook(&hook, &big, Duration::from_millis(300))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("timed out"), "got: {err}");
     }
 
@@ -206,20 +226,31 @@ mod tests {
         let r = Recipe::load(&dir).expect("load dummy recipe");
         r.validate().expect("dummy recipe validates");
 
-        let prov = run_hook(&r.hook("provision"), &json!({"subscription": {"id": "s1"}}), DEFAULT_TIMEOUT)
-            .await
-            .expect("provision runs");
-        assert!(prov.stdout_json.get("payload").is_some(), "provision returns a delivery payload");
+        let prov = run_hook(
+            &r.hook("provision"),
+            &json!({"subscription": {"id": "s1"}}),
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .expect("provision runs");
+        assert!(
+            prov.stdout_json.get("payload").is_some(),
+            "provision returns a delivery payload"
+        );
 
         let op = r.operation("status").expect("status op declared");
-        let res = run_hook(&r.op_hook(op), &json!({}), DEFAULT_TIMEOUT).await.expect("op runs");
+        let res = run_hook(&r.op_hook(op), &json!({}), DEFAULT_TIMEOUT)
+            .await
+            .expect("op runs");
         assert_eq!(res.stdout_json["state"], json!("running"));
     }
 
     #[tokio::test]
     async fn non_json_stdout_is_failure() {
         let hook = write_hook("garbage", "#!/usr/bin/env bash\necho not-json\n");
-        let err = run_hook(&hook, &json!({}), DEFAULT_TIMEOUT).await.unwrap_err();
+        let err = run_hook(&hook, &json!({}), DEFAULT_TIMEOUT)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("not JSON"));
     }
 
@@ -231,7 +262,9 @@ mod tests {
             "flood-out",
             "#!/usr/bin/env bash\nhead -c 5000000 /dev/zero | tr '\\0' 'a'\n",
         );
-        let err = run_hook(&hook, &json!({}), Duration::from_millis(800)).await.unwrap_err();
+        let err = run_hook(&hook, &json!({}), Duration::from_millis(800))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("exceeded the"), "got: {err}");
     }
 
@@ -246,7 +279,9 @@ mod tests {
             "#!/usr/bin/env bash\nhead -c 5000000 /dev/zero | tr '\\0' 'a'\nsleep 5\n",
         );
         let big = json!({ "blob": "x".repeat(256 * 1024) }); // >> the pipe buffer; never drained
-        let err = run_hook(&hook, &big, Duration::from_millis(800)).await.unwrap_err();
+        let err = run_hook(&hook, &big, Duration::from_millis(800))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("exceeded the"), "got: {err}");
     }
 
@@ -257,7 +292,9 @@ mod tests {
             "flood-err",
             "#!/usr/bin/env bash\nhead -c 5000000 /dev/zero | tr '\\0' 'a' >&2\necho '{}'\n",
         );
-        let err = run_hook(&hook, &json!({}), Duration::from_millis(800)).await.unwrap_err();
+        let err = run_hook(&hook, &json!({}), Duration::from_millis(800))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("exceeded the"), "got: {err}");
     }
 }

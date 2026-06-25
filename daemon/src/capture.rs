@@ -35,7 +35,9 @@ pub enum Capture {
 /// Apply `settlement` to the durable state. Idempotent: a redelivered settlement is a no-op (or,
 /// for a terminal/expired invoice, contributes no second refund row — the refund key is UNIQUE).
 pub async fn capture(store: &Store, settlement: Settlement, now: i64) -> Result<Capture> {
-    store.transaction(move |tx| capture_txn(tx, &settlement, now)).await
+    store
+        .transaction(move |tx| capture_txn(tx, &settlement, now))
+        .await
 }
 
 fn capture_txn(tx: &Transaction, s: &Settlement, now: i64) -> Result<Capture> {
@@ -107,7 +109,13 @@ struct SubRow {
 
 /// The invoice just flipped OPEN -> PAID. Route the subscription move by the invoice CLASS and the
 /// current sub state.
-fn apply_paid(tx: &Transaction, kind: Option<&str>, sub_id: Option<&str>, s: &Settlement, now: i64) -> Result<Capture> {
+fn apply_paid(
+    tx: &Transaction,
+    kind: Option<&str>,
+    sub_id: Option<&str>,
+    s: &Settlement,
+    now: i64,
+) -> Result<Capture> {
     let sub_id = match sub_id {
         Some(id) => id,
         // PAID invoice with no subscription (shouldn't happen) -> refund rather than strand funds.
@@ -134,7 +142,14 @@ fn apply_paid(tx: &Transaction, kind: Option<&str>, sub_id: Option<&str>, s: &Se
             },
         )
         .optional()?;
-    let SubRow { state, period_s, renew_lead_s, retention_s, paid_through, refund_dest } = match sub {
+    let SubRow {
+        state,
+        period_s,
+        renew_lead_s,
+        retention_s,
+        paid_through,
+        refund_dest,
+    } = match sub {
         Some(v) => v,
         None => {
             refund_intent(tx, Some(sub_id), None, s, now)?;
@@ -172,7 +187,8 @@ fn apply_paid(tx: &Transaction, kind: Option<&str>, sub_id: Option<&str>, s: &Se
                     return Ok(Capture::RefundDue);
                 }
             }
-            let new_paid_through = paid_through.unwrap_or(s.settled_at).max(s.settled_at) + period_s;
+            let new_paid_through =
+                paid_through.unwrap_or(s.settled_at).max(s.settled_at) + period_s;
             let soft = new_paid_through - renew_lead_s;
             tx.execute(
                 "UPDATE subscription
@@ -181,8 +197,22 @@ fn apply_paid(tx: &Transaction, kind: Option<&str>, sub_id: Option<&str>, s: &Se
                 params![sub_id, new_paid_through, soft, now],
             )?;
             let resumed = st == "SUSPENDED";
-            journal(tx, Some(sub_id), if resumed { "renew_resume" } else { "renew_extend" }, s, now)?;
-            Ok(if resumed { Capture::Resumed } else { Capture::Renewed })
+            journal(
+                tx,
+                Some(sub_id),
+                if resumed {
+                    "renew_resume"
+                } else {
+                    "renew_extend"
+                },
+                s,
+                now,
+            )?;
+            Ok(if resumed {
+                Capture::Resumed
+            } else {
+                Capture::Renewed
+            })
         }
         // Settled-but-terminal: an order invoice whose sub already moved on, or a renewal on a
         // terminal sub. Funds arrived (invoice is PAID) but there's no service to grant -> refund,
@@ -197,9 +227,15 @@ fn apply_paid(tx: &Transaction, kind: Option<&str>, sub_id: Option<&str>, s: &Se
 
 /// Read a subscription's refund destination (BOLT12 offer / LN address), if the sub exists.
 fn sub_refund_dest(tx: &Transaction, sub_id: Option<&str>) -> Result<Option<String>> {
-    let Some(sub_id) = sub_id else { return Ok(None) };
+    let Some(sub_id) = sub_id else {
+        return Ok(None);
+    };
     Ok(tx
-        .query_row("SELECT refund_dest FROM subscription WHERE id = ?1", params![sub_id], |r| r.get(0))
+        .query_row(
+            "SELECT refund_dest FROM subscription WHERE id = ?1",
+            params![sub_id],
+            |r| r.get(0),
+        )
         .optional()?
         .flatten())
 }
@@ -208,7 +244,13 @@ fn sub_refund_dest(tx: &Transaction, sub_id: Option<&str>) -> Result<Option<Stri
 /// (UNIQUE). `ON CONFLICT DO NOTHING` => a redelivered terminal settlement contributes exactly one
 /// refund row (§6.6). Returns `true` iff a NEW row was inserted (so callers can skip a redundant
 /// journal entry on replay). Execution is lnrent-7fp.11's job.
-fn refund_intent(tx: &Transaction, sub_id: Option<&str>, dest: Option<&str>, s: &Settlement, now: i64) -> Result<bool> {
+fn refund_intent(
+    tx: &Transaction,
+    sub_id: Option<&str>,
+    dest: Option<&str>,
+    s: &Settlement,
+    now: i64,
+) -> Result<bool> {
     let n = tx.execute(
         "INSERT INTO refund_attempt
             (id, subscription_id, dest, amount_sat, idempotency_key, status, attempts, created_at, updated_at)
@@ -228,7 +270,13 @@ fn refund_intent(tx: &Transaction, sub_id: Option<&str>, dest: Option<&str>, s: 
 
 /// Journal a settlement event to `event_log` in the same txn (every mutation is journaled,
 /// ADR-0001/§6.5).
-fn journal(tx: &Transaction, sub_id: Option<&str>, kind: &str, s: &Settlement, now: i64) -> Result<()> {
+fn journal(
+    tx: &Transaction,
+    sub_id: Option<&str>,
+    kind: &str,
+    s: &Settlement,
+    now: i64,
+) -> Result<()> {
     let detail = serde_json::json!({
         "external_id": s.external_id,
         "amount_sat": s.amount_sat,
@@ -296,14 +344,25 @@ mod tests {
     }
 
     fn settlement(external_id: &str, settled_at: i64) -> Settlement {
-        Settlement { invoice_id: format!("inv-{external_id}"), external_id: external_id.to_string(), amount_sat: 1000, settled_at }
+        Settlement {
+            invoice_id: format!("inv-{external_id}"),
+            external_id: external_id.to_string(),
+            amount_sat: 1000,
+            settled_at,
+        }
     }
 
     async fn sub_state(s: &Store, id: &str) -> String {
         let id = id.to_string();
-        s.read(move |c| Ok(c.query_row("SELECT state FROM subscription WHERE id=?1", params![id], |r| r.get(0))?))
-            .await
-            .unwrap()
+        s.read(move |c| {
+            Ok(c.query_row(
+                "SELECT state FROM subscription WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap()
     }
     async fn inv_status(s: &Store, ext: &str) -> (String, Option<i64>) {
         let ext = ext.to_string();
@@ -318,14 +377,22 @@ mod tests {
         .unwrap()
     }
     async fn refund_count(s: &Store) -> i64 {
-        s.read(|c| Ok(c.query_row("SELECT count(*) FROM refund_attempt", [], |r| r.get(0))?)).await.unwrap()
+        s.read(|c| Ok(c.query_row("SELECT count(*) FROM refund_attempt", [], |r| r.get(0))?))
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
     async fn order_capture_moves_pending_to_provisioning() {
         let s = mem_store();
-        seed(&s, "o1", "PENDING", None, 100, 10, 0, None, "order", "OPEN", "ext1").await;
-        assert_eq!(capture(&s, settlement("ext1", 500), 1).await.unwrap(), Capture::Captured);
+        seed(
+            &s, "o1", "PENDING", None, 100, 10, 0, None, "order", "OPEN", "ext1",
+        )
+        .await;
+        assert_eq!(
+            capture(&s, settlement("ext1", 500), 1).await.unwrap(),
+            Capture::Captured
+        );
         assert_eq!(sub_state(&s, "o1").await, "PROVISIONING");
         let (st, applied) = inv_status(&s, "ext1").await;
         assert_eq!(st, "PAID");
@@ -336,26 +403,58 @@ mod tests {
     #[tokio::test]
     async fn replayed_settlement_is_a_noop() {
         let s = mem_store();
-        seed(&s, "o1", "PENDING", None, 100, 10, 0, None, "order", "OPEN", "ext1").await;
+        seed(
+            &s, "o1", "PENDING", None, 100, 10, 0, None, "order", "OPEN", "ext1",
+        )
+        .await;
         capture(&s, settlement("ext1", 500), 1).await.unwrap();
         // A redelivery of the same settlement changes nothing.
-        assert_eq!(capture(&s, settlement("ext1", 999), 2).await.unwrap(), Capture::NoOp);
+        assert_eq!(
+            capture(&s, settlement("ext1", 999), 2).await.unwrap(),
+            Capture::NoOp
+        );
         assert_eq!(sub_state(&s, "o1").await, "PROVISIONING");
         let (_, applied) = inv_status(&s, "ext1").await;
-        assert_eq!(applied, Some(500), "applied_at is NOT overwritten by the replay");
+        assert_eq!(
+            applied,
+            Some(500),
+            "applied_at is NOT overwritten by the replay"
+        );
     }
 
     #[tokio::test]
     async fn renewal_extends_paid_through_with_max_formula() {
         let s = mem_store();
         // ACTIVE, paid_through=1000, period=100. An EARLY renewal (settled_at < paid_through).
-        seed(&s, "o1", "ACTIVE", Some(1000), 100, 10, 1000, None, "renewal", "OPEN", "rext").await;
-        assert_eq!(capture(&s, settlement("rext", 500), 1).await.unwrap(), Capture::Renewed);
+        seed(
+            &s,
+            "o1",
+            "ACTIVE",
+            Some(1000),
+            100,
+            10,
+            1000,
+            None,
+            "renewal",
+            "OPEN",
+            "rext",
+        )
+        .await;
+        assert_eq!(
+            capture(&s, settlement("rext", 500), 1).await.unwrap(),
+            Capture::Renewed
+        );
         let pt: i64 = {
             let id = "o1".to_string();
-            s.read(move |c| Ok(c.query_row("SELECT paid_through FROM subscription WHERE id=?1", params![id], |r| r.get(0))?))
-                .await
-                .unwrap()
+            s.read(move |c| {
+                Ok(c.query_row(
+                    "SELECT paid_through FROM subscription WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap()
         };
         assert_eq!(pt, 1100, "max(1000,500)+100");
         assert_eq!(sub_state(&s, "o1").await, "ACTIVE");
@@ -365,23 +464,65 @@ mod tests {
     async fn late_renewal_never_lands_in_the_past() {
         let s = mem_store();
         // paid_through already lapsed (100) but the sub is still ACTIVE; settled_at=1000 is later.
-        seed(&s, "o1", "ACTIVE", Some(100), 100, 10, 2000, None, "renewal", "OPEN", "rext").await;
+        seed(
+            &s,
+            "o1",
+            "ACTIVE",
+            Some(100),
+            100,
+            10,
+            2000,
+            None,
+            "renewal",
+            "OPEN",
+            "rext",
+        )
+        .await;
         capture(&s, settlement("rext", 1000), 1).await.unwrap();
         let pt: i64 = {
             let id = "o1".to_string();
-            s.read(move |c| Ok(c.query_row("SELECT paid_through FROM subscription WHERE id=?1", params![id], |r| r.get(0))?))
-                .await
-                .unwrap()
+            s.read(move |c| {
+                Ok(c.query_row(
+                    "SELECT paid_through FROM subscription WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap()
         };
-        assert_eq!(pt, 1100, "max(100,1000)+100 — settled_at, not the stale paid_through");
+        assert_eq!(
+            pt, 1100,
+            "max(100,1000)+100 — settled_at, not the stale paid_through"
+        );
     }
 
     #[tokio::test]
     async fn renewal_resumes_a_suspended_sub() {
         let s = mem_store();
-        seed(&s, "o1", "SUSPENDED", Some(100), 100, 10, 2000, None, "renewal", "OPEN", "rext").await;
-        assert_eq!(capture(&s, settlement("rext", 1000), 1).await.unwrap(), Capture::Resumed);
-        assert_eq!(sub_state(&s, "o1").await, "ACTIVE", "a paid renewal resumes a suspended sub");
+        seed(
+            &s,
+            "o1",
+            "SUSPENDED",
+            Some(100),
+            100,
+            10,
+            2000,
+            None,
+            "renewal",
+            "OPEN",
+            "rext",
+        )
+        .await;
+        assert_eq!(
+            capture(&s, settlement("rext", 1000), 1).await.unwrap(),
+            Capture::Resumed
+        );
+        assert_eq!(
+            sub_state(&s, "o1").await,
+            "ACTIVE",
+            "a paid renewal resumes a suspended sub"
+        );
     }
 
     // A renewal that lands AFTER retention (paid_through + retention_s) must refund, not resurrect
@@ -392,16 +533,37 @@ mod tests {
         for state in ["ACTIVE", "SUSPENDED"] {
             let s = mem_store();
             // paid_through=100, retention=50 -> retention ends at 150; settlement at 200 is too late.
-            seed(&s, "o1", state, Some(100), 100, 10, 50, Some("lnaddr@x"), "renewal", "OPEN", "rext").await;
+            seed(
+                &s,
+                "o1",
+                state,
+                Some(100),
+                100,
+                10,
+                50,
+                Some("lnaddr@x"),
+                "renewal",
+                "OPEN",
+                "rext",
+            )
+            .await;
             assert_eq!(
                 capture(&s, settlement("rext", 200), 1).await.unwrap(),
                 Capture::RefundDue,
                 "{state}: a past-retention renewal refunds"
             );
-            assert_eq!(sub_state(&s, "o1").await, state, "{state}: the sub is NOT resurrected to ACTIVE");
+            assert_eq!(
+                sub_state(&s, "o1").await,
+                state,
+                "{state}: the sub is NOT resurrected to ACTIVE"
+            );
             // Invoice still flipped PAID (funds arrived) and exactly one refund recorded.
             assert_eq!(inv_status(&s, "rext").await.0, "PAID");
-            assert_eq!(refund_count(&s).await, 1, "{state}: one refund for the late renewal");
+            assert_eq!(
+                refund_count(&s).await,
+                1,
+                "{state}: one refund for the late renewal"
+            );
         }
     }
 
@@ -411,17 +573,47 @@ mod tests {
     async fn retention_boundary_is_inclusive_terminal() {
         // paid_through=100, retention=50 -> retention end at 150.
         let at_boundary = mem_store();
-        seed(&at_boundary, "o1", "ACTIVE", Some(100), 100, 10, 50, Some("d"), "renewal", "OPEN", "rext").await;
+        seed(
+            &at_boundary,
+            "o1",
+            "ACTIVE",
+            Some(100),
+            100,
+            10,
+            50,
+            Some("d"),
+            "renewal",
+            "OPEN",
+            "rext",
+        )
+        .await;
         assert_eq!(
-            capture(&at_boundary, settlement("rext", 150), 1).await.unwrap(),
+            capture(&at_boundary, settlement("rext", 150), 1)
+                .await
+                .unwrap(),
             Capture::RefundDue,
             "settling exactly at retention end is too late -> refund"
         );
 
         let just_inside = mem_store();
-        seed(&just_inside, "o2", "ACTIVE", Some(100), 100, 10, 50, Some("d"), "renewal", "OPEN", "rin").await;
+        seed(
+            &just_inside,
+            "o2",
+            "ACTIVE",
+            Some(100),
+            100,
+            10,
+            50,
+            Some("d"),
+            "renewal",
+            "OPEN",
+            "rin",
+        )
+        .await;
         assert_eq!(
-            capture(&just_inside, settlement("rin", 149), 1).await.unwrap(),
+            capture(&just_inside, settlement("rin", 149), 1)
+                .await
+                .unwrap(),
             Capture::Renewed,
             "one second inside the window still renews"
         );
@@ -447,23 +639,53 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(capture(&s, settlement("ext1", 500), 1).await.unwrap(), Capture::RefundDue);
-        assert_eq!(sub_state(&s, "o1").await, "PENDING", "a null-kind invoice never captures the order");
+        assert_eq!(
+            capture(&s, settlement("ext1", 500), 1).await.unwrap(),
+            Capture::RefundDue
+        );
+        assert_eq!(
+            sub_state(&s, "o1").await,
+            "PENDING",
+            "a null-kind invoice never captures the order"
+        );
         assert_eq!(refund_count(&s).await, 1);
     }
 
     #[tokio::test]
     async fn settlement_on_an_expired_invoice_refunds_once() {
         let s = mem_store();
-        seed(&s, "o1", "PENDING", None, 100, 10, 0, Some("lnaddr@x"), "order", "EXPIRED", "ext1").await;
-        assert_eq!(capture(&s, settlement("ext1", 500), 1).await.unwrap(), Capture::RefundDue);
+        seed(
+            &s,
+            "o1",
+            "PENDING",
+            None,
+            100,
+            10,
+            0,
+            Some("lnaddr@x"),
+            "order",
+            "EXPIRED",
+            "ext1",
+        )
+        .await;
+        assert_eq!(
+            capture(&s, settlement("ext1", 500), 1).await.unwrap(),
+            Capture::RefundDue
+        );
         // Invoice stays EXPIRED (not flipped to PAID) but is stamped for audit.
         let (st, _) = inv_status(&s, "ext1").await;
         assert_eq!(st, "EXPIRED");
         assert_eq!(refund_count(&s).await, 1);
         // A redelivery does NOT create a second refund (UNIQUE refund key).
-        assert_eq!(capture(&s, settlement("ext1", 600), 2).await.unwrap(), Capture::RefundDue);
-        assert_eq!(refund_count(&s).await, 1, "exactly one refund row per terminal settlement");
+        assert_eq!(
+            capture(&s, settlement("ext1", 600), 2).await.unwrap(),
+            Capture::RefundDue
+        );
+        assert_eq!(
+            refund_count(&s).await,
+            1,
+            "exactly one refund row per terminal settlement"
+        );
         // The refund row carries the sub's dest + the deterministic key.
         let (dest, key): (Option<String>, String) = {
             s.read(|c| {
@@ -484,11 +706,31 @@ mod tests {
     async fn settlement_on_a_terminal_sub_pays_invoice_then_refunds() {
         let s = mem_store();
         // An OPEN order invoice whose sub already TERMINATED.
-        seed(&s, "o1", "TERMINATED", None, 100, 10, 0, Some("lnaddr@x"), "order", "OPEN", "ext1").await;
-        assert_eq!(capture(&s, settlement("ext1", 500), 1).await.unwrap(), Capture::RefundDue);
+        seed(
+            &s,
+            "o1",
+            "TERMINATED",
+            None,
+            100,
+            10,
+            0,
+            Some("lnaddr@x"),
+            "order",
+            "OPEN",
+            "ext1",
+        )
+        .await;
+        assert_eq!(
+            capture(&s, settlement("ext1", 500), 1).await.unwrap(),
+            Capture::RefundDue
+        );
         let (st, _) = inv_status(&s, "ext1").await;
         assert_eq!(st, "PAID", "funds arrived, so the invoice is PAID...");
-        assert_eq!(sub_state(&s, "o1").await, "TERMINATED", "...but the order is not resurrected");
+        assert_eq!(
+            sub_state(&s, "o1").await,
+            "TERMINATED",
+            "...but the order is not resurrected"
+        );
         assert_eq!(refund_count(&s).await, 1);
     }
 
@@ -496,13 +738,18 @@ mod tests {
     async fn unmatched_settlement_records_a_refund_intent() {
         let s = mem_store();
         // No invoice for this external_id at all.
-        assert_eq!(capture(&s, settlement("ghost", 500), 1).await.unwrap(), Capture::RefundDue);
+        assert_eq!(
+            capture(&s, settlement("ghost", 500), 1).await.unwrap(),
+            Capture::RefundDue
+        );
         assert_eq!(refund_count(&s).await, 1);
         let (sub, key): (Option<String>, String) = {
             s.read(|c| {
-                Ok(c.query_row("SELECT subscription_id, idempotency_key FROM refund_attempt", [], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })?)
+                Ok(c.query_row(
+                    "SELECT subscription_id, idempotency_key FROM refund_attempt",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
             })
             .await
             .unwrap()
