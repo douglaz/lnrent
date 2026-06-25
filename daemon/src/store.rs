@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS outbox (   -- pending operator->buyer NIP-17 DMs (ADR
   subscription_id TEXT,
   msg_type        TEXT,
   payload_json    TEXT,
-  state           TEXT,    -- PENDING | SENT
+  state           TEXT,    -- PENDING | SENT | FAILED (structurally-undeliverable, quarantined)
   attempts        INTEGER,
   created_at      INTEGER,
   sent_at         INTEGER

@@ -4,12 +4,13 @@
 //! actor (ADR-0001) — so there is no TOCTOU. A reservation is `HELD` from order through
 //! provisioning, `CONSUMED` once the Instance is `ACTIVE`, and `RELEASED` on expiry / refund
 //! / terminate. `available = host budget - live usage`, where live usage is every `CONSUMED`
-//! reservation plus every `HELD` reservation whose TTL has not passed.
+//! reservation plus every `HELD` unpaid reservation whose TTL has not passed, plus every `HELD`
+//! paid/provisioning order even past its initial invoice TTL.
 
 use crate::recipe::{Recipe, Resources};
 use crate::store::Store;
 use anyhow::{bail, Result};
-use rusqlite::OptionalExtension;
+use rusqlite::{OptionalExtension, Transaction};
 use serde_json::{Map, Value};
 
 /// The operator-configured rentable budget for a host (set at onboard, §9.3).
@@ -134,18 +135,59 @@ pub async fn reserve(
 pub async fn consume(store: &Store, order_id: &str, now: i64) -> Result<()> {
     let oid = order_id.to_string();
     store
-        .transaction(move |tx| {
-            let n = tx.execute(
-                "UPDATE reservation SET state='CONSUMED' WHERE order_id=?1 AND state='HELD'",
-                rusqlite::params![oid],
-            )?;
-            if n != 1 {
-                bail!("consume: no HELD reservation for order `{oid}` (affected {n})");
-            }
-            journal(tx, &oid, "reserve_consume", "{}", now)?;
-            Ok(())
-        })
+        .transaction(move |tx| consume_txn(tx, &oid, now))
         .await
+}
+
+/// No live `HELD` reservation to consume for an order — the sole *business* failure of
+/// [`consume_txn`]: a concurrent refund/terminate already RELEASED the hold, or it was already
+/// CONSUMED. This is distinct from a transient rusqlite/journal error, so the provision step can
+/// turn THIS into REFUND_DUE while letting a real DB error propagate and abort the drive rather
+/// than refund a successfully-provisioned buyer (Reviewer 2).
+#[derive(Debug)]
+pub struct NoHeldReservation {
+    pub order_id: String,
+    pub affected: usize,
+}
+
+impl std::fmt::Display for NoHeldReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "consume: no HELD reservation for order `{}` (affected {})",
+            self.order_id, self.affected
+        )
+    }
+}
+
+impl std::error::Error for NoHeldReservation {}
+
+/// HELD -> CONSUMED inside an EXISTING transaction (the txn-bound variant of [`consume`]). The
+/// provision step (lnrent-7fp.10) calls this so the reservation is consumed in the SAME txn that
+/// moves the subscription to ACTIVE — an ACTIVE sub then atomically holds live capacity, with no
+/// window where it is live without a CONSUMED hold.
+///
+/// Consume does NOT gate on `expires_at`: it only ever runs once the order is PAID and settled
+/// (the sub is in PROVISIONING), so the hold is committed capacity that must be honored through
+/// provisioning. The TTL is the pre-payment GC for *unpaid* holds ([`live_usage`]); refunding a
+/// paid buyer just because a slow hook or a restart pushed activation past the TTL would be wrong
+/// (codex P2). The only *business* failure is a missing/non-HELD hold (e.g. a concurrent refund
+/// RELEASED it), surfaced as a typed [`NoHeldReservation`] the caller turns into REFUND_DUE; a
+/// transient DB error propagates as itself.
+pub fn consume_txn(tx: &Transaction, order_id: &str, now: i64) -> Result<()> {
+    let n = tx.execute(
+        "UPDATE reservation SET state='CONSUMED' WHERE order_id=?1 AND state='HELD'",
+        rusqlite::params![order_id],
+    )?;
+    if n != 1 {
+        return Err(NoHeldReservation {
+            order_id: order_id.to_string(),
+            affected: n,
+        }
+        .into());
+    }
+    journal(tx, order_id, "reserve_consume", "{}", now)?;
+    Ok(())
 }
 
 /// -> RELEASED, on invoice expiry / refund / terminate (§9.3). Idempotent: returns whether a
@@ -153,17 +195,24 @@ pub async fn consume(store: &Store, order_id: &str, now: i64) -> Result<()> {
 pub async fn release(store: &Store, order_id: &str, now: i64) -> Result<bool> {
     let oid = order_id.to_string();
     store
-        .transaction(move |tx| {
-            let n = tx.execute(
-                "UPDATE reservation SET state='RELEASED' WHERE order_id=?1 AND state IN ('HELD','CONSUMED')",
-                rusqlite::params![oid],
-            )?;
-            if n > 0 {
-                journal(tx, &oid, "reserve_release", "{}", now)?;
-            }
-            Ok(n > 0)
-        })
+        .transaction(move |tx| release_txn(tx, &oid, now))
         .await
+}
+
+/// -> RELEASED inside an EXISTING transaction (the txn-bound variant of [`release`]). §9.3 has
+/// expiry / `destroy` / refund / terminate release the reservation, so a refunded or cancelled
+/// order leaves nothing reserved. The provision FAILURE path does NOT release here — it leaves the
+/// paid hold HELD for the refund executor (lnrent-7fp.11), mirroring capture's refund paths.
+/// Idempotent: returns whether a live reservation was released.
+pub fn release_txn(tx: &Transaction, order_id: &str, now: i64) -> Result<bool> {
+    let n = tx.execute(
+        "UPDATE reservation SET state='RELEASED' WHERE order_id=?1 AND state IN ('HELD','CONSUMED')",
+        rusqlite::params![order_id],
+    )?;
+    if n > 0 {
+        journal(tx, order_id, "reserve_release", "{}", now)?;
+    }
+    Ok(n > 0)
 }
 
 /// Journal a capacity mutation to `event_log` in the same txn (every mutation is journaled,
@@ -183,10 +232,12 @@ fn journal(
 }
 
 /// Sum of live usage = every CONSUMED reservation (each is an active Instance's hold) + every
-/// HELD reservation still within its TTL (an expired-but-not-yet-released HELD must not block
-/// new orders), EXCLUDING `exclude_order_id` (so a re-reserve doesn't count its own hold and
-/// reject itself). With one reservation per order (`UNIQUE(order_id)`) and checked `consume`,
-/// CONSUMED reservations ARE the active Instances, so this equals the spec's
+/// HELD reservation still within its TTL + every HELD paid/provisioning order even past TTL,
+/// EXCLUDING `exclude_order_id` (so a re-reserve doesn't count its own hold and reject itself).
+/// Expired unpaid HELD rows do not block new orders, but a paid order that capture has moved into
+/// PROVISIONING keeps its capacity while the idempotent provision hook/restart path catches up.
+/// With one reservation per order (`UNIQUE(order_id)`) and checked `consume`, CONSUMED reservations
+/// ARE the active Instances, so this equals the spec's
 /// `budget - (active Instances + live reservations)` (§9.3). Uses sqlite's JSON1.
 fn live_usage(
     tx: &rusqlite::Transaction,
@@ -199,9 +250,28 @@ fn live_usage(
             COALESCE(SUM(json_extract(resources_json,'$.mem_mb')),0),
             COALESCE(SUM(json_extract(resources_json,'$.disk_gb')),0),
             COALESCE(SUM(json_extract(ports_json,'$.count')),0)
-         FROM reservation
-         WHERE (state='CONSUMED' OR (state='HELD' AND expires_at > ?1))
-           AND order_id <> ?2",
+         FROM reservation r
+         WHERE (
+             r.state='CONSUMED'
+             OR (
+               r.state='HELD'
+               AND (
+                 r.expires_at > ?1
+                 OR EXISTS (
+                   SELECT 1 FROM invoice i
+                   WHERE i.subscription_id = r.order_id
+                     AND i.kind='order'
+                     AND i.status='PAID'
+                 )
+                 OR EXISTS (
+                   SELECT 1 FROM subscription s
+                   WHERE s.id = r.order_id
+                     AND s.state='PROVISIONING'
+                 )
+               )
+             )
+           )
+           AND r.order_id <> ?2",
         rusqlite::params![now, exclude_order_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )
@@ -323,6 +393,30 @@ mod tests {
         );
     }
 
+    // A paid order's hold is consumed through provisioning even if its TTL has passed: consume only
+    // runs post-payment, so a slow hook / restart must not turn the hold into a spurious refund
+    // (codex P2). The TTL only GCs *unpaid* holds (see `expired_held_reservation_frees_the_slot`).
+    #[tokio::test]
+    async fn consume_honors_a_paid_hold_past_its_ttl() {
+        let s = mem_store();
+        reserve(&s, "r1", "o1", req_one(), budget_one(), 100, 0)
+            .await
+            .unwrap();
+        // now=101 is past the TTL of 100, yet the (paid) hold is still consumed.
+        consume(&s, "o1", 101).await.unwrap();
+        let state: String = s
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT state FROM reservation WHERE order_id='o1'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "CONSUMED");
+    }
+
     // A re-reserve of the SAME order on a host the order already fills must stay Reserved — it
     // must not count its own hold and reject itself as CapacityFull (codex re-review).
     #[tokio::test]
@@ -428,6 +522,39 @@ mod tests {
                 .await
                 .unwrap(),
             Reserve::Reserved
+        );
+    }
+
+    #[tokio::test]
+    async fn paid_held_reservation_counts_even_after_ttl() {
+        let s = mem_store();
+        assert_eq!(
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 100, 0)
+                .await
+                .unwrap(),
+            Reserve::Reserved
+        );
+        s.transaction(|tx| {
+            tx.execute(
+                "INSERT INTO subscription (id, state) VALUES ('o1', 'PROVISIONING')",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO invoice (id, subscription_id, external_id, kind, status)
+                 VALUES ('i1', 'o1', 'order:o1', 'order', 'PAID')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reserve(&s, "r2", "o2", req_one(), budget_one(), 300, 150)
+                .await
+                .unwrap(),
+            Reserve::CapacityFull,
+            "a paid order keeps its HELD capacity while provisioning catches up"
         );
     }
 

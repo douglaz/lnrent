@@ -9,6 +9,7 @@ pub mod identity;
 pub mod ipc;
 pub mod nostr_engine;
 pub mod order_intake;
+pub mod provision;
 pub mod recipe;
 pub mod reservation;
 pub mod runner;
