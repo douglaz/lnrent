@@ -1440,21 +1440,11 @@ fn reject_unsafe_components(dir: &Path) -> Result<(), IpcError> {
                     mode & 0o7777
                 )));
             }
-            Some(DirHazard::UntrustedSharedOwner) => {
-                return Err(config_err(format!(
-                    "data dir component {} is a group/world-writable directory owned by uid {} \
-                     instead of the operator uid {} or root; refusing to bootstrap through an \
-                     untrusted shared directory (its owner could redirect the operator seed / config)",
-                    component.display(),
-                    meta.uid(),
-                    current_euid()
-                )));
-            }
             Some(DirHazard::ForeignOwnerWritableComponent) => {
                 return Err(config_err(format!(
-                    "data dir component {} is owner-writable and owned by uid {} instead of \
-                     the operator uid {} or root; refusing to bootstrap through a foreign-owned \
-                     writable directory (its owner could redirect the operator seed / config)",
+                    "data dir component {} is owned by uid {} instead of the operator uid {} or \
+                     root; refusing to bootstrap through a foreign-owned directory (its owner could \
+                     re-chmod it and redirect the operator seed / config)",
                     component.display(),
                     meta.uid(),
                     current_euid()
@@ -1472,11 +1462,8 @@ enum DirHazard {
     /// A group/world-writable, NON-sticky intermediate ancestor: another user can redirect the dirs
     /// we create beneath it.
     WritableNonStickyAncestor,
-    /// A group/world-writable (shared) directory owned by neither root nor the operator: its owner
-    /// can rename/replace entries even under the sticky bit.
-    UntrustedSharedOwner,
-    /// A directory owned by neither root nor the operator while its owner has write permission:
-    /// that owner can rename/replace child entries even when group/world permissions are closed.
+    /// A directory owned by neither root nor the operator (nor the overflow sentinel): its owner can
+    /// re-chmod and rename/replace child entries at any time, so it is rejected regardless of mode.
     ForeignOwnerWritableComponent,
 }
 
@@ -1485,30 +1472,28 @@ enum DirHazard {
 /// more strictly by [`reject_unsafe_preexisting_dir`]; here it only suppresses the intermediate
 /// writable-ancestor check. Returns the hazard, or `None` when safe.
 ///
-/// A foreign-owned directory with its owner-write bit set is unsafe even when group/world
-/// permissions are closed: that owner can rename/replace the next component, or secret files when
-/// the component is the leaf. Exceptions, via [`existing_dir_owner_is_safe_for_euid`]: a component
-/// owned by root, by the operator, or by the unmappable overflow uid (the root-squash / userns
-/// sentinel) is trusted — the last keeps a root-squashed `0755` `/` usable. A foreign-owned component
-/// with no write bits is allowed regardless.
+/// A foreign-owned directory is unsafe **regardless of its current mode**: the owner controls the
+/// inode and can re-`chmod` it at any time to add write bits and then rename/replace the next
+/// component (or the secret files when it is the leaf), so the current bits are not a durable
+/// guarantee (codex confirmation P2). Exceptions, via [`existing_dir_owner_is_safe_for_euid`]: a
+/// component owned by root, by the operator, or by the unmappable overflow uid (the root-squash /
+/// userns sentinel) is trusted — the last keeps a root-squashed `0755` `/` usable.
 fn dir_component_hazard(owner_uid: u32, mode: u32, euid: u32, is_leaf: bool) -> Option<DirHazard> {
     // 0o022 = group/other-writable; 0o1000 = sticky.
     let writable_by_others = mode & 0o022 != 0;
-    let owner_writable = mode & 0o200 != 0;
     let sticky = mode & 0o1000 != 0;
-    if owner_writable && !existing_dir_owner_is_safe_for_euid(owner_uid, euid) {
+    // Reject any REAL foreign-owned component up front, write bits or not — a non-writable mode now
+    // does not stop its owner re-opening it later.
+    if !existing_dir_owner_is_safe_for_euid(owner_uid, euid) {
         return Some(DirHazard::ForeignOwnerWritableComponent);
     }
+    // From here the owner is trusted (euid / root / overflow). A trusted-owner but world-writable
+    // ancestor still lets OTHER users stage a swap unless the sticky bit protects it.
     if !writable_by_others {
         return None;
     }
     if !is_leaf && !sticky {
         return Some(DirHazard::WritableNonStickyAncestor);
-    }
-    // A shared (writable) dir: its owner can rename/replace our entries even under the sticky bit,
-    // so trust it only when root or the operator owns it.
-    if !existing_dir_owner_is_safe_for_euid(owner_uid, euid) {
-        return Some(DirHazard::UntrustedSharedOwner);
     }
     None
 }
@@ -3651,11 +3636,17 @@ mod tests {
         let foreign = 4242;
         assert_ne!(foreign, overflow_uid());
 
-        // Read-only ancestor owned by a foreign uid: safe regardless of owner.
-        assert_eq!(dir_component_hazard(foreign, 0o555, euid, false), None);
-        // ...the same as a leaf component.
-        assert_eq!(dir_component_hazard(foreign, 0o555, euid, true), None);
-        // But a foreign-owned 0755 component is unsafe: its owner can redirect child entries.
+        // A foreign-owned component is rejected REGARDLESS of its current mode — even a read-only
+        // 0o555 — because its owner can re-chmod it later and redirect child entries (codex P2).
+        assert_eq!(
+            dir_component_hazard(foreign, 0o555, euid, false),
+            Some(DirHazard::ForeignOwnerWritableComponent)
+        );
+        assert_eq!(
+            dir_component_hazard(foreign, 0o555, euid, true),
+            Some(DirHazard::ForeignOwnerWritableComponent)
+        );
+        // A foreign-owned 0755 component is likewise unsafe: its owner can redirect child entries.
         assert_eq!(
             dir_component_hazard(foreign, 0o755, euid, false),
             Some(DirHazard::ForeignOwnerWritableComponent)

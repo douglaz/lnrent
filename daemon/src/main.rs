@@ -214,7 +214,12 @@ fn emit_bootstrap_error(err: &IpcError, json: bool) -> ExitCode {
             })
         );
     } else {
-        eprintln!("lnrentd bootstrap: {} ({})", err.message, err.code);
+        eprintln!(
+            "lnrentd bootstrap: {} ({}{})",
+            err.message,
+            err.code,
+            if err.retryable { ", retryable" } else { "" }
+        );
     }
     ExitCode::from(config::exit_code(&err.code))
 }
