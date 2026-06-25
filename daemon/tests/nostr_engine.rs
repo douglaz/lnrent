@@ -10,7 +10,8 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use nostr_relay_builder::MockRelay;
+use nostr_relay_builder::builder::RateLimit;
+use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
 use nostr_sdk::prelude::*;
 use tokio::time::timeout;
 
@@ -22,8 +23,9 @@ use lnrentd::nostr_engine::{listing_from_recipe, NostrEngine, OpHandler, OrderHa
 use lnrentd::recipe::Recipe;
 use lnrentd::store::Store;
 
-/// A 10s ceiling on every relay round-trip so a wiring bug fails the test instead of hanging.
-const DEADLINE: Duration = Duration::from_secs(10);
+/// A 20s ceiling on every relay round-trip so a wiring bug fails the test instead of hanging.
+const DEADLINE: Duration = Duration::from_secs(20);
+static HEAVY_RELAY_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn dummy_recipe() -> Recipe {
     let dir = format!("{}/../recipes/dummy", env!("CARGO_MANIFEST_DIR"));
@@ -50,6 +52,30 @@ async fn mock_relay() -> MockRelay {
         }
     }
     panic!("local relay failed after retries: {}", last_err.unwrap());
+}
+
+async fn high_throughput_relay() -> (LocalRelay, String) {
+    let mut last_err = None;
+    for _ in 0..10 {
+        let relay = LocalRelay::new(RelayBuilder::default().rate_limit(RateLimit {
+            max_reqs: 2_000,
+            notes_per_minute: 1_000_000,
+        }));
+        match relay.run().await {
+            Ok(()) => {
+                let url = relay.url().await.to_string();
+                return (relay, url);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    panic!(
+        "local high-throughput relay failed after retries: {}",
+        last_err.unwrap()
+    );
 }
 
 fn temp_db_path(name: &str) -> std::path::PathBuf {
@@ -327,6 +353,105 @@ async fn order_request_invoice_ready_round_trips_over_nip17() {
         1,
         "the order handler ran once for one request"
     );
+}
+
+#[tokio::test]
+async fn inbound_startup_backfill_pages_past_relay_limit_to_old_valid_wrap() {
+    const GARBAGE: usize = 600;
+    const RELAY_DEFAULT_FILTER_LIMIT: usize = 500;
+
+    let _heavy = HEAVY_RELAY_TEST.lock().await;
+    let (_relay, url) = high_throughput_relay().await;
+
+    let op_keys = Keys::generate();
+    let buyer_keys = Keys::generate();
+    let engine = NostrEngine::connect(op_keys.clone(), std::slice::from_ref(&url), store().await)
+        .await
+        .expect("operator engine connects");
+    let buyer = buyer_client(&url, buyer_keys.clone()).await;
+
+    let order = Msg::OrderRequest(OrderRequest {
+        id: "startup-buried-valid-order".into(),
+        listing_id: format!("30402:{}:dummy-1", op_keys.public_key().to_hex()),
+        params: serde_json::json!({}),
+        refund_dest: None,
+    });
+    let valid = gift_wrap(&buyer_keys, &op_keys.public_key(), &order)
+        .await
+        .expect("gift-wrap the valid order.request");
+    buyer
+        .send_event(&valid)
+        .await
+        .expect("buyer publishes the valid order.request");
+
+    let garbage_signer = Keys::generate();
+    let garbage_created_at = valid.created_at + 1;
+    for i in 0..GARBAGE {
+        let wrap = EventBuilder::new(Kind::GiftWrap, format!("garbage-not-a-nip44-payload-{i}"))
+            .tag(Tag::public_key(op_keys.public_key()))
+            .custom_created_at(garbage_created_at)
+            .sign_with_keys(&garbage_signer)
+            .expect("sign garbage gift wrap");
+        let output = buyer
+            .send_event(&wrap)
+            .await
+            .expect("buyer publishes garbage gift wrap");
+        assert!(
+            !output.success.is_empty(),
+            "garbage wrap {i} was not accepted by the relay: {:?}",
+            output.failed
+        );
+    }
+
+    let retained = buyer
+        .fetch_events(
+            Filter::new()
+                .kind(Kind::GiftWrap)
+                .pubkey(op_keys.public_key())
+                .limit(GARBAGE * 2),
+            DEADLINE,
+        )
+        .await
+        .expect("count retained inbound wraps");
+    assert!(
+        retained.len() > RELAY_DEFAULT_FILTER_LIMIT,
+        "test setup must retain more than the relay default limit"
+    );
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let order_handler: Arc<dyn OrderHandler> = Arc::new(CountingOrderHandler {
+        calls: Arc::clone(&calls),
+        fail: false,
+    });
+    let op_handler: Arc<dyn OpHandler> = Arc::new(StubOpHandler {
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+
+    let inbound = engine.clone();
+    let handle = tokio::spawn(async move {
+        let _ = inbound.run_inbound(order_handler, op_handler).await;
+    });
+
+    timeout(DEADLINE, async {
+        loop {
+            if calls.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("startup paged backfill routed the old valid wrap buried behind > limit garbage");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "exactly the buried valid wrap routes; same-timestamp garbage is ignored"
+    );
+
+    handle.abort();
+    let _ = handle.await;
 }
 
 // Acceptance: a duplicate inbound DM (same outer event id) is processed EXACTLY once — and the

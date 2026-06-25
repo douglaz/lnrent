@@ -64,6 +64,32 @@ const INBOUND_SUB_ID: &str = "lnrent-inbound";
 /// hide a valid copy behind a malformed same-id copy from another relay.
 const INBOUND_BACKFILL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the same-timestamp overflow fallback waits for a relay to answer the initial
+/// negentropy handshake. Unsupported relays should fall back quickly to the plain timestamp walk.
+const INBOUND_BACKFILL_NEGENTROPY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Page size for the lag/restart inbound backfill REQ. A NIP-17 gift wrap's `created_at` is
+/// randomized (§5.1) so the backfill cannot key a `since` cursor on it; instead it pages the
+/// retained set newest→oldest with an explicit `limit` and a backward `until` cursor. Relays
+/// clamp an ABSENT limit (the in-process `nostr-relay-builder` relay defaults to 500), so a single
+/// unpaged fetch would let an attacker bury an older RETAINED money-path DM behind more than this
+/// many newer `#p` gift-wrap garbage events — a permanently-lost order/op DM. Paging with an
+/// explicit limit and a backward cursor walks past that garbage; the durable `seen_message` dedupe
+/// makes the per-page boundary overlap cheap to re-decrypt.
+const INBOUND_BACKFILL_PAGE_LIMIT: usize = 500;
+
+/// Exact-id chunk size used only after negentropy identifies a same-timestamp overflow that cannot
+/// be paged with a plain `until` cursor. Keep this below common relay max limits so exact-id fetches
+/// are not clamped.
+const INBOUND_BACKFILL_ID_CHUNK_LIMIT: usize = 100;
+
+/// Upper bound on backfill pages PER RELAY so the paged backfill still terminates against a relay
+/// that returns an unbounded stream of full pages (e.g. an attacker minting `#p` gift-wrap garbage
+/// faster than we page). [`INBOUND_BACKFILL_PAGE_LIMIT`] events per page × this cap is far above any
+/// realistic retained set (bounded by [`SEEN_MESSAGE_RETENTION_SECS`]), so a legitimate backlog is
+/// never truncated; hitting the cap is logged, never silent.
+const INBOUND_BACKFILL_MAX_PAGES: usize = 256;
+
 /// Upper bound on inbound gift wraps decoded + routed concurrently. The inbound loop acquires a
 /// permit before spawning a per-wrap task, so a startup backfill — or a flood of attacker-minted
 /// kind-1059 wraps (the `#p` recipient tag is public, the signer ephemeral) — applies backpressure:
@@ -226,6 +252,27 @@ impl NostrEngine {
         // resubscribe below is only logged because by then the loop is already running and the next
         // lag (or relay reconnect) re-triggers it.
         self.subscribe_inbound_with_retry().await?;
+        // A live subscription replay can be clamped by the relay's default limit because the
+        // long-lived REQ intentionally carries no limit, so run the explicit paged retained-set
+        // fetch on startup too. SPAWN it rather than await it: the paged backfill can walk up to
+        // [`INBOUND_BACKFILL_MAX_PAGES`] sequential pages per relay against a large or adversarial
+        // retained set, and awaiting it here would block entering the live recv loop — silencing
+        // fresh DM routing behind that fetch. The CLOSED-recovery path already spawns its backfill
+        // for exactly this reason, and the in-flight + durable seen-message dedupe collapses the
+        // overlap between this backfill and the live subscription replay.
+        {
+            let engine = self.clone();
+            let order = Arc::clone(&order);
+            let op = Arc::clone(&op);
+            tokio::spawn(async move {
+                if let Err(e) = engine.fetch_inbound_backlog(order, op).await {
+                    tracing::error!(
+                        error = %e,
+                        "failed to fetch inbound backlog after initial subscribe"
+                    );
+                }
+            });
+        }
         loop {
             match notifications.recv().await {
                 Ok(RelayPoolNotification::Message { relay_url, message }) => match message {
@@ -236,6 +283,11 @@ impl NostrEngine {
                         subscription_id,
                         event,
                     } if subscription_id.as_ref().as_str() == INBOUND_SUB_ID => {
+                        // An EVENT under our sub id proves this relay's inbound subscription is live
+                        // again, so reset its CLOSED-resubscribe backoff (a recovered relay must
+                        // return to fast retry, not stay pinned at the max backoff from old
+                        // transient closures).
+                        reset_closed_resubscribe(&closed_resubscriptions, &relay_url);
                         self.queue_inbound_event(
                             event.into_owned(),
                             Arc::clone(&order),
@@ -267,19 +319,58 @@ impl NostrEngine {
                             );
                             let engine = self.clone();
                             let closed_resubscriptions = Arc::clone(&closed_resubscriptions);
+                            let order = Arc::clone(&order);
+                            let op = Arc::clone(&op);
                             tokio::spawn(async move {
-                                tokio::time::sleep(backoff).await;
-                                if let Err(e) = engine
-                                    .subscribe_inbound_to_with_retry(relay_url.clone())
-                                    .await
-                                {
-                                    tracing::error!(
-                                        relay = %relay_url,
-                                        error = %e,
-                                        "failed to resubscribe relay after inbound CLOSED"
-                                    );
+                                let mut backoff = backoff;
+                                loop {
+                                    tokio::time::sleep(backoff).await;
+                                    let recovered = match engine
+                                        .subscribe_inbound_to_with_retry(relay_url.clone())
+                                        .await
+                                    {
+                                        Ok(()) => {
+                                            if let Err(e) = engine
+                                                .fetch_inbound_backlog_from_url(
+                                                    relay_url.clone(),
+                                                    Arc::clone(&order),
+                                                    Arc::clone(&op),
+                                                )
+                                                .await
+                                            {
+                                                tracing::error!(
+                                                    relay = %relay_url,
+                                                    error = %e,
+                                                    "failed to fetch inbound backlog after CLOSED recovery"
+                                                );
+                                            }
+                                            true
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                relay = %relay_url,
+                                                error = %e,
+                                                "failed to resubscribe relay after inbound CLOSED"
+                                            );
+                                            false
+                                        }
+                                    };
+
+                                    if let Some(next_backoff) = finish_closed_resubscribe(
+                                        &closed_resubscriptions,
+                                        &relay_url,
+                                        recovered,
+                                    ) {
+                                        tracing::warn!(
+                                            relay = %relay_url,
+                                            backoff_ms = next_backoff.as_millis(),
+                                            "relay closed inbound subscription during pending recovery; scheduling another retry"
+                                        );
+                                        backoff = next_backoff;
+                                    } else {
+                                        break;
+                                    }
                                 }
-                                finish_closed_resubscribe(&closed_resubscriptions, &relay_url);
                             });
                         } else {
                             tracing::debug!(
@@ -289,7 +380,16 @@ impl NostrEngine {
                             );
                         }
                     }
-                    // Every other relay message (EOSE, OK, NOTICE, AUTH, COUNT, messages for other
+                    // EOSE for our REQ confirms the relay accepted the (re)subscription and finished
+                    // replaying its retained set — the subscription is healthy — so reset the
+                    // per-relay CLOSED-resubscribe backoff (same recovery signal as a live EVENT,
+                    // and it fires even when the retained set is empty so there is no EVENT to ride).
+                    RelayMessage::EndOfStoredEvents(subscription_id)
+                        if subscription_id.as_ref().as_str() == INBOUND_SUB_ID =>
+                    {
+                        reset_closed_resubscribe(&closed_resubscriptions, &relay_url);
+                    }
+                    // Every other relay message (OK, NOTICE, AUTH, COUNT, messages for other
                     // subscription ids, …) is irrelevant to inbound DM routing.
                     _ => {}
                 },
@@ -313,15 +413,17 @@ impl NostrEngine {
                         skipped,
                         "inbound notification stream lagged; fetching retained inbound DMs"
                     );
-                    if let Err(e) = self
-                        .fetch_inbound_backlog(Arc::clone(&order), Arc::clone(&op))
-                        .await
-                    {
-                        tracing::error!(error = %e, "failed to fetch inbound backlog after lag");
-                    }
-                    if let Err(e) = self.subscribe_inbound_with_retry().await {
-                        tracing::error!(error = %e, "failed to resubscribe after inbound lag");
-                    }
+                    let engine = self.clone();
+                    let order = Arc::clone(&order);
+                    let op = Arc::clone(&op);
+                    tokio::spawn(async move {
+                        if let Err(e) = engine.fetch_inbound_backlog(order, op).await {
+                            tracing::error!(error = %e, "failed to fetch inbound backlog after lag");
+                        }
+                        if let Err(e) = engine.subscribe_inbound_with_retry().await {
+                            tracing::error!(error = %e, "failed to resubscribe after inbound lag");
+                        }
+                    });
                 }
             }
         }
@@ -476,8 +578,23 @@ impl NostrEngine {
         order: Arc<dyn OrderHandler>,
         op: Arc<dyn OpHandler>,
     ) -> Result<()> {
-        // The subscription already filters to kind 1059, but guard before decoding.
-        if event.kind != Kind::GiftWrap {
+        // Re-enforce the operator's inbound filter on the RAW relay-message path before any
+        // verify/decrypt work. The REQ already filters to kind 1059 tagged to the operator, but a
+        // malicious or noncompliant relay can push arbitrary events under our subscription id; an
+        // unchecked kind-1059 without our `#p` tag would force needless signature-verify + NIP-44
+        // decrypt. Match the same [`inbound_filter`](Self::inbound_filter) (kind 1059 AND a `p` tag
+        // equal to the operator pubkey) so the engine enforces its own filter boundary. (`#p` is
+        // public, so this is not full DoS defense — it just keeps the engine honest about what it
+        // accepts under its subscription.)
+        if !self
+            .inbound_filter()
+            .match_event(&event, MatchEventOptions::new())
+        {
+            tracing::debug!(
+                event_id = %event.id,
+                kind = %event.kind,
+                "dropping inbound event that does not match the operator inbound filter"
+            );
             return Ok(());
         }
         // Backpressure: block until a concurrency slot frees BEFORE spawning, so a relay backfill
@@ -546,32 +663,238 @@ impl NostrEngine {
         Ok(())
     }
 
+    async fn fetch_inbound_backlog_from_url(
+        &self,
+        relay_url: RelayUrl,
+        order: Arc<dyn OrderHandler>,
+        op: Arc<dyn OpHandler>,
+    ) -> Result<usize> {
+        let mut relays = self.client.relays().await;
+        let relay = relays.remove(&relay_url).with_context(|| {
+            format!("streaming retained inbound DMs from {relay_url}: relay not configured")
+        })?;
+        self.fetch_inbound_backlog_from_relay(relay_url, relay, self.inbound_filter(), order, op)
+            .await
+    }
+
     async fn fetch_inbound_backlog_from_relay(
         &self,
         relay_url: RelayUrl,
         relay: Relay,
-        filter: Filter,
+        base_filter: Filter,
         order: Arc<dyn OrderHandler>,
         op: Arc<dyn OpHandler>,
     ) -> Result<usize> {
-        let mut events = relay
-            .stream_events(filter, INBOUND_BACKFILL_TIMEOUT, ReqExitPolicy::ExitOnEOSE)
-            .await
-            .with_context(|| format!("streaming retained inbound DMs from {relay_url}"))?;
+        // Page the retained set newest→oldest with an explicit page limit and a backward `until`
+        // cursor. A NIP-17 gift wrap's `created_at` is randomized (§5.1), so the backfill cannot key
+        // a `since` cursor on it; it walks `until` backward instead, deduping the inclusive
+        // page-boundary overlap by event id (the durable `seen_message` row still covers anything a
+        // prior run handled).
+        //
+        // Termination must NOT assume "a page shorter than the REQUESTED limit ⇒ exhausted". A relay
+        // clamps a requested limit to its own maximum (NIP-11 `max_limit`, or the in-process relay's
+        // `max_filter_limit`), which is not portably readable and a noncompliant relay need not
+        // advertise. If the walk stopped on `page_items < INBOUND_BACKFILL_PAGE_LIMIT`, a relay that
+        // clamps below that limit would make EVERY page look short and the walk would stop after the
+        // newest page — letting an attacker bury an older RETAINED money-path DM behind clamp-many
+        // newer `#p` garbage events (a permanently-lost order/op DM). Instead we keep walking while
+        // the `until` cursor advances to a strictly-older second, and stop only when it STALLS on a
+        // single `created_at` second. At a stall, timestamp paging cannot cross that second, so we
+        // tell a benign short tail apart from a same-second overflow by whether the stalled page is
+        // as full as the LARGEST page the relay has handed us (its OBSERVED clamp — not our request):
+        // a full pinned page may be hiding more same-second events behind the clamp, so reconcile
+        // exact ids via negentropy; a short pinned page is the whole tail at that second, so stop.
+        // `INBOUND_BACKFILL_MAX_PAGES` bounds the walk against an infinite relay.
+        let mut until: Option<Timestamp> = None;
+        let mut seen_ids: HashSet<EventId> = HashSet::new();
+        // The (id, created_at) of every wrap queued this backfill — handed to the negentropy
+        // reconciliation as OUR local set (see [`fetch_inbound_backlog_via_negentropy`]).
+        let mut local_items: Vec<(EventId, Timestamp)> = Vec::new();
+        // The largest page the relay has actually returned, i.e. its observed clamp. Compared
+        // against a stalled page's size to tell a benign exhausted tail from a same-second overflow.
+        let mut observed_page_limit = 0usize;
         let mut count = 0usize;
-        while let Some(event) = events.next().await {
-            match event {
-                Ok(event) => {
-                    self.queue_inbound_event(event, Arc::clone(&order), Arc::clone(&op))
-                        .await?;
-                    count += 1;
+        for page in 0..INBOUND_BACKFILL_MAX_PAGES {
+            let mut filter = base_filter.clone().limit(INBOUND_BACKFILL_PAGE_LIMIT);
+            if let Some(until) = until {
+                filter = filter.until(until);
+            }
+            let mut events = relay
+                .stream_events(filter, INBOUND_BACKFILL_TIMEOUT, ReqExitPolicy::ExitOnEOSE)
+                .await
+                .with_context(|| format!("streaming retained inbound DMs from {relay_url}"))?;
+
+            let mut page_items = 0usize;
+            let mut oldest: Option<Timestamp> = None;
+            while let Some(event) = events.next().await {
+                page_items += 1;
+                match event {
+                    Ok(event) => {
+                        oldest = Some(oldest.map_or(event.created_at, |t| t.min(event.created_at)));
+                        // Dedup the deliberate cursor overlap (and any relay-side duplicate) by id so
+                        // the same wrap isn't re-queued across pages; the durable `seen_message`
+                        // dedupe still covers wraps a prior backfill/run already handled.
+                        if seen_ids.insert(event.id) {
+                            local_items.push((event.id, event.created_at));
+                            self.queue_inbound_event(event, Arc::clone(&order), Arc::clone(&op))
+                                .await?;
+                            count += 1;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            relay = %relay_url,
+                            error = %e,
+                            "relay returned an invalid retained inbound DM"
+                        );
+                    }
                 }
+            }
+            observed_page_limit = observed_page_limit.max(page_items);
+
+            // An empty page means the relay has nothing at/below the cursor: the walk is exhausted.
+            if page_items == 0 {
+                return Ok(count);
+            }
+            // A non-empty page with no valid (deserializable) event leaves no timestamp to move the
+            // cursor to; stop rather than re-fetch the identical page forever.
+            let Some(oldest) = oldest else {
+                return Ok(count);
+            };
+
+            // The cursor advanced iff this page reached a strictly-older second than the cursor
+            // (always true on the first, cursor-less page). Keep walking regardless of how short the
+            // page is — the relay may simply be clamping it below our requested limit.
+            let cursor_advanced = match until {
+                Some(until) => oldest < until,
+                None => true,
+            };
+            if cursor_advanced {
+                until = Some(oldest);
+                if page + 1 == INBOUND_BACKFILL_MAX_PAGES {
+                    tracing::warn!(
+                        relay = %relay_url,
+                        pages = INBOUND_BACKFILL_MAX_PAGES,
+                        queued = count,
+                        "inbound backfill hit the per-relay page cap; stopping (retained set exceeds cap)"
+                    );
+                }
+                continue;
+            }
+
+            // Cursor stalled: every event in this page shares `oldest == until`, so timestamp paging
+            // cannot move past this second. A page SHORTER than the observed clamp is the relay's
+            // whole (short) tail at this second → exhausted.
+            if page_items < observed_page_limit {
+                return Ok(count);
+            }
+            // A FULL pinned page may be hiding more same-second events behind the relay's clamp (the
+            // buried-money-DM attack), so reconcile the exact missing ids via negentropy.
+            tracing::warn!(
+                relay = %relay_url,
+                queued = count,
+                timestamp = %oldest,
+                "inbound backfill cursor stalled on a single timestamp; reconciling exact ids"
+            );
+            match self
+                .fetch_inbound_backlog_via_negentropy(
+                    &relay_url,
+                    &relay,
+                    base_filter.clone(),
+                    &local_items,
+                    Arc::clone(&order),
+                    Arc::clone(&op),
+                )
+                .await
+            {
+                Ok(n) => count += n,
                 Err(e) => {
+                    // Negentropy is a best-effort enhancement for same-second overflow; a relay that
+                    // does not support it (or times out the handshake) must not discard the events we
+                    // already paged. Log and return what we queued rather than failing the backfill.
                     tracing::warn!(
                         relay = %relay_url,
                         error = %e,
-                        "relay returned an invalid retained inbound DM"
+                        queued = count,
+                        timestamp = %oldest,
+                        "same-timestamp inbound backfill reconciliation failed; returning paged events"
                     );
+                }
+            }
+            return Ok(count);
+        }
+        Ok(count)
+    }
+
+    async fn fetch_inbound_backlog_via_negentropy(
+        &self,
+        relay_url: &RelayUrl,
+        relay: &Relay,
+        filter: Filter,
+        local_items: &[(EventId, Timestamp)],
+        order: Arc<dyn OrderHandler>,
+        op: Arc<dyn OpHandler>,
+    ) -> Result<usize> {
+        // Use negentropy only as an ID reconciliation step. Letting the SDK perform the "down"
+        // fetch internally makes the backfill depend on that helper's subscription bookkeeping; by
+        // running it as a dry run and doing our own exact-id fetches below, the transport keeps the
+        // same bounded chunking and queue/dedupe path as ordinary backfill pages.
+        //
+        // Seed reconciliation with OUR queued `(id, created_at)` set (`local_items`), NOT the SDK
+        // client's event cache. `relay.sync` derives the local set from `database().negentropy_items`
+        // — the client database — which can already hold a wrap the live subscription saved but this
+        // engine lagged on and never routed. Such a wrap would then be absent from `remote` and never
+        // re-fetched: a permanently-lost money-path DM. `sync_with_items` makes `remote` exactly the
+        // relay's retained set minus what we have queued, independent of the client cache.
+        let opts = SyncOptions::new()
+            .initial_timeout(INBOUND_BACKFILL_NEGENTROPY_TIMEOUT)
+            .direction(SyncDirection::Down)
+            .dry_run();
+        let id_filter = filter.clone();
+        let reconciliation = relay
+            .sync_with_items(filter, local_items.to_vec(), &opts)
+            .await
+            .with_context(|| {
+                format!("negentropy reconciling retained inbound DMs from {relay_url}")
+            })?;
+
+        if reconciliation.remote.is_empty() {
+            return Ok(0);
+        }
+
+        // Dedup the exact-id fetches against what paging already queued (the `local_items` ids),
+        // so an event the relay also returned via the timestamp walk isn't re-queued here. Owned by
+        // this step rather than threaded in from the caller — the caller returns immediately after.
+        let mut seen_ids: HashSet<EventId> = local_items.iter().map(|&(id, _)| id).collect();
+        let mut count = 0usize;
+        let ids: Vec<EventId> = reconciliation.remote.into_iter().collect();
+        for chunk in ids.chunks(INBOUND_BACKFILL_ID_CHUNK_LIMIT) {
+            let mut events = relay
+                .stream_events(
+                    id_filter.clone().ids(chunk.iter().copied()),
+                    INBOUND_BACKFILL_TIMEOUT,
+                    ReqExitPolicy::ExitOnEOSE,
+                )
+                .await
+                .with_context(|| {
+                    format!("fetching exact retained inbound DM ids from {relay_url}")
+                })?;
+            while let Some(event) = events.next().await {
+                match event {
+                    Ok(event) => {
+                        if seen_ids.insert(event.id) {
+                            self.queue_inbound_event(event, Arc::clone(&order), Arc::clone(&op))
+                                .await?;
+                            count += 1;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            relay = %relay_url,
+                            error = %e,
+                            "relay returned an invalid exact-id retained inbound DM"
+                        );
+                    }
                 }
             }
         }
@@ -723,6 +1046,7 @@ type ClosedResubscriptions = Arc<Mutex<HashMap<RelayUrl, ClosedResubscribe>>>;
 struct ClosedResubscribe {
     attempts: u32,
     pending: bool,
+    retry_requested: bool,
 }
 
 fn schedule_closed_resubscribe(
@@ -734,19 +1058,51 @@ fn schedule_closed_resubscribe(
         .expect("closed-resubscribe map mutex poisoned");
     let state = closed.entry(relay_url.clone()).or_default();
     if state.pending {
+        state.retry_requested = true;
         return None;
     }
 
     let delay = inbound_closed_backoff(state.attempts);
     state.attempts = state.attempts.saturating_add(1);
     state.pending = true;
+    state.retry_requested = false;
     Some(delay)
 }
 
-fn finish_closed_resubscribe(closed: &ClosedResubscriptions, relay_url: &RelayUrl) {
+fn finish_closed_resubscribe(
+    closed: &ClosedResubscriptions,
+    relay_url: &RelayUrl,
+    healthy: bool,
+) -> Option<Duration> {
     if let Ok(mut closed) = closed.lock() {
         if let Some(state) = closed.get_mut(relay_url) {
+            if state.retry_requested {
+                state.retry_requested = false;
+                let delay = inbound_closed_backoff(state.attempts);
+                state.attempts = state.attempts.saturating_add(1);
+                state.pending = true;
+                return Some(delay);
+            }
             state.pending = false;
+            if healthy {
+                state.attempts = 0;
+            }
+        }
+    }
+    None
+}
+
+/// Reset a relay's CLOSED-resubscribe backoff after its inbound subscription proves healthy again
+/// (an EVENT or EOSE under [`INBOUND_SUB_ID`]). [`finish_closed_resubscribe`] only clears the
+/// in-flight `pending` flag, so without this a relay that recovered from old transient closures
+/// would stay pinned at [`INBOUND_CLOSED_MAX_BACKOFF`] forever; zeroing `attempts` returns it to
+/// fast retry on the next closure. The `pending` flag is left untouched so an in-flight resubscribe
+/// task still clears it on completion. A no-op for a relay that never closed (no map entry).
+fn reset_closed_resubscribe(closed: &ClosedResubscriptions, relay_url: &RelayUrl) {
+    if let Ok(mut closed) = closed.lock() {
+        if let Some(state) = closed.get_mut(relay_url) {
+            state.attempts = 0;
+            state.retry_requested = false;
         }
     }
 }
@@ -924,11 +1280,13 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use nostr_relay_builder::builder::{PolicyResult, QueryPolicy};
+    use nostr_relay_builder::builder::{PolicyResult, QueryPolicy, RateLimit};
     use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
+    use nostr_sdk::nostr::nips::nip44;
     use tokio::time::timeout;
 
     const TEST_DEADLINE: Duration = Duration::from_secs(10);
+    static RELAY_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Start a local `MockRelay`, retrying the upstream port race (`nostr-relay-builder` 0.44 picks
     /// a random port, drops its probe listener, then re-binds — a TOCTOU window where a concurrent
@@ -998,6 +1356,103 @@ mod tests {
         );
     }
 
+    /// Start a local relay whose per-connection event rate limit is high enough to accept a large
+    /// retained set in one test. The default `nostr-relay-builder` limit is 60 notes/minute, which
+    /// silently drops most of a > 500-event publish as `OK: false` (and `send_event` does not raise
+    /// that as an error) — so without this the paged-backfill test would never retain more than one
+    /// page. Retries the same upstream port race as [`mock_relay`].
+    async fn high_throughput_relay() -> (LocalRelay, String) {
+        let mut last_err = None;
+        for _ in 0..10 {
+            let relay = LocalRelay::new(RelayBuilder::default().rate_limit(RateLimit {
+                max_reqs: 500,
+                notes_per_minute: 1_000_000,
+            }));
+            match relay.run().await {
+                Ok(()) => {
+                    let url = relay.url().await.to_string();
+                    return (relay, url);
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        panic!(
+            "local high-throughput relay failed after retries: {}",
+            last_err.unwrap()
+        );
+    }
+
+    /// Start a local relay that CLAMPS any requested filter limit down to `max_filter_limit` (the
+    /// load-shedding public relay whose NIP-11 `max_limit` is below the backfill page size) while
+    /// still accepting a large retained set. The default `nostr-relay-builder` relay leaves
+    /// `max_filter_limit` unset, so it honors our `limit(INBOUND_BACKFILL_PAGE_LIMIT)` and the
+    /// clamped-walk path never triggers — this helper forces the clamp. Retries the same upstream
+    /// port race as [`mock_relay`].
+    async fn clamped_relay(max_filter_limit: usize) -> (LocalRelay, String) {
+        let mut last_err = None;
+        for _ in 0..10 {
+            let relay = LocalRelay::new(
+                RelayBuilder::default()
+                    .max_filter_limit(max_filter_limit)
+                    .rate_limit(RateLimit {
+                        max_reqs: 500,
+                        notes_per_minute: 1_000_000,
+                    }),
+            );
+            match relay.run().await {
+                Ok(()) => {
+                    let url = relay.url().await.to_string();
+                    return (relay, url);
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        panic!("local clamped relay failed after retries: {}", last_err.unwrap());
+    }
+
+    async fn buyer_client(url: &str, keys: Keys) -> Client {
+        let client = Client::new(keys);
+        client.add_relay(url).await.expect("buyer add relay");
+        client.connect().await;
+        client.wait_for_connection(TEST_DEADLINE).await;
+        client
+    }
+
+    async fn gift_wrap_at(
+        sender: &Keys,
+        recipient: &PublicKey,
+        msg: &Msg,
+        created_at: Timestamp,
+    ) -> Event {
+        let content = serde_json::to_string(msg).expect("serialize lnrent DM");
+        let rumor = EventBuilder::private_msg_rumor(*recipient, content).build(sender.public_key());
+        let seal = EventBuilder::seal(sender, recipient, rumor)
+            .await
+            .expect("build seal")
+            .sign(sender)
+            .await
+            .expect("sign seal");
+        let wrap_keys = Keys::generate();
+        let content = nip44::encrypt(
+            wrap_keys.secret_key(),
+            recipient,
+            seal.as_json(),
+            nip44::Version::default(),
+        )
+        .expect("encrypt seal");
+        EventBuilder::new(Kind::GiftWrap, content)
+            .tag(Tag::public_key(*recipient))
+            .custom_created_at(created_at)
+            .sign_with_keys(&wrap_keys)
+            .expect("sign gift wrap")
+    }
+
     struct CountingOrderHandler {
         calls: Arc<AtomicUsize>,
     }
@@ -1027,6 +1482,120 @@ mod tests {
         assert!(
             err.to_string().contains("no relays accepted"),
             "unexpected error: {err}"
+        );
+    }
+
+    // P3b (lnrent-7fp.5, codex xhigh): repeated server-side CLOSEDs climb the per-relay backoff, but
+    // a recovered relay must return to fast retry. `finish_closed_resubscribe` only clears `pending`,
+    // so without `reset_closed_resubscribe` a relay with old transient closures stays pinned at the
+    // max backoff forever. An inbound EVENT/EOSE for our subscription resets the attempt counter.
+    #[test]
+    fn inbound_activity_resets_closed_resubscribe_backoff() {
+        let closed: ClosedResubscriptions = Arc::new(Mutex::new(HashMap::new()));
+        let relay = RelayUrl::parse("wss://relay.example").expect("relay url");
+
+        // Three handled closures climb the backoff (each schedule bumps `attempts`, each finish
+        // clears `pending` so the next closure can schedule again).
+        let first = schedule_closed_resubscribe(&closed, &relay).expect("first schedule");
+        finish_closed_resubscribe(&closed, &relay, false);
+        schedule_closed_resubscribe(&closed, &relay).expect("second schedule");
+        finish_closed_resubscribe(&closed, &relay, false);
+        let third = schedule_closed_resubscribe(&closed, &relay).expect("third schedule");
+        finish_closed_resubscribe(&closed, &relay, false);
+        assert!(
+            third > first,
+            "backoff must grow across repeated closures: {third:?} !> {first:?}"
+        );
+
+        // Recovery: an inbound EVENT/EOSE for this relay's subscription resets the attempt counter,
+        // so the next closure backs off from the base again instead of the climbed maximum.
+        reset_closed_resubscribe(&closed, &relay);
+        let after_recovery =
+            schedule_closed_resubscribe(&closed, &relay).expect("schedule after recovery");
+        assert_eq!(
+            after_recovery, first,
+            "a recovered relay returns to the base backoff after EVENT/EOSE"
+        );
+    }
+
+    // Reviewer 1 P2: if another CLOSED arrives while the previous CLOSED recovery task is still
+    // pending, it must not be swallowed. The pending task should schedule one more retry when it
+    // finishes, otherwise the relay can remain unsubscribed forever.
+    #[test]
+    fn closed_during_pending_recovery_schedules_followup_retry() {
+        let closed: ClosedResubscriptions = Arc::new(Mutex::new(HashMap::new()));
+        let relay = RelayUrl::parse("wss://relay.example").expect("relay url");
+
+        let first = schedule_closed_resubscribe(&closed, &relay).expect("first schedule");
+        assert!(
+            schedule_closed_resubscribe(&closed, &relay).is_none(),
+            "a second CLOSED while recovery is pending is coalesced, not spawned immediately"
+        );
+
+        let followup = finish_closed_resubscribe(&closed, &relay, true)
+            .expect("pending CLOSED schedules a follow-up retry");
+        assert!(
+            followup > first,
+            "follow-up retry should continue the backoff sequence: {followup:?} !> {first:?}"
+        );
+
+        assert!(
+            finish_closed_resubscribe(&closed, &relay, true).is_none(),
+            "once the follow-up finishes quietly, no extra retry remains"
+        );
+        let after_quiet =
+            schedule_closed_resubscribe(&closed, &relay).expect("schedule after quiet recovery");
+        assert_eq!(
+            after_quiet, first,
+            "a quiet successful recovery resets future CLOSED retries to the base backoff"
+        );
+    }
+
+    // P3a (lnrent-7fp.5, codex xhigh): the raw relay-message path must enforce the same inbound
+    // filter as the REQ before verify/decrypt work. A malicious relay can send arbitrary kind-1059s
+    // under our subscription id; a wrap tagged to another pubkey must be dropped before it reaches
+    // `process_inbound` (observable here because process_inbound would negative-cache the
+    // undecryptable wrap).
+    #[tokio::test]
+    async fn raw_relay_message_requires_operator_p_tag_before_decode() {
+        let _relay_test = RELAY_TEST.lock().await;
+        let relay = mock_relay().await;
+        let url = relay.url().await.to_string();
+
+        let op_keys = Keys::generate();
+        let buyer_keys = Keys::generate();
+        let stranger_keys = Keys::generate();
+        let store = Store::open_spawn(":memory:").expect("open in-memory store");
+        let engine = NostrEngine::connect(op_keys, std::slice::from_ref(&url), store)
+            .await
+            .expect("operator engine connects");
+
+        let msg = Msg::OrderRequest(lnrent_wire::OrderRequest {
+            id: "wrong-p-tag".into(),
+            listing_id: "30402:op:dummy-1".into(),
+            params: serde_json::json!({}),
+            refund_dest: None,
+        });
+        let wrap = gift_wrap(&buyer_keys, &stranger_keys.public_key(), &msg)
+            .await
+            .expect("gift-wrap to a non-operator recipient");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let order_handler: Arc<dyn OrderHandler> = Arc::new(CountingOrderHandler {
+            calls: Arc::clone(&calls),
+        });
+        let op_handler: Arc<dyn OpHandler> = Arc::new(NoopOpHandler);
+
+        engine
+            .queue_inbound_event(wrap.clone(), order_handler, op_handler)
+            .await
+            .expect("queue wrong-recipient relay event");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            !engine.is_negative_cached(wrap.id),
+            "wrong-#p relay events are dropped before decrypt/negative-cache work"
         );
     }
 
@@ -1095,6 +1664,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_loop_routes_saved_replay_from_raw_relay_message() {
+        let _relay_test = RELAY_TEST.lock().await;
         let relay = mock_relay().await;
         let url = relay.url().await.to_string();
 
@@ -1171,6 +1741,7 @@ mod tests {
     // `seen_message` rows dedupe it, proving the replay is cheap and exactly-once.
     #[tokio::test]
     async fn fetch_inbound_backlog_routes_retained_wraps_then_dedupes_replay() {
+        let _relay_test = RELAY_TEST.lock().await;
         let relay = mock_relay().await;
         let url = relay.url().await.to_string();
 
@@ -1241,6 +1812,252 @@ mod tests {
         );
     }
 
+    // Reviewer 1 P1: a full backfill page pinned to one `created_at` second must not skip the rest
+    // of that second. Timestamp-only pagination cannot advance inside that bucket, so the backfill
+    // falls back to negentropy and exact-id fetches.
+    #[tokio::test]
+    async fn fetch_inbound_backlog_recovers_same_timestamp_overflow_with_exact_ids() {
+        const SAME_SECOND_GARBAGE_BEFORE_VALID: usize = 600;
+        const RELAY_DEFAULT_FILTER_LIMIT: usize = 500;
+        const ROUTE_DEADLINE: Duration = Duration::from_secs(30);
+
+        let _relay_test = RELAY_TEST.lock().await;
+        let (_relay, url) = high_throughput_relay().await;
+
+        let op_keys = Keys::generate();
+        let buyer_keys = Keys::generate();
+        let store = Store::open_spawn(":memory:").expect("open in-memory store");
+        let engine = NostrEngine::connect(op_keys.clone(), std::slice::from_ref(&url), store)
+            .await
+            .expect("operator engine connects");
+        let buyer = buyer_client(&url, buyer_keys.clone()).await;
+
+        let msg = Msg::OrderRequest(lnrent_wire::OrderRequest {
+            id: "same-second-buried-valid-order".into(),
+            listing_id: format!("30402:{}:dummy-1", op_keys.public_key().to_hex()),
+            params: serde_json::json!({}),
+            refund_dest: None,
+        });
+        let created_at = Timestamp::now();
+        let valid = loop {
+            let wrap = gift_wrap_at(&buyer_keys, &op_keys.public_key(), &msg, created_at).await;
+            if wrap.id.as_bytes()[0] >= 0xf0 {
+                break wrap;
+            }
+        };
+        buyer
+            .send_event(&valid)
+            .await
+            .expect("buyer publishes the valid order.request");
+
+        let garbage_signer = Keys::generate();
+        let mut accepted = 0usize;
+        let mut attempts = 0usize;
+        while accepted < SAME_SECOND_GARBAGE_BEFORE_VALID {
+            attempts += 1;
+            assert!(
+                attempts < SAME_SECOND_GARBAGE_BEFORE_VALID * 4,
+                "could not generate enough lower-id garbage to bury the valid wrap"
+            );
+            let wrap = EventBuilder::new(
+                Kind::GiftWrap,
+                format!("same-second-garbage-not-a-nip44-payload-{attempts}"),
+            )
+            .tag(Tag::public_key(op_keys.public_key()))
+            .custom_created_at(created_at)
+            .sign_with_keys(&garbage_signer)
+            .expect("sign same-second garbage gift wrap");
+            if wrap.id >= valid.id {
+                continue;
+            }
+            let output = buyer
+                .send_event(&wrap)
+                .await
+                .expect("buyer publishes same-second garbage gift wrap");
+            assert!(
+                !output.success.is_empty(),
+                "garbage wrap {accepted} was not accepted by the relay: {:?}",
+                output.failed
+            );
+            engine.note_non_routable(wrap.id);
+            accepted += 1;
+        }
+
+        let first_page = buyer
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::GiftWrap)
+                    .pubkey(op_keys.public_key())
+                    .since(created_at)
+                    .until(created_at)
+                    .limit(RELAY_DEFAULT_FILTER_LIMIT),
+                TEST_DEADLINE,
+            )
+            .await
+            .expect("fetch same-second first page");
+        assert_eq!(
+            first_page.len(),
+            RELAY_DEFAULT_FILTER_LIMIT,
+            "same-second page must be full"
+        );
+        assert!(
+            !first_page.iter().any(|event| event.id == valid.id),
+            "valid wrap must be beyond the relay's first same-second page"
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let order_handler: Arc<dyn OrderHandler> = Arc::new(CountingOrderHandler {
+            calls: Arc::clone(&calls),
+        });
+        let op_handler: Arc<dyn OpHandler> = Arc::new(NoopOpHandler);
+
+        engine
+            .fetch_inbound_backlog(Arc::clone(&order_handler), Arc::clone(&op_handler))
+            .await
+            .expect("backfill same-second retained set");
+        timeout(ROUTE_DEADLINE, async {
+            loop {
+                if calls.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("same-second exact-id fallback routed the valid wrap beyond the first page");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly the buried valid wrap routes; same-second garbage is ignored"
+        );
+    }
+
+    // Reviewer 2 P1 (lnrent-7fp.5, codex xhigh): the paged backfill must not treat a page shorter
+    // than the REQUESTED limit as "retained set exhausted". A relay whose max filter limit is below
+    // INBOUND_BACKFILL_PAGE_LIMIT clamps every page short, so a "short page = done" walk stops after
+    // the newest page and silently drops older retained money-path DMs. Here the relay clamps to 50
+    // while retaining MORE than its default filter limit (600) DISTINCT-timestamp wraps, with the one
+    // valid lnrent DM as the OLDEST — many clamped pages deep. The cursor-advancing walk must page
+    // all the way back and still route it (the same-second negentropy fallback is NOT what is under
+    // test here: distinct timestamps keep the cursor advancing).
+    #[tokio::test]
+    async fn fetch_inbound_backlog_pages_past_a_clamped_filter_limit() {
+        const CLAMP: usize = 50;
+        const GARBAGE_NEWER_THAN_VALID: usize = 600;
+        const ROUTE_DEADLINE: Duration = Duration::from_secs(30);
+
+        const {
+            assert!(
+                CLAMP < INBOUND_BACKFILL_PAGE_LIMIT,
+                "the relay must clamp below our requested page size to exercise the bug"
+            )
+        };
+
+        let _relay_test = RELAY_TEST.lock().await;
+        let (_relay, url) = clamped_relay(CLAMP).await;
+
+        let op_keys = Keys::generate();
+        let buyer_keys = Keys::generate();
+        let store = Store::open_spawn(":memory:").expect("open in-memory store");
+        let engine = NostrEngine::connect(op_keys.clone(), std::slice::from_ref(&url), store)
+            .await
+            .expect("operator engine connects");
+        let buyer = buyer_client(&url, buyer_keys.clone()).await;
+
+        // The valid order DM is the OLDEST retained wrap, buried behind GARBAGE_NEWER_THAN_VALID
+        // newer (distinct-second) #p gift-wrap garbage — so it sits many clamped pages deep.
+        let base = Timestamp::now();
+        let valid_created_at =
+            Timestamp::from_secs(base.as_secs() - GARBAGE_NEWER_THAN_VALID as u64 - 1);
+        let msg = Msg::OrderRequest(lnrent_wire::OrderRequest {
+            id: "clamped-buried-valid-order".into(),
+            listing_id: format!("30402:{}:dummy-1", op_keys.public_key().to_hex()),
+            params: serde_json::json!({}),
+            refund_dest: None,
+        });
+        let valid = gift_wrap_at(&buyer_keys, &op_keys.public_key(), &msg, valid_created_at).await;
+        buyer
+            .send_event(&valid)
+            .await
+            .expect("buyer publishes the buried valid order.request");
+
+        let garbage_signer = Keys::generate();
+        for i in 0..GARBAGE_NEWER_THAN_VALID {
+            // Distinct, strictly-newer timestamps so the backfill cursor genuinely advances
+            // page-by-page rather than pinning on one second.
+            let created_at = Timestamp::from_secs(base.as_secs() - i as u64);
+            let wrap = EventBuilder::new(
+                Kind::GiftWrap,
+                format!("clamped-garbage-not-a-nip44-payload-{i}"),
+            )
+            .tag(Tag::public_key(op_keys.public_key()))
+            .custom_created_at(created_at)
+            .sign_with_keys(&garbage_signer)
+            .expect("sign clamped garbage gift wrap");
+            let output = buyer
+                .send_event(&wrap)
+                .await
+                .expect("buyer publishes clamped garbage gift wrap");
+            assert!(
+                !output.success.is_empty(),
+                "garbage wrap {i} was not accepted by the relay: {:?}",
+                output.failed
+            );
+        }
+
+        // The relay clamps our requested page below INBOUND_BACKFILL_PAGE_LIMIT, and the valid wrap
+        // is beyond that first page: a "short page = done" walk would stop here and lose it.
+        let first_page = buyer
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::GiftWrap)
+                    .pubkey(op_keys.public_key())
+                    .limit(INBOUND_BACKFILL_PAGE_LIMIT),
+                TEST_DEADLINE,
+            )
+            .await
+            .expect("fetch clamped first page");
+        assert_eq!(
+            first_page.len(),
+            CLAMP,
+            "the relay must clamp our requested page below INBOUND_BACKFILL_PAGE_LIMIT"
+        );
+        assert!(
+            !first_page.iter().any(|event| event.id == valid.id),
+            "the valid wrap must be beyond the relay's first clamped page"
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let order_handler: Arc<dyn OrderHandler> = Arc::new(CountingOrderHandler {
+            calls: Arc::clone(&calls),
+        });
+        let op_handler: Arc<dyn OpHandler> = Arc::new(NoopOpHandler);
+
+        engine
+            .fetch_inbound_backlog(Arc::clone(&order_handler), Arc::clone(&op_handler))
+            .await
+            .expect("backfill the clamped retained set");
+        timeout(ROUTE_DEADLINE, async {
+            loop {
+                if calls.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("paged backfill walked past the clamp and routed the buried valid wrap");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly the buried valid wrap routes; clamped garbage is ignored"
+        );
+    }
+
     // P2 (lnrent-7fp.5, Reviewer 1): a relay can END the long-lived inbound REQ server-side
     // (`CLOSED`) AFTER `subscribe_with_id` already reported success (it only enqueued the REQ).
     // The engine must OBSERVE that closure and recover — without it that relay silently stops
@@ -1250,6 +2067,7 @@ mod tests {
     // is the retained order.request delivered + routed — so the handler firing proves the recovery.
     #[tokio::test]
     async fn relay_closed_inbound_subscription_is_resubscribed() {
+        let _relay_test = RELAY_TEST.lock().await;
         let (_relay, url) = rejecting_relay().await;
 
         let op_keys = Keys::generate();
