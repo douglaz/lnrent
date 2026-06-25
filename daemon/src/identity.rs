@@ -16,12 +16,20 @@
 //! The seed and derived keys are secret: they live in the data dir with tight perms (config.rs)
 //! and are NEVER logged. `OperatorIdentity` deliberately has no `Debug` so key material can't leak
 //! through a `{:?}`.
+//!
+//! Secret-memory hygiene is BEST-EFFORT, not a guarantee. We zeroize the buffers we own — the
+//! 64-byte BIP39 seed (via `Zeroizing`, on every return path), the decoded `Mnemonic`'s entropy
+//! (bip39's `zeroize` feature), the `Keys` secret (on its own drop), and the Fedimint root secret
+//! (on `OperatorIdentity` drop). But `nostr`'s NIP-06 helper (`Keys::from_mnemonic_*`) re-parses the
+//! mnemonic and constructs its OWN seed / BIP32 Xpriv intermediates that are not reachable through
+//! its public API, so those transient copies are NOT wiped (a known, documented limitation). Do not
+//! read these comments as a claim that every copy of the key material is erased.
 
 use hkdf::Hkdf;
 use nostr::nips::nip06::FromMnemonic;
 use nostr::{Keys, PublicKey, ToBech32};
 use sha2::Sha256;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::ipc::IpcError;
 
@@ -74,7 +82,13 @@ impl OperatorIdentity {
             message: format!("invalid BIP39 mnemonic: {e}"),
             retryable: false,
         })?;
-        let mut seed = parsed.to_seed_normalized(passphrase.unwrap_or_default());
+        // Wrap OUR 64-byte BIP39 seed in `Zeroizing` so it is wiped on EVERY return path — including
+        // the early `?` error from `Keys::from_mnemonic_with_account` below — not just after a
+        // successful derivation (review P2: the old explicit `seed.zeroize()` ran only on success).
+        // This is honest best-effort: `Keys::from_mnemonic_*` re-parses the mnemonic and builds its
+        // OWN seed / BIP32 Xpriv intermediates we cannot reach, so those copies are NOT wiped (see
+        // the module doc). We zeroize the buffers we own; we do not claim all copies are erased.
+        let seed = Zeroizing::new(parsed.to_seed_normalized(passphrase.unwrap_or_default()));
 
         // NIP-06 account `BOX_INDEX` (m/44'/1237'/BOX_INDEX'/0/0) — the marketplace signer. M1a is
         // account 0. Deriving with an EXPLICIT `Some(BOX_INDEX)` (rather than the implicit account-0
@@ -87,10 +101,9 @@ impl OperatorIdentity {
                 retryable: false,
             })?;
 
-        let fedimint_root_secret = derive_fedimint_root_secret(&seed);
-        // The 64-byte BIP39 seed has served both derivations; wipe the in-memory copy so it doesn't
-        // linger (the `Keys` secret and the root secret are the only material we deliberately keep).
-        seed.zeroize();
+        let fedimint_root_secret = derive_fedimint_root_secret(seed.as_slice());
+        // `seed` (Zeroizing) wipes itself when it drops at function exit — and on the early-error
+        // path above — so the in-memory copy doesn't linger (§13) (review P2).
         Ok(OperatorIdentity {
             keys,
             fedimint_root_secret,

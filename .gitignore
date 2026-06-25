@@ -4,6 +4,9 @@
 *.sqlite
 *.sqlite-*
 
+# local scratch dirs used while reproducing bootstrap/data-dir bugs (cfg.toml/err/out, sqlite, etc.)
+.tmp-test/
+
 # bv (beads viewer) local config and caches
 .bv/
 
