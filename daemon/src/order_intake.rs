@@ -185,12 +185,19 @@ impl OrderIntake {
             }
         };
 
+        // (Invoice-expiry is enforced at SETTLEMENT, not issuance: comparing the backend's
+        // invoice.expires_at to our clock here is fragile across clock sources, so capture rejects a
+        // settlement at/after expiry instead — see lnrent-g5p.)
+
         // The response we will both cache and (after commit) send. order_id is known now.
         let response = Msg::OrderInvoice(OrderInvoice {
             request_id: req.id.clone(),
             order_id: order_id.clone(),
             bolt11: invoice.bolt11.clone(),
-            amount_sat,
+            // Use the RETURNED invoice's amount, not the current listing price: create_invoice is
+            // idempotent on external_id, so a crash-retry (or reissue after a price edit) returns the
+            // ORIGINAL invoice — the reply/DB amount must match its bolt11, never drift (codex pass 4).
+            amount_sat: invoice.amount_sat,
             period: self.recipe.pricing.period.clone(),
             expires_at: invoice.expires_at,
         });
@@ -217,7 +224,7 @@ impl OrderIntake {
             backend_invoice_id: invoice.backend_invoice_id.clone(),
             payment_hash: invoice.payment_hash.clone(),
             bolt11: invoice.bolt11.clone(),
-            amount_sat: amount_sat as i64,
+            amount_sat: invoice.amount_sat as i64,
             inv_expires_at: invoice.expires_at,
             response_json,
             now,
@@ -241,7 +248,15 @@ impl OrderIntake {
         // 6. AFTER commit, send order.invoice — ours, or a concurrent winner's cached response.
         let to_send = match winner {
             Some(json) => {
-                serde_json::from_str(&json).context("decoding concurrent cached order response")?
+                let msg: Msg = serde_json::from_str(&json)
+                    .context("decoding concurrent cached order response")?;
+                // We reserved capacity but a concurrent same-id request won the idempotency row
+                // with a NON-invoice (an error — e.g. a pre-order failure that had no hold of its
+                // own to release). No order will consume our hold, so release it (codex pass 3 P2).
+                if !matches!(msg, Msg::OrderInvoice(_)) {
+                    reservation::release(&self.store, &order_id, now).await?;
+                }
+                msg
             }
             None => response,
         };
@@ -262,16 +277,35 @@ impl OrderIntake {
             return Ok(());
         }
         let now = self.clock.now();
-        let due_at = self
-            .load_paid_through(&req.subscription_id)
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "renew.request for unknown subscription {}",
-                    req.subscription_id
-                )
-            })?
-            .unwrap_or(now);
+        // Authorize + gate state: only the OWNING buyer may renew, and only a renewable
+        // (ACTIVE/SUSPENDED) subscription. Otherwise drop silently — an outsider must not be able
+        // to mint a payable billing.invoice for someone else's sub, and a PENDING/terminal sub must
+        // not get a renewal invoice that capture would later refund (§5.1 sender auth, §6.3).
+        let Some((buyer_hex, state, paid_through, retention_s)) =
+            self.load_renewable(&req.subscription_id).await?
+        else {
+            tracing::warn!(sub = %req.subscription_id, "renew.request for unknown subscription — dropped");
+            return Ok(());
+        };
+        if buyer_hex != sender.to_hex() {
+            tracing::warn!(sub = %req.subscription_id, "renew.request from a non-owner — dropped");
+            return Ok(());
+        }
+        if !matches!(state.as_str(), "ACTIVE" | "SUSPENDED") {
+            tracing::warn!(sub = %req.subscription_id, %state, "renew.request for a non-renewable state — dropped");
+            return Ok(());
+        }
+        // Past the retention boundary (paid_through + retention_s) the rental is effectively
+        // terminal even if reconcile hasn't flipped it yet — and capture refunds settlements at/after
+        // that boundary (the inclusive gate in lnrent-7fp.8). Issuing a renewal invoice now would
+        // only ever be refunded, never applied, so drop it (codex pass 3 P2; §6.3).
+        if let Some(pt) = paid_through {
+            if now >= pt + retention_s {
+                tracing::warn!(sub = %req.subscription_id, "renew.request past the retention window — dropped");
+                return Ok(());
+            }
+        }
+        let due_at = paid_through.unwrap_or(now);
         let external_id = format!("renew:req:{}:{}", sender.to_hex(), req.id);
         let response = self
             .issue_renewal(
@@ -334,7 +368,10 @@ impl OrderIntake {
             subscription_id: subscription_id.to_string(),
             request_id,
             bolt11: invoice.bolt11.clone(),
-            amount_sat,
+            // The returned invoice's amount, not the current recipe price: a deterministic-external_id
+            // reissue (esp. renew:auto:<sub>:<cycle_anchor>) returns the ORIGINAL invoice, so the
+            // advertised/stored amount must track its bolt11, never the edited price (codex pass 4).
+            amount_sat: invoice.amount_sat,
             due_at,
             expires_at: invoice.expires_at,
         });
@@ -345,7 +382,7 @@ impl OrderIntake {
             backend_invoice_id: invoice.backend_invoice_id.clone(),
             payment_hash: invoice.payment_hash.clone(),
             bolt11: invoice.bolt11.clone(),
-            amount_sat: amount_sat as i64,
+            amount_sat: invoice.amount_sat as i64,
             inv_expires_at: invoice.expires_at,
             dedupe: dedupe.map(|(s, r)| {
                 (
@@ -356,8 +393,12 @@ impl OrderIntake {
             }),
             now,
         };
-        self.store.transaction(move |tx| owned.write(tx)).await?;
-        Ok(response)
+        let cached = self.store.transaction(move |tx| owned.write(tx)).await?;
+        match cached {
+            Some(json) => Ok(serde_json::from_str(&json)
+                .context("decoding cached renewal response on race")?),
+            None => Ok(response),
+        }
     }
 
     /// Send `order.error` and release any HELD reservation for `release_order_id`, leaving no
@@ -373,17 +414,30 @@ impl OrderIntake {
         out: &dyn Outbound,
     ) -> Result<()> {
         let now = self.clock.now();
-        if let Some(order_id) = release_order_id {
-            reservation::release(&self.store, order_id, now).await?;
-        }
         let response = Msg::OrderError(OrderError {
             request_id: request_id.to_string(),
             order_id: None,
             error,
         });
-        self.cache_response_row(sender, request_id, "order", &response, now)
+        // Cache the error FIRST; the cache insert is the idempotency arbiter (we resend the winner).
+        let cached = self
+            .cache_response_row(sender, request_id, "order", &response, now)
             .await?;
-        out.reply(sender, &response).await?;
+        let to_send = match cached {
+            Some(c) => serde_json::from_str(&c).context("decoding cached order response on race")?,
+            None => response,
+        };
+        // Release the HELD reservation UNLESS an order.invoice owns it. Only a committed order keeps
+        // the hold: if we won (our error), nothing committed; if a concurrent NON-invoice response
+        // won (an error, or a cross-type reused id that cached a billing.invoice), no order will
+        // consume the hold either — so release it (codex pass 6 P2; symmetric with the write-race
+        // path). release is idempotent, so a double-release across racers is harmless.
+        if !matches!(to_send, Msg::OrderInvoice(_)) {
+            if let Some(order_id) = release_order_id {
+                reservation::release(&self.store, order_id, now).await?;
+            }
+        }
+        out.reply(sender, &to_send).await?;
         Ok(())
     }
 
@@ -410,7 +464,9 @@ impl OrderIntake {
     }
 
     /// Cache a standalone response row (used for the error paths, which write no sub/invoice).
-    /// `ON CONFLICT DO NOTHING` so a concurrent duplicate keeps the first cached answer.
+    /// `ON CONFLICT DO NOTHING` keeps the first cached answer; returns `Some(cached_json)` when a
+    /// concurrent duplicate already cached a response (so the caller resends THAT, not its freshly
+    /// built one — the idempotency contract, §5.1), else `None`.
     async fn cache_response_row(
         &self,
         sender: &PublicKey,
@@ -418,7 +474,7 @@ impl OrderIntake {
         kind: &str,
         msg: &Msg,
         now: i64,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let (s, r, k, mt, json) = (
             sender.to_hex(),
             request_id.to_string(),
@@ -428,14 +484,24 @@ impl OrderIntake {
         );
         self.store
             .transaction(move |tx| {
-                tx.execute(
+                let n = tx.execute(
                     "INSERT INTO inbound_request
                         (sender_pubkey, request_id, kind, response_msg_type, response_json, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(sender_pubkey, request_id) DO NOTHING",
                     params![s, r, k, mt, json, now],
                 )?;
-                Ok(())
+                if n > 0 {
+                    return Ok(None); // we cached ours
+                }
+                // Lost the race: return the already-cached response to resend.
+                Ok(tx
+                    .query_row(
+                        "SELECT response_json FROM inbound_request WHERE sender_pubkey=?1 AND request_id=?2",
+                        params![s, r],
+                        |row| row.get(0),
+                    )
+                    .optional()?)
             })
             .await
     }
@@ -464,16 +530,26 @@ impl OrderIntake {
             .await
     }
 
-    /// `Some(paid_through)` if the subscription exists (the inner Option is its nullable
-    /// `paid_through`); `None` if there is no such subscription.
-    async fn load_paid_through(&self, sub_id: &str) -> Result<Option<Option<i64>>> {
+    /// The fields a buyer renewal must be authorized against: `(buyer_pubkey_hex, state,
+    /// paid_through, retention_s)` if the subscription exists, else `None`.
+    async fn load_renewable(
+        &self,
+        sub_id: &str,
+    ) -> Result<Option<(String, String, Option<i64>, i64)>> {
         let id = sub_id.to_string();
         self.store
             .read(move |c| {
                 Ok(c.query_row(
-                    "SELECT paid_through FROM subscription WHERE id = ?1",
+                    "SELECT buyer_pubkey, state, paid_through, retention_s FROM subscription WHERE id = ?1",
                     params![id],
-                    |r| r.get::<_, Option<i64>>(0),
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                            r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                            r.get::<_, Option<i64>>(2)?,
+                            r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        ))
+                    },
                 )
                 .optional()?)
             })
@@ -551,11 +627,14 @@ impl OrderWrite {
         if let Some(json) = existing {
             return Ok(Some(json));
         }
+        // next_deadline = the invoice expiry: an unpaid PENDING order must be discoverable by the
+        // reconcile `next_deadline <= now` cursor (lnrent-7fp.9) so it flips to EXPIRED at expiry —
+        // otherwise the invoice stays OPEN and a late settlement would be captured/provisioned.
         tx.execute(
             "INSERT INTO subscription
                 (id, recipe_id, listing_id, buyer_pubkey, state, params_json, refund_dest,
-                 period_s, renew_lead_s, retention_s, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'PENDING', ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                 period_s, renew_lead_s, retention_s, next_deadline, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'PENDING', ?5, ?6, ?7, ?8, ?9, ?11, ?10, ?10)",
             params![
                 self.order_id,
                 self.recipe_id,
@@ -567,6 +646,7 @@ impl OrderWrite {
                 self.renew_lead_s,
                 self.retention_s,
                 self.now,
+                self.inv_expires_at,
             ],
         )?;
         tx.execute(
@@ -597,11 +677,19 @@ impl OrderWrite {
                 self.now
             ],
         )?;
+        // Finalize the reservation TTL to the invoice's authoritative expiry (one expiry horizon,
+        // §9.3) atomically with the commit. The hold was created at reserve-time with a provisional
+        // TTL; the backend's `invoice.expires_at` — not our local clock — is the real horizon, so
+        // align it here, where it can never diverge from the invoice/sub deadline (codex pass 2 P1).
+        tx.execute(
+            "UPDATE reservation SET expires_at = ?2 WHERE order_id = ?1",
+            params![self.order_id, self.inv_expires_at],
+        )?;
         tx.execute(
             "INSERT INTO event_log (subscription_id, kind, detail_json, at) VALUES (?1, 'order_placed', ?2, ?3)",
             params![
                 self.order_id,
-                format!("{{\"external_id\":\"{}\"}}", self.external_id),
+                serde_json::json!({ "external_id": self.external_id }).to_string(),
                 self.now,
             ],
         )?;
@@ -626,7 +714,26 @@ struct RenewalWrite {
 }
 
 impl RenewalWrite {
-    fn write(self, tx: &rusqlite::Transaction) -> Result<()> {
+    /// Returns `Some(cached_json)` when a concurrent buyer renew.request for the same
+    /// `(sender, request_id)` already cached a response (so the caller resends THAT, mirroring
+    /// `OrderWrite`), else `None`.
+    fn write(self, tx: &rusqlite::Transaction) -> Result<Option<String>> {
+        // Dedup FIRST for a buyer renew: the (sender, request_id) key is SHARED with orders, so if a
+        // response is already cached for it (e.g. a concurrent order committed first), resend THAT and
+        // create NO renewal invoice — mirroring OrderWrite (codex pass 3 P2). The store actor
+        // serializes txns, so this read is authoritative; a soft-date renewal (dedupe=None) skips it.
+        if let Some((sender_hex, request_id, _)) = self.dedupe.as_ref() {
+            if let Some(json) = tx
+                .query_row(
+                    "SELECT response_json FROM inbound_request WHERE sender_pubkey=?1 AND request_id=?2",
+                    params![sender_hex, request_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                return Ok(Some(json));
+            }
+        }
         // Idempotent on external_id: re-issuing the same cycle never creates a 2nd invoice.
         tx.execute(
             "INSERT INTO invoice
@@ -659,11 +766,11 @@ impl RenewalWrite {
             "INSERT INTO event_log (subscription_id, kind, detail_json, at) VALUES (?1, 'renew_invoice', ?2, ?3)",
             params![
                 self.subscription_id,
-                format!("{{\"external_id\":\"{}\"}}", self.external_id),
+                serde_json::json!({ "external_id": self.external_id }).to_string(),
                 self.now,
             ],
         )?;
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -1140,6 +1247,95 @@ mod tests {
             pick(&msgs[0].1),
             pick(&msgs[1].1),
             "the duplicate resends the cached order.invoice"
+        );
+    }
+
+    // P1 (codex pass 1): a renew.request is gated on owner + renewable state — a non-owner cannot
+    // mint a billing.invoice for someone else's sub, and a terminal/PENDING sub gets none (capture
+    // would only refund such a payment). Both cases drop silently with no reply, no invoice.
+    #[tokio::test]
+    async fn renew_request_is_gated_on_owner_and_renewable_state() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        seed_active_sub(&store, "sub-1", &buyer.public_key().to_hex(), 5000).await;
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1000),
+            dummy_recipe(),
+            budget_with_room(),
+        );
+
+        // Non-owner renew -> dropped.
+        let stranger = Keys::generate();
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                stranger.public_key(),
+                Msg::RenewRequest(RenewRequest { id: "x".into(), subscription_id: "sub-1".into() }),
+                &out,
+            )
+            .await
+            .unwrap();
+        assert!(out.messages().is_empty(), "a non-owner renew is dropped, no reply");
+        assert_eq!(count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await, 0);
+
+        // Owner renew on a now-terminal sub -> dropped.
+        store
+            .transaction(|tx| {
+                tx.execute("UPDATE subscription SET state='TERMINATED' WHERE id='sub-1'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let out2 = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                Msg::RenewRequest(RenewRequest { id: "y".into(), subscription_id: "sub-1".into() }),
+                &out2,
+            )
+            .await
+            .unwrap();
+        assert!(out2.messages().is_empty(), "a renew on a terminal sub is dropped");
+        assert_eq!(count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await, 0);
+    }
+
+    // P1 (codex pass 1): an unpaid PENDING order's sub carries next_deadline = the invoice expiry,
+    // so the reconcile cursor (next_deadline <= now, lnrent-7fp.9) can expire it before a late
+    // settlement is captured. A NULL next_deadline would make the order invisible to reconcile.
+    #[tokio::test]
+    async fn pending_order_sets_next_deadline_to_invoice_expiry() {
+        let store = mem_store();
+        let recipe = dummy_recipe();
+        let listing_id = "30402:op:dummy-1";
+        seed_listing(&store, listing_id, "dummy", recipe.pricing.amount_sat as i64).await;
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1000),
+            recipe,
+            budget_with_room(),
+        );
+        let sender = Keys::generate().public_key();
+        let out = RecordingOutbound::default();
+        handler.handle(sender, order("nd-1", listing_id, json!({})), &out).await.unwrap();
+
+        let (next_deadline, expires_at): (Option<i64>, i64) = store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT s.next_deadline, i.expires_at FROM subscription s
+                     JOIN invoice i ON i.subscription_id = s.id WHERE s.state='PENDING'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            next_deadline,
+            Some(expires_at),
+            "PENDING order next_deadline must equal the invoice expiry so reconcile can expire it"
         );
     }
 }
