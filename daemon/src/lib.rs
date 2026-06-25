@@ -3,7 +3,9 @@
 pub mod backends;
 pub mod capture;
 pub mod clock;
+pub mod config;
 pub mod domain;
+pub mod identity;
 pub mod ipc;
 pub mod nostr_engine;
 pub mod recipe;

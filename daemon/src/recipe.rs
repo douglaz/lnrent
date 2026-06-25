@@ -8,6 +8,14 @@ use std::path::{Path, PathBuf};
 /// Lifecycle hooks every recipe must ship (SPEC.md §7, §7.2).
 const LIFECYCLE_HOOKS: [&str; 5] = ["provision", "suspend", "resume", "destroy", "healthcheck"];
 
+/// True if `backend` is a known compute backend selector (SPEC.md §8.1): one of the fixed
+/// `host | incus | libvirt | proxmox`, or a `cloud-*` provider. This is the canonical allowlist,
+/// shared by recipe validation here and operator-config validation (config.rs) so the two can't
+/// drift apart.
+pub(crate) fn is_known_compute_backend(backend: &str) -> bool {
+    matches!(backend, "host" | "incus" | "libvirt" | "proxmox") || backend.starts_with("cloud-")
+}
+
 /// True if `path` exists and is an executable regular file (any exec bit set).
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -143,7 +151,9 @@ impl Recipe {
             if entry.file_type()?.is_dir() && path.join("recipe.toml").exists() {
                 match Recipe::load(&path) {
                     Ok(r) => out.push(r),
-                    Err(e) => tracing::warn!(dir = %path.display(), error = %e, "skipping unparseable recipe"),
+                    Err(e) => {
+                        tracing::warn!(dir = %path.display(), error = %e, "skipping unparseable recipe")
+                    }
                 }
             }
         }
@@ -176,31 +186,48 @@ impl Recipe {
         for name in LIFECYCLE_HOOKS {
             let h = self.hook(name);
             if !is_executable(&h) {
-                bail!("recipe `{}`: lifecycle hook `{name}` missing or not executable ({})",
-                    self.service.id, h.display());
+                bail!(
+                    "recipe `{}`: lifecycle hook `{name}` missing or not executable ({})",
+                    self.service.id,
+                    h.display()
+                );
             }
         }
 
         // Backend / isolation / tier / OS (§8.1, §9.1, ADR-0007).
         let backend = &self.provisioning.backend;
-        let backend_ok = matches!(backend.as_str(), "host" | "incus" | "libvirt" | "proxmox")
-            || backend.starts_with("cloud-");
-        if !backend_ok {
-            bail!("recipe `{}`: unknown compute backend `{backend}`", self.service.id);
+        if !is_known_compute_backend(backend) {
+            bail!(
+                "recipe `{}`: unknown compute backend `{backend}`",
+                self.service.id
+            );
         }
-        if !matches!(self.provisioning.isolation.as_str(), "none" | "container" | "vm") {
-            bail!("recipe `{}`: unknown isolation `{}`", self.service.id, self.provisioning.isolation);
+        if !matches!(
+            self.provisioning.isolation.as_str(),
+            "none" | "container" | "vm"
+        ) {
+            bail!(
+                "recipe `{}`: unknown isolation `{}`",
+                self.service.id,
+                self.provisioning.isolation
+            );
         }
         if !matches!(self.provisioning.tier.as_str(), "0" | "1" | "1.5" | "2") {
-            bail!("recipe `{}`: invalid security tier `{}` (must be 0|1|1.5|2)",
-                self.service.id, self.provisioning.tier);
+            bail!(
+                "recipe `{}`: invalid security tier `{}` (must be 0|1|1.5|2)",
+                self.service.id,
+                self.provisioning.tier
+            );
         }
         if self.os.supports.is_empty() {
             bail!("recipe `{}`: os.supports is empty", self.service.id);
         }
         for os in &self.os.supports {
             if !matches!(os.as_str(), "nixos" | "debian") {
-                bail!("recipe `{}`: unsupported OS `{os}` (nixos|debian)", self.service.id);
+                bail!(
+                    "recipe `{}`: unsupported OS `{os}` (nixos|debian)",
+                    self.service.id
+                );
             }
         }
 
@@ -208,31 +235,51 @@ impl Recipe {
         let mut seen = HashSet::new();
         for op in &self.operations {
             if !seen.insert(op.name.as_str()) {
-                bail!("recipe `{}`: duplicate operation name `{}`", self.service.id, op.name);
+                bail!(
+                    "recipe `{}`: duplicate operation name `{}`",
+                    self.service.id,
+                    op.name
+                );
             }
             if !matches!(op.kind.as_str(), "request" | "interactive") {
-                bail!("recipe `{}`: operation `{}` has unknown kind `{}` (request|interactive)",
-                    self.service.id, op.name, op.kind);
+                bail!(
+                    "recipe `{}`: operation `{}` has unknown kind `{}` (request|interactive)",
+                    self.service.id,
+                    op.name,
+                    op.kind
+                );
             }
             if !op.hook_is_safe() {
-                bail!("recipe `{}`: operation `{}` has unsafe hook `{}` (bare filename only)",
-                    self.service.id, op.name, op.hook);
+                bail!(
+                    "recipe `{}`: operation `{}` has unsafe hook `{}` (bare filename only)",
+                    self.service.id,
+                    op.name,
+                    op.hook
+                );
             }
             // request-kind ops run on dispatch, so their hook must exist + be executable now;
             // interactive ops bind a session target (M1b) and are not executed here.
             if op.kind == "request" {
                 let h = self.op_hook(op);
                 if !is_executable(&h) {
-                    bail!("recipe `{}`: operation `{}` hook missing or not executable ({})",
-                        self.service.id, op.name, h.display());
+                    bail!(
+                        "recipe `{}`: operation `{}` hook missing or not executable ({})",
+                        self.service.id,
+                        op.name,
+                        h.display()
+                    );
                 }
                 // Defense-in-depth: the canonicalized hook must stay inside `ops/` (no symlink escape).
                 let ops_dir = self.dir.join("ops");
                 let (canon_ops, canon_hook) = (ops_dir.canonicalize(), h.canonicalize());
                 if let (Ok(co), Ok(ch)) = (canon_ops, canon_hook) {
                     if !ch.starts_with(&co) {
-                        bail!("recipe `{}`: operation `{}` hook escapes ops/ ({})",
-                            self.service.id, op.name, ch.display());
+                        bail!(
+                            "recipe `{}`: operation `{}` hook escapes ops/ ({})",
+                            self.service.id,
+                            op.name,
+                            ch.display()
+                        );
                     }
                 }
             }
@@ -323,7 +370,9 @@ hook = "get-config"
     // request-op hooks exist and are executable, backend/tier/os/ops are well-formed).
     #[test]
     fn wireguard_recipe_validates() {
-        wireguard().validate().expect("wireguard recipe should validate");
+        wireguard()
+            .validate()
+            .expect("wireguard recipe should validate");
     }
 
     #[test]

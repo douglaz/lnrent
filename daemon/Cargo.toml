@@ -28,6 +28,28 @@ lnrent-wire = { path = "../wire" }
 # rust-nostr high-level client for relay publish/subscribe. Pinned to the SAME nostr 0.44 the
 # wire crate uses, so `Keys`/`Event`/`Msg` types unify across the codec and the transport.
 nostr-sdk = "0.44"
+# NIP-06 account-0 key derivation from the operator BIP39 seed (lnrent-7fp.16, ADR-0004). This is
+# the SAME `nostr` 0.44 nostr-sdk/lnrent-wire already use; we only add the `nip06` feature here for
+# `Keys::from_mnemonic`. The `nip06` feature also re-exports `bip39`, which we use to compute the
+# raw seed feeding the Fedimint HKDF — so that seed is byte-identical to the NIP-06 derivation.
+nostr = { version = "0.44", features = ["nip06"] }
+# Enable bip39's `zeroize` feature on the SAME bip39 2.x crate `nostr`'s `nip06` re-exports (Cargo
+# unifies it to one instance), so the intermediate decoded `Mnemonic` (word indices / entropy)
+# zeroizes on drop — matching the seed / mnemonic / root-secret wiping hygiene in identity.rs (§13).
+# We don't import this directly; declaring the dep just flips the feature on `nostr::bip39::Mnemonic`.
+bip39 = { version = "2.2", features = ["zeroize"] }
+# HKDF-SHA256 derivation of the Fedimint client root secret from the same seed, domain-separated by
+# the fixed info string `lnrent:fedimint:v1` so the Nostr and Fedimint key spaces can't collide
+# (ADR-0004/0012, SPEC.md §4.6). Only the secret is derived here; the real client is bead .4.
+hkdf = "0.12"
+sha2 = "0.10"
+# `O_NOFOLLOW` when reopening persisted secret files (operator.seed / fedimint.json), so a
+# pre-existing data dir can't point those secrets outside the data-dir backup/perms boundary.
+libc = "0.2"
+# Best-effort zeroization of in-memory secret residue (the BIP39 seed copy, the mnemonic string,
+# and the Fedimint root-secret buffer) on drop — the seed/keys are never logged (§13) and this
+# closes the freed-memory residue too (lnrent-7fp.16).
+zeroize = "1"
 # `async fn` in the injected handler/outbound trait objects (object-safe via this macro).
 async-trait = "0.1"
 
