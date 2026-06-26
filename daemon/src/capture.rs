@@ -42,14 +42,16 @@ pub async fn capture(store: &Store, settlement: Settlement, now: i64) -> Result<
 
 fn capture_txn(tx: &Transaction, s: &Settlement, now: i64) -> Result<Capture> {
     // Look the invoice up by its correlation token (external_id UNIQUE, NOT NULL — ADR-0009).
-    let inv: Option<(String, String, Option<String>, Option<String>)> = tx
+    // expires_at is the bolt11/reservation expiry; it gates the order-capture path in apply_paid.
+    #[allow(clippy::type_complexity)]
+    let inv: Option<(String, String, Option<String>, Option<String>, Option<i64>)> = tx
         .query_row(
-            "SELECT id, status, kind, subscription_id FROM invoice WHERE external_id = ?1",
+            "SELECT id, status, kind, subscription_id, expires_at FROM invoice WHERE external_id = ?1",
             params![s.external_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    let (inv_id, status, kind, sub_id) = match inv {
+    let (inv_id, status, kind, sub_id, expires_at) = match inv {
         // Unmatched settlement: the backend should pre-filter these, but if one slips through we
         // record a single refund intent (sub/dest unknown) rather than swallow money.
         None => {
@@ -76,7 +78,7 @@ fn capture_txn(tx: &Transaction, s: &Settlement, now: i64) -> Result<Capture> {
             if n == 0 {
                 return Ok(Capture::NoOp);
             }
-            apply_paid(tx, kind.as_deref(), sub_id.as_deref(), s, now)
+            apply_paid(tx, kind.as_deref(), sub_id.as_deref(), expires_at, s, now)
         }
         // EXPIRED or any other terminal invoice status: funds arrived too late -> refund. Stamp
         // settled_at for audit, keep the terminal status, write exactly one refund intent. Journal
@@ -113,6 +115,7 @@ fn apply_paid(
     tx: &Transaction,
     kind: Option<&str>,
     sub_id: Option<&str>,
+    order_expires_at: Option<i64>,
     s: &Settlement,
     now: i64,
 ) -> Result<Capture> {
@@ -163,6 +166,19 @@ fn apply_paid(
     match (kind, state.as_str()) {
         // First capture: PENDING -> PROVISIONING. paid_through is set later, at ACTIVE (lnrent-7fp.10).
         (Some("order"), "PENDING") => {
+            // Settlement-expiry gate: funds arrived (the OPEN -> PAID CAS already ran), but if the
+            // settlement lands at or after the order invoice's expiry the reservation was released
+            // by reconcile, or is due to be; route to refund instead of provisioning. INCLUSIVE
+            // boundary (`>=`), symmetric to the renewal retention gate below; a NULL expires_at
+            // means no expiry, so provision as before. Like the retention/terminal arms this only
+            // DETECTS the refund — it leaves the sub state untouched (capture never moves it here).
+            if let Some(exp) = order_expires_at {
+                if s.settled_at >= exp {
+                    refund_intent(tx, Some(sub_id), refund_dest.as_deref(), s, now)?;
+                    journal(tx, Some(sub_id), "settle_expired_refund", s, now)?;
+                    return Ok(Capture::RefundDue);
+                }
+            }
             tx.execute(
                 "UPDATE subscription SET state='PROVISIONING', updated_at=?2 WHERE id=?1",
                 params![sub_id, now],
@@ -381,6 +397,19 @@ mod tests {
             .await
             .unwrap()
     }
+    /// Stamp an order invoice's bolt11 expiry (`seed` leaves `expires_at` NULL).
+    async fn set_expiry(s: &Store, ext: &str, exp: i64) {
+        let ext = ext.to_string();
+        s.transaction(move |tx| {
+            tx.execute(
+                "UPDATE invoice SET expires_at=?2 WHERE external_id=?1",
+                params![ext, exp],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn order_capture_moves_pending_to_provisioning() {
@@ -397,6 +426,99 @@ mod tests {
         let (st, applied) = inv_status(&s, "ext1").await;
         assert_eq!(st, "PAID");
         assert_eq!(applied, Some(500), "applied_at stamped from the settlement");
+        assert_eq!(refund_count(&s).await, 0);
+    }
+
+    // Settlement-expiry gate: an order settlement landing AT or AFTER the invoice's expiry is too
+    // late (the reservation was, or is due to be, released by reconcile) -> refund, not provision.
+    // Boundary is INCLUSIVE (`>=`), symmetric to the retention gate; like that gate it only DETECTS
+    // the refund, so the sub state is left untouched (stays PENDING, NOT PROVISIONING).
+    #[tokio::test]
+    async fn order_settlement_at_or_after_expiry_refunds_not_provisions() {
+        // expiry E = 1000: exercise the inclusive boundary (settled_at == E) and strictly after.
+        for settled_at in [1000, 1500] {
+            let s = mem_store();
+            seed(
+                &s,
+                "o1",
+                "PENDING",
+                None,
+                100,
+                10,
+                0,
+                Some("lnaddr@x"),
+                "order",
+                "OPEN",
+                "ext1",
+            )
+            .await;
+            set_expiry(&s, "ext1", 1000).await;
+            assert_eq!(
+                capture(&s, settlement("ext1", settled_at), 1)
+                    .await
+                    .unwrap(),
+                Capture::RefundDue,
+                "settled_at={settled_at} >= expiry -> refund"
+            );
+            assert_eq!(
+                sub_state(&s, "o1").await,
+                "PENDING",
+                "settled_at={settled_at}: an expired order does NOT provision"
+            );
+            // Funds arrived, so the OPEN->PAID CAS still flipped the invoice; one refund recorded
+            // (with the sub's dest, like the other refund paths).
+            assert_eq!(inv_status(&s, "ext1").await.0, "PAID");
+            assert_eq!(
+                refund_count(&s).await,
+                1,
+                "settled_at={settled_at}: exactly one refund for the expired order"
+            );
+        }
+    }
+
+    // One second before expiry is in time -> provision as today (unchanged from the no-expiry path).
+    #[tokio::test]
+    async fn order_settlement_before_expiry_provisions() {
+        let s = mem_store();
+        seed(
+            &s,
+            "o1",
+            "PENDING",
+            None,
+            100,
+            10,
+            0,
+            Some("lnaddr@x"),
+            "order",
+            "OPEN",
+            "ext1",
+        )
+        .await;
+        set_expiry(&s, "ext1", 1000).await;
+        assert_eq!(
+            capture(&s, settlement("ext1", 999), 1).await.unwrap(),
+            Capture::Captured,
+            "one second before expiry still provisions"
+        );
+        assert_eq!(sub_state(&s, "o1").await, "PROVISIONING");
+        assert_eq!(inv_status(&s, "ext1").await.0, "PAID");
+        assert_eq!(refund_count(&s).await, 0);
+    }
+
+    // A NULL expires_at means NO expiry is enforced -> provision even far in the future.
+    #[tokio::test]
+    async fn order_settlement_with_null_expiry_provisions() {
+        let s = mem_store();
+        seed(
+            &s, "o1", "PENDING", None, 100, 10, 0, None, "order", "OPEN", "ext1",
+        )
+        .await; // seed leaves expires_at NULL
+        assert_eq!(
+            capture(&s, settlement("ext1", 1_000_000), 1).await.unwrap(),
+            Capture::Captured,
+            "a NULL expires_at never expires -> provision"
+        );
+        assert_eq!(sub_state(&s, "o1").await, "PROVISIONING");
         assert_eq!(refund_count(&s).await, 0);
     }
 
