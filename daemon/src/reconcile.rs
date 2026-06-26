@@ -282,6 +282,44 @@ impl Reconciler {
         }
     }
 
+    /// True when the sub has an OPEN renewal invoice the backend reports PAID — capture (.8) has not
+    /// applied the settlement yet, so suspend / terminate must DEFER and leave it for capture to
+    /// resume/extend, rather than suspend/terminate (and later refund) a TIMELY-paid renewal while
+    /// the settlement watch lagged a reconcile tick (codex P1). A lookup error also defers (retry next
+    /// tick) rather than guessing the renewal lapsed; only a definitive Open/Expired lets it proceed.
+    async fn renewal_settlement_pending(&self, sub_id: &str) -> Result<bool> {
+        let id = sub_id.to_string();
+        let invoice_ids: Vec<String> = self
+            .store
+            .read(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT id FROM invoice
+                      WHERE subscription_id=?1 AND kind='renewal' AND status='OPEN'",
+                )?;
+                let rows = stmt
+                    .query_map(params![id], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        for invoice_id in invoice_ids {
+            match self.payment.lookup(&invoice_id) {
+                Ok(PaymentStatus::Paid) => {
+                    tracing::warn!(sub = %sub_id, invoice = %invoice_id,
+                        "reconcile: renewal invoice paid at backend; deferring suspend/terminate for capture");
+                    return Ok(true);
+                }
+                Ok(PaymentStatus::Open | PaymentStatus::Expired) => {}
+                Err(e) => {
+                    tracing::warn!(sub = %sub_id, invoice = %invoice_id, error = %e,
+                        "reconcile: renewal invoice lookup failed; deferring suspend/terminate");
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     async fn subscription_matches(&self, sub_id: &str, state: &str, nd: i64) -> Result<bool> {
         let (id, state) = (sub_id.to_string(), state.to_string());
         self.store
@@ -518,6 +556,11 @@ impl Reconciler {
         if !self.subscription_matches(sub_id, "ACTIVE", nd).await? {
             return Ok(false);
         }
+        // A renewal paid at the backend but not yet captured will extend paid_through and move this
+        // deadline — don't suspend a timely-paid sub out from under the pending capture (codex P1).
+        if self.renewal_settlement_pending(sub_id).await? {
+            return Ok(false);
+        }
         self.run_lifecycle_hook("suspend", sub_id, buyer_hex)
             .await?;
 
@@ -560,6 +603,11 @@ impl Reconciler {
     /// released leaves the retention cursor due for a retry. Hook failure is logged and non-fatal.
     async fn fire_destroy(&self, sub_id: &str, buyer_hex: &str, nd: i64, now: i64) -> Result<bool> {
         if !self.subscription_matches_destroy(sub_id, nd).await? {
+            return Ok(false);
+        }
+        // A renewal paid within the resumable window (settled_at < paid_through + retention_s) will
+        // RESUME the sub at capture — don't terminate it while that settlement is pending (codex P1).
+        if self.renewal_settlement_pending(sub_id).await? {
             return Ok(false);
         }
         self.run_lifecycle_hook("destroy", sub_id, buyer_hex)
@@ -609,6 +657,19 @@ impl Reconciler {
             .await?;
         let mut expired = 0;
         for (inv_id, sub_id) in rows {
+            // Don't expire a renewal invoice the backend reports PAID — leave it OPEN for capture
+            // (.8) to apply (codex P1). A lookup error skips it this tick and retries next tick.
+            match self.payment.lookup(&inv_id) {
+                Ok(PaymentStatus::Paid) => {
+                    tracing::warn!(invoice = %inv_id, "reconcile: renewal invoice paid at backend; leaving OPEN for capture");
+                    continue;
+                }
+                Ok(PaymentStatus::Open | PaymentStatus::Expired) => {}
+                Err(e) => {
+                    tracing::warn!(invoice = %inv_id, error = %e, "reconcile: renewal invoice lookup failed; will retry expiry next tick");
+                    continue;
+                }
+            }
             let claimed = self
                 .store
                 .transaction(move |tx| {
@@ -1101,6 +1162,37 @@ mod tests {
             .await,
             1
         );
+    }
+
+    // codex P1: a renewal paid at the backend but not yet captured (settlement watch lagged this
+    // tick) must NOT be suspended out from under the pending capture, which will extend paid_through.
+    // reconcile defers the suspend; the sub stays ACTIVE and the renewal invoice stays OPEN.
+    #[tokio::test]
+    async fn renewal_paid_at_backend_defers_suspend() {
+        let store = mem_store();
+        let payment = Arc::new(crate::backends::MockPayment::new());
+        let inv = payment
+            .create_invoice(100, "lnrent renewal s1", 10000, "renew:auto:s1:1000")
+            .unwrap();
+        payment.settle("renew:auto:s1:1000", 980).unwrap(); // paid at backend; capture pending
+        // ACTIVE sub due for SUSPEND at paid_through=1000 (cursor == paid_through), retention 500.
+        seed_sub(&store, "s1", "ACTIVE", "buyer", Some(1000), 500, Some(1000)).await;
+        seed_invoice(
+            &store,
+            &inv.id,
+            "s1",
+            "renew:auto:s1:1000",
+            "renewal",
+            "OPEN",
+            Some(inv.expires_at),
+        )
+        .await;
+        let r = Reconciler::new(store.clone(), payment.clone(), dummy_recipe());
+
+        let rep = r.reconcile_tick(1000).await.unwrap();
+        assert_eq!(rep.suspended, 0, "a paid-pending renewal defers the suspend");
+        assert_eq!(sub_state(&store, "s1").await, "ACTIVE");
+        assert_eq!(inv_status(&store, "renew:auto:s1:1000").await, "OPEN");
     }
 
     // Test 1d: a SUSPENDED sub past its retention end -> TERMINATED, the destroy hook ran, the
