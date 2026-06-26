@@ -8,6 +8,7 @@ pub mod domain;
 pub mod identity;
 pub mod ipc;
 pub mod nostr_engine;
+pub mod op_dispatch;
 pub mod order_intake;
 pub mod provision;
 pub mod recipe;
