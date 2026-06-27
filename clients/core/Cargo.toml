@@ -1,0 +1,22 @@
+[package]
+name = "lnrent-buyer-core"
+version = "0.1.0"
+edition = "2021"
+description = "lnrent buyer-side protocol logic (target-agnostic; the CLI and the web client share it)"
+
+# TARGET-AGNOSTIC by construction (SPEC.md §4.7, ADR-0014, lnrent-7fp.13): pure protocol over the
+# shared `lnrent-wire` codec, with all I/O injected as traits the host implements. NO native-only
+# dep (no nostr-sdk, no tokio net, no sqlite, no std::os) so it compiles for wasm32 unchanged — the
+# native build/test is the gate here; wasm is verified separately in the nix devshell.
+[dependencies]
+lnrent-wire = { path = "../../wire" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+# Object-safe async traits (Relay / GiftWrapStream) — pure proc-macro, target-agnostic (the daemon
+# uses the same crate for its handler traits).
+async-trait = "0.1"
+
+[dev-dependencies]
+# A fake in-memory Relay + generated Keys drive the unit tests; no network.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

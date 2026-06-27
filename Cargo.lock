@@ -828,6 +828,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
+name = "lnrent-buyer-cli"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "lnrent-buyer-core",
+ "lnrent-wire",
+ "lnrentd",
+ "nostr-relay-builder",
+ "nostr-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "lnrent-buyer-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "lnrent-wire",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "lnrent-wire"
 version = "0.1.0"
 dependencies = [
