@@ -504,6 +504,16 @@ fn resolve_data_dir(raw: &RawConfig) -> PathBuf {
 /// reuse it. Structured errors only — never a prompt; the caller maps `err.code` to an exit via
 /// [`exit_code`].
 pub async fn bootstrap_headless(raw: RawConfig) -> Result<Operator, IpcError> {
+    // The daemon runtime wiring (lnrent-7fp.21) needs the same boot but also the opened store
+    // handle; share the one open below and discard the store here.
+    bootstrap_headless_with_store(raw).await.map(|(op, _)| op)
+}
+
+/// Like [`bootstrap_headless`] but ALSO returns the opened [`Store`] handle so the daemon runtime
+/// (lnrent-7fp.21) boots from a SINGLE open of the state DB (the supervisor shares this handle)
+/// instead of opening it twice. The store is opened exactly once here; the seam exists only so the
+/// runtime can avoid a double open — the bootstrap logic is unchanged.
+pub async fn bootstrap_headless_with_store(raw: RawConfig) -> Result<(Operator, Store), IpcError> {
     // Hold the merged config in a `Zeroizing` guard so its plaintext mnemonic is wiped on EVERY
     // return path here — including the early `create_private_dir_all` / `Store::open_spawn` errors,
     // which return BEFORE `bootstrap` moves the mnemonic into its own zeroizing guard. `RawConfig`
@@ -527,7 +537,18 @@ pub async fn bootstrap_headless(raw: RawConfig) -> Result<Operator, IpcError> {
     // DB's own perms must be tightened to owner-only or its later credential-bearing rows would be
     // group/world-readable — same 0600 contract as the seed/fedimint files (review R1 P2).
     harden_state_db_perms(&db_path)?;
-    bootstrap(std::mem::take(&mut *raw), &store).await
+    let op = bootstrap(std::mem::take(&mut *raw), &store).await?;
+    Ok((op, store))
+}
+
+/// The payment backend a merged [`RawConfig`] resolves to, WITHOUT opening the store or persisting
+/// anything. The daemon (lnrent-7fp.21) calls this to reject an unsupported backend (M1a is
+/// MockPayment only) BEFORE [`bootstrap_headless_with_store`] commits the operator row/seed —
+/// otherwise a committed `fedimint` row + `fedimint.json` would brick a subsequent retry with
+/// `mock` (a `config_conflict`, since the federation invite pins the money-routing backend and is
+/// never silently repointed). A read-only resolve; it does not change any existing config logic.
+pub fn resolved_payment_backend(raw: &RawConfig) -> Result<PaymentMode, IpcError> {
+    Ok(resolve_config(raw)?.payment_backend)
 }
 
 /// Resolve [`RawConfig`] into a validated [`OperatorConfig`], applying M1a defaults (mock backend,

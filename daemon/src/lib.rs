@@ -17,3 +17,4 @@ pub mod refund;
 pub mod reservation;
 pub mod runner;
 pub mod store;
+pub mod supervisor;

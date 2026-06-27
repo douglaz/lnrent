@@ -9,11 +9,15 @@
 //! prints the structured `{code, message, retryable}` error to stderr and exits nonzero. (The
 //! daemon-startup wiring that also bootstraps is bead .21.)
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use lnrentd::config::{self, BootstrapInput, RawConfig};
-use lnrentd::ipc::{self, IpcError};
-use lnrentd::{recipe::Recipe, store::Store};
+use lnrentd::backends::{MockPayment, PaymentBackend};
+use lnrentd::clock::{Clock, SystemClock};
+use lnrentd::config::{self, BootstrapInput, PaymentMode, RawConfig};
+use lnrentd::ipc::IpcError;
+use lnrentd::nostr_engine::NostrEngine;
+use lnrentd::recipe::Recipe;
+use lnrentd::supervisor::{Intervals, Supervisor};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -92,42 +96,144 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Open state, load recipes, and serve the operator IPC socket. The long-running daemon path.
+/// The long-running daemon (lnrent-7fp.21): bootstrap the operator identity + config, open state
+/// ONCE, connect the Nostr engine, load the operator's recipe, and run the supervised M1a money path
+/// (IPC + Nostr inbound + settlement→capture + reconcile + maintenance) until a Ctrl-C / SIGTERM
+/// triggers a graceful shutdown.
 async fn run_daemon() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let data_dir = std::env::var("LNRENT_DATA_DIR").unwrap_or_else(|_| "./data".into());
-    std::fs::create_dir_all(&data_dir)?;
-    let db_path = format!("{data_dir}/lnrent.sqlite");
-    let store = Store::open_spawn(&db_path)?;
-    tracing::info!(db = %db_path, "lnrentd state opened; store actor up (sole writer)");
-
-    let recipes_dir = std::env::var("LNRENT_RECIPES_DIR").unwrap_or_else(|_| "./recipes".into());
-    // Only recipes that PASS validation enter the live catalog — an invalid recipe is disabled,
-    // not silently kept around for listing/dispatch (codex #5).
-    let recipes: Vec<Recipe> = match Recipe::load_all(&recipes_dir) {
-        Ok(rs) => rs
-            .into_iter()
-            .filter(|r| match r.validate() {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::error!(id = %r.service.id, error = %e, "recipe failed validation — DISABLED");
-                    false
-                }
-            })
-            .collect(),
-        Err(e) => {
-            tracing::warn!(error = %e, dir = %recipes_dir, "no recipes loaded");
-            Vec::new()
-        }
+    // Bootstrap is idempotent on a re-run (reads back the persisted seed); it opens the state DB
+    // ONCE and hands back the shared store handle (no double open).
+    let input = BootstrapInput {
+        flags: RawConfig::default(),
+        config_path: None,
+        read_stdin: false,
     };
-    tracing::info!(count = recipes.len(), dir = %recipes_dir, "recipes loaded (validated)");
+    let mut raw = config::load_raw_config(input)
+        .map_err(|e| anyhow::anyhow!("operator bootstrap failed: {} ({})", e.message, e.code))?;
+    // M1a is MockPayment only (FedimintPayment is a stub, backends.rs). Reject `fedimint` BEFORE
+    // bootstrap persists the operator row/seed: committing a `fedimint` row + `fedimint.json` would
+    // brick a later retry with `mock` (a `config_conflict`, since the federation invite is never
+    // silently repointed). The post-bootstrap check below still guards the inherited case (a
+    // re-bootstrap that omits the backend but already stored `fedimint`).
+    if config::resolved_payment_backend(&raw)
+        .map_err(|e| anyhow::anyhow!("operator bootstrap failed: {} ({})", e.message, e.code))?
+        == PaymentMode::Fedimint
+    {
+        anyhow::bail!(
+            "payment_backend=fedimint is not supported in M1a (FedimintPayment is a stub); \
+             bootstrap with payment_backend=mock"
+        );
+    }
+    let (operator, store) = config::bootstrap_headless_with_store(std::mem::take(&mut *raw))
+        .await
+        .map_err(|e| anyhow::anyhow!("operator bootstrap failed: {} ({})", e.message, e.code))?;
+    tracing::info!(
+        operator = %operator.identity.npub(),
+        "lnrentd state opened; store actor up (sole writer); operator identity ready"
+    );
 
-    // TODO M1: reconcile loop (§6.5), Nostr engine, payment watch — spawned alongside serve().
-    let sock = format!("{data_dir}/lnrent.sock");
-    let clock: Arc<dyn lnrentd::clock::Clock> = Arc::new(lnrentd::clock::SystemClock);
-    tracing::info!(socket = %sock, "lnrentd up; serving operator IPC");
-    ipc::serve(store, Arc::new(recipes), clock, &sock).await
+    // M1a is MockPayment only — the Fedimint backend is a stub (lnrent-7fp.4, backends.rs). Fail
+    // clearly rather than silently mis-route money.
+    if operator.config.payment_backend == PaymentMode::Fedimint {
+        anyhow::bail!(
+            "payment_backend=fedimint is not supported in M1a (FedimintPayment is a stub); \
+             bootstrap with payment_backend=mock"
+        );
+    }
+    // Construct the CONCRETE MockPayment so the supervisor can keep its internal clock synced to the
+    // SystemClock (`set_now` is mock-only, not on the PaymentBackend trait). Seed it now too, so the
+    // very first invoice issued before the first maintenance tick already stamps a live expiry rather
+    // than a 1970 one (which reconcile would instantly expire).
+    let mock = Arc::new(MockPayment::new());
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    mock.set_now(clock.now());
+    let payment: Arc<dyn PaymentBackend> = mock.clone();
+
+    // The operator's recipe (M1a single-recipe): only a recipe that PASSES validation is served.
+    let recipes_dir = std::env::var("LNRENT_RECIPES_DIR").unwrap_or_else(|_| "./recipes".into());
+    let recipe = load_operator_recipe(&recipes_dir)?;
+    tracing::info!(recipe = %recipe.service.id, "operator recipe loaded (validated)");
+
+    // Connect the Nostr engine with the operator account-0 key + configured relays.
+    let engine = NostrEngine::connect(
+        operator.identity.keys().clone(),
+        &operator.config.relays,
+        store.clone(),
+    )
+    .await
+    .context("connecting the operator Nostr engine")?;
+
+    let sock = operator.config.data_dir.join("lnrent.sock");
+    let supervisor = Supervisor::build(
+        store,
+        engine,
+        payment,
+        clock,
+        recipe,
+        sock,
+        Intervals::production(),
+    )
+    .await?
+    .with_payment_clock_sync(move |now| mock.set_now(now));
+    let running = supervisor.start().await?;
+
+    // Run until a termination signal, then shut down gracefully (drain in-flight + flush outbox).
+    wait_for_term_signal().await;
+    tracing::info!("lnrentd: termination signal received; shutting down");
+    running.shutdown().await
+}
+
+/// Load + validate the operator's recipe(s) and return the single one M1a serves (lowest id wins,
+/// for determinism). Fails clearly when no recipe validates.
+fn load_operator_recipe(recipes_dir: &str) -> Result<Recipe> {
+    let mut recipes: Vec<Recipe> = Recipe::load_all(recipes_dir)
+        .with_context(|| format!("loading recipes from {recipes_dir}"))?
+        .into_iter()
+        .filter(|r| match r.validate() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(id = %r.service.id, error = %e, "recipe failed validation — DISABLED");
+                false
+            }
+        })
+        .collect();
+    recipes.sort_by(|a, b| a.service.id.cmp(&b.service.id));
+    let mut iter = recipes.into_iter();
+    let recipe = iter
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no valid recipe found in {recipes_dir}"))?;
+    let extra = iter.len();
+    if extra > 0 {
+        tracing::warn!(chosen = %recipe.service.id, ignored = extra, "M1a serves a single recipe; ignoring the rest");
+    }
+    Ok(recipe)
+}
+
+/// Resolve on Ctrl-C or SIGTERM — the graceful-shutdown trigger (the daemon is Unix-only: it owns a
+/// Unix-domain IPC socket).
+async fn wait_for_term_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot install SIGTERM handler; Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// The headless `lnrentd bootstrap` entrypoint: merge the four sources, run the bootstrap, and emit

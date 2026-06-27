@@ -21,7 +21,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util", "net", "signal"] }
 # The shared wire codec (lnrent-7fp.19): DM types, gift-wrap, 30402 listings. The Nostr engine
 # is built ON it and must NOT re-implement those.
 lnrent-wire = { path = "../wire" }

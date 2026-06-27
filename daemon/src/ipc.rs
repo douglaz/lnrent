@@ -72,28 +72,69 @@ impl Reply {
 const MAX_REQUEST_BYTES: u64 = 1 << 18; // 256 KiB
 
 /// Serve IPC on `path` until the listener errors. Each connection is one request -> one reply.
-/// The socket is created owner-only and is removed-then-rebound to clear a stale socket.
+/// The socket is created owner-only and is removed-then-rebound to clear a stale socket. This is
+/// the never-shutdown form; the daemon supervisor (lnrent-7fp.21) uses [`serve_with_shutdown`].
 pub async fn serve(
     store: Store,
     recipes: Arc<Vec<Recipe>>,
     clock: Arc<dyn Clock>,
     path: impl AsRef<Path>,
 ) -> Result<()> {
+    // A signal that never fires: the loop only ends on a listener error.
+    let (_never, rx) = tokio::sync::watch::channel(false);
+    serve_with_shutdown(store, recipes, clock, path, rx).await
+}
+
+/// Like [`serve`] but stops accepting new connections once `shutdown` flips to `true`, returning
+/// `Ok(())` for a graceful stop. In-flight connections each commit on their own spawned task; the
+/// store actor (sole writer, ADR-0001) serializes their writes regardless of this accept loop. The
+/// wire protocol is unchanged — this only adds a cancellation arm to the accept loop.
+pub async fn serve_with_shutdown(
+    store: Store,
+    recipes: Arc<Vec<Recipe>>,
+    clock: Arc<dyn Clock>,
+    path: impl AsRef<Path>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     let path = path.as_ref();
+    if *shutdown.borrow() {
+        return Ok(()); // already shutting down — never bind
+    }
     let _ = std::fs::remove_file(path);
     let listener =
         UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("perms on {}", path.display()))?;
     tracing::info!(socket = %path.display(), "ipc serving");
+    // Track the spawned per-connection handlers so a graceful shutdown can AWAIT the ones still
+    // in flight — committing an admin txn and writing its reply — instead of dropping them when the
+    // accept loop stops (the handlers were previously detached, so a shutdown could lose an in-flight
+    // admin txn+reply, violating the graceful-shutdown AC).
+    let mut conns = tokio::task::JoinSet::new();
     loop {
-        let (stream, _addr) = listener.accept().await?;
-        let (store, recipes, clock) = (store.clone(), recipes.clone(), clock.clone());
-        tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, store, recipes, clock).await {
-                tracing::warn!(error = %e, "ipc connection error");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _addr) = accepted?;
+                let (store, recipes, clock) = (store.clone(), recipes.clone(), clock.clone());
+                conns.spawn(async move {
+                    if let Err(e) = handle_conn(stream, store, recipes, clock).await {
+                        tracing::warn!(error = %e, "ipc connection error");
+                    }
+                });
+                // Reap completed handlers so the set doesn't grow unbounded under steady load.
+                while conns.try_join_next().is_some() {}
             }
-        });
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    tracing::info!(socket = %path.display(), "ipc serve: shutdown signaled; draining in-flight handlers");
+                    let _ = std::fs::remove_file(path);
+                    // Let in-flight handlers finish their txn + reply. Bounded by the supervisor's
+                    // shutdown grace, which aborts this whole task if the drain overruns.
+                    while conns.join_next().await.is_some() {}
+                    return Ok(());
+                }
+            }
+        }
     }
 }
 
