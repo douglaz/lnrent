@@ -4,8 +4,10 @@
 //! `fedimint-client` 0.11.1 + `fedimint-rocksdb` (a 2nd DB engine, bundled C++) are never compiled
 //! into the wasm buyer.
 //!
-//! Status: `.4b` client construction (join/open) DONE; `.4c.2` (THIS) inbound receive —
-//! `create_invoice` / `watch` / `lookup`. `.4c.3` (outbound `pay` / status) is still stubbed.
+//! Status: `.4b` client construction DONE; `.4c.2` inbound receive (`create_invoice`/`watch`/
+//! `lookup`) DONE; `.4c.3` outbound `pay`/`payment_status` DONE — the whole `PaymentBackend` trait
+//! is implemented. `.4d` is the live `devimint` regtest integration test; `main.rs` still rejects
+//! `payment_backend=fedimint` until that passes + the refund-dest resolver lands (codex review).
 //!
 //! Design (folding in the codex `.4` review):
 //!  - **Gateway required** — `create_bolt11_invoice` with no gateway is internal-only; `.4c` selects
@@ -42,10 +44,10 @@ use fedimint_core::invite_code::InviteCode;
 use fedimint_core::Amount;
 use fedimint_derive_secret::DerivableSecret;
 use fedimint_ln_client::{
-    LightningClientInit, LightningClientModule, LightningOperationMeta,
-    LightningOperationMetaVariant, LnReceiveState,
+    InternalPayState, LightningClientInit, LightningClientModule, LightningOperationMeta,
+    LightningOperationMetaVariant, LnPayState, LnReceiveState, PayType,
 };
-use fedimint_ln_common::lightning_invoice::{Bolt11InvoiceDescription, Description};
+use fedimint_ln_common::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use fedimint_mint_client::MintClientInit;
 use fedimint_rocksdb::RocksDb;
 use fedimint_wallet_client::WalletClientInit;
@@ -81,7 +83,8 @@ CREATE TABLE IF NOT EXISTS fedimint_pay (
     idempotency_key  TEXT PRIMARY KEY,
     operation_id     TEXT NOT NULL,
     backend_pay_id   TEXT NOT NULL,
-    status           TEXT NOT NULL DEFAULT 'PENDING'
+    status           TEXT NOT NULL DEFAULT 'PENDING',
+    pay_kind         TEXT NOT NULL DEFAULT 'ln'
 );
 ";
 
@@ -181,6 +184,67 @@ impl FedimintPayment {
 
         Ok(me)
     }
+
+    /// Await a refund payment to a terminal state, recording the outcome in the pay index and
+    /// returning the backend payment id (the operation-id hex) on success, or an error on a
+    /// definitive failure. Outbound, so there is no settled_at/over-credit concern — `into_stream()`
+    /// (which replays a cached terminal outcome as a single item) is sufficient, unlike `watch()`.
+    async fn await_pay(&self, payment_type: PayType, key: &str) -> Result<String> {
+        let op_hex = payment_type.operation_id().fmt_full().to_string();
+        let ln = self
+            .client
+            .get_first_module::<LightningClientModule>()
+            .context("fedimint: no lightning module")?;
+        match payment_type {
+            PayType::Lightning(op) => {
+                let mut updates = ln
+                    .subscribe_ln_pay(op)
+                    .await
+                    .context("subscribing to refund payment")?
+                    .into_stream();
+                while let Some(state) = updates.next().await {
+                    match state {
+                        LnPayState::Success { .. } => {
+                            pay_idx_mark(&self.index, key, "SUCCEEDED")?;
+                            return Ok(op_hex);
+                        }
+                        // Created / Funded / AwaitingChange / WaitingForRefund -> keep waiting.
+                        LnPayState::Created
+                        | LnPayState::Funded { .. }
+                        | LnPayState::AwaitingChange
+                        | LnPayState::WaitingForRefund { .. } => {}
+                        // Refunded / Canceled / UnexpectedError -> definitive failure.
+                        other => {
+                            pay_idx_mark(&self.index, key, "FAILED")?;
+                            anyhow::bail!("refund payment failed: {other:?}");
+                        }
+                    }
+                }
+                anyhow::bail!("refund ln-pay stream ended without a terminal state")
+            }
+            PayType::Internal(op) => {
+                let mut updates = ln
+                    .subscribe_internal_pay(op)
+                    .await
+                    .context("subscribing to internal refund payment")?
+                    .into_stream();
+                while let Some(state) = updates.next().await {
+                    match state {
+                        InternalPayState::Preimage(_) => {
+                            pay_idx_mark(&self.index, key, "SUCCEEDED")?;
+                            return Ok(op_hex);
+                        }
+                        InternalPayState::Funding => {}
+                        other => {
+                            pay_idx_mark(&self.index, key, "FAILED")?;
+                            anyhow::bail!("internal refund payment failed: {other:?}");
+                        }
+                    }
+                }
+                anyhow::bail!("refund internal-pay stream ended without a terminal state")
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -268,14 +332,77 @@ impl PaymentBackend for FedimintPayment {
         }
     }
 
-    async fn pay(&self, _dest: &str, _amount_sat: u64, _idempotency_key: &str) -> Result<String> {
-        todo!(".4c.3: pay_bolt11_invoice via a selected gateway, idempotent on the key")
+    async fn pay(&self, dest: &str, amount_sat: u64, idempotency_key: &str) -> Result<String> {
+        // Idempotent on the key: a SUCCEEDED key never re-pays; a PENDING key re-awaits the SAME
+        // operation (a crash mid-pay resumes — fedimint persists the op); a FAILED key (the prior LN
+        // attempt was refunded back to us, so no funds left) or an absent key initiates a fresh
+        // attempt. fedimint additionally dedups per invoice payment-hash internally.
+        if let Some((op_hex, status, kind)) = pay_idx_get(&self.index, idempotency_key)? {
+            match status.as_str() {
+                "SUCCEEDED" => return Ok(op_hex),
+                "PENDING" => {
+                    let op = OperationId::from_str(&op_hex)
+                        .map_err(|e| anyhow!("invalid stored pay operation id: {e}"))?;
+                    let pt = if kind == "internal" {
+                        PayType::Internal(op)
+                    } else {
+                        PayType::Lightning(op)
+                    };
+                    return self.await_pay(pt, idempotency_key).await;
+                }
+                _ => {} // FAILED -> re-attempt below (the prior payment refunded; not a double-pay)
+            }
+        }
+
+        let invoice = Bolt11Invoice::from_str(dest).context("parsing refund bolt11")?;
+        let inv_msat = invoice
+            .amount_milli_satoshis()
+            .context("refund bolt11 has no amount")?;
+        anyhow::ensure!(
+            inv_msat == amount_sat.saturating_mul(1000),
+            "refund bolt11 amount {inv_msat} msat != owed {} msat",
+            amount_sat.saturating_mul(1000)
+        );
+
+        let ln = self
+            .client
+            .get_first_module::<LightningClientModule>()
+            .context("fedimint: no lightning module")?;
+        let gateway = ln
+            .get_gateway(None, false)
+            .await
+            .context("selecting a lightning gateway for the refund")?
+            .context("federation has no available lightning gateway")?;
+        let outgoing = ln
+            .pay_bolt11_invoice(
+                Some(gateway),
+                invoice,
+                json!({ "lnrent_idempotency_key": idempotency_key }),
+            )
+            .await
+            .context("initiating refund payment")?;
+
+        let kind = if matches!(outgoing.payment_type, PayType::Internal(_)) {
+            "internal"
+        } else {
+            "ln"
+        };
+        let op_hex = outgoing.payment_type.operation_id().fmt_full().to_string();
+        pay_idx_upsert(&self.index, idempotency_key, &op_hex, "PENDING", kind)?;
+        self.await_pay(outgoing.payment_type, idempotency_key).await
     }
-    async fn payment_status(&self, _payment_id: &str) -> Result<PayStatus> {
-        todo!(".4c.3: subscribe_ln_pay terminal state -> PayStatus")
+
+    async fn payment_status(&self, payment_id: &str) -> Result<PayStatus> {
+        Ok(map_pay_status(pay_idx_status_by_op(
+            &self.index,
+            payment_id,
+        )?))
     }
-    async fn payment_status_by_key(&self, _idempotency_key: &str) -> Result<PayStatus> {
-        todo!(".4c.3: pay index / operation-log status by key")
+    async fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus> {
+        Ok(map_pay_status(pay_idx_status_by_key(
+            &self.index,
+            idempotency_key,
+        )?))
     }
 
     async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
@@ -534,4 +661,86 @@ fn idx_mark_paid(index: &Mutex<Connection>, op_hex: &str, settled_at: Option<i64
         params![op_hex, settled_at],
     )?;
     Ok(())
+}
+
+// ---- the lnrent-owned outbound-pay index (refund idempotency, keyed by idempotency_key) ----------
+
+/// `(operation_id_hex, status, pay_kind)` for a refund key, if any.
+fn pay_idx_get(index: &Mutex<Connection>, key: &str) -> Result<Option<(String, String, String)>> {
+    let conn = index.lock().unwrap();
+    let row = conn
+        .query_row(
+            "SELECT operation_id, status, pay_kind FROM fedimint_pay WHERE idempotency_key = ?1",
+            params![key],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+fn pay_idx_status_by_op(index: &Mutex<Connection>, op_hex: &str) -> Result<Option<String>> {
+    let conn = index.lock().unwrap();
+    let s = conn
+        .query_row(
+            "SELECT status FROM fedimint_pay WHERE operation_id = ?1",
+            params![op_hex],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(s)
+}
+
+fn pay_idx_status_by_key(index: &Mutex<Connection>, key: &str) -> Result<Option<String>> {
+    let conn = index.lock().unwrap();
+    let s = conn
+        .query_row(
+            "SELECT status FROM fedimint_pay WHERE idempotency_key = ?1",
+            params![key],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(s)
+}
+
+/// Insert (or, on a FAILED-then-retry, replace) the pay row for a key as PENDING under a new op.
+fn pay_idx_upsert(
+    index: &Mutex<Connection>,
+    key: &str,
+    op_hex: &str,
+    status: &str,
+    kind: &str,
+) -> Result<()> {
+    let conn = index.lock().unwrap();
+    conn.execute(
+        "INSERT INTO fedimint_pay (idempotency_key, operation_id, backend_pay_id, status, pay_kind)
+         VALUES (?1, ?2, ?2, ?3, ?4)
+         ON CONFLICT(idempotency_key)
+           DO UPDATE SET operation_id = ?2, backend_pay_id = ?2, status = ?3, pay_kind = ?4",
+        params![key, op_hex, status, kind],
+    )?;
+    Ok(())
+}
+
+fn pay_idx_mark(index: &Mutex<Connection>, key: &str, status: &str) -> Result<()> {
+    let conn = index.lock().unwrap();
+    conn.execute(
+        "UPDATE fedimint_pay SET status = ?2 WHERE idempotency_key = ?1",
+        params![key, status],
+    )?;
+    Ok(())
+}
+
+fn map_pay_status(s: Option<String>) -> PayStatus {
+    match s.as_deref() {
+        Some("SUCCEEDED") => PayStatus::Succeeded,
+        Some("FAILED") => PayStatus::Failed,
+        Some("PENDING") => PayStatus::Pending,
+        _ => PayStatus::Unknown,
+    }
 }
