@@ -164,12 +164,16 @@ impl OrderIntake {
         //    idempotent on it, so a crash-retry regenerates the same invoice.
         let external_id = format!("order:{sender_hex}:{}", req.id);
         let amount_sat = listing.amount_sat as u64;
-        let invoice = match self.payment.create_invoice(
-            amount_sat,
-            &format!("lnrent order {order_id}"),
-            INVOICE_EXPIRY_S,
-            &external_id,
-        ) {
+        let invoice = match self
+            .payment
+            .create_invoice(
+                amount_sat,
+                &format!("lnrent order {order_id}"),
+                INVOICE_EXPIRY_S,
+                &external_id,
+            )
+            .await
+        {
             Ok(inv) => inv,
             Err(e) => {
                 // No sub committed yet — release the HELD reservation, then a structured error.
@@ -385,6 +389,7 @@ impl OrderIntake {
                 invoice_expiry_s,
                 external_id,
             )
+            .await
             .context("creating renewal invoice")?;
         let response = Msg::BillingInvoice(BillingInvoice {
             subscription_id: subscription_id.to_string(),

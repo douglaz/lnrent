@@ -405,6 +405,7 @@ impl Supervisor {
         let settle_rx = self
             .payment
             .watch()
+            .await
             .context("opening payment settlement stream")?;
 
         self.publish_and_upsert_listing().await?;
@@ -487,6 +488,7 @@ impl Supervisor {
                             Some(rx) => rx,
                             None => payment
                                 .watch()
+                                .await
                                 .context("re-opening settlement stream on restart")?,
                         };
                         run_settlement_loop(rx, store, clock, nudge2, sd).await
@@ -1028,7 +1030,7 @@ async fn settlement_catch_up(
         suspend_not_before,
     ) in open
     {
-        match payment.lookup(&inv_id) {
+        match payment.lookup(&inv_id).await {
             Ok(PaymentStatus::Paid) => {
                 let now = clock.now();
                 // Latest in-window settle time the recovered payment can carry: the invoice expiry (the
@@ -1258,6 +1260,7 @@ mod tests {
         mock.set_now(0); // invoice expires_at = 0 + 8000 = 8000 (well past B, so not the binding cap)
         let inv = mock
             .create_invoice(1000, "lnrent renewal s1", 8000, "renew:auto:s1:1000")
+            .await
             .unwrap();
         let inv_id = inv.id.clone();
         let expires_at = inv.expires_at;
@@ -1333,6 +1336,7 @@ mod tests {
         mock.set_now(0);
         let inv = mock
             .create_invoice(1000, "lnrent renewal s1", 8000, "renew:auto:s1:1000")
+            .await
             .unwrap();
         let inv_id = inv.id.clone();
         let expires_at = inv.expires_at;

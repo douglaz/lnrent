@@ -520,9 +520,10 @@ async fn drop_and_wait_for_ipc_down(running: RunningSupervisor, sock: PathBuf) {
 
 /// Create the MockPayment invoice for `external_id` (so a later `lookup`/`settle` resolves) and
 /// return the local invoice id + absolute expiry.
-fn mint_invoice(payment: &Arc<MockPayment>, external_id: &str) -> (String, i64) {
+async fn mint_invoice(payment: &Arc<MockPayment>, external_id: &str) -> (String, i64) {
     let inv = payment
         .create_invoice(100, &format!("lnrent {external_id}"), 3600, external_id)
+        .await
         .expect("mint mock invoice");
     (inv.id, inv.expires_at)
 }
@@ -1141,7 +1142,7 @@ async fn settlement_on_terminal_sub_refunds_without_resurrection() {
     )
     .await;
     let ext = format!("renew:auto:{sub_id}:{PAID_THROUGH}");
-    let (inv_id, exp) = mint_invoice(&payment, &ext);
+    let (inv_id, exp) = mint_invoice(&payment, &ext).await;
     seed_invoice(
         &store,
         &inv_id,
@@ -1353,7 +1354,7 @@ async fn late_order_settlement_refunds_without_provisioning() {
     .await;
     // Read the order invoice's bolt11 expiry, then push a live watched settlement AT that expiry.
     // This exercises the supervisor's wired settlement loop and the g5p INCLUSIVE expiry gate.
-    let (inv_id, expires_at) = mint_invoice(&payment, &external_id); // idempotent: returns the existing invoice
+    let (inv_id, expires_at) = mint_invoice(&payment, &external_id).await; // idempotent: returns the existing invoice
     assert_eq!(
         invoice_status(&store, &external_id)
             .await
@@ -1439,7 +1440,7 @@ async fn boot_catches_up_a_settlement_missed_while_down() {
     // the backend has marked the invoice paid (the watch() push was lost — there was no watcher).
     let sub_id = format!("ord:{buyer_hex}:c9a");
     let ext = format!("order:{buyer_hex}:c9a");
-    let (inv_id, exp) = mint_invoice(&payment, &ext);
+    let (inv_id, exp) = mint_invoice(&payment, &ext).await;
     seed_subscription(
         &store,
         &sub_id,
@@ -1715,6 +1716,7 @@ async fn boot_records_an_already_paid_refund_without_double_pay() {
     // The backend already paid this key before the crash (the fast-skip path must NOT pay again).
     let pre_pay_id = payment
         .pay("lnaddr@buyer", 100, &idem_key)
+        .await
         .expect("pre-pay the refund key");
 
     let _sup = start_supervisor(
@@ -1756,7 +1758,7 @@ async fn boot_records_an_already_paid_refund_without_double_pay() {
     );
     // The key still maps to the SAME backend payment id (idempotent) — no second payment was made.
     assert_eq!(
-        payment.pay("lnaddr@buyer", 100, &idem_key).unwrap(),
+        payment.pay("lnaddr@buyer", 100, &idem_key).await.unwrap(),
         pre_pay_id,
         "the refund key is idempotent: the fast-skip never double-paid"
     );

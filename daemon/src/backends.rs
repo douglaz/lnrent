@@ -8,6 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use tokio::sync::mpsc;
 
+use async_trait::async_trait;
+
 /// Where a workload runs. SPEC.md §8.1 (was `ProvisionBackend` in early drafts).
 pub trait ComputeBackend: Send + Sync {
     /// Create a container/VM; returns the Instance handle to record.
@@ -28,29 +30,34 @@ pub trait NetworkBackend: Send + Sync {
 
 /// Receiving and refunding Lightning. SPEC.md §6.1. No hold invoices on the v1
 /// backends, so `pay` exists for capture-then-refund (ADR-0003).
+///
+/// Async because the real backend (Fedimint, lnrent-7fp.4) is async to the core
+/// (`fedimint-client`); the in-memory `MockPayment` satisfies it trivially. Every call site is
+/// already inside an `async fn`, so it just `.await`s here (no runtime-nesting bridge).
+#[async_trait]
 pub trait PaymentBackend: Send + Sync {
     /// Create (or return the existing) invoice. **Idempotent on `external_id`**: a repeated
     /// call with the same `external_id` MUST return the same invoice, not a duplicate — so a
     /// retry after a crash regenerates the same `external_id` and reuses the invoice (§6.6).
-    fn create_invoice(
+    async fn create_invoice(
         &self,
         amount_sat: u64,
         memo: &str,
         expiry_s: u32,
         external_id: &str, // binds settlement -> order (ADR-0009); deterministic per invoice class (§6.6)
     ) -> Result<Invoice>;
-    fn lookup(&self, id: &str) -> Result<PaymentStatus>;
+    async fn lookup(&self, id: &str) -> Result<PaymentStatus>;
     /// Outbound payment, used for refunds. **Idempotent on `idempotency_key`**: calling twice
     /// with the same key never pays twice (ADR-0009, SPEC §6.6). Returns a backend payment id.
-    fn pay(&self, dest: &str, amount_sat: u64, idempotency_key: &str) -> Result<String>;
+    async fn pay(&self, dest: &str, amount_sat: u64, idempotency_key: &str) -> Result<String>;
     /// Status of an outbound payment by its backend id (ADR-0009 refund ledger).
-    fn payment_status(&self, payment_id: &str) -> Result<PayStatus>;
+    async fn payment_status(&self, payment_id: &str) -> Result<PayStatus>;
     /// Check an in-flight refund by its idempotency key after a crash (SPEC §6.6). An
     /// optimization only — retrying `pay(key)` is always safe (the key dedups).
-    fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus>;
+    async fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus>;
     /// Stream of settled payments (push). `Settlement.external_id` carries the order id
     /// (SPEC §6.1). M1a wires this to the Fedimint client settlement stream.
-    fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>>;
+    async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>>;
 }
 
 #[derive(Debug, Clone)]
@@ -138,8 +145,9 @@ impl NetworkBackend for WireguardNetwork {
 /// gateway. Cannot hold invoices (ADR-0003). phoenixd is a secondary backend (M3).
 pub struct FedimintPayment;
 
+#[async_trait]
 impl PaymentBackend for FedimintPayment {
-    fn create_invoice(
+    async fn create_invoice(
         &self,
         _amount_sat: u64,
         _memo: &str,
@@ -148,19 +156,19 @@ impl PaymentBackend for FedimintPayment {
     ) -> Result<Invoice> {
         bail!("fedimint.create_invoice not implemented (M0 stub)")
     }
-    fn lookup(&self, _id: &str) -> Result<PaymentStatus> {
+    async fn lookup(&self, _id: &str) -> Result<PaymentStatus> {
         bail!("fedimint.lookup not implemented (M0 stub)")
     }
-    fn pay(&self, _dest: &str, _amount_sat: u64, _idempotency_key: &str) -> Result<String> {
+    async fn pay(&self, _dest: &str, _amount_sat: u64, _idempotency_key: &str) -> Result<String> {
         bail!("fedimint.pay not implemented (M0 stub)")
     }
-    fn payment_status(&self, _payment_id: &str) -> Result<PayStatus> {
+    async fn payment_status(&self, _payment_id: &str) -> Result<PayStatus> {
         bail!("fedimint.payment_status not implemented (M0 stub)")
     }
-    fn payment_status_by_key(&self, _idempotency_key: &str) -> Result<PayStatus> {
+    async fn payment_status_by_key(&self, _idempotency_key: &str) -> Result<PayStatus> {
         bail!("fedimint.payment_status_by_key not implemented (M0 stub)")
     }
-    fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
+    async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
         bail!("fedimint.watch not implemented (M0 stub)")
     }
 }
@@ -222,8 +230,9 @@ impl MockPayment {
     }
 }
 
+#[async_trait]
 impl PaymentBackend for MockPayment {
-    fn create_invoice(
+    async fn create_invoice(
         &self,
         amount_sat: u64,
         _memo: &str,
@@ -248,7 +257,7 @@ impl PaymentBackend for MockPayment {
         st.invoices.insert(external_id.to_string(), inv.clone());
         Ok(inv)
     }
-    fn lookup(&self, id: &str) -> Result<PaymentStatus> {
+    async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
         let st = self.state.lock().unwrap();
         match st.invoices.values().find(|inv| inv.id == id) {
             Some(inv) if st.paid.contains(&inv.external_id) => Ok(PaymentStatus::Paid),
@@ -257,7 +266,7 @@ impl PaymentBackend for MockPayment {
             None => Ok(PaymentStatus::Expired), // unknown id -> gone
         }
     }
-    fn pay(&self, _dest: &str, _amount_sat: u64, idempotency_key: &str) -> Result<String> {
+    async fn pay(&self, _dest: &str, _amount_sat: u64, idempotency_key: &str) -> Result<String> {
         let mut st = self.state.lock().unwrap();
         if let Some(pid) = st.payments.get(idempotency_key) {
             return Ok(pid.clone()); // idempotent on key -> never pays twice
@@ -268,7 +277,7 @@ impl PaymentBackend for MockPayment {
         st.payments.insert(idempotency_key.to_string(), pid.clone());
         Ok(pid)
     }
-    fn payment_status(&self, payment_id: &str) -> Result<PayStatus> {
+    async fn payment_status(&self, payment_id: &str) -> Result<PayStatus> {
         let st = self.state.lock().unwrap();
         Ok(if st.payments.values().any(|p| p == payment_id) {
             PayStatus::Succeeded
@@ -276,7 +285,7 @@ impl PaymentBackend for MockPayment {
             PayStatus::Unknown
         })
     }
-    fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus> {
+    async fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus> {
         let st = self.state.lock().unwrap();
         Ok(if st.payments.contains_key(idempotency_key) {
             PayStatus::Succeeded
@@ -284,7 +293,7 @@ impl PaymentBackend for MockPayment {
             PayStatus::Unknown
         })
     }
-    fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+    async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
         let (tx, rx) = mpsc::channel(64);
         self.state.lock().unwrap().settle_tx = Some(tx);
         Ok(rx)
@@ -308,11 +317,11 @@ pub trait Observability: Send + Sync {
 mod mock_payment_tests {
     use super::*;
 
-    #[test]
-    fn create_invoice_is_idempotent_on_external_id() {
+    #[tokio::test]
+    async fn create_invoice_is_idempotent_on_external_id() {
         let m = MockPayment::new();
-        let a = m.create_invoice(1000, "memo", 3600, "ext1").unwrap();
-        let b = m.create_invoice(9999, "other", 60, "ext1").unwrap();
+        let a = m.create_invoice(1000, "memo", 3600, "ext1").await.unwrap();
+        let b = m.create_invoice(9999, "other", 60, "ext1").await.unwrap();
         assert_eq!(
             a.id, b.id,
             "same external_id -> same invoice, never a duplicate"
@@ -323,38 +332,38 @@ mod mock_payment_tests {
         );
     }
 
-    #[test]
-    fn lookup_honors_absolute_expiry() {
+    #[tokio::test]
+    async fn lookup_honors_absolute_expiry() {
         let m = MockPayment::new();
         m.set_now(1_000);
-        let inv = m.create_invoice(1000, "memo", 60, "ext1").unwrap();
+        let inv = m.create_invoice(1000, "memo", 60, "ext1").await.unwrap();
         assert_eq!(inv.expires_at, 1_060, "absolute expiry = now + expiry_s");
-        assert_eq!(m.lookup(&inv.id).unwrap(), PaymentStatus::Open);
+        assert_eq!(m.lookup(&inv.id).await.unwrap(), PaymentStatus::Open);
         m.set_now(1_100); // past expiry
-        assert_eq!(m.lookup(&inv.id).unwrap(), PaymentStatus::Expired);
+        assert_eq!(m.lookup(&inv.id).await.unwrap(), PaymentStatus::Expired);
     }
 
-    #[test]
-    fn settle_flips_lookup_to_paid_even_past_expiry() {
+    #[tokio::test]
+    async fn settle_flips_lookup_to_paid_even_past_expiry() {
         let m = MockPayment::new();
-        let inv = m.create_invoice(1000, "memo", 60, "ext1").unwrap();
+        let inv = m.create_invoice(1000, "memo", 60, "ext1").await.unwrap();
         m.settle("ext1", 30).unwrap();
         m.set_now(10_000); // a paid invoice stays Paid regardless of the clock
-        assert_eq!(m.lookup(&inv.id).unwrap(), PaymentStatus::Paid);
+        assert_eq!(m.lookup(&inv.id).await.unwrap(), PaymentStatus::Paid);
     }
 
-    #[test]
-    fn pay_is_idempotent_on_key() {
+    #[tokio::test]
+    async fn pay_is_idempotent_on_key() {
         let m = MockPayment::new();
-        let p1 = m.pay("dest", 500, "refund:x").unwrap();
-        let p2 = m.pay("dest", 500, "refund:x").unwrap();
+        let p1 = m.pay("dest", 500, "refund:x").await.unwrap();
+        let p2 = m.pay("dest", 500, "refund:x").await.unwrap();
         assert_eq!(p1, p2, "same key -> same payment id, never pays twice");
         assert_eq!(
-            m.payment_status_by_key("refund:x").unwrap(),
+            m.payment_status_by_key("refund:x").await.unwrap(),
             PayStatus::Succeeded
         );
         assert_eq!(
-            m.payment_status_by_key("refund:never").unwrap(),
+            m.payment_status_by_key("refund:never").await.unwrap(),
             PayStatus::Unknown
         );
     }
@@ -362,8 +371,8 @@ mod mock_payment_tests {
     #[tokio::test]
     async fn settle_pushes_on_the_watch_stream() {
         let m = MockPayment::new();
-        m.create_invoice(1000, "memo", 60, "ext1").unwrap();
-        let mut rx = m.watch().unwrap();
+        m.create_invoice(1000, "memo", 60, "ext1").await.unwrap();
+        let mut rx = m.watch().await.unwrap();
         let pushed = m.settle("ext1", 42).unwrap();
         let got = rx.recv().await.expect("a settlement arrives on watch()");
         assert_eq!(got.external_id, "ext1");

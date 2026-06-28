@@ -435,7 +435,7 @@ impl Reconciler {
         let Some(invoice_id) = invoice_id else {
             return Ok(true);
         };
-        match self.payment.lookup(&invoice_id) {
+        match self.payment.lookup(&invoice_id).await {
             Ok(PaymentStatus::Paid) => {
                 tracing::warn!(
                     sub = %sub_id,
@@ -478,7 +478,7 @@ impl Reconciler {
             })
             .await?;
         for invoice_id in invoice_ids {
-            match self.payment.lookup(&invoice_id) {
+            match self.payment.lookup(&invoice_id).await {
                 Ok(PaymentStatus::Paid) => {
                     tracing::warn!(sub = %sub_id, invoice = %invoice_id,
                         "reconcile: renewal invoice paid at backend; deferring suspend/terminate for capture");
@@ -679,12 +679,16 @@ impl Reconciler {
         // minting a second one. On a stale cursor the CAS below affects 0 rows and we never insert a
         // DB invoice row; the backend invoice minted just above is harmless (same idempotent
         // external_id, self-expiring), so no DB row is ever stranded.
-        let invoice = match self.payment.create_invoice(
-            self.recipe.pricing.amount_sat,
-            &format!("lnrent renewal {sub_id}"),
-            expiry_s,
-            &external_id,
-        ) {
+        let invoice = match self
+            .payment
+            .create_invoice(
+                self.recipe.pricing.amount_sat,
+                &format!("lnrent renewal {sub_id}"),
+                expiry_s,
+                &external_id,
+            )
+            .await
+        {
             Ok(inv) => inv,
             Err(e) => {
                 // A transient backend outage must not abort the whole tick — leave the cursor so the
@@ -854,7 +858,7 @@ impl Reconciler {
         for (inv_id, sub_id) in rows {
             // Don't expire a renewal invoice the backend reports PAID — leave it OPEN for capture
             // (.8) to apply (codex P1). A lookup error skips it this tick and retries next tick.
-            match self.payment.lookup(&inv_id) {
+            match self.payment.lookup(&inv_id).await {
                 Ok(PaymentStatus::Paid) => {
                     tracing::warn!(invoice = %inv_id, "reconcile: renewal invoice paid at backend; leaving OPEN for capture");
                     continue;
@@ -1370,6 +1374,7 @@ mod tests {
         let payment = Arc::new(crate::backends::MockPayment::new());
         let inv = payment
             .create_invoice(100, "lnrent order o1", 100, "order:o1")
+            .await
             .unwrap();
         payment.settle("order:o1", 80).unwrap();
         seed_sub(
@@ -1502,6 +1507,7 @@ mod tests {
         let payment = Arc::new(crate::backends::MockPayment::new());
         let inv = payment
             .create_invoice(100, "lnrent renewal s1", 10000, "renew:auto:s1:1000")
+            .await
             .unwrap();
         payment.settle("renew:auto:s1:1000", 980).unwrap(); // paid at backend; capture pending
                                                             // ACTIVE sub due for SUSPEND at paid_through=1000 (cursor == paid_through), retention 500.

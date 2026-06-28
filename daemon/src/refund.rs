@@ -116,7 +116,7 @@ impl Refunder {
         // Fast-skip: a prior attempt already paid on this key (e.g. a crash after pay but before the
         // SENT bookkeeping committed). Record SENT WITHOUT paying again. Only `Succeeded` skips — an
         // Unknown/Pending/Failed (or a lookup error) falls through to `pay`, which the key dedups.
-        if self.already_paid(&row.idempotency_key) {
+        if self.already_paid(&row.idempotency_key).await {
             // succeeded on a prior attempt; the backend payment id is unknown without re-paying.
             return self.finish_sent(&row, None, amount, now).await;
         }
@@ -126,12 +126,12 @@ impl Refunder {
             return self.commit_structural_failure(&row, amount, now).await;
         };
 
-        match self.payment.pay(dest, amount, &row.idempotency_key) {
+        match self.payment.pay(dest, amount, &row.idempotency_key).await {
             Ok(backend_payment_id) => {
                 self.finish_sent(&row, Some(backend_payment_id), amount, now)
                     .await
             }
-            Err(e) => match self.status_by_key_after_error(&row.idempotency_key) {
+            Err(e) => match self.status_by_key_after_error(&row.idempotency_key).await {
                 PayStatus::Succeeded => self.finish_sent(&row, None, amount, now).await,
                 PayStatus::Failed => {
                     tracing::warn!(
@@ -157,17 +157,17 @@ impl Refunder {
     /// `Succeeded` per the backend's idempotency-key status — the refund already went out on this
     /// key. Only `Succeeded` counts as paid; an `Unknown`/`Pending`/`Failed` (or a lookup error) is
     /// not, so the caller falls through to `pay`, which the key dedups.
-    fn already_paid(&self, idempotency_key: &str) -> bool {
+    async fn already_paid(&self, idempotency_key: &str) -> bool {
         matches!(
-            self.payment.payment_status_by_key(idempotency_key),
+            self.payment.payment_status_by_key(idempotency_key).await,
             Ok(PayStatus::Succeeded)
         )
     }
 
     /// Re-check the key after a `pay` error. Lookup errors are treated as `Unknown`: terminalizing
     /// while the backend cannot answer is unsafe because the payment may still settle later.
-    fn status_by_key_after_error(&self, idempotency_key: &str) -> PayStatus {
-        match self.payment.payment_status_by_key(idempotency_key) {
+    async fn status_by_key_after_error(&self, idempotency_key: &str) -> PayStatus {
+        match self.payment.payment_status_by_key(idempotency_key).await {
             Ok(status) => status,
             Err(e) => {
                 tracing::warn!(
@@ -483,6 +483,7 @@ mod tests {
     use crate::backends::{Invoice, PaymentStatus, Settlement};
     use crate::clock::TestClock;
     use crate::store::{Store, SCHEMA};
+    use async_trait::async_trait;
     use rusqlite::{Connection, OptionalExtension};
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -545,8 +546,14 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl PaymentBackend for TestPayment {
-        fn pay(&self, _dest: &str, _amount_sat: u64, idempotency_key: &str) -> Result<String> {
+        async fn pay(
+            &self,
+            _dest: &str,
+            _amount_sat: u64,
+            idempotency_key: &str,
+        ) -> Result<String> {
             let mut st = self.inner.lock().unwrap();
             st.pay_calls += 1;
             if st.settle_then_fail {
@@ -572,7 +579,7 @@ mod tests {
             st.paid.insert(idempotency_key.to_string(), pid.clone());
             Ok(pid)
         }
-        fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus> {
+        async fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus> {
             let st = self.inner.lock().unwrap();
             Ok(if st.paid.contains_key(idempotency_key) {
                 PayStatus::Succeeded
@@ -580,16 +587,16 @@ mod tests {
                 st.failed_status.unwrap_or(PayStatus::Unknown)
             })
         }
-        fn create_invoice(&self, _: u64, _: &str, _: u32, _: &str) -> Result<Invoice> {
+        async fn create_invoice(&self, _: u64, _: &str, _: u32, _: &str) -> Result<Invoice> {
             unimplemented!("refunder never receives")
         }
-        fn lookup(&self, _: &str) -> Result<PaymentStatus> {
+        async fn lookup(&self, _: &str) -> Result<PaymentStatus> {
             unimplemented!("refunder never looks up invoices")
         }
-        fn payment_status(&self, _: &str) -> Result<PayStatus> {
+        async fn payment_status(&self, _: &str) -> Result<PayStatus> {
             unimplemented!("refunder checks by key, not id")
         }
-        fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+        async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
             unimplemented!("refunder never watches")
         }
     }
