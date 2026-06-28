@@ -58,7 +58,6 @@ async-trait = "0.1"
 # re-clone, HEAD worktree untouched). Daemon-only (a 2nd DB engine, RocksDB C++; glibc-dynamic,
 # ADR-0015); never compiled into the wasm buyer. All optional so mock builds don't pull this tree.
 fedimint-client = { git = "file:///home/master/p/fedimint", tag = "v0.11.1", optional = true }
-fedimint-client-module = { git = "file:///home/master/p/fedimint", tag = "v0.11.1", optional = true }
 fedimint-core = { git = "file:///home/master/p/fedimint", tag = "v0.11.1", optional = true }
 fedimint-rocksdb = { git = "file:///home/master/p/fedimint", tag = "v0.11.1", optional = true }
 fedimint-derive-secret = { git = "file:///home/master/p/fedimint", tag = "v0.11.1", optional = true }
@@ -75,7 +74,6 @@ futures-util = { version = "0.3", optional = true }
 # money path + CI build without the heavy fedimint/rocksdb tree or a live federation.
 fedimint = [
     "dep:fedimint-client",
-    "dep:fedimint-client-module",
     "dep:fedimint-core",
     "dep:fedimint-rocksdb",
     "dep:fedimint-derive-secret",

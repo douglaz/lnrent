@@ -28,6 +28,7 @@
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -37,7 +38,6 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use fedimint_client::{Client, ClientHandleArc, OperationId, RootSecret};
-use fedimint_client_module::oplog::UpdateStreamOrOutcome;
 use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
@@ -65,6 +65,11 @@ const ROOT_SECRET_SALT: &[u8] = b"lnrent:fedimint:client:v1";
 /// `create_invoice`/`pay` (keyed by `external_id` / `idempotency_key`), separate from fedimint's
 /// rocksdb (codex finding #3).
 const INDEX_DB_FILE: &str = "lnrent_index.db";
+
+/// Bound on how long `pay()` blocks awaiting a refund to a terminal state before returning and
+/// leaving the row PENDING (recoverable). Stops one stuck refund (gateway down, or a payment parked
+/// in `WaitingForRefund`) from blocking the serial Refunder / maintenance pass (codex P1).
+const PAY_AWAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 const INDEX_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS fedimint_invoice (
@@ -95,6 +100,10 @@ pub struct FedimintPayment {
     index: Arc<Mutex<Connection>>,
     settle_tx: Mutex<Option<mpsc::Sender<Settlement>>>,
     clock: Arc<dyn Clock>,
+    /// Serializes `create_invoice`'s check->mint->insert so two concurrent same-`external_id` callers
+    /// can't both mint a gateway invoice (the loser would otherwise be stranded — absent from the
+    /// index, never watched). Async so it can be held across the mint `.await` (codex P1).
+    create_lock: tokio::sync::Mutex<()>,
 }
 
 impl FedimintPayment {
@@ -167,19 +176,20 @@ impl FedimintPayment {
             index: Arc::new(Mutex::new(conn)),
             settle_tx: Mutex::new(None),
             clock,
+            create_lock: tokio::sync::Mutex::new(()),
         };
 
-        // Backfill any invoice fedimint committed but the daemon never indexed (crash window). Best
-        // effort: on failure, create_invoice still self-heals via the index on the next attempt.
-        match recover_index_from_oplog(&me.client, &me.index).await {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(
-                backfilled = n,
+        // Backfill any invoice fedimint committed but the daemon never indexed (the crash window
+        // between minting and idx_insert). FAIL-CLOSED (codex P1): refusing to start on a recovery
+        // error is safer for real money than reopening the duplicate-mint window by continuing.
+        let recovered = recover_index_from_oplog(&me.client, &me.index)
+            .await
+            .context("fedimint: oplog index recovery failed; refusing to start")?;
+        if recovered > 0 {
+            tracing::info!(
+                backfilled = recovered,
                 "fedimint: recovered invoice index rows from oplog"
-            ),
-            Err(e) => {
-                tracing::warn!(error = %e, "fedimint: oplog index recovery failed (continuing)")
-            }
+            );
         }
 
         Ok(me)
@@ -245,6 +255,27 @@ impl FedimintPayment {
             }
         }
     }
+
+    /// `await_pay` under a [`PAY_AWAIT_TIMEOUT`]. On timeout the pay row stays PENDING and an Err is
+    /// returned, so `payment_status_by_key` reports Pending (recoverable) and the Refunder re-drives
+    /// it on the next pass instead of blocking on a stuck payment (codex P1).
+    async fn await_pay_bounded(&self, payment_type: PayType, key: &str) -> Result<String> {
+        match tokio::time::timeout(PAY_AWAIT_TIMEOUT, self.await_pay(payment_type, key)).await {
+            Ok(r) => r,
+            Err(_) => anyhow::bail!(
+                "refund payment still pending after {}s; leaving PENDING for the next drive",
+                PAY_AWAIT_TIMEOUT.as_secs()
+            ),
+        }
+    }
+
+    /// Park a structurally-invalid refund (bad / zero / mismatched bolt11) as a FAILED key row (no
+    /// real operation) so `payment_status_by_key` reports Failed and the Refunder parks it rather
+    /// than retrying a bad destination forever (codex P2).
+    async fn fail_pay_preflight(&self, key: &str, msg: String) -> Result<String> {
+        pay_idx_upsert(&self.index, key, "(preflight-failed)", "FAILED", "ln")?;
+        anyhow::bail!(msg)
+    }
 }
 
 #[async_trait]
@@ -256,6 +287,9 @@ impl PaymentBackend for FedimintPayment {
         expiry_s: u32,
         external_id: &str,
     ) -> Result<Invoice> {
+        // Serialize check->mint->insert so two concurrent same-external_id callers can't both mint
+        // (codex P1): the second waits here, then finds the index populated and returns the winner.
+        let _create_guard = self.create_lock.lock().await;
         // Idempotent on external_id: a repeat (or crash-retry) returns the stored invoice, never a
         // second gateway invoice.
         if let Some(inv) = idx_get_by_external(&self.index, external_id)? {
@@ -313,6 +347,7 @@ impl PaymentBackend for FedimintPayment {
                 inv.external_id.clone(),
                 inv.id.clone(),
                 amount_sat,
+                true, // live: a freshly-created invoice pushes Settlement on Claimed
             ));
         }
 
@@ -348,21 +383,43 @@ impl PaymentBackend for FedimintPayment {
                     } else {
                         PayType::Lightning(op)
                     };
-                    return self.await_pay(pt, idempotency_key).await;
+                    return self.await_pay_bounded(pt, idempotency_key).await;
                 }
                 _ => {} // FAILED -> re-attempt below (the prior payment refunded; not a double-pay)
             }
         }
 
-        let invoice = Bolt11Invoice::from_str(dest).context("parsing refund bolt11")?;
-        let inv_msat = invoice
-            .amount_milli_satoshis()
-            .context("refund bolt11 has no amount")?;
-        anyhow::ensure!(
-            inv_msat == amount_sat.saturating_mul(1000),
-            "refund bolt11 amount {inv_msat} msat != owed {} msat",
-            amount_sat.saturating_mul(1000)
-        );
+        // Structural preflight failures (bad bolt11, no amount, amount mismatch) happen before any
+        // operation exists. Park them as a FAILED key row so payment_status_by_key reports Failed and
+        // the Refunder parks the refund for an operator rather than retrying a bad dest forever
+        // (codex P2). .4c is bolt11-only; the LNURL/BOLT12 resolver is a separate bead.
+        let invoice = match Bolt11Invoice::from_str(dest) {
+            Ok(i) => i,
+            Err(e) => {
+                return self
+                    .fail_pay_preflight(idempotency_key, format!("refund bolt11 parse error: {e}"))
+                    .await
+            }
+        };
+        let inv_msat = match invoice.amount_milli_satoshis() {
+            Some(a) => a,
+            None => {
+                return self
+                    .fail_pay_preflight(idempotency_key, "refund bolt11 has no amount".to_string())
+                    .await
+            }
+        };
+        if inv_msat != amount_sat.saturating_mul(1000) {
+            return self
+                .fail_pay_preflight(
+                    idempotency_key,
+                    format!(
+                        "refund bolt11 amount {inv_msat} msat != owed {} msat",
+                        amount_sat.saturating_mul(1000)
+                    ),
+                )
+                .await;
+        }
 
         let ln = self
             .client
@@ -388,8 +445,15 @@ impl PaymentBackend for FedimintPayment {
             "ln"
         };
         let op_hex = outgoing.payment_type.operation_id().fmt_full().to_string();
+        // Crash window (codex P1, deferred): a crash between pay_bolt11_invoice committing and this
+        // upsert leaves no key row -> payment_status_by_key=Unknown -> the Refunder retries pay(key).
+        // For .4c (bolt11-only, fixed refund_dest) fedimint's per-payment-hash dedup prevents a
+        // double-pay on that retry. Once the LNURL/BOLT12 resolver lands (a retry could resolve a
+        // FRESH bolt11) this must recover fedimint_pay from the oplog extra_meta on open, symmetric
+        // to recover_index_from_oplog.
         pay_idx_upsert(&self.index, idempotency_key, &op_hex, "PENDING", kind)?;
-        self.await_pay(outgoing.payment_type, idempotency_key).await
+        self.await_pay_bounded(outgoing.payment_type, idempotency_key)
+            .await
     }
 
     async fn payment_status(&self, payment_id: &str) -> Result<PayStatus> {
@@ -409,8 +473,9 @@ impl PaymentBackend for FedimintPayment {
         let (tx, rx) = mpsc::channel(64);
         *self.settle_tx.lock().unwrap() = Some(tx.clone());
 
-        // Boot/restart re-subscribe: stream every still-OPEN invoice. A cached (settled-while-down)
-        // op is handled inside run_receive_task (mark PAID, no live push; catch-up recovers it).
+        // Boot/restart re-subscribe: stream every still-OPEN invoice as a RECOVERY task (live=false)
+        // — it marks PAID without pushing; the supervisor catch-up recovers each with a capped
+        // timestamp (codex P1). Newly-created invoices get their own live task from create_invoice.
         for row in idx_list_open(&self.index)? {
             let op = match OperationId::from_str(&row.operation_id) {
                 Ok(op) => op,
@@ -428,6 +493,7 @@ impl PaymentBackend for FedimintPayment {
                 row.external_id,
                 row.invoice_id,
                 row.amount_sat,
+                false, // recovery: mark PAID without pushing; catch-up recovers with a capped ts
             ));
         }
 
@@ -443,10 +509,12 @@ struct OpenRow {
     amount_sat: u64,
 }
 
-/// Stream one invoice operation to settlement. A LIVE `Claimed` (the op was still pending when we
-/// subscribed) marks the index PAID and pushes a `Settlement{settled_at = now}`. A CACHED terminal
-/// `Claimed` (already settled at subscribe time) only marks PAID — the supervisor catch-up recovers
-/// it with a safe capped timestamp, so a settlement observed late never over-credits.
+/// Stream one invoice operation to settlement. `live` decides provenance: a freshly-created invoice
+/// (`live=true`) pushes a `Settlement{settled_at=now}` on `Claimed`; a boot/restart re-subscription
+/// (`live=false`) only marks the index PAID (settled_at=NULL) and never pushes, because fedimint
+/// replays a settled-while-down op as an ordinary stream indistinguishable from a live transition —
+/// the supervisor catch-up then recovers it with a safe capped timestamp, so a late-observed
+/// settlement never over-credits `paid_through` (codex P1).
 #[allow(clippy::too_many_arguments)]
 async fn run_receive_task(
     client: ClientHandleArc,
@@ -457,6 +525,7 @@ async fn run_receive_task(
     external_id: String,
     invoice_id: String,
     amount_sat: u64,
+    live: bool,
 ) {
     let op_hex = op.fmt_full().to_string();
     let sub = {
@@ -476,40 +545,31 @@ async fn run_receive_task(
         }
     };
 
-    match sub {
-        UpdateStreamOrOutcome::Outcome(state) => {
-            // Cached/terminal at subscribe time — settled (or failed) before we watched.
-            if matches!(state, LnReceiveState::Claimed) {
-                if let Err(e) = idx_mark_paid(&index, &op_hex, None) {
-                    tracing::error!(op = %op_hex, error = %e, "fedimint: index mark-paid (cached) failed");
+    let mut stream = sub.into_stream();
+    while let Some(state) = stream.next().await {
+        match state {
+            LnReceiveState::Claimed => {
+                let settled_at = if live { Some(clock.now()) } else { None };
+                if let Err(e) = idx_mark_paid(&index, &op_hex, settled_at) {
+                    tracing::error!(op = %op_hex, error = %e, "fedimint: index mark-paid failed");
                 }
-            }
-        }
-        UpdateStreamOrOutcome::UpdateStream(mut stream) => {
-            while let Some(state) = stream.next().await {
-                match state {
-                    LnReceiveState::Claimed => {
-                        let settled_at = clock.now();
-                        if let Err(e) = idx_mark_paid(&index, &op_hex, Some(settled_at)) {
-                            tracing::error!(op = %op_hex, error = %e, "fedimint: index mark-paid failed");
-                        }
-                        let _ = tx
-                            .send(Settlement {
-                                invoice_id,
-                                external_id,
-                                amount_sat,
-                                settled_at,
-                            })
-                            .await;
-                        return;
-                    }
-                    LnReceiveState::Canceled { reason } => {
-                        tracing::warn!(op = %op_hex, ?reason, "fedimint: ln receive canceled");
-                        return;
-                    }
-                    _ => {}
+                if let Some(at) = settled_at {
+                    let _ = tx
+                        .send(Settlement {
+                            invoice_id,
+                            external_id,
+                            amount_sat,
+                            settled_at: at,
+                        })
+                        .await;
                 }
+                return;
             }
+            LnReceiveState::Canceled { reason } => {
+                tracing::warn!(op = %op_hex, ?reason, "fedimint: ln receive canceled");
+                return;
+            }
+            _ => {}
         }
     }
 }
@@ -534,7 +594,13 @@ async fn recover_index_from_oplog(
             if entry.operation_module_kind() != fedimint_ln_common::KIND.as_str() {
                 continue;
             }
-            let meta: LightningOperationMeta = entry.meta();
+            let meta: LightningOperationMeta = match entry.try_meta() {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(error = %e, "fedimint: skipping oplog entry with undecodable ln meta");
+                    continue;
+                }
+            };
             let LightningOperationMetaVariant::Receive { invoice, .. } = &meta.variant else {
                 continue;
             };
