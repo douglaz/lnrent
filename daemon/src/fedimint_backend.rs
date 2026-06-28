@@ -4,41 +4,54 @@
 //! `fedimint-client` 0.11.1 + `fedimint-rocksdb` (a 2nd DB engine, bundled C++) are never compiled
 //! into the wasm buyer.
 //!
-//! `.4b` (THIS) wires the heavy deps + the client construction (join/open the federation) + the
-//! lnrent-owned sqlite idempotency index. The `PaymentBackend` methods are stubbed; the receive/pay
-//! state-machine wiring is `.4c`:
-//!  - `.4c.2` create_invoice / watch / lookup (gateway bolt11 + `subscribe_ln_receive` fan-in)
-//!  - `.4c.3` pay / payment_status (gateway `pay_bolt11_invoice` + `subscribe_ln_pay`)
+//! Status: `.4b` client construction (join/open) DONE; `.4c.2` (THIS) inbound receive —
+//! `create_invoice` / `watch` / `lookup`. `.4c.3` (outbound `pay` / status) is still stubbed.
 //!
-//! Design (folding in the codex .4 review):
-//!  - **Gateway required** — `create_bolt11_invoice` / `pay_bolt11_invoice` with no gateway are
-//!    internal-only / fail `NoLnGatewayAvailable`; `.4c` selects one via `get_gateway(None,false)` /
-//!    `select_available_gateway` after `update_gateway_cache`.
-//!  - **Idempotency on `external_id`** — an lnrent-owned sqlite index (NOT fedimint's rocksdb), plus
-//!    `extra_meta = {"lnrent_external_id": …}` stamped into the fedimint operation so a boot oplog
-//!    scan can backfill the index after a crash between minting and persisting (codex finding #3).
+//! Design (folding in the codex `.4` review):
+//!  - **Gateway required** — `create_bolt11_invoice` with no gateway is internal-only; `.4c` selects
+//!    one via `get_gateway(None, false)` (refreshes the cache + picks one, else errors).
+//!  - **Idempotency on `external_id`** — an lnrent-owned sqlite index (NOT fedimint's rocksdb) is the
+//!    anchor: `create_invoice` returns the stored invoice on a repeat. `extra_meta =
+//!    {"lnrent_external_id": …}` is stamped into the fedimint operation so a boot oplog scan
+//!    ([`recover_index_from_oplog`]) backfills the index after a crash between minting and
+//!    persisting — closing the duplicate-mint window (codex finding #3).
+//!  - **Settlement timestamp** — `watch()` streams each open invoice. A LIVE `Claimed` (observed
+//!    while watching) pushes a `Settlement{settled_at = now}`. A CACHED terminal `Claimed` (already
+//!    settled at subscribe time — e.g. while the daemon was down) only marks the index PAID and does
+//!    NOT push: the supervisor settlement catch-up recovers it via `lookup()` with a SAFE capped
+//!    timestamp, so a past settlement never over-credits `paid_through` (codex review).
 //!  - **Root secret** — lnrent's 32-byte secret (`identity.rs`) is wrapped as a fedimint
-//!    `DerivableSecret` via `new_root`, under `StandardDoubleDerive` (the standard per-federation
-//!    derivation), so the client position is deterministically recoverable from the operator seed.
+//!    `DerivableSecret` (`new_root`) under `StandardDoubleDerive`, so the position is recoverable.
 
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use rusqlite::Connection;
+use futures_util::StreamExt;
+use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::json;
+use tokio::sync::mpsc;
 
-use fedimint_client::{Client, ClientHandleArc, RootSecret};
+use fedimint_client::{Client, ClientHandleArc, OperationId, RootSecret};
+use fedimint_client_module::oplog::UpdateStreamOrOutcome;
 use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
+use fedimint_core::Amount;
 use fedimint_derive_secret::DerivableSecret;
-use fedimint_ln_client::LightningClientInit;
+use fedimint_ln_client::{
+    LightningClientInit, LightningClientModule, LightningOperationMeta,
+    LightningOperationMetaVariant, LnReceiveState,
+};
+use fedimint_ln_common::lightning_invoice::{Bolt11InvoiceDescription, Description};
 use fedimint_mint_client::MintClientInit;
 use fedimint_rocksdb::RocksDb;
 use fedimint_wallet_client::WalletClientInit;
 
 use crate::backends::{Invoice, PayStatus, PaymentBackend, PaymentStatus, Settlement};
+use crate::clock::Clock;
 
 /// HKDF salt for wrapping lnrent's (provisional) 32-byte Fedimint root secret (`identity.rs`,
 /// already domain-separated by `lnrent:fedimint:v1`) into a fedimint `DerivableSecret`. Fixed +
@@ -46,10 +59,9 @@ use crate::backends::{Invoice, PayStatus, PaymentBackend, PaymentStatus, Settlem
 /// recoverable from the operator seed (codex `.4b` note).
 const ROOT_SECRET_SALT: &[u8] = b"lnrent:fedimint:client:v1";
 
-/// The lnrent-owned sqlite index, per federation data-dir. It is the idempotency anchor for
-/// `create_invoice`/`pay` (keyed by `external_id` / `idempotency_key`) and closes the crash window
-/// between fedimint committing an operation and the daemon persisting its own row. NOT inside
-/// fedimint's rocksdb (codex finding #3).
+/// The lnrent-owned sqlite index, per federation data-dir. The idempotency anchor for
+/// `create_invoice`/`pay` (keyed by `external_id` / `idempotency_key`), separate from fedimint's
+/// rocksdb (codex finding #3).
 const INDEX_DB_FILE: &str = "lnrent_index.db";
 
 const INDEX_SCHEMA: &str = "\
@@ -64,6 +76,7 @@ CREATE TABLE IF NOT EXISTS fedimint_invoice (
     status        TEXT NOT NULL DEFAULT 'OPEN',
     settled_at    INTEGER
 );
+CREATE INDEX IF NOT EXISTS fedimint_invoice_by_invoice_id ON fedimint_invoice (invoice_id);
 CREATE TABLE IF NOT EXISTS fedimint_pay (
     idempotency_key  TEXT PRIMARY KEY,
     operation_id     TEXT NOT NULL,
@@ -72,25 +85,26 @@ CREATE TABLE IF NOT EXISTS fedimint_pay (
 );
 ";
 
-/// Real Fedimint backend: holds the joined fedimint client and the lnrent-owned idempotency index.
-/// The `watch()` settlement fan-in manager + the receive/pay state-machine wiring land in `.4c`.
+/// Real Fedimint backend: the joined fedimint client, the lnrent-owned idempotency index, the
+/// registered settlement sender (set by `watch()`), and a clock for observed-settlement timestamps.
 pub struct FedimintPayment {
-    // `.4c` reads these; `.4b` only constructs them, hence the allow.
-    #[allow(dead_code)]
     client: ClientHandleArc,
-    #[allow(dead_code)]
-    index: Mutex<Connection>,
+    index: Arc<Mutex<Connection>>,
+    settle_tx: Mutex<Option<mpsc::Sender<Settlement>>>,
+    clock: Arc<dyn Clock>,
 }
 
 impl FedimintPayment {
     /// Join (first run) or open (subsequent runs) the federation named by `invite_code`. The
     /// fedimint client rocksdb + the lnrent index sqlite both live under
     /// `data_dir/fedimint/<federation_id>/`. `root_secret` is lnrent's deterministic 32-byte seed
-    /// (`identity.rs`), wrapped as a fedimint `DerivableSecret` under `StandardDoubleDerive`.
+    /// (`identity.rs`), wrapped as a fedimint `DerivableSecret` under `StandardDoubleDerive`. On
+    /// open it backfills the index from the fedimint oplog (crash-window recovery).
     pub async fn join_or_open(
         invite_code: &str,
         data_dir: &Path,
         root_secret: &[u8; 32],
+        clock: Arc<dyn Clock>,
     ) -> Result<Self> {
         let invite: InviteCode = invite_code
             .parse()
@@ -145,10 +159,27 @@ impl FedimintPayment {
         conn.execute_batch(INDEX_SCHEMA)
             .context("initialising lnrent index schema")?;
 
-        Ok(Self {
+        let me = Self {
             client,
-            index: Mutex::new(conn),
-        })
+            index: Arc::new(Mutex::new(conn)),
+            settle_tx: Mutex::new(None),
+            clock,
+        };
+
+        // Backfill any invoice fedimint committed but the daemon never indexed (crash window). Best
+        // effort: on failure, create_invoice still self-heals via the index on the next attempt.
+        match recover_index_from_oplog(&me.client, &me.index).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                backfilled = n,
+                "fedimint: recovered invoice index rows from oplog"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "fedimint: oplog index recovery failed (continuing)")
+            }
+        }
+
+        Ok(me)
     }
 }
 
@@ -156,16 +187,87 @@ impl FedimintPayment {
 impl PaymentBackend for FedimintPayment {
     async fn create_invoice(
         &self,
-        _amount_sat: u64,
-        _memo: &str,
-        _expiry_s: u32,
-        _external_id: &str,
+        amount_sat: u64,
+        memo: &str,
+        expiry_s: u32,
+        external_id: &str,
     ) -> Result<Invoice> {
-        todo!(".4c.2: select gateway + create_bolt11_invoice, idempotent on external_id via the index")
+        // Idempotent on external_id: a repeat (or crash-retry) returns the stored invoice, never a
+        // second gateway invoice.
+        if let Some(inv) = idx_get_by_external(&self.index, external_id)? {
+            return Ok(inv);
+        }
+
+        let ln = self
+            .client
+            .get_first_module::<LightningClientModule>()
+            .context("fedimint: no lightning module")?;
+        // A gateway is REQUIRED for an externally-payable invoice (codex finding #1). get_gateway
+        // refreshes the cache then picks one; Err if the federation has none registered.
+        let gateway = ln
+            .get_gateway(None, false)
+            .await
+            .context("selecting a lightning gateway")?
+            .context("federation has no available lightning gateway")?;
+
+        let desc = Description::new(memo.to_string())
+            .map_err(|e| anyhow!("invalid invoice description: {e}"))?;
+        let (op, invoice, _preimage) = ln
+            .create_bolt11_invoice(
+                Amount::from_sats(amount_sat),
+                Bolt11InvoiceDescription::Direct(desc),
+                Some(u64::from(expiry_s)),
+                json!({ "lnrent_external_id": external_id }),
+                Some(gateway),
+            )
+            .await
+            .context("creating gateway bolt11 invoice")?;
+
+        let op_hex = op.fmt_full().to_string();
+        let inv = Invoice {
+            id: format!("fm-{op_hex}"),
+            external_id: external_id.to_string(),
+            backend_invoice_id: op_hex.clone(),
+            payment_hash: invoice.payment_hash().to_string(),
+            bolt11: invoice.to_string(),
+            amount_sat,
+            // Absolute expiry from our clock at creation (matches the field's contract + MockPayment).
+            expires_at: self.clock.now() + i64::from(expiry_s),
+        };
+        idx_insert(&self.index, &inv, &op_hex)?;
+
+        // If a watcher is already registered, stream this fresh (live) invoice's settlement now;
+        // otherwise the next watch() picks it up from the index (status OPEN).
+        let tx = self.settle_tx.lock().unwrap().clone();
+        if let Some(tx) = tx {
+            tokio::spawn(run_receive_task(
+                self.client.clone(),
+                self.index.clone(),
+                tx,
+                self.clock.clone(),
+                op,
+                inv.external_id.clone(),
+                inv.id.clone(),
+                amount_sat,
+            ));
+        }
+
+        Ok(inv)
     }
-    async fn lookup(&self, _id: &str) -> Result<PaymentStatus> {
-        todo!(".4c.2: index/operation status -> PaymentStatus")
+
+    async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
+        match idx_get_status_by_invoice_id(&self.index, id)? {
+            Some((status, expires_at)) => Ok(if status == "PAID" {
+                PaymentStatus::Paid
+            } else if self.clock.now() >= expires_at {
+                PaymentStatus::Expired
+            } else {
+                PaymentStatus::Open
+            }),
+            None => Ok(PaymentStatus::Expired), // unknown id -> gone (mirrors MockPayment)
+        }
     }
+
     async fn pay(&self, _dest: &str, _amount_sat: u64, _idempotency_key: &str) -> Result<String> {
         todo!(".4c.3: pay_bolt11_invoice via a selected gateway, idempotent on the key")
     }
@@ -175,9 +277,261 @@ impl PaymentBackend for FedimintPayment {
     async fn payment_status_by_key(&self, _idempotency_key: &str) -> Result<PayStatus> {
         todo!(".4c.3: pay index / operation-log status by key")
     }
-    async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
-        todo!(
-            ".4c.2: fan-in subscribe_ln_receive across open ops + boot re-subscribe -> Settlement"
-        )
+
+    async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+        let (tx, rx) = mpsc::channel(64);
+        *self.settle_tx.lock().unwrap() = Some(tx.clone());
+
+        // Boot/restart re-subscribe: stream every still-OPEN invoice. A cached (settled-while-down)
+        // op is handled inside run_receive_task (mark PAID, no live push; catch-up recovers it).
+        for row in idx_list_open(&self.index)? {
+            let op = match OperationId::from_str(&row.operation_id) {
+                Ok(op) => op,
+                Err(e) => {
+                    tracing::error!(op = %row.operation_id, error = %e, "fedimint: bad stored operation id; skipping");
+                    continue;
+                }
+            };
+            tokio::spawn(run_receive_task(
+                self.client.clone(),
+                self.index.clone(),
+                tx.clone(),
+                self.clock.clone(),
+                op,
+                row.external_id,
+                row.invoice_id,
+                row.amount_sat,
+            ));
+        }
+
+        Ok(rx)
     }
+}
+
+/// A still-OPEN index row to (re-)subscribe to on `watch()`.
+struct OpenRow {
+    external_id: String,
+    operation_id: String,
+    invoice_id: String,
+    amount_sat: u64,
+}
+
+/// Stream one invoice operation to settlement. A LIVE `Claimed` (the op was still pending when we
+/// subscribed) marks the index PAID and pushes a `Settlement{settled_at = now}`. A CACHED terminal
+/// `Claimed` (already settled at subscribe time) only marks PAID — the supervisor catch-up recovers
+/// it with a safe capped timestamp, so a settlement observed late never over-credits.
+#[allow(clippy::too_many_arguments)]
+async fn run_receive_task(
+    client: ClientHandleArc,
+    index: Arc<Mutex<Connection>>,
+    tx: mpsc::Sender<Settlement>,
+    clock: Arc<dyn Clock>,
+    op: OperationId,
+    external_id: String,
+    invoice_id: String,
+    amount_sat: u64,
+) {
+    let op_hex = op.fmt_full().to_string();
+    let sub = {
+        let ln = match client.get_first_module::<LightningClientModule>() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(error = %e, "fedimint: no lightning module for receive task");
+                return;
+            }
+        };
+        match ln.subscribe_ln_receive(op).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(op = %op_hex, error = %e, "fedimint: subscribe_ln_receive failed");
+                return;
+            }
+        }
+    };
+
+    match sub {
+        UpdateStreamOrOutcome::Outcome(state) => {
+            // Cached/terminal at subscribe time — settled (or failed) before we watched.
+            if matches!(state, LnReceiveState::Claimed) {
+                if let Err(e) = idx_mark_paid(&index, &op_hex, None) {
+                    tracing::error!(op = %op_hex, error = %e, "fedimint: index mark-paid (cached) failed");
+                }
+            }
+        }
+        UpdateStreamOrOutcome::UpdateStream(mut stream) => {
+            while let Some(state) = stream.next().await {
+                match state {
+                    LnReceiveState::Claimed => {
+                        let settled_at = clock.now();
+                        if let Err(e) = idx_mark_paid(&index, &op_hex, Some(settled_at)) {
+                            tracing::error!(op = %op_hex, error = %e, "fedimint: index mark-paid failed");
+                        }
+                        let _ = tx
+                            .send(Settlement {
+                                invoice_id,
+                                external_id,
+                                amount_sat,
+                                settled_at,
+                            })
+                            .await;
+                        return;
+                    }
+                    LnReceiveState::Canceled { reason } => {
+                        tracing::warn!(op = %op_hex, ?reason, "fedimint: ln receive canceled");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Scan the fedimint operation log for Receive ops stamped with an `lnrent_external_id` that the
+/// index is missing, and backfill them — closing the window where fedimint committed an invoice but
+/// the daemon crashed before persisting the index row (codex finding #3).
+async fn recover_index_from_oplog(
+    client: &ClientHandleArc,
+    index: &Arc<Mutex<Connection>>,
+) -> Result<usize> {
+    let log = client.operation_log();
+    let mut backfilled = 0usize;
+    let mut last = None;
+    loop {
+        let page = log.paginate_operations_rev(100, last).await;
+        let count = page.len();
+        if count == 0 {
+            break;
+        }
+        for (key, entry) in &page {
+            if entry.operation_module_kind() != fedimint_ln_common::KIND.as_str() {
+                continue;
+            }
+            let meta: LightningOperationMeta = entry.meta();
+            let LightningOperationMetaVariant::Receive { invoice, .. } = &meta.variant else {
+                continue;
+            };
+            let Some(ext) = meta
+                .extra_meta
+                .get("lnrent_external_id")
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            if idx_get_by_external(index, ext)?.is_some() {
+                continue;
+            }
+            let op_hex = key.operation_id.fmt_full().to_string();
+            let inv = Invoice {
+                id: format!("fm-{op_hex}"),
+                external_id: ext.to_string(),
+                backend_invoice_id: op_hex.clone(),
+                payment_hash: invoice.payment_hash().to_string(),
+                bolt11: invoice.to_string(),
+                amount_sat: invoice.amount_milli_satoshis().unwrap_or(0) / 1000,
+                expires_at: invoice
+                    .expires_at()
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            };
+            idx_insert(index, &inv, &op_hex)?;
+            backfilled += 1;
+        }
+        last = page.last().map(|(k, _)| *k);
+        if count < 100 {
+            break;
+        }
+    }
+    Ok(backfilled)
+}
+
+// ---- the lnrent-owned sqlite index (sync; guards never cross an await) ---------------------------
+
+fn idx_get_by_external(index: &Mutex<Connection>, ext: &str) -> Result<Option<Invoice>> {
+    let conn = index.lock().unwrap();
+    let inv = conn
+        .query_row(
+            "SELECT external_id, operation_id, invoice_id, bolt11, payment_hash, amount_sat, expires_at
+               FROM fedimint_invoice WHERE external_id = ?1",
+            params![ext],
+            |r| {
+                Ok(Invoice {
+                    external_id: r.get::<_, String>(0)?,
+                    backend_invoice_id: r.get::<_, String>(1)?,
+                    id: r.get::<_, String>(2)?,
+                    bolt11: r.get::<_, String>(3)?,
+                    payment_hash: r.get::<_, String>(4)?,
+                    amount_sat: r.get::<_, i64>(5)? as u64,
+                    expires_at: r.get::<_, i64>(6)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(inv)
+}
+
+fn idx_get_status_by_invoice_id(
+    index: &Mutex<Connection>,
+    id: &str,
+) -> Result<Option<(String, i64)>> {
+    let conn = index.lock().unwrap();
+    let row = conn
+        .query_row(
+            "SELECT status, expires_at FROM fedimint_invoice WHERE invoice_id = ?1",
+            params![id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
+fn idx_list_open(index: &Mutex<Connection>) -> Result<Vec<OpenRow>> {
+    let conn = index.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT external_id, operation_id, invoice_id, amount_sat
+           FROM fedimint_invoice WHERE status = 'OPEN'",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(OpenRow {
+                external_id: r.get::<_, String>(0)?,
+                operation_id: r.get::<_, String>(1)?,
+                invoice_id: r.get::<_, String>(2)?,
+                amount_sat: r.get::<_, i64>(3)? as u64,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn idx_insert(index: &Mutex<Connection>, inv: &Invoice, op_hex: &str) -> Result<()> {
+    let conn = index.lock().unwrap();
+    conn.execute(
+        "INSERT INTO fedimint_invoice
+            (external_id, operation_id, invoice_id, bolt11, payment_hash, amount_sat, expires_at, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'OPEN')
+         ON CONFLICT(external_id) DO NOTHING",
+        params![
+            inv.external_id,
+            op_hex,
+            inv.id,
+            inv.bolt11,
+            inv.payment_hash,
+            inv.amount_sat as i64,
+            inv.expires_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Mark an invoice PAID by its operation id. `settled_at` is `Some` for a LIVE settlement (recorded)
+/// and `None` for a cached one (left NULL — the supervisor catch-up supplies a safe timestamp).
+fn idx_mark_paid(index: &Mutex<Connection>, op_hex: &str, settled_at: Option<i64>) -> Result<()> {
+    let conn = index.lock().unwrap();
+    conn.execute(
+        "UPDATE fedimint_invoice SET status = 'PAID', settled_at = COALESCE(?2, settled_at)
+           WHERE operation_id = ?1",
+        params![op_hex, settled_at],
+    )?;
+    Ok(())
 }
