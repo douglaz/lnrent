@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS subscription (
   paid_through         INTEGER, -- hard expiry
   soft_date            INTEGER, -- renewal recommended from here
   next_deadline        INTEGER, -- reconcile-loop cursor
+  suspend_not_before   INTEGER, -- suspend FLOOR set ONLY by downtime credit (§6.5)
   created_at           INTEGER,
   updated_at           INTEGER
 );
@@ -195,11 +196,21 @@ CREATE TABLE IF NOT EXISTS seen_message (  -- transport dedup of inbound gift wr
 CREATE INDEX IF NOT EXISTS seen_message_seen_at_idx ON seen_message(seen_at);
 "#;
 
+/// Migration 3 (lnrent-7fp.22): the downtime-credit suspend FLOOR. A NULLABLE absolute timestamp on
+/// `subscription`, set ONLY by the restart downtime-credit path (§6.5, ADR-0005): on restart we
+/// credit the operator's outage so a buyer gets their full `renew_lead` window of operator
+/// availability before suspension. `paid_through` is NEVER moved (it anchors prepaid money AND the
+/// `renew:auto:<sub>:<paid_through>` invoice key); the floor self-expires once a later renewal pushes
+/// `paid_through` past it. Existing rows get NULL — no credit, which is correct. Appended as a NEW
+/// migration — never edit a shipped migration.
+const M3_SUSPEND_NOT_BEFORE: &str =
+    "ALTER TABLE subscription ADD COLUMN suspend_not_before INTEGER;";
+
 /// Ordered migrations (lnrent-7fp.3): index `i` upgrades the DB from schema version `i` to
-/// `i+1`. Version 1 is the §11 schema; version 2 adds `seen_message` (lnrent-7fp.5). A future
-/// schema change appends a new entry of `ALTER`/`CREATE` statements; **never edit a shipped
-/// migration**.
-const MIGRATIONS: &[&str] = &[SCHEMA, M2_SEEN_MESSAGE];
+/// `i+1`. Version 1 is the §11 schema; version 2 adds `seen_message` (lnrent-7fp.5); version 3 adds
+/// `subscription.suspend_not_before` (lnrent-7fp.22). A future schema change appends a new entry of
+/// `ALTER`/`CREATE` statements; **never edit a shipped migration**.
+const MIGRATIONS: &[&str] = &[SCHEMA, M2_SEEN_MESSAGE, M3_SUSPEND_NOT_BEFORE];
 
 /// The target schema version this binary expects (= number of migrations).
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -209,12 +220,40 @@ pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 pub fn migrate(conn: &Connection) -> Result<()> {
     let mut current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     while (current as usize) < MIGRATIONS.len() {
-        conn.execute_batch(MIGRATIONS[current as usize])?;
+        if let Err(e) = conn.execute_batch(MIGRATIONS[current as usize]) {
+            if current == 2
+                && is_duplicate_suspend_not_before(&e)
+                && has_column(conn, "subscription", "suspend_not_before")?
+            {
+                // Fresh DBs apply the current CREATE TABLE first; legacy v2 DBs get the ALTER.
+            } else {
+                return Err(e.into());
+            }
+        }
         // user_version can't be a bound parameter; the value is an internal counter, not input.
         conn.execute_batch(&format!("PRAGMA user_version = {}", current + 1))?;
         current += 1;
     }
     Ok(())
+}
+
+fn is_duplicate_suspend_not_before(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(_, Some(msg))
+            if msg.contains("duplicate column name: suspend_not_before")
+    )
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for name in rows {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Open the state database, enable WAL (durability + headroom for a future read-only connection;

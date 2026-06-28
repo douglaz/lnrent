@@ -281,7 +281,7 @@ impl OrderIntake {
         // (ACTIVE/SUSPENDED) subscription. Otherwise drop silently — an outsider must not be able
         // to mint a payable billing.invoice for someone else's sub, and a PENDING/terminal sub must
         // not get a renewal invoice that capture would later refund (§5.1 sender auth, §6.3).
-        let Some((buyer_hex, state, paid_through, retention_s)) =
+        let Some((buyer_hex, state, paid_through, retention_s, suspend_not_before)) =
             self.load_renewable(&req.subscription_id).await?
         else {
             tracing::warn!(sub = %req.subscription_id, "renew.request for unknown subscription — dropped");
@@ -295,15 +295,26 @@ impl OrderIntake {
             tracing::warn!(sub = %req.subscription_id, %state, "renew.request for a non-renewable state — dropped");
             return Ok(());
         }
-        // Past the retention boundary (paid_through + retention_s) the rental is effectively
-        // terminal even if reconcile hasn't flipped it yet — and capture refunds settlements at/after
-        // that boundary (the inclusive gate in lnrent-7fp.8). Issuing a renewal invoice now would
-        // only ever be refunded, never applied, so drop it (codex pass 3 P2; §6.3).
+        // Past the CREDITED resumable boundary B = max(paid_through, suspend_not_before) +
+        // retention_s the rental is effectively terminal even if reconcile hasn't flipped it yet —
+        // and capture refunds settlements at/after that SAME boundary (the inclusive downtime-credit
+        // gate in lnrent-7fp.8/§6.5). A downtime credit raises suspend_not_before above paid_through,
+        // keeping the buyer resumable PAST the raw paid_through + retention_s; gating on raw
+        // paid_through here would wrongly drop a renewal that capture would still accept (issuance and
+        // capture must agree). Issuing a renewal invoice at/after B would only ever be refunded, never
+        // applied, so drop it then (codex pass 3 P2; §6.3, §6.5). The paid_through math is unchanged:
+        // due_at below stays anchored to paid_through, never the floor.
+        let mut invoice_expiry_s = INVOICE_EXPIRY_S;
         if let Some(pt) = paid_through {
-            if now >= pt + retention_s {
-                tracing::warn!(sub = %req.subscription_id, "renew.request past the retention window — dropped");
+            let effective_suspend_at = pt.max(suspend_not_before.unwrap_or(pt));
+            let resumable_until = effective_suspend_at + retention_s;
+            if now >= resumable_until {
+                tracing::warn!(sub = %req.subscription_id, "renew.request past the credited resumable window — dropped");
                 return Ok(());
             }
+            invoice_expiry_s =
+                u32::try_from((resumable_until - now).max(i64::from(INVOICE_EXPIRY_S)))
+                    .unwrap_or(u32::MAX);
         }
         let due_at = paid_through.unwrap_or(now);
         let external_id = format!("renew:req:{}:{}", sender.to_hex(), req.id);
@@ -314,6 +325,7 @@ impl OrderIntake {
                 Some(req.id.clone()),
                 due_at,
                 now,
+                invoice_expiry_s,
                 Some((&sender, &req.id)),
             )
             .await?;
@@ -336,7 +348,15 @@ impl OrderIntake {
         let buyer = self.load_buyer(subscription_id).await?;
         let external_id = format!("renew:auto:{subscription_id}:{cycle_anchor}");
         let response = self
-            .issue_renewal(subscription_id, &external_id, None, cycle_anchor, now, None)
+            .issue_renewal(
+                subscription_id,
+                &external_id,
+                None,
+                cycle_anchor,
+                now,
+                INVOICE_EXPIRY_S,
+                None,
+            )
             .await?;
         out.reply(&buyer, &response).await?;
         Ok(())
@@ -345,6 +365,7 @@ impl OrderIntake {
     /// Shared renewal issuance: create the invoice (idempotent on `external_id`), persist the OPEN
     /// renewal invoice — and, for a buyer request, the cached `inbound_request` response — in one
     /// transaction, and return the `billing.invoice` message to send.
+    #[allow(clippy::too_many_arguments)]
     async fn issue_renewal(
         &self,
         subscription_id: &str,
@@ -352,6 +373,7 @@ impl OrderIntake {
         request_id: Option<String>,
         due_at: i64,
         now: i64,
+        invoice_expiry_s: u32,
         dedupe: Option<(&PublicKey, &str)>,
     ) -> Result<Msg> {
         let amount_sat = self.recipe.pricing.amount_sat;
@@ -360,7 +382,7 @@ impl OrderIntake {
             .create_invoice(
                 amount_sat,
                 &format!("lnrent renewal {subscription_id}"),
-                INVOICE_EXPIRY_S,
+                invoice_expiry_s,
                 external_id,
             )
             .context("creating renewal invoice")?;
@@ -395,8 +417,10 @@ impl OrderIntake {
         };
         let cached = self.store.transaction(move |tx| owned.write(tx)).await?;
         match cached {
-            Some(json) => Ok(serde_json::from_str(&json)
-                .context("decoding cached renewal response on race")?),
+            Some(json) => {
+                Ok(serde_json::from_str(&json)
+                    .context("decoding cached renewal response on race")?)
+            }
             None => Ok(response),
         }
     }
@@ -424,7 +448,9 @@ impl OrderIntake {
             .cache_response_row(sender, request_id, "order", &response, now)
             .await?;
         let to_send = match cached {
-            Some(c) => serde_json::from_str(&c).context("decoding cached order response on race")?,
+            Some(c) => {
+                serde_json::from_str(&c).context("decoding cached order response on race")?
+            }
             None => response,
         };
         // Release the HELD reservation UNLESS an order.invoice owns it. Only a committed order keeps
@@ -531,16 +557,19 @@ impl OrderIntake {
     }
 
     /// The fields a buyer renewal must be authorized against: `(buyer_pubkey_hex, state,
-    /// paid_through, retention_s)` if the subscription exists, else `None`.
+    /// paid_through, retention_s, suspend_not_before)` if the subscription exists, else `None`.
+    /// `suspend_not_before` is the downtime-credit FLOOR (§6.5); it widens the renewal eligibility
+    /// window the same way it widens capture's resumable boundary.
     async fn load_renewable(
         &self,
         sub_id: &str,
-    ) -> Result<Option<(String, String, Option<i64>, i64)>> {
+    ) -> Result<Option<(String, String, Option<i64>, i64, Option<i64>)>> {
         let id = sub_id.to_string();
         self.store
             .read(move |c| {
                 Ok(c.query_row(
-                    "SELECT buyer_pubkey, state, paid_through, retention_s FROM subscription WHERE id = ?1",
+                    "SELECT buyer_pubkey, state, paid_through, retention_s, suspend_not_before
+                     FROM subscription WHERE id = ?1",
                     params![id],
                     |r| {
                         Ok((
@@ -548,6 +577,7 @@ impl OrderIntake {
                             r.get::<_, Option<String>>(1)?.unwrap_or_default(),
                             r.get::<_, Option<i64>>(2)?,
                             r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                            r.get::<_, Option<i64>>(4)?,
                         ))
                     },
                 )
@@ -903,6 +933,41 @@ mod tests {
                         (id, recipe_id, buyer_pubkey, state, period_s, renew_lead_s, retention_s, paid_through, created_at, updated_at)
                      VALUES (?1, 'dummy', ?2, 'ACTIVE', 2592000, 604800, 604800, ?3, 0, 0)",
                     params![id, buyer, paid_through],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Seed a renewable sub with full control over state, retention, paid_through, and the
+    /// downtime-credit FLOOR (`suspend_not_before`), so the credited-window renewal gate (§6.5,
+    /// lnrent-7fp.22) can be exercised. period/lead are small fixed values — irrelevant to the gate.
+    async fn seed_renewable_sub(
+        store: &Store,
+        id: &str,
+        buyer_hex: &str,
+        state: &str,
+        paid_through: i64,
+        retention_s: i64,
+        suspend_not_before: Option<i64>,
+    ) {
+        let (id, buyer, state) = (id.to_string(), buyer_hex.to_string(), state.to_string());
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO subscription
+                        (id, recipe_id, buyer_pubkey, state, period_s, renew_lead_s, retention_s,
+                         paid_through, suspend_not_before, created_at, updated_at)
+                     VALUES (?1, 'dummy', ?2, ?3, 100, 10, ?4, ?5, ?6, 0, 0)",
+                    params![
+                        id,
+                        buyer,
+                        state,
+                        retention_s,
+                        paid_through,
+                        suspend_not_before
+                    ],
                 )?;
                 Ok(())
             })
@@ -1272,18 +1337,30 @@ mod tests {
         handler
             .handle(
                 stranger.public_key(),
-                Msg::RenewRequest(RenewRequest { id: "x".into(), subscription_id: "sub-1".into() }),
+                Msg::RenewRequest(RenewRequest {
+                    id: "x".into(),
+                    subscription_id: "sub-1".into(),
+                }),
                 &out,
             )
             .await
             .unwrap();
-        assert!(out.messages().is_empty(), "a non-owner renew is dropped, no reply");
-        assert_eq!(count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await, 0);
+        assert!(
+            out.messages().is_empty(),
+            "a non-owner renew is dropped, no reply"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
+            0
+        );
 
         // Owner renew on a now-terminal sub -> dropped.
         store
             .transaction(|tx| {
-                tx.execute("UPDATE subscription SET state='TERMINATED' WHERE id='sub-1'", [])?;
+                tx.execute(
+                    "UPDATE subscription SET state='TERMINATED' WHERE id='sub-1'",
+                    [],
+                )?;
                 Ok(())
             })
             .await
@@ -1292,13 +1369,22 @@ mod tests {
         handler
             .handle(
                 buyer.public_key(),
-                Msg::RenewRequest(RenewRequest { id: "y".into(), subscription_id: "sub-1".into() }),
+                Msg::RenewRequest(RenewRequest {
+                    id: "y".into(),
+                    subscription_id: "sub-1".into(),
+                }),
                 &out2,
             )
             .await
             .unwrap();
-        assert!(out2.messages().is_empty(), "a renew on a terminal sub is dropped");
-        assert_eq!(count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await, 0);
+        assert!(
+            out2.messages().is_empty(),
+            "a renew on a terminal sub is dropped"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
+            0
+        );
     }
 
     // P1 (codex pass 1): an unpaid PENDING order's sub carries next_deadline = the invoice expiry,
@@ -1309,7 +1395,13 @@ mod tests {
         let store = mem_store();
         let recipe = dummy_recipe();
         let listing_id = "30402:op:dummy-1";
-        seed_listing(&store, listing_id, "dummy", recipe.pricing.amount_sat as i64).await;
+        seed_listing(
+            &store,
+            listing_id,
+            "dummy",
+            recipe.pricing.amount_sat as i64,
+        )
+        .await;
         let handler = intake(
             store.clone(),
             Arc::new(MockPayment::new()),
@@ -1319,7 +1411,10 @@ mod tests {
         );
         let sender = Keys::generate().public_key();
         let out = RecordingOutbound::default();
-        handler.handle(sender, order("nd-1", listing_id, json!({})), &out).await.unwrap();
+        handler
+            .handle(sender, order("nd-1", listing_id, json!({})), &out)
+            .await
+            .unwrap();
 
         let (next_deadline, expires_at): (Option<i64>, i64) = store
             .read(|c| {
@@ -1337,5 +1432,195 @@ mod tests {
             Some(expires_at),
             "PENDING order next_deadline must equal the invoice expiry so reconcile can expire it"
         );
+    }
+
+    // lnrent-7fp.22 FIX A: a buyer renew.request INSIDE the credited resumable window
+    // (paid_through + retention_s <= now < B = max(paid_through, suspend_not_before) + retention_s)
+    // is ACCEPTED — a downtime credit keeps the sub resumable past the raw retention boundary, so the
+    // gate must honor the credited boundary, not raw paid_through. And it is consistent with capture:
+    // a settlement at the SAME now RESUMES the sub (it does not refund).
+    #[tokio::test]
+    async fn renew_request_in_credited_window_is_accepted_and_capture_resumes() {
+        let store = mem_store();
+        let payment = Arc::new(MockPayment::new());
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        // paid_through=1000, retention=500 -> raw boundary 1500. Credited floor 6000 ->
+        // effective_suspend_at = max(1000, 6000) = 6000 -> credited boundary B = 6500. The sub is
+        // still in its credited resumable window; now=2200 is in [1500, 6500): past the RAW boundary,
+        // before the CREDITED one. B is also more than the default 1h invoice expiry away.
+        seed_renewable_sub(
+            &store,
+            "sub-1",
+            &buyer_hex,
+            "SUSPENDED",
+            1000,
+            500,
+            Some(6000),
+        )
+        .await;
+        let now = 2200;
+        payment.set_now(now); // so the issued invoice's absolute expiry is sane (now + expiry_s)
+        let handler = intake(
+            store.clone(),
+            payment.clone(),
+            TestClock::new(now),
+            dummy_recipe(),
+            budget_with_room(),
+        );
+
+        // Accepted: a billing.invoice is issued (raw gate would have DROPPED this with no reply).
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                Msg::RenewRequest(RenewRequest {
+                    id: "rr-credit".into(),
+                    subscription_id: "sub-1".into(),
+                }),
+                &out,
+            )
+            .await
+            .unwrap();
+        let (_, msg) = out.only();
+        let bi = match msg {
+            Msg::BillingInvoice(b) => b,
+            other => panic!("expected billing.invoice (renewal accepted), got {other:?}"),
+        };
+        assert_eq!(bi.subscription_id, "sub-1");
+        assert_eq!(
+            bi.due_at, 1000,
+            "due_at stays anchored to paid_through, never the credited floor"
+        );
+        assert!(
+            bi.expires_at >= 6500,
+            "credited-window renewal invoice expires at {}, before B=6500",
+            bi.expires_at
+        );
+        let ext = format!("renew:req:{buyer_hex}:rr-credit");
+        assert_eq!(
+            count(
+                &store,
+                &format!(
+                    "SELECT count(*) FROM invoice WHERE kind='renewal' AND external_id='{ext}'"
+                )
+            )
+            .await,
+            1,
+            "the credited-window renewal invoice was issued"
+        );
+
+        // Consistency with capture: a settlement of that very invoice at the SAME now RESUMES the
+        // sub (extends paid_through, ACTIVE) — it does not refund. Issuance and capture agree on B.
+        let settlement = crate::backends::Settlement {
+            invoice_id: format!("inv-{ext}"),
+            external_id: ext.clone(),
+            amount_sat: dummy_recipe().pricing.amount_sat,
+            settled_at: now,
+        };
+        let outcome = crate::capture::capture(&store, settlement, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            crate::capture::Capture::Resumed,
+            "capture resumes a settlement inside the credited window — consistent with the accepted renew"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM refund_attempt").await,
+            0,
+            "no refund for a settlement inside the credited window"
+        );
+    }
+
+    // lnrent-7fp.22 FIX A: a buyer renew.request AT/AFTER the credited boundary B is past the
+    // (credited) window — dropped silently, no reply, no invoice — and capture is consistent: a
+    // settlement at the SAME now is terminal and REFUNDS.
+    #[tokio::test]
+    async fn renew_request_past_credited_window_is_dropped_and_capture_refunds() {
+        let store = mem_store();
+        let payment = Arc::new(MockPayment::new());
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        // Same shape: credited boundary B = 2000 + 500 = 2500. now = 2500 is AT B (inclusive-terminal).
+        seed_renewable_sub(
+            &store,
+            "sub-1",
+            &buyer_hex,
+            "SUSPENDED",
+            1000,
+            500,
+            Some(2000),
+        )
+        .await;
+        let now = 2500;
+        payment.set_now(now);
+        let handler = intake(
+            store.clone(),
+            payment.clone(),
+            TestClock::new(now),
+            dummy_recipe(),
+            budget_with_room(),
+        );
+
+        // Dropped: no reply, no renewal invoice.
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                Msg::RenewRequest(RenewRequest {
+                    id: "rr-late".into(),
+                    subscription_id: "sub-1".into(),
+                }),
+                &out,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.messages().is_empty(),
+            "a renew at/after the credited boundary is dropped, no reply"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
+            0,
+            "no renewal invoice past the credited window"
+        );
+
+        // Consistency with capture: had such a payment somehow arrived (e.g. a stale invoice), a
+        // settlement at the SAME now is terminal -> RefundDue. Both gates agree the window has closed.
+        let ext = "renew:auto:sub-1:1000";
+        seed_open_renewal_invoice(&store, ext, "sub-1").await;
+        let settlement = crate::backends::Settlement {
+            invoice_id: format!("inv-{ext}"),
+            external_id: ext.to_string(),
+            amount_sat: dummy_recipe().pricing.amount_sat,
+            settled_at: now,
+        };
+        let outcome = crate::capture::capture(&store, settlement, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            crate::capture::Capture::RefundDue,
+            "capture refunds a settlement at/after the credited boundary — consistent with the dropped renew"
+        );
+    }
+
+    /// Seed a standalone OPEN renewal invoice (no daemon issuance), so a capture-consistency check
+    /// has an invoice to settle against the credited-window boundary.
+    async fn seed_open_renewal_invoice(store: &Store, external_id: &str, sub_id: &str) {
+        let (ext, sub) = (external_id.to_string(), sub_id.to_string());
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO invoice
+                        (id, subscription_id, external_id, kind, amount_sat, status, issued_at)
+                     VALUES (?1, ?2, ?3, 'renewal', 100, 'OPEN', 0)",
+                    params![format!("inv-{ext}"), sub, ext],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 }

@@ -106,6 +106,9 @@ struct SubRow {
     renew_lead_s: i64,
     retention_s: i64,
     paid_through: Option<i64>,
+    /// The downtime-credit suspend FLOOR (§6.5, lnrent-7fp.22); NULL when no outage was credited.
+    /// Used ONLY to widen the renewal retention-refund gate — never the paid_through math.
+    suspend_not_before: Option<i64>,
     refund_dest: Option<String>,
 }
 
@@ -130,7 +133,7 @@ fn apply_paid(
     };
     let sub: Option<SubRow> = tx
         .query_row(
-            "SELECT state, period_s, renew_lead_s, retention_s, paid_through, refund_dest
+            "SELECT state, period_s, renew_lead_s, retention_s, paid_through, suspend_not_before, refund_dest
              FROM subscription WHERE id = ?1",
             params![sub_id],
             |r| {
@@ -140,7 +143,8 @@ fn apply_paid(
                     renew_lead_s: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
                     retention_s: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
                     paid_through: r.get(4)?,
-                    refund_dest: r.get(5)?,
+                    suspend_not_before: r.get(5)?,
+                    refund_dest: r.get(6)?,
                 })
             },
         )
@@ -151,6 +155,7 @@ fn apply_paid(
         renew_lead_s,
         retention_s,
         paid_through,
+        suspend_not_before,
         refund_dest,
     } = match sub {
         Some(v) => v,
@@ -191,13 +196,20 @@ fn apply_paid(
         // never lands in the past (§6.3).
         (Some("renewal"), st @ ("ACTIVE" | "SUSPENDED")) => {
             // Reconcile is periodic, so a sub can still read ACTIVE/SUSPENDED past its retention
-            // end (paid_through + retention_s) before the TERMINATED flip lands. A settlement that
-            // arrives at or after retention end is too late: the Instance is destroyed (or due to
-            // be — reconcile fires `destroy` at `now >= retention end`, §6.5), so refund rather
-            // than resurrect service. The boundary is INCLUSIVE-terminal to match that `>=`; the
-            // retention window `[paid_through, paid_through + retention_s)` IS the late-renewal grace.
+            // end before the TERMINATED flip lands. A settlement that arrives at or after retention
+            // end is too late: the Instance is destroyed (or due to be — reconcile fires `destroy`
+            // at `now >= retention end`, §6.5), so refund rather than resurrect service. The
+            // boundary is INCLUSIVE-terminal to match that `>=`.
+            //
+            // Honor the downtime-credit FLOOR (§6.5, lnrent-7fp.22): a credited outage moves
+            // reconcile's destroy deadline to `effective_suspend_at + retention_s` where
+            // `effective_suspend_at = max(paid_through, suspend_not_before)`. The resumable window
+            // must use that SAME boundary, else a renewal paid inside the credited retention window
+            // would be wrongly refunded (treated terminal) instead of resuming. `paid_through` is
+            // the natural floor when no outage was credited (suspend_not_before NULL).
             if let Some(pt) = paid_through {
-                if s.settled_at >= pt + retention_s {
+                let effective_suspend_at = pt.max(suspend_not_before.unwrap_or(pt));
+                if s.settled_at >= effective_suspend_at + retention_s {
                     refund_intent(tx, Some(sub_id), refund_dest.as_deref(), s, now)?;
                     journal(tx, Some(sub_id), "settle_terminal_refund", s, now)?;
                     return Ok(Capture::RefundDue);
@@ -206,9 +218,16 @@ fn apply_paid(
             let new_paid_through =
                 paid_through.unwrap_or(s.settled_at).max(s.settled_at) + period_s;
             let soft = new_paid_through - renew_lead_s;
+            // Clear the downtime-credit FLOOR: the buyer just paid, so the credit is consumed
+            // (lnrent-7fp.22 FIX 3). store.rs notes the floor "self-expires once paid_through passes
+            // it" — but that only holds when `period_s > renew_lead_s`; with a degenerate
+            // `renew_lead_s >= period_s` the renewed `paid_through` can land at/before a stale floor,
+            // pinning suspension past the newly-paid `paid_through`. Setting it NULL here makes the
+            // effective suspend boundary track the fresh `paid_through` unconditionally.
             tx.execute(
                 "UPDATE subscription
-                   SET state='ACTIVE', paid_through=?2, soft_date=?3, next_deadline=?3, updated_at=?4
+                   SET state='ACTIVE', paid_through=?2, soft_date=?3, next_deadline=?3,
+                       suspend_not_before=NULL, updated_at=?4
                  WHERE id=?1",
                 params![sub_id, new_paid_through, soft, now],
             )?;
@@ -404,6 +423,20 @@ mod tests {
             tx.execute(
                 "UPDATE invoice SET expires_at=?2 WHERE external_id=?1",
                 params![ext, exp],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Stamp a subscription's downtime-credit suspend FLOOR (`seed` leaves it NULL); §6.5.
+    async fn set_suspend_not_before(s: &Store, sub_id: &str, floor: i64) {
+        let sub_id = sub_id.to_string();
+        s.transaction(move |tx| {
+            tx.execute(
+                "UPDATE subscription SET suspend_not_before=?2 WHERE id=?1",
+                params![sub_id, floor],
             )?;
             Ok(())
         })
@@ -741,6 +774,75 @@ mod tests {
         );
     }
 
+    // FIX 2 (§6.5, lnrent-7fp.22): the renewal retention-refund gate honors the downtime-credit
+    // FLOOR. With a credited `suspend_not_before`, reconcile's destroy deadline is
+    // `effective_suspend_at + retention_s` (effective_suspend_at = max(paid_through,
+    // suspend_not_before)); the resumable window must use that SAME boundary. A renewal settling
+    // AFTER the OLD paid_through+retention_s but BEFORE the credited boundary RESUMES (extends), not
+    // refunds; one at/after the credited boundary refunds. (paid_through math is unchanged — anchored
+    // to paid_through, never to the floor.)
+    #[tokio::test]
+    async fn renewal_inside_credited_retention_window_resumes_not_refunds() {
+        // paid_through=1000, retention=500 -> OLD boundary 1500. Credited floor 1300 ->
+        // effective_suspend_at = max(1000,1300) = 1300 -> credited boundary 1300+500 = 1800.
+        // A settlement at 1600 is past the OLD 1500 but inside the credited window: it must RESUME.
+        let resumes = mem_store();
+        seed(
+            &resumes,
+            "o1",
+            "SUSPENDED",
+            Some(1000),
+            100,
+            10,
+            500,
+            Some("d"),
+            "renewal",
+            "OPEN",
+            "rext",
+        )
+        .await;
+        set_suspend_not_before(&resumes, "o1", 1300).await;
+        assert_eq!(
+            capture(&resumes, settlement("rext", 1600), 1)
+                .await
+                .unwrap(),
+            Capture::Resumed,
+            "a renewal inside the CREDITED retention window resumes (does not refund)"
+        );
+        assert_eq!(sub_state(&resumes, "o1").await, "ACTIVE");
+        assert_eq!(inv_status(&resumes, "rext").await.0, "PAID");
+        assert_eq!(refund_count(&resumes).await, 0);
+
+        // A settlement exactly at the credited boundary (1800) is too late -> refund, no resurrection.
+        let refunds = mem_store();
+        seed(
+            &refunds,
+            "o2",
+            "SUSPENDED",
+            Some(1000),
+            100,
+            10,
+            500,
+            Some("d"),
+            "renewal",
+            "OPEN",
+            "rin",
+        )
+        .await;
+        set_suspend_not_before(&refunds, "o2", 1300).await;
+        assert_eq!(
+            capture(&refunds, settlement("rin", 1800), 1).await.unwrap(),
+            Capture::RefundDue,
+            "at/after the credited boundary the renewal refunds"
+        );
+        assert_eq!(
+            sub_state(&refunds, "o2").await,
+            "SUSPENDED",
+            "the sub is NOT resurrected"
+        );
+        assert_eq!(refund_count(&refunds).await, 1);
+    }
+
     // A settlement on an invoice with NULL/unknown kind is NOT assumed to be an order: it must not
     // capture/provision — it refunds (codex re-review: route by explicit invoice class).
     #[tokio::test]
@@ -878,5 +980,53 @@ mod tests {
         };
         assert_eq!(sub, None, "no sub known for an unmatched settlement");
         assert_eq!(key, "refund:ghost");
+    }
+
+    // FIX 3 (§6.5, lnrent-7fp.22): a renewal that extends paid_through CLEARS the downtime-credit
+    // floor (the credit is consumed). With a degenerate `renew_lead_s >= period_s` the renewed
+    // paid_through can land at/before a stale floor; store.rs's "self-expires once paid_through passes
+    // it" no longer holds, so without clearing it the floor would pin suspension past the newly-paid
+    // paid_through. After the renewal suspend_not_before is NULL.
+    #[tokio::test]
+    async fn renewal_clears_the_downtime_credit_floor() {
+        let s = mem_store();
+        // period=100, renew_lead=150 (>= period), retention=500, paid_through=1000. Credited floor
+        // 1300 -> effective boundary max(1000,1300)+500 = 1800; a settlement at 1100 is inside it.
+        seed(
+            &s,
+            "o1",
+            "ACTIVE",
+            Some(1000),
+            100,
+            150,
+            500,
+            None,
+            "renewal",
+            "OPEN",
+            "rext",
+        )
+        .await;
+        set_suspend_not_before(&s, "o1", 1300).await;
+        assert_eq!(
+            capture(&s, settlement("rext", 1100), 1).await.unwrap(),
+            Capture::Renewed
+        );
+        // new_paid_through = max(1000,1100)+period(100) = 1200 (< the old stale floor 1300).
+        let (pt, snb): (i64, Option<i64>) = {
+            s.read(|c| {
+                Ok(c.query_row(
+                    "SELECT paid_through, suspend_not_before FROM subscription WHERE id='o1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(pt, 1200, "max(1000,1100)+period");
+        assert_eq!(
+            snb, None,
+            "the renewal cleared the stale floor (which would otherwise pin suspension at 1300 > 1200)"
+        );
     }
 }

@@ -321,12 +321,12 @@ impl Supervisor {
     }
 
     /// Run-once boot recovery, in the order each subsystem's durable recovery requires (lnrent-7fp.21):
-    /// op-dispatch interrupted ops, settlement catch-up, provisioning re-drive (+ failed cleanups),
-    /// refunds, a reconcile catch-up tick, then the outbox drain. Each step is idempotent; an error
-    /// in one is logged and does not block the rest (the periodic loops will retry).
+    /// op-dispatch interrupted ops, downtime credit, settlement catch-up, provisioning re-drive
+    /// (+ failed cleanups), refunds, a reconcile catch-up tick, then the outbox drain. Each step is
+    /// idempotent; an error in one is logged and does not block the rest (the periodic loops will retry).
     async fn boot_recovery(&self) -> Result<()> {
         tracing::info!(
-            "boot recovery: op-dispatch -> settlement catch-up -> provision -> refund -> reconcile -> outbox"
+            "boot recovery: op-dispatch -> downtime-credit -> settlement catch-up -> provision -> refund -> reconcile -> outbox"
         );
 
         match self.op_dispatch.recover_interrupted_ops().await {
@@ -335,9 +335,25 @@ impl Supervisor {
                 tracing::error!(error = %format!("{e:#}"), "boot recovery: op-dispatch recovery failed")
             }
         }
+        // Credit the operator's outage BEFORE settlement catch-up and reconcile catch-up, so a buyer
+        // whose renewal was paid during the outage is recovered against the credited boundary, and a
+        // buyer whose soft-date/paid_through fell inside downtime is not suspended for it (§6.5). The
+        // credit raises the suspend floor (+ leaves a pre-reminder cursor) that both later steps honor.
+        match self
+            .reconciler
+            .apply_restart_downtime_credit(self.clock.now())
+            .await
+        {
+            Ok(n) => tracing::info!(count = n, "boot recovery: downtime credit applied"),
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "boot recovery: downtime credit failed")
+            }
+        }
         // Catch any settlement the live watch() stream missed while the daemon was down (a PAID order
         // left stuck PENDING forever otherwise); each caught order moves to PROVISIONING for the
         // re-drive below. Idempotent — capture's OPEN->PAID CAS no-ops an already-applied settlement.
+        // Runs after downtime credit so renewal catch-up caps recovered settlements at the same
+        // credited boundary capture's refund gate uses.
         match settlement_catch_up(&self.store, &self.payment, &self.clock).await {
             Ok(n) => tracing::info!(count = n, "boot recovery: settlements caught up"),
             Err(e) => {
@@ -961,13 +977,23 @@ async fn settlement_catch_up(
     payment: &Arc<dyn PaymentBackend>,
     clock: &Arc<dyn Clock>,
 ) -> Result<usize> {
-    // (id, external_id, amount_sat, expires_at, kind, sub.paid_through, sub.retention_s)
-    type CatchUpRow = (String, String, i64, Option<i64>, String, Option<i64>, Option<i64>);
+    // (id, external_id, amount_sat, expires_at, kind, sub.paid_through, sub.retention_s,
+    //  sub.suspend_not_before)
+    type CatchUpRow = (
+        String,
+        String,
+        i64,
+        Option<i64>,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    );
     let open: Vec<CatchUpRow> = store
         .read(|c| {
             let mut stmt = c.prepare(
                 "SELECT i.id, i.external_id, COALESCE(i.amount_sat, 0), i.expires_at, i.kind,
-                        s.paid_through, s.retention_s
+                        s.paid_through, s.retention_s, s.suspend_not_before
                    FROM invoice i
                    LEFT JOIN subscription s ON s.id = i.subscription_id
                   WHERE i.status='OPEN' AND i.kind IN ('order', 'renewal')",
@@ -982,6 +1008,7 @@ async fn settlement_catch_up(
                         r.get::<_, String>(4)?,
                         r.get::<_, Option<i64>>(5)?,
                         r.get::<_, Option<i64>>(6)?,
+                        r.get::<_, Option<i64>>(7)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -990,17 +1017,31 @@ async fn settlement_catch_up(
         .await?;
 
     let mut caught = 0;
-    for (inv_id, external_id, amount_sat, expires_at, kind, paid_through, retention_s) in open {
+    for (
+        inv_id,
+        external_id,
+        amount_sat,
+        expires_at,
+        kind,
+        paid_through,
+        retention_s,
+        suspend_not_before,
+    ) in open
+    {
         match payment.lookup(&inv_id) {
             Ok(PaymentStatus::Paid) => {
                 let now = clock.now();
                 // Latest in-window settle time the recovered payment can carry: the invoice expiry (the
-                // order gate, capture refunds at settled_at >= expires_at), and for a renewal ALSO
-                // `paid_through + retention_s` (capture refunds a renewal at settled_at >= that boundary).
-                // Cap by the binding one, so a renewal paid in time but recovered late isn't stamped past
-                // retention and wrongly refunded.
+                // order gate, capture refunds at settled_at >= expires_at), and for a renewal ALSO the
+                // CREDITED resumable boundary `B = max(paid_through, suspend_not_before) + retention_s`
+                // (the SAME boundary capture's renewal refund gate honors, §6.5, lnrent-7fp.22). Cap by
+                // the binding one, so a renewal paid in time but recovered late isn't stamped past the
+                // credited boundary and wrongly capped — capping at the RAW `paid_through + retention_s`
+                // would extend `paid_through` from a too-early `settled_at` for a credited sub.
                 let renewal_boundary = match (kind.as_str(), paid_through, retention_s) {
-                    ("renewal", Some(pt), Some(ret)) => Some(pt + ret),
+                    ("renewal", Some(pt), Some(ret)) => {
+                        Some(pt.max(suspend_not_before.unwrap_or(pt)) + ret)
+                    }
                     _ => None,
                 };
                 let settled_at = recovered_settled_at(now, min_opt(expires_at, renewal_boundary));
@@ -1035,8 +1076,8 @@ async fn settlement_catch_up(
 /// backend's paid timestamp. On catch-up after the local invoice expiry, using `now` would fabricate
 /// a too-late settlement and refund a payment the backend had already marked paid while reconcile
 /// deliberately kept the invoice OPEN for capture. Use the latest in-window timestamp (the binding
-/// `cap`: the invoice expiry, and for a renewal also `paid_through + retention_s`) instead; live
-/// settlements still carry their exact backend timestamp.
+/// `cap`: the invoice expiry, and for a renewal also the effective credited retention boundary)
+/// instead; live settlements still carry their exact backend timestamp.
 fn recovered_settled_at(now: i64, cap: Option<i64>) -> i64 {
     match cap {
         Some(c) if now >= c => c.saturating_sub(1),
@@ -1191,5 +1232,187 @@ mod tests {
         );
         assert!(parse_budget(r#"{"mem_mb":1,"disk_gb":1}"#).is_none());
         assert!(parse_budget("not json").is_none());
+    }
+
+    // FIX 1 (§6.5, lnrent-7fp.22): settlement catch-up honors the CREDITED resumable boundary
+    // B = max(paid_through, suspend_not_before) + retention_s. A missed renewal settlement recovered
+    // when `paid_through + retention_s <= now < B` must be capped at B (not the raw
+    // paid_through + retention_s), so capture extends paid_through from the correct in-window
+    // settled_at instead of a too-early one — consistent with capture's own renewal refund gate.
+    #[tokio::test]
+    async fn settlement_catch_up_caps_credited_renewal_at_effective_boundary() {
+        use crate::backends::MockPayment;
+        use crate::clock::TestClock;
+        use crate::store::migrate;
+        use rusqlite::{params, Connection};
+
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let store = Store::spawn(conn);
+
+        // paid_through=1000, retention=500 -> RAW boundary 1500. Credited floor 1300 -> effective
+        // boundary B = max(1000,1300)+500 = 1800. Recovery at now=1600 sits in [1500, 1800): the RAW
+        // cap would stamp settled_at=1499 (under-extending paid_through to 1599); the CREDITED cap
+        // stamps settled_at=now=1600 (extending paid_through to 1700).
+        let mock = Arc::new(MockPayment::new());
+        mock.set_now(0); // invoice expires_at = 0 + 8000 = 8000 (well past B, so not the binding cap)
+        let inv = mock
+            .create_invoice(1000, "lnrent renewal s1", 8000, "renew:auto:s1:1000")
+            .unwrap();
+        let inv_id = inv.id.clone();
+        let expires_at = inv.expires_at;
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO subscription
+                        (id, state, period_s, renew_lead_s, retention_s, paid_through,
+                         suspend_not_before, next_deadline, created_at, updated_at)
+                     VALUES ('s1','ACTIVE',100,10,500,1000,1300,1000,0,0)",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO invoice
+                        (id, subscription_id, external_id, kind, amount_sat, status, expires_at, issued_at)
+                     VALUES (?1,'s1','renew:auto:s1:1000','renewal',1000,'OPEN',?2,0)",
+                    params![inv_id, expires_at],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        mock.settle("renew:auto:s1:1000", 1234).unwrap(); // paid at backend (time ignored on recovery)
+
+        let payment: Arc<dyn PaymentBackend> = mock.clone();
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1600));
+        settlement_catch_up(&store, &payment, &clock).await.unwrap();
+
+        let (state, pt, refunds): (String, i64, i64) = store
+            .read(|c| {
+                let row = c.query_row(
+                    "SELECT state, paid_through FROM subscription WHERE id='s1'",
+                    [],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                )?;
+                let refunds: i64 =
+                    c.query_row("SELECT count(*) FROM refund_attempt", [], |r| r.get(0))?;
+                Ok((row.0, row.1, refunds))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            state, "ACTIVE",
+            "a credited renewal recovered in-window renews"
+        );
+        assert_eq!(
+            pt, 1700,
+            "paid_through extends from settled_at=now(1600) capped at the credited boundary B, not \
+             the raw paid_through+retention_s (which would cap at 1499 -> paid_through 1599)"
+        );
+        assert_eq!(refunds, 0, "no refund for an in-window credited renewal");
+    }
+
+    // Boot-order regression for the same invariant as the catch-up cap above: the restart credit must
+    // be installed BEFORE settlement catch-up scans missed payments. Otherwise a renewal paid during
+    // the outage is recovered with suspend_not_before still NULL, capped at raw paid_through+retention,
+    // and paid_through extends from a too-early recovered settled_at.
+    #[tokio::test]
+    async fn downtime_credit_precedes_settlement_catch_up_for_same_outage_renewal() {
+        use crate::backends::MockPayment;
+        use crate::clock::TestClock;
+        use crate::store::migrate;
+        use rusqlite::{params, Connection};
+
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let store = Store::spawn(conn);
+
+        // paid_through=1000, retention=500 -> raw boundary 1500. The outage [950,1600]
+        // credits a floor at 1650, so the effective boundary B becomes 2150. Catch-up at now=1600
+        // must therefore recover the settlement at 1600, not raw-boundary-capped 1499.
+        let mock = Arc::new(MockPayment::new());
+        mock.set_now(0);
+        let inv = mock
+            .create_invoice(1000, "lnrent renewal s1", 8000, "renew:auto:s1:1000")
+            .unwrap();
+        let inv_id = inv.id.clone();
+        let expires_at = inv.expires_at;
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO daemon_state (rowid, last_heartbeat) VALUES (1, 950)",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO subscription
+                        (id, state, period_s, renew_lead_s, retention_s, paid_through,
+                         soft_date, next_deadline, created_at, updated_at)
+                     VALUES ('s1','ACTIVE',100,100,500,1000,900,1000,0,0)",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO invoice
+                        (id, subscription_id, external_id, kind, amount_sat, status, expires_at, issued_at)
+                     VALUES (?1,'s1','renew:auto:s1:1000','renewal',1000,'OPEN',?2,0)",
+                    params![inv_id, expires_at],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        mock.settle("renew:auto:s1:1000", 1234).unwrap();
+
+        let payment: Arc<dyn PaymentBackend> = mock.clone();
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1600));
+        let recipe = Recipe::load(format!("{}/../recipes/dummy", env!("CARGO_MANIFEST_DIR")))
+            .expect("dummy recipe");
+        let reconciler = Reconciler::new(store.clone(), payment.clone(), recipe);
+
+        assert_eq!(
+            reconciler
+                .apply_restart_downtime_credit(clock.now())
+                .await
+                .unwrap(),
+            1,
+            "restart installs the credited floor before missed settlements are recovered"
+        );
+        settlement_catch_up(&store, &payment, &clock).await.unwrap();
+
+        let (state, pt, snb, settled_at, refunds): (String, i64, Option<i64>, i64, i64) = store
+            .read(|c| {
+                let sub = c.query_row(
+                    "SELECT state, paid_through, suspend_not_before FROM subscription WHERE id='s1'",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, Option<i64>>(2)?,
+                        ))
+                    },
+                )?;
+                let settled_at =
+                    c.query_row("SELECT settled_at FROM invoice WHERE external_id='renew:auto:s1:1000'", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?;
+                let refunds: i64 =
+                    c.query_row("SELECT count(*) FROM refund_attempt", [], |r| r.get(0))?;
+                Ok((sub.0, sub.1, sub.2, settled_at, refunds))
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "ACTIVE");
+        assert_eq!(
+            settled_at, 1600,
+            "recovered settlement is capped against the credited boundary, not raw paid_through+retention"
+        );
+        assert_eq!(
+            pt, 1700,
+            "paid_through extends from the credited in-window recovered settlement"
+        );
+        assert_eq!(
+            snb, None,
+            "the renewal consumed the just-installed downtime-credit floor"
+        );
+        assert_eq!(refunds, 0);
     }
 }

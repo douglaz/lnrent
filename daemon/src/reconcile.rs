@@ -11,11 +11,16 @@
 //! sole-writer store actor serializes them, ADR-0001/§6.5). Buyer DMs are never published here —
 //! they are ENQUEUED as `PENDING` `outbox` rows that the delivery sender (lnrent-7fp.10) publishes.
 //!
-//! Scope carve-out: §6.5's downtime credit — shifting these deadlines forward by an operator-outage
-//! window so a buyer is never suspended for the operator's downtime (ADR-0005) — is a SEPARATE bead
-//! (lnrent-7fp.22) and is NOT built here; reconcile fires purely on wall-clock `now`. The supervisor
-//! (lnrent-7fp.21) MUST land .22 before wiring this live, or an operator outage would wrongly
-//! suspend/terminate buyers.
+//! Downtime credit (§6.5, ADR-0005, lnrent-7fp.22): an operator outage must never suspend a buyer for
+//! the operator's own downtime. Each [`Reconciler::reconcile_tick`] stamps a liveness heartbeat into
+//! `daemon_state`; on restart [`Reconciler::apply_restart_downtime_credit`] reads the gap since that
+//! heartbeat and, for every ACTIVE sub whose `soft_date`/`paid_through` fell inside the outage, raises
+//! a NULLABLE `suspend_not_before` FLOOR so the buyer still gets their full `renew_lead` window of
+//! availability before suspension. `paid_through` is NEVER moved (it anchors prepaid money AND the
+//! `renew:auto:<sub>:<paid_through>` invoice key); the floor self-expires once a later renewal pushes
+//! `paid_through` past it. The credit path NEVER mints invoices — a missed soft reminder fires via the
+//! existing soft-date transition on the boot catch-up tick. The ACTIVE suspend transition then gates
+//! on `effective_suspend_at = max(paid_through, suspend_not_before)`.
 //!
 //! The five transitions (the machine is finite; reconcile fires exactly these):
 //! 1. **PENDING order expiry** — an unpaid order's invoice expired: sub `-> EXPIRED`, its OPEN order
@@ -50,10 +55,12 @@ use crate::runner::{run_hook, DEFAULT_TIMEOUT};
 use crate::store::Store;
 
 /// FLOOR for the soft-date auto-renewal invoice's Lightning expiry (seconds). The actual expiry is
-/// sized to the renewal WINDOW — from soft_date through the resumable boundary `paid_through +
-/// retention_s` — so the proactively-issued invoice is payable for its whole advertised window (a
-/// renewal has no capacity-reservation hold, unlike a first order, so the 1h order horizon does NOT
-/// apply). This floor only guards a degenerate too-small window. An internal default, not a knob.
+/// sized to the renewal WINDOW — from soft_date through the CREDITED resumable boundary
+/// `effective_suspend_at + retention_s` (= `max(paid_through, suspend_not_before) + retention_s`,
+/// §6.5) — so the proactively-issued invoice is payable for its whole advertised window, even after
+/// a downtime credit pushes that boundary out (a renewal has no capacity-reservation hold, unlike a
+/// first order, so the 1h order horizon does NOT apply). This floor only guards a degenerate
+/// too-small window. An internal default, not a knob.
 const RENEWAL_INVOICE_MIN_EXPIRY_S: u32 = 3600;
 
 /// What one [`Reconciler::reconcile_tick`] did. Every count is a fired transition; all are normal
@@ -93,6 +100,19 @@ struct DueSub {
     paid_through: Option<i64>,
     retention_s: i64,
     next_deadline: i64,
+    /// The downtime-credit suspend FLOOR (§6.5); NULL when no outage was credited.
+    suspend_not_before: Option<i64>,
+}
+
+/// An ACTIVE subscription read while applying restart downtime credit (§6.5): its timers + the current
+/// floor/cursor, so the credit math runs entirely off DB rows.
+struct CreditCandidate {
+    id: String,
+    renew_lead_s: Option<i64>,
+    soft_date: Option<i64>,
+    paid_through: Option<i64>,
+    suspend_not_before: Option<i64>,
+    next_deadline: Option<i64>,
 }
 
 /// Recorded instance facts passed to `suspend`/`destroy` hooks when the subscription has already
@@ -139,32 +159,42 @@ impl Reconciler {
                     }
                 }
                 "ACTIVE" => match d.paid_through {
-                    // Cursor before paid_through => it sits at soft_date: the renewal reminder.
-                    Some(pt) if d.next_deadline < pt => {
-                        if self
-                            .fire_soft_reminder(
-                                &d.id,
-                                &d.buyer_pubkey,
-                                pt,
-                                d.retention_s,
-                                d.next_deadline,
-                                now,
-                            )
-                            .await?
-                        {
-                            report.reminded += 1;
-                        } else {
-                            report.noops += 1;
-                        }
-                    }
-                    // Cursor at/after paid_through: the unpaid grace ran out — suspend.
                     Some(pt) => {
-                        if self
+                        // Downtime credit (§6.5): never suspend before this FLOOR. paid_through is the
+                        // natural floor when no outage was credited (suspend_not_before NULL).
+                        let effective_suspend_at = pt.max(d.suspend_not_before.unwrap_or(pt));
+                        if d.next_deadline < pt {
+                            // Cursor before paid_through => it sits at soft_date: the renewal reminder.
+                            if self
+                                .fire_soft_reminder(
+                                    &d.id,
+                                    &d.buyer_pubkey,
+                                    pt,
+                                    effective_suspend_at,
+                                    d.retention_s,
+                                    d.next_deadline,
+                                    now,
+                                )
+                                .await?
+                            {
+                                report.reminded += 1;
+                            } else {
+                                report.noops += 1;
+                            }
+                        } else if self
+                            // Cursor at/after paid_through: the unpaid grace ran out — suspend, but
+                            // only once `now` reaches the credited floor. Retention runs from the
+                            // CREDITED suspension (§6.5): the destroy deadline is
+                            // effective_suspend_at + retention_s, so a credited sub gets its full
+                            // retention window AFTER it actually suspends — never suspended then
+                            // immediately destroyed because pt + retention_s already passed. For an
+                            // uncredited sub effective_suspend_at == pt, so this is unchanged.
                             .fire_suspend(
                                 &d.id,
                                 &d.buyer_pubkey,
                                 d.next_deadline,
-                                pt + d.retention_s,
+                                effective_suspend_at,
+                                effective_suspend_at + d.retention_s,
                                 now,
                             )
                             .await?
@@ -204,7 +234,150 @@ impl Reconciler {
         // only the invoice flips, the subscription is untouched.
         report.invoices_expired = self.expire_open_renewals(now).await?;
 
+        // Stamp the liveness heartbeat AFTER the due scan, so the next restart's downtime credit
+        // (§6.5) measures the outage from the last time the daemon was known up.
+        self.write_heartbeat(now).await?;
+
         Ok(report)
+    }
+
+    /// Record this tick's wall-clock as the daemon liveness heartbeat (single-row `daemon_state`,
+    /// rowid 1). [`Reconciler::apply_restart_downtime_credit`] reads this on the next boot to size the
+    /// outage to credit. Written every tick, so the heartbeat tracks liveness at the reconcile cadence.
+    async fn write_heartbeat(&self, now: i64) -> Result<()> {
+        self.store
+            .transaction(move |tx| {
+                write_heartbeat_txn(tx, now)?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Boot downtime credit (§6.5, ADR-0005). In ONE txn: read the last liveness heartbeat; if there
+    /// is none (first boot) just establish it and credit nothing. Otherwise, for every ACTIVE sub
+    /// whose `soft_date` or `paid_through` fell inside the outage window `[last, now]`, raise a
+    /// `suspend_not_before` FLOOR so the buyer still gets their full `renew_lead` window of operator
+    /// availability before suspension. `paid_through` is NEVER moved and NO invoice is ever minted here
+    /// — a missed soft reminder fires via the normal soft-date transition on the boot catch-up tick.
+    ///
+    /// For each credited sub: `lead = max(renew_lead_s, 0)`; `soft = soft_date ?? paid_through - lead`;
+    /// `pre_available = clamp(last - soft, 0, lead)` is how much lead the buyer already saw before the
+    /// outage; `target = now + (lead - pre_available)` gives back the rest from restart;
+    /// `new_floor = max(suspend_not_before ?? paid_through, paid_through, target)` (so the floor never
+    /// regresses and never precedes the prepaid window). The cursor moves to `new_floor` UNLESS the sub
+    /// is still pre-reminder (`next_deadline < paid_through`), in which case it is LEFT so the missed
+    /// soft reminder still fires on restart. Each UPDATE preserves the reconcile CAS shape. Returns the
+    /// number of subs credited.
+    pub async fn apply_restart_downtime_credit(&self, now: i64) -> Result<usize> {
+        self.store
+            .transaction(move |tx| {
+                let last: Option<i64> = tx
+                    .query_row(
+                        "SELECT last_heartbeat FROM daemon_state WHERE rowid=1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                // First boot (or a pre-heartbeat DB): establish the heartbeat, credit nothing — there
+                // is no known prior uptime, so no outage to credit.
+                let Some(last) = last else {
+                    write_heartbeat_txn(tx, now)?;
+                    return Ok(0);
+                };
+                // Clock did not advance past the last heartbeat (equal, or went backwards): nothing to
+                // credit; leave the heartbeat as-is.
+                if now <= last {
+                    return Ok(0);
+                }
+
+                let candidates = {
+                    // Credit a sub iff the outage window [last, now] OVERLAPS its renewal window
+                    // [soft_date, effective_suspend_at] at all: `soft_date <= now AND
+                    // effective_suspend_at >= last`, where the upper bound is the CREDITED floor
+                    // `effective_suspend_at = max(paid_through, suspend_not_before)` (soft_date defaulted
+                    // to `paid_through - renew_lead`). Using the EFFECTIVE floor (not raw paid_through) as
+                    // the upper bound lets a REPEAT outage — one starting after an earlier credit already
+                    // pushed the floor past paid_through — still be credited (lnrent-7fp.22 FIX 2);
+                    // `paid_through >= last` would drop it as soon as `last > paid_through`. A BETWEEN-on-
+                    // the-endpoints test would MISS an outage lying WHOLLY inside the window and silently
+                    // drop that overlap (§6.5). For an uncredited sub the MAX is just paid_through, so the
+                    // single-outage selection is unchanged; MAX(..) is NULL when paid_through is NULL (an
+                    // anomalous ACTIVE sub), so those stay filtered out.
+                    let mut stmt = tx.prepare(
+                        "SELECT id, renew_lead_s, soft_date, paid_through, suspend_not_before, next_deadline
+                           FROM subscription
+                          WHERE state='ACTIVE'
+                            AND COALESCE(soft_date, paid_through - COALESCE(renew_lead_s, 0)) <= ?2
+                            AND MAX(paid_through, COALESCE(suspend_not_before, paid_through)) >= ?1",
+                    )?;
+                    let rows = stmt
+                        .query_map(params![last, now], |r| {
+                            Ok(CreditCandidate {
+                                id: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                                renew_lead_s: r.get(1)?,
+                                soft_date: r.get(2)?,
+                                paid_through: r.get(3)?,
+                                suspend_not_before: r.get(4)?,
+                                next_deadline: r.get(5)?,
+                            })
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    rows
+                };
+
+                let mut credited = 0;
+                for c in candidates {
+                    // The credit math needs both; an ACTIVE sub missing either is anomalous — skip it
+                    // rather than fabricate a floor (and the CAS guard cannot match a NULL cursor).
+                    let (Some(pt), Some(nd)) = (c.paid_through, c.next_deadline) else {
+                        tracing::debug!(sub = %c.id, "downtime credit: ACTIVE sub missing paid_through/next_deadline — skipping");
+                        continue;
+                    };
+                    let lead = c.renew_lead_s.unwrap_or(0).max(0);
+                    let raw_soft = c.soft_date.unwrap_or(pt - lead);
+                    let existing_floor = c.suspend_not_before.unwrap_or(pt).max(pt);
+                    // Measure already-seen availability from the EFFECTIVE credited lead-window start,
+                    // which shifts right as each credited outage advances the floor (the credited window
+                    // ends at `existing_floor`, so it starts at `existing_floor - lead`). For a REPEAT
+                    // outage this makes the credit add only the NON-overlapping operator-down time of the
+                    // new outage, so the buyer still gets a full `renew_lead` of online time before
+                    // suspension (lnrent-7fp.22 FIX 2). For an uncredited sub `existing_floor` ==
+                    // paid_through, so the window start is the original soft_date and the single-outage
+                    // result is unchanged.
+                    let window_start = raw_soft.max(existing_floor - lead);
+                    let pre_available = (last - window_start).clamp(0, lead);
+                    let target = now + (lead - pre_available);
+                    let new_floor = existing_floor.max(target);
+                    // Pre-reminder (cursor at soft_date): LEAVE the cursor so the missed soft reminder
+                    // still fires on the boot catch-up; it then advances the cursor to the floor.
+                    let new_cursor = if nd < pt { nd } else { new_floor };
+                    // A no-op credit whose computed effective floor AND cursor already equal the
+                    // stored effective values still satisfies the CAS guard (the row matches, n==1),
+                    // but it moves neither the suspend boundary nor the cursor — so it must not
+                    // inflate the credited count or append a `downtime_credit` journal row
+                    // (lnrent-7fp.22 FIX C). `suspend_not_before=NULL` and `new_floor=paid_through`
+                    // are a no-op too: the effective floor was already paid_through.
+                    if existing_floor == new_floor && new_cursor == nd {
+                        continue;
+                    }
+                    let n = tx.execute(
+                        "UPDATE subscription
+                            SET suspend_not_before=?2, next_deadline=?3, updated_at=?4
+                          WHERE id=?1 AND state='ACTIVE' AND next_deadline=?5",
+                        params![c.id, new_floor, new_cursor, now, nd],
+                    )?;
+                    if n == 1 {
+                        journal(tx, &c.id, "downtime_credit", now)?;
+                        credited += 1;
+                    }
+                }
+
+                // Establish the new heartbeat in the SAME txn, so the credited outage is consumed
+                // exactly once even if the credit + the heartbeat must be all-or-nothing.
+                write_heartbeat_txn(tx, now)?;
+                Ok(credited)
+            })
+            .await
     }
 
     /// Read every subscription whose cursor is due. NULL cursors are excluded — a cleared cursor is
@@ -213,7 +386,8 @@ impl Reconciler {
         self.store
             .read(move |c| {
                 let mut stmt = c.prepare(
-                    "SELECT id, state, buyer_pubkey, paid_through, retention_s, next_deadline
+                    "SELECT id, state, buyer_pubkey, paid_through, retention_s, next_deadline,
+                            suspend_not_before
                      FROM subscription
                      WHERE next_deadline IS NOT NULL AND next_deadline <= ?1
                      ORDER BY next_deadline",
@@ -227,6 +401,7 @@ impl Reconciler {
                             paid_through: r.get(3)?,
                             retention_s: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
                             next_deadline: r.get(5)?,
+                            suspend_not_before: r.get(6)?,
                         })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -472,22 +647,32 @@ impl Reconciler {
     /// `renew:auto:<sub>:<paid_through>` external_id, so one cycle yields exactly one invoice. The
     /// invoice is created on the payment backend first (idempotent), then ONE txn does the guarded
     /// cursor advance + the OPEN renewal invoice + the `billing.invoice`/`billing.notice` outbox
-    /// rows. `paid_through` is NOT extended here — that is capture's, on settlement.
+    /// rows. `paid_through` is NOT extended here — that is capture's, on settlement. The cursor
+    /// advances to `effective_suspend_at` (the downtime-credit FLOOR, §6.5), not raw `paid_through`,
+    /// so a credited outage delays suspension; the invoice/`due_at` still key on `paid_through`.
+    #[allow(clippy::too_many_arguments)]
     async fn fire_soft_reminder(
         &self,
         sub_id: &str,
         buyer_hex: &str,
         paid_through: i64,
+        effective_suspend_at: i64,
         retention_s: i64,
         cursor_nd: i64,
         now: i64,
     ) -> Result<bool> {
+        // external_id stays paid_through-anchored (one cycle = one invoice); only the expiry sizing
+        // honors the credited boundary.
         let external_id = format!("renew:auto:{sub_id}:{paid_through}");
-        // Size the expiry to the renewal WINDOW: payable from now (soft_date) through the resumable
-        // boundary paid_through + retention_s (after which capture would refund a settlement anyway —
-        // the inclusive retention gate in .8), floored at RENEWAL_INVOICE_MIN_EXPIRY_S.
+        // Size the expiry to the CREDITED renewal WINDOW (§6.5, lnrent-7fp.22): payable from now
+        // (soft_date) through the resumable boundary B = effective_suspend_at + retention_s
+        // (= max(paid_through, suspend_not_before) + retention_s) — the SAME boundary capture's
+        // renewal refund gate honors, after which a settlement would be refunded anyway. Sizing to
+        // the stale paid_through + retention_s would, after a long credited outage, mint an invoice
+        // that expires before B, leaving the credited window unusable for payment. Floored at
+        // RENEWAL_INVOICE_MIN_EXPIRY_S.
         let expiry_s = u32::try_from(
-            (paid_through + retention_s - now).max(i64::from(RENEWAL_INVOICE_MIN_EXPIRY_S)),
+            (effective_suspend_at + retention_s - now).max(i64::from(RENEWAL_INVOICE_MIN_EXPIRY_S)),
         )
         .unwrap_or(u32::MAX);
         // Idempotent on external_id: a re-fire (or crash-retry) reuses the same invoice rather than
@@ -525,6 +710,7 @@ impl Reconciler {
             sub_id: sub_id.to_string(),
             buyer_hex: buyer_hex.to_string(),
             paid_through,
+            effective_suspend_at,
             cursor_nd,
             external_id,
             inv_id: invoice.id.clone(),
@@ -540,19 +726,28 @@ impl Reconciler {
         self.store.transaction(move |tx| write.write(tx)).await
     }
 
-    /// Transition 3 — suspend. First verify the cursor is still due, then run the recipe `suspend`
-    /// hook best-effort before the state/cursor move; a crash during the hook leaves the same due
-    /// cursor for the next tick. Hook failure is logged and non-fatal per this bead's scope. The
-    /// durable move remains a CAS guarded on `(state='ACTIVE', next_deadline=nd)`: ACTIVE
-    /// `-> SUSPENDED`, cursor `-> retention end`, and a `billing.notice` enqueued in one txn.
+    /// Transition 3 — suspend. Gate on the downtime-credit FLOOR first (§6.5): never suspend before
+    /// `effective_suspend_at`, even if the cursor came due. Then verify the cursor is still due and run
+    /// the recipe `suspend` hook best-effort before the state/cursor move; a crash during the hook
+    /// leaves the same due cursor for the next tick. Hook failure is logged and non-fatal per this
+    /// bead's scope. The durable move remains a CAS guarded on `(state='ACTIVE', next_deadline=nd)`:
+    /// ACTIVE `-> SUSPENDED`, cursor `-> retention_end`, and a `billing.notice` enqueued in one txn.
+    /// `retention_end` is `effective_suspend_at + retention_s` (retention runs from the CREDITED
+    /// suspension, §6.5), so a long-credited sub is never suspended-then-instantly-destroyed.
     async fn fire_suspend(
         &self,
         sub_id: &str,
         buyer_hex: &str,
         nd: i64,
+        effective_suspend_at: i64,
         retention_end: i64,
         now: i64,
     ) -> Result<bool> {
+        // Downtime credit (§6.5): a credited outage pushed the suspend FLOOR past `now` — do not
+        // suspend the buyer for the operator's downtime. The cursor stays put; a later tick fires.
+        if now < effective_suspend_at {
+            return Ok(false);
+        }
         if !self.subscription_matches(sub_id, "ACTIVE", nd).await? {
             return Ok(false);
         }
@@ -698,6 +893,9 @@ struct SoftReminderWrite {
     sub_id: String,
     buyer_hex: String,
     paid_through: i64,
+    /// Where the cursor advances to: the downtime-credit suspend FLOOR (§6.5), which equals
+    /// `paid_through` when no outage was credited.
+    effective_suspend_at: i64,
     /// The cursor value the fire was scheduled against — the CAS guard, so a stale fire is a no-op.
     cursor_nd: i64,
     external_id: String,
@@ -716,11 +914,17 @@ impl SoftReminderWrite {
     /// Guarded cursor advance + OPEN renewal invoice + `billing.invoice`/`billing.notice` outbox
     /// rows, in one txn. Returns `false` (no-op) when the cursor already advanced.
     fn write(self, tx: &Transaction) -> Result<bool> {
-        // CAS: advance ACTIVE's cursor from soft_date to paid_through. State stays ACTIVE.
+        // CAS: advance ACTIVE's cursor from soft_date to the effective suspend time (the credit FLOOR,
+        // = paid_through when uncredited). State stays ACTIVE.
         let n = tx.execute(
             "UPDATE subscription SET next_deadline=?2, updated_at=?3
              WHERE id=?1 AND state='ACTIVE' AND next_deadline=?4",
-            params![self.sub_id, self.paid_through, self.now, self.cursor_nd],
+            params![
+                self.sub_id,
+                self.effective_suspend_at,
+                self.now,
+                self.cursor_nd
+            ],
         )?;
         if n == 0 {
             return Ok(false);
@@ -775,6 +979,20 @@ impl SoftReminderWrite {
     }
 }
 
+/// Upsert the single-row liveness heartbeat (`daemon_state`, rowid 1) inside `tx` — the shared SQL
+/// for both the per-tick heartbeat and the boot downtime credit's same-txn heartbeat (§6.5). The
+/// write is MONOTONIC (`MAX(last_heartbeat, excluded.last_heartbeat)`): a tick whose wall-clock `now`
+/// moved BACKWARD never regresses the heartbeat, so a later restart can't re-credit an interval the
+/// daemon was actually alive for (the boot credit's `now <= last` early-return guards the same way).
+fn write_heartbeat_txn(tx: &Transaction, now: i64) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO daemon_state (rowid, last_heartbeat) VALUES (1, ?1)
+         ON CONFLICT(rowid) DO UPDATE SET last_heartbeat=MAX(last_heartbeat, excluded.last_heartbeat)",
+        params![now],
+    )?;
+    Ok(())
+}
+
 /// Journal a reconcile event to `event_log` in the same txn (every mutation is journaled,
 /// ADR-0001/§6.5). `subscription_id` is the affected sub (or order).
 fn journal(tx: &Transaction, sub_id: &str, kind: &str, now: i64) -> rusqlite::Result<()> {
@@ -812,15 +1030,17 @@ fn enqueue(
 mod tests {
     use super::*;
     use crate::clock::{Clock, TestClock};
-    use crate::store::{Store, SCHEMA};
+    use crate::store::{migrate, Store};
     use rusqlite::Connection;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    // Build via migrate() (not raw SCHEMA) so the store carries every applied migration — including
+    // `subscription.suspend_not_before` (migration 3, §6.5), which the downtime-credit tests read.
     fn mem_store() -> Store {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).unwrap();
         Store::spawn(conn)
     }
 
@@ -989,6 +1209,115 @@ mod tests {
         let sql = sql.to_string();
         store
             .read(move |c| Ok(c.query_row(&sql, [], |r| r.get(0))?))
+            .await
+            .unwrap()
+    }
+
+    // ---- downtime-credit helpers (§6.5, lnrent-7fp.22) ----------------------
+
+    /// Seed an ACTIVE sub with full control over the credit-relevant timers (renew_lead_s, soft_date)
+    /// that the trimmed `seed_sub` hard-codes; `suspend_not_before` starts NULL (no credit yet).
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_active_sub(
+        store: &Store,
+        id: &str,
+        buyer: &str,
+        renew_lead_s: i64,
+        soft_date: i64,
+        paid_through: i64,
+        retention_s: i64,
+        next_deadline: i64,
+    ) {
+        let (id, buyer) = (id.to_string(), buyer.to_string());
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO subscription
+                        (id, state, buyer_pubkey, period_s, renew_lead_s, retention_s,
+                         paid_through, soft_date, next_deadline, created_at, updated_at)
+                     VALUES (?1, 'ACTIVE', ?2, 100, ?3, ?4, ?5, ?6, ?7, 0, 0)",
+                    params![
+                        id,
+                        buyer,
+                        renew_lead_s,
+                        retention_s,
+                        paid_through,
+                        soft_date,
+                        next_deadline
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Stamp the liveness heartbeat (single-row `daemon_state`, rowid 1) so a restart credit measures
+    /// the outage from `last`.
+    async fn set_heartbeat(store: &Store, last: i64) {
+        store
+            .transaction(move |tx| {
+                write_heartbeat_txn(tx, last)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn heartbeat(store: &Store) -> Option<i64> {
+        store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT last_heartbeat FROM daemon_state WHERE rowid=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?)
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn sub_suspend_not_before(store: &Store, id: &str) -> Option<i64> {
+        let id = id.to_string();
+        store
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT suspend_not_before FROM subscription WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Stamp the downtime-credit FLOOR directly (the credit normally computes it; tests that need a
+    /// pre-existing floor set it here).
+    async fn set_suspend_not_before(store: &Store, id: &str, floor: i64) {
+        let id = id.to_string();
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "UPDATE subscription SET suspend_not_before=?2 WHERE id=?1",
+                    params![id, floor],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn inv_expires_at(store: &Store, external_id: &str) -> Option<i64> {
+        let external_id = external_id.to_string();
+        store
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT expires_at FROM invoice WHERE external_id=?1",
+                    params![external_id],
+                    |r| r.get(0),
+                )?)
+            })
             .await
             .unwrap()
     }
@@ -1175,7 +1504,7 @@ mod tests {
             .create_invoice(100, "lnrent renewal s1", 10000, "renew:auto:s1:1000")
             .unwrap();
         payment.settle("renew:auto:s1:1000", 980).unwrap(); // paid at backend; capture pending
-        // ACTIVE sub due for SUSPEND at paid_through=1000 (cursor == paid_through), retention 500.
+                                                            // ACTIVE sub due for SUSPEND at paid_through=1000 (cursor == paid_through), retention 500.
         seed_sub(&store, "s1", "ACTIVE", "buyer", Some(1000), 500, Some(1000)).await;
         seed_invoice(
             &store,
@@ -1190,7 +1519,10 @@ mod tests {
         let r = Reconciler::new(store.clone(), payment.clone(), dummy_recipe());
 
         let rep = r.reconcile_tick(1000).await.unwrap();
-        assert_eq!(rep.suspended, 0, "a paid-pending renewal defers the suspend");
+        assert_eq!(
+            rep.suspended, 0,
+            "a paid-pending renewal defers the suspend"
+        );
         assert_eq!(sub_state(&store, "s1").await, "ACTIVE");
         assert_eq!(inv_status(&store, "renew:auto:s1:1000").await, "OPEN");
     }
@@ -1398,5 +1730,472 @@ mod tests {
             0,
             "a no-op journals nothing"
         );
+    }
+
+    // ---- downtime credit (§6.5, ADR-0005, lnrent-7fp.22) -------------------
+
+    // Test 1: the suspend deadline (paid_through) fell INSIDE the outage. Credit raises
+    // suspend_not_before (paid_through UNCHANGED) so the buyer gets the rest of their renew_lead
+    // window from restart; a boot reconcile BEFORE the credited time does NOT suspend, and suspension
+    // fires exactly at the credited floor.
+    #[tokio::test]
+    async fn suspend_deadline_inside_outage_is_credited_not_suspended() {
+        let store = mem_store();
+        let clock = TestClock::new(1100);
+        // renew_lead=100, soft_date=900, paid_through=1000; post-reminder so the cursor sits at
+        // paid_through. Outage: last alive 950 (50s of lead already seen) -> restart at 1100.
+        seed_active_sub(&store, "s1", "buyer", 100, 900, 1000, 500, 1000).await;
+        set_heartbeat(&store, 950).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        let credited = r.apply_restart_downtime_credit(clock.now()).await.unwrap();
+        assert_eq!(credited, 1);
+        // pre_available = clamp(950-900,0,100)=50; target = 1100 + (100-50) = 1150.
+        assert_eq!(sub_suspend_not_before(&store, "s1").await, Some(1150));
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM subscription WHERE id='s1' AND paid_through=1000"
+            )
+            .await,
+            1,
+            "paid_through is the prepaid-money anchor — never moved by credit"
+        );
+        // Cursor (post-reminder) advanced to the floor so reconcile re-checks at the credited time.
+        assert_eq!(sub_next_deadline(&store, "s1").await, Some(1150));
+
+        // A boot reconcile at restart does NOT suspend — the credited floor is still in the future.
+        let rep = r.reconcile_tick(clock.now()).await.unwrap();
+        assert_eq!(rep.suspended, 0, "no suspend before the credited floor");
+        assert_eq!(sub_state(&store, "s1").await, "ACTIVE");
+
+        // At the credited floor the suspend fires normally (CAS-guarded on the advanced cursor).
+        clock.set(1150);
+        let rep = r.reconcile_tick(clock.now()).await.unwrap();
+        assert_eq!(rep.suspended, 1, "suspends exactly at the credited floor");
+        assert_eq!(sub_state(&store, "s1").await, "SUSPENDED");
+    }
+
+    // Test 2: the deadline fell OUTSIDE the outage window — no credit, and the existing suspend timing
+    // is unchanged.
+    #[tokio::test]
+    async fn deadline_outside_outage_is_not_credited() {
+        let store = mem_store();
+        // Same sub shape as Test 1 but the outage [500,600] precedes both soft_date(900)/paid_through(1000).
+        seed_active_sub(&store, "s1", "buyer", 100, 900, 1000, 500, 1000).await;
+        set_heartbeat(&store, 500).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        let credited = r.apply_restart_downtime_credit(600).await.unwrap();
+        assert_eq!(
+            credited, 0,
+            "deadline outside the outage -> nothing credited"
+        );
+        assert_eq!(sub_suspend_not_before(&store, "s1").await, None);
+        assert_eq!(
+            sub_next_deadline(&store, "s1").await,
+            Some(1000),
+            "cursor untouched"
+        );
+
+        // Existing timing unchanged: still ACTIVE just before paid_through, suspends at paid_through.
+        let rep = r.reconcile_tick(999).await.unwrap();
+        assert_eq!(rep.suspended, 0);
+        assert_eq!(sub_state(&store, "s1").await, "ACTIVE");
+        let rep = r.reconcile_tick(1000).await.unwrap();
+        assert_eq!(
+            rep.suspended, 1,
+            "suspend timing is unchanged (fires at paid_through)"
+        );
+        assert_eq!(sub_state(&store, "s1").await, "SUSPENDED");
+    }
+
+    // Test 3: a SOFT-DATE-only outage (soft_date in [last,now], paid_through still ahead). Credit is
+    // stored, the cursor STAYS at soft_date, and the normal boot reconcile issues EXACTLY ONE
+    // renew:auto:<sub>:<paid_through> invoice and advances the cursor to the credited suspend time.
+    #[tokio::test]
+    async fn soft_date_only_outage_credits_then_reminds_once() {
+        let store = mem_store();
+        // renew_lead=100, soft_date=900, paid_through=1000; pre-reminder (cursor at soft_date).
+        // Outage: last alive 850 (no lead seen yet) -> restart at 950, before paid_through.
+        seed_active_sub(&store, "s1", "buyerhex", 100, 900, 1000, 500, 900).await;
+        set_heartbeat(&store, 850).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        let credited = r.apply_restart_downtime_credit(950).await.unwrap();
+        assert_eq!(credited, 1);
+        // pre_available = clamp(850-900,0,100)=0; target = 950 + 100 = 1050.
+        assert_eq!(sub_suspend_not_before(&store, "s1").await, Some(1050));
+        assert_eq!(
+            sub_next_deadline(&store, "s1").await,
+            Some(900),
+            "pre-reminder: cursor LEFT at soft_date so the missed reminder still fires"
+        );
+
+        // The boot catch-up reconcile fires the soft reminder: ONE renew:auto invoice keyed on the
+        // UNCHANGED paid_through, and the cursor advances to the credited floor (1050), not 1000.
+        let rep = r.reconcile_tick(950).await.unwrap();
+        assert_eq!(rep.reminded, 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM invoice WHERE external_id='renew:auto:s1:1000'"
+            )
+            .await,
+            1,
+            "exactly one renew:auto invoice keyed on the unchanged paid_through"
+        );
+        assert_eq!(
+            sub_next_deadline(&store, "s1").await,
+            Some(1050),
+            "cursor advanced to the credited suspend time, not raw paid_through"
+        );
+    }
+
+    // Test 4: renew_lead_s == 0 (soft_date == paid_through). target == now, so there is no lead window
+    // to credit and suspension may occur on restart — and NO auto invoice is created (the zero-lead
+    // soft branch never fires, the credit path mints nothing).
+    #[tokio::test]
+    async fn zero_lead_credits_no_delay_and_no_invoice() {
+        let store = mem_store();
+        // renew_lead=0 => soft_date == paid_through == 1000; cursor at paid_through.
+        seed_active_sub(&store, "s1", "buyer", 0, 1000, 1000, 500, 1000).await;
+        set_heartbeat(&store, 950).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        let credited = r.apply_restart_downtime_credit(1100).await.unwrap();
+        assert_eq!(credited, 1);
+        // lead=0 => target=now=1100 => floor = max(1000,1000,1100) = 1100 (= now: no delay credited).
+        assert_eq!(sub_suspend_not_before(&store, "s1").await, Some(1100));
+
+        // Boot reconcile at restart: the suspend may fire (floor == now), and crucially NO renewal
+        // invoice is minted (no soft window) — no auto-invoice duplication.
+        let rep = r.reconcile_tick(1100).await.unwrap();
+        assert_eq!(rep.reminded, 0, "zero-lead never takes the soft branch");
+        assert_eq!(rep.suspended, 1, "no lead to credit -> suspends on restart");
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
+            0,
+            "the credit path mints nothing; zero-lead issues no auto invoice"
+        );
+    }
+
+    // Test 5: idempotency — running credit + reconcile twice for the same cycle yields exactly ONE
+    // renewal invoice row for the unchanged external_id (the cursor advance + the renew:auto
+    // ON CONFLICT idempotency + the same-txn heartbeat together prevent any duplicate).
+    #[tokio::test]
+    async fn credit_plus_reconcile_is_idempotent_across_two_runs() {
+        let store = mem_store();
+        seed_active_sub(&store, "s1", "buyerhex", 100, 900, 1000, 500, 900).await;
+        set_heartbeat(&store, 850).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        // First cycle: credit (sets the heartbeat to 950) then reconcile (mints the one invoice).
+        assert_eq!(r.apply_restart_downtime_credit(950).await.unwrap(), 1);
+        assert_eq!(r.reconcile_tick(950).await.unwrap().reminded, 1);
+        assert_eq!(heartbeat(&store).await, Some(950));
+
+        // Second cycle at the same now: credit no-ops (now <= last heartbeat), and reconcile finds the
+        // cursor already advanced past now -> no second reminder.
+        assert_eq!(
+            r.apply_restart_downtime_credit(950).await.unwrap(),
+            0,
+            "no second credit for the same cycle (now <= last heartbeat)"
+        );
+        assert_eq!(r.reconcile_tick(950).await.unwrap().reminded, 0);
+
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
+            1,
+            "exactly one renewal invoice across both runs"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM invoice WHERE external_id='renew:auto:s1:1000'"
+            )
+            .await,
+            1,
+            "the unchanged external_id was never duplicated"
+        );
+    }
+
+    // FIX 1 (§6.5, lnrent-7fp.22): a LONG outage credits a floor PAST the ORIGINAL paid_through +
+    // retention_s. On restart the sub must NOT be immediately destroyed — it suspends at the credited
+    // time, and retention runs from THAT credited suspension (destroy at effective_suspend_at +
+    // retention_s), so the buyer gets the full retention window AFTER the credited suspension.
+    #[tokio::test]
+    async fn long_outage_suspends_at_credited_time_then_full_retention() {
+        let store = mem_store();
+        let clock = TestClock::new(2000);
+        // renew_lead=100, soft_date=900, paid_through=1000, retention=50 -> ORIGINAL retention end
+        // 1050. Post-reminder cursor at paid_through. Outage: last alive 950 -> restart at 2000 (LONG;
+        // far past 1050), so the credited floor lands well beyond the original retention end.
+        seed_active_sub(&store, "s1", "buyer", 100, 900, 1000, 50, 1000).await;
+        set_heartbeat(&store, 950).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        let credited = r.apply_restart_downtime_credit(clock.now()).await.unwrap();
+        assert_eq!(credited, 1);
+        // pre_available = clamp(950-900,0,100)=50; target = 2000 + (100-50) = 2050 (> 1050, the
+        // original paid_through+retention_s).
+        assert_eq!(sub_suspend_not_before(&store, "s1").await, Some(2050));
+        // Post-reminder cursor advanced to the credited floor so reconcile re-checks at that time.
+        assert_eq!(sub_next_deadline(&store, "s1").await, Some(2050));
+
+        // Boot reconcile at restart: the credited floor (2050) is still in the future, so the sub is
+        // NOT due — crucially it is NOT suspended-then-immediately-destroyed.
+        let rep = r.reconcile_tick(clock.now()).await.unwrap();
+        assert_eq!(rep.suspended, 0, "not suspended before the credited floor");
+        assert_eq!(
+            rep.terminated, 0,
+            "a long-credited sub is NOT immediately destroyed on restart"
+        );
+        assert_eq!(sub_state(&store, "s1").await, "ACTIVE");
+
+        // At the credited floor: the suspend fires, and the destroy deadline runs from the CREDITED
+        // suspension — effective_suspend_at + retention_s = 2050 + 50 = 2100 (NOT the stale 1050).
+        clock.set(2050);
+        let rep = r.reconcile_tick(clock.now()).await.unwrap();
+        assert_eq!(rep.suspended, 1, "suspends exactly at the credited floor");
+        assert_eq!(rep.terminated, 0, "it suspends, it does not destroy");
+        assert_eq!(sub_state(&store, "s1").await, "SUSPENDED");
+        assert_eq!(
+            sub_next_deadline(&store, "s1").await,
+            Some(2100),
+            "destroy deadline = effective_suspend_at + retention_s (full retention after suspension)"
+        );
+
+        // Retention actually elapses before destroy: still SUSPENDED just before 2100...
+        let rep = r.reconcile_tick(2099).await.unwrap();
+        assert_eq!(rep.terminated, 0);
+        assert_eq!(sub_state(&store, "s1").await, "SUSPENDED");
+        // ...and TERMINATED at the credited retention end.
+        clock.set(2100);
+        let rep = r.reconcile_tick(clock.now()).await.unwrap();
+        assert_eq!(rep.terminated, 1, "destroys at the credited retention end");
+        assert_eq!(sub_state(&store, "s1").await, "TERMINATED");
+    }
+
+    // FIX 3 (§6.5, lnrent-7fp.22): an outage lying WHOLLY INSIDE the renewal window — neither
+    // soft_date nor paid_through falls in [last, now] — still OVERLAPS the renewal window, so it must
+    // be credited (the reduced amount), not silently dropped by an endpoint-only BETWEEN filter.
+    #[tokio::test]
+    async fn interior_outage_overlapping_window_is_credited() {
+        let store = mem_store();
+        // renew_lead=100, soft_date=900, paid_through=1000; outage [950, 990] lies wholly inside the
+        // renewal window [900, 1000] — neither 900 nor 1000 is in [950, 990].
+        seed_active_sub(&store, "s1", "buyer", 100, 900, 1000, 500, 1000).await;
+        set_heartbeat(&store, 950).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        let credited = r.apply_restart_downtime_credit(990).await.unwrap();
+        assert_eq!(
+            credited, 1,
+            "an interior outage overlaps the window and IS credited"
+        );
+        // pre_available = clamp(950-900,0,100)=50; target = 990 + (100-50) = 1040 (the reduced credit
+        // for the partially-elapsed lead).
+        assert_eq!(sub_suspend_not_before(&store, "s1").await, Some(1040));
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM subscription WHERE id='s1' AND paid_through=1000"
+            )
+            .await,
+            1,
+            "paid_through is never moved by the credit"
+        );
+    }
+
+    // FIX 4 (§6.5, lnrent-7fp.22): the per-tick heartbeat upsert is MONOTONIC. A tick whose
+    // wall-clock `now` moved BACKWARD must not regress last_heartbeat, else a later restart could
+    // re-credit an interval the daemon was actually alive for.
+    #[tokio::test]
+    async fn per_tick_heartbeat_is_monotonic() {
+        let store = mem_store();
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        // A normal tick stamps the heartbeat forward.
+        r.reconcile_tick(1000).await.unwrap();
+        assert_eq!(heartbeat(&store).await, Some(1000));
+
+        // A backward `now` does NOT pull the heartbeat back.
+        r.reconcile_tick(900).await.unwrap();
+        assert_eq!(
+            heartbeat(&store).await,
+            Some(1000),
+            "a backward now does not regress last_heartbeat"
+        );
+
+        // Moving forward again advances it normally.
+        r.reconcile_tick(1100).await.unwrap();
+        assert_eq!(heartbeat(&store).await, Some(1100));
+    }
+
+    // FIX B (§6.5, lnrent-7fp.22): the soft-date auto-reminder invoice's expiry must cover the
+    // CREDITED boundary B = effective_suspend_at + retention_s, not the stale paid_through +
+    // retention_s. After a long credited outage the freshly-minted auto-invoice would otherwise
+    // expire before B, leaving the credited window unusable for payment.
+    #[tokio::test]
+    async fn soft_reminder_invoice_expiry_covers_credited_boundary() {
+        let store = mem_store();
+        // renew_lead=100, soft_date(cursor)=900, paid_through=1000, retention=500. A large credited
+        // floor (5000) -> effective_suspend_at = max(1000,5000) = 5000 -> B = 5000+500 = 5500. The
+        // raw boundary paid_through+retention_s = 1500 is far short of B.
+        seed_active_sub(&store, "s1", "buyerhex", 100, 900, 1000, 500, 900).await;
+        set_suspend_not_before(&store, "s1", 5000).await;
+        let payment = Arc::new(crate::backends::MockPayment::new());
+        let now = 900;
+        payment.set_now(now); // mock stamps expires_at = now + expiry_s
+        let r = Reconciler::new(store.clone(), payment, dummy_recipe());
+
+        let rep = r.reconcile_tick(now).await.unwrap();
+        assert_eq!(
+            rep.reminded, 1,
+            "the credited sub still fires its soft reminder"
+        );
+
+        // The invoice is keyed on the UNCHANGED paid_through, but its expiry covers B (5500).
+        let b = 5000 + 500;
+        let expires_at = inv_expires_at(&store, "renew:auto:s1:1000")
+            .await
+            .expect("renewal invoice has an expiry");
+        assert!(
+            expires_at >= b,
+            "auto-invoice expiry {expires_at} must reach the credited boundary B={b} (raw \
+             paid_through+retention_s=1500 would have it expire at 4500, before B)"
+        );
+        // Cursor advanced to the credited floor, as the cascade requires (state stays ACTIVE).
+        assert_eq!(sub_next_deadline(&store, "s1").await, Some(5000));
+        assert_eq!(sub_state(&store, "s1").await, "ACTIVE");
+    }
+
+    // FIX C (§6.5, lnrent-7fp.22): a no-op credit — the computed floor AND cursor already equal the
+    // stored values — still matches the CAS row, but it moves nothing, so it must NOT inflate the
+    // credited count or append a `downtime_credit` journal row.
+    #[tokio::test]
+    async fn noop_credit_does_not_increment_count_or_journal() {
+        let store = mem_store();
+        // Already-credited, post-reminder sub: floor=2100, cursor advanced to the floor (2100).
+        // renew_lead=100, soft_date=1900, paid_through=2000, retention=500.
+        seed_active_sub(&store, "s1", "buyer", 100, 1900, 2000, 500, 2100).await;
+        set_suspend_not_before(&store, "s1", 2100).await;
+        // A clean restart (no real new outage): last alive 1950, restart at 1960. The candidate query
+        // still selects it (soft_date 1900 <= 1960, paid_through 2000 >= 1950), but the math recomputes
+        // the SAME floor: pre_available=clamp(1950-1900,0,100)=50; target=1960+(100-50)=2010;
+        // new_floor = max(2100, 2000, 2010) = 2100 (== stored), new_cursor = 2100 (== stored cursor).
+        set_heartbeat(&store, 1950).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        let credited = r.apply_restart_downtime_credit(1960).await.unwrap();
+        assert_eq!(credited, 0, "a no-op credit is not counted");
+        assert_eq!(
+            sub_suspend_not_before(&store, "s1").await,
+            Some(2100),
+            "the floor is unchanged"
+        );
+        assert_eq!(
+            sub_next_deadline(&store, "s1").await,
+            Some(2100),
+            "the cursor is unchanged"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM event_log WHERE subscription_id='s1' AND kind='downtime_credit'"
+            )
+            .await,
+            0,
+            "a no-op credit writes no downtime_credit journal row"
+        );
+        // The heartbeat still advances to the restart time (consumed exactly once).
+        assert_eq!(heartbeat(&store).await, Some(1960));
+    }
+
+    // FIX 2 (§6.5, lnrent-7fp.22): a SECOND outage whose window overlaps an already-credited window
+    // must add only its NON-overlapping operator-down time, so the buyer still gets a full renew_lead
+    // of ONLINE time before suspension. Before this fix the credit SELECT dropped the sub as soon as
+    // `last > paid_through`, so the second outage consumed previously-credited availability and the
+    // sub could suspend after LESS than renew_lead of online time.
+    #[tokio::test]
+    async fn repeat_outage_credits_non_overlapping_downtime() {
+        let store = mem_store();
+        // renew_lead=100, soft_date=900, paid_through=1000, retention=500; post-reminder cursor at
+        // paid_through.
+        seed_active_sub(&store, "s1", "buyer", 100, 900, 1000, 500, 1000).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        // First outage: alive through 950 (50s of lead seen online) -> restart at 1100.
+        set_heartbeat(&store, 950).await;
+        assert_eq!(r.apply_restart_downtime_credit(1100).await.unwrap(), 1);
+        // pre_available = clamp(950-900,0,100)=50; target = 1100 + (100-50) = 1150.
+        assert_eq!(sub_suspend_not_before(&store, "s1").await, Some(1150));
+        assert_eq!(sub_next_deadline(&store, "s1").await, Some(1150));
+
+        // The daemon then ran online until 1120 (20s more lead seen: 70s total) before a SECOND
+        // outage, and restarts at 1200.
+        set_heartbeat(&store, 1120).await;
+        assert_eq!(
+            r.apply_restart_downtime_credit(1200).await.unwrap(),
+            1,
+            "the second outage is still credited (selected via the EFFECTIVE floor, not paid_through)"
+        );
+        // window_start = max(900, 1150-100=1050)=1050; pre_available = clamp(1120-1050,0,100)=70;
+        // target = 1200 + (100-70) = 1230. The floor advances by exactly the second outage's
+        // operator-down time (1200-1120 = 80): 1150 + 80 = 1230. The buyer thus still gets a full
+        // renew_lead (100s) of ONLINE time before suspension: 50 (900-950) + 20 (1100-1120) +
+        // 30 (1200-1230) = 100.
+        assert_eq!(sub_suspend_not_before(&store, "s1").await, Some(1230));
+        assert_eq!(sub_next_deadline(&store, "s1").await, Some(1230));
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM subscription WHERE id='s1' AND paid_through=1000"
+            )
+            .await,
+            1,
+            "paid_through is never moved by either credit"
+        );
+    }
+
+    // FIX 4 (§6.5, lnrent-7fp.22): a credit whose computed new_floor == paid_through (here a restart
+    // exactly at soft_date with the outage starting before it) leaves the EFFECTIVE suspend boundary
+    // and the cursor unchanged, so it must NOT flip suspend_not_before NULL->paid_through, write a
+    // `downtime_credit` journal row, or inflate the credited count.
+    #[tokio::test]
+    async fn noop_credit_at_paid_through_floor_does_not_journal_or_count() {
+        let store = mem_store();
+        // renew_lead=100, soft_date=900, paid_through=1000; pre-reminder cursor at soft_date.
+        seed_active_sub(&store, "s1", "buyer", 100, 900, 1000, 500, 900).await;
+        // Outage starts BEFORE soft_date (last=850, no lead seen) and the restart lands exactly at
+        // soft_date (now=900): pre_available = clamp(850-900,0,100)=0; target = 900 + 100 = 1000 =
+        // paid_through; new_floor = max(1000,1000) = 1000 == paid_through (a zero-effect credit).
+        set_heartbeat(&store, 850).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        let credited = r.apply_restart_downtime_credit(900).await.unwrap();
+        assert_eq!(credited, 0, "a new_floor == paid_through credit is a no-op");
+        assert_eq!(
+            sub_suspend_not_before(&store, "s1").await,
+            None,
+            "suspend_not_before is NOT flipped NULL -> paid_through"
+        );
+        assert_eq!(
+            sub_next_deadline(&store, "s1").await,
+            Some(900),
+            "the cursor is left at soft_date"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM event_log WHERE subscription_id='s1' AND kind='downtime_credit'"
+            )
+            .await,
+            0,
+            "a no-op credit writes no downtime_credit journal row"
+        );
+        // The heartbeat still advances to the restart time (consumed exactly once).
+        assert_eq!(heartbeat(&store).await, Some(900));
     }
 }
