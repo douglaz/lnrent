@@ -5,6 +5,9 @@ pub mod capture;
 pub mod clock;
 pub mod config;
 pub mod domain;
+/// Real Fedimint backend (lnrent-7fp.4) — only when the `fedimint` feature is on (default OFF).
+#[cfg(feature = "fedimint")]
+pub mod fedimint_backend;
 pub mod identity;
 pub mod ipc;
 pub mod nostr_engine;
