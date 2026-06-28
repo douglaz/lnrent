@@ -651,10 +651,16 @@ transition at most once and cannot double-run or wedge.
 Because all dates are absolute wall-clock timestamps, the loop is **downtime-safe**: a
 transition missed while the Box was off fires on restart. But suspension is **credited
 for operator downtime** (ADR-0005): the daemon persists a heartbeat, and on restart it
-shifts any renewal/suspend deadline that fell inside its downtime window forward by the
-outage length and re-sends the reminder, so a buyer is never suspended for the operator's
-outage. The buyer can also request a renewal invoice on demand (`renew.request`);
-reminders are otherwise best-effort.
+records a per-subscription `suspend_not_before` floor for any ACTIVE sub whose renewal
+window overlapped its downtime window — WITHOUT moving `paid_through` (the prepaid-money +
+`renew:auto` invoice anchor), so renewal math and the duplicate-invoice guard are untouched.
+The credited "resumable until" boundary `B = max(paid_through, suspend_not_before) +
+retention_s` is honored uniformly by the suspend/destroy transitions, capture's renewal
+refund gate, the buyer's `renew.request`, and the restart settlement catch-up, so a buyer is
+never suspended (nor destroyed, nor refused renewal) for the operator's outage; the missed
+reminder fires on the restart tick. The buyer can also request a renewal invoice on demand
+(`renew.request`); reminders are otherwise best-effort. (Crediting an already-SUSPENDED sub's
+retention is tracked separately.)
 
 ### 6.6 Durable handshake and crash recovery (M1a)
 
@@ -1102,6 +1108,7 @@ CREATE TABLE subscription (
   paid_through INTEGER,              -- hard expiry; service interrupted after this
   soft_date INTEGER,                 -- paid_through - renew_lead_s; renewal recommended from here
   next_deadline INTEGER,             -- reconcile-loop cursor
+  suspend_not_before INTEGER,        -- downtime-credit floor (ADR-0005, §6.5); NULL = no credit; never moves paid_through
   created_at INTEGER, updated_at INTEGER);
 
 CREATE TABLE invoice (

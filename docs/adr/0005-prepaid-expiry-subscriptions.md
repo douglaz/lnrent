@@ -33,7 +33,16 @@ operator was down during a subscription's renewal window (`soft_date -> paid_thr
 the buyer could not renew (no invoice issued, no reminders) yet would be suspended the
 moment the operator returns. Home-lab boxes reboot, lose power, and sleep, so this is a
 real churn/dispute generator. Fix: the daemon persists a heartbeat, and on restart it
-**credits its own downtime** — any renewal/suspend deadline that fell inside the downtime
-window is shifted forward by the outage length and its reminder re-sent, so every buyer
-gets their full `renew_lead` window of actual operator availability before suspension. A
-buyer is never suspended for the operator's outage.
+**credits its own downtime**. Rather than move `paid_through` (the prepaid-money and the
+`renew:auto:<sub>:<paid_through>` invoice anchor), it records a per-subscription
+`suspend_not_before` floor for any ACTIVE sub whose renewal window overlapped the outage
+`[last_heartbeat, now]`, computed so the buyer gets their full `renew_lead` window of actual
+operator availability before suspension; the missed reminder fires normally on the restart
+tick. Every consumer of the "resumable until" boundary honors the credited
+`B = max(paid_through, suspend_not_before) + retention_s`: the suspend transition
+(`effective_suspend_at = max(paid_through, suspend_not_before)`) and the destroy that runs
+`retention_s` after it, capture's renewal refund gate, the buyer's `renew.request`, and the
+restart settlement catch-up. So a buyer is never suspended — nor destroyed, nor refused a
+renewal — for the operator's outage. The floor never moves a deadline *earlier*, self-expires
+once a renewal pushes `paid_through` past it, and is cleared on renewal. (Crediting an
+*already-SUSPENDED* sub's retention/destroy is tracked separately, lnrent-d6n.)
