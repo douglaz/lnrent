@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# DigitalOcean VPS provision hook (lnrent recipes/do-vps). SPEC §7.2.
+#
+# Input  (stdin) : subscription JSON {subscription{id,params{ssh_pubkey}}, instance{id}, params, host{...}}.
+# Output (stdout): {"payload":{"host":<ipv4>,"port":22,"user":"root"}, "handles":{"droplet_id":<id>}}.
+# Env (from the daemon's environment, inherited by the hook):
+#   DO_TOKEN   (REQUIRED) DigitalOcean API token.
+#   DO_REGION  (default nyc3) DO_SIZE (default s-1vcpu-1gb) DO_IMAGE (default ubuntu-24-04-x64).
+#
+# IDEMPOTENT: the droplet is tagged `sub:<id>`; a re-run (daemon retry / boot recovery) finds the
+# existing droplet by tag and reuses it instead of creating a second one. Bounded poll (<120s hook
+# budget); if a slow boot exceeds it, the next attempt's find-by-tag continues polling the same droplet.
+set -euo pipefail
+
+err() { echo "{\"error\":$(jq -Rn --arg m "$1" '$m')}"; exit 1; }
+
+: "${DO_TOKEN:?DO_TOKEN not set — the operator must configure the DigitalOcean API token in the daemon env}"
+REGION="${DO_REGION:-nyc3}"
+SIZE="${DO_SIZE:-s-1vcpu-1gb}"
+IMAGE="${DO_IMAGE:-debian-12-x64}"
+API="https://api.digitalocean.com/v2"
+AUTH=(-H "Authorization: Bearer ${DO_TOKEN}" -H "Content-Type: application/json")
+
+input="$(cat)"
+sub_id="$(jq -r '.subscription.id // .instance.subscription_id // empty' <<<"$input")"
+ssh_pubkey="$(jq -r '.subscription.params.ssh_pubkey // .params.ssh_pubkey // empty' <<<"$input")"
+[ -n "$sub_id" ] || err "missing subscription.id in hook input"
+[ -n "$ssh_pubkey" ] || err "missing params.ssh_pubkey"
+# The pubkey is buyer-supplied and gets written into the VM's authorized_keys via cloud-init, so
+# validate its shape BEFORE it reaches user_data (injection guard).
+grep -Eq '^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/]+={0,2}( .*)?$' <<<"$ssh_pubkey" \
+  || err "ssh_pubkey is not a well-formed OpenSSH public key"
+
+tag="sub:${sub_id}"
+# DO droplet names must be valid hostnames (alnum/./-, no leading/trailing hyphen). Use printf (no
+# trailing newline), map non-alnum -> '-', truncate, strip edge dashes, and guard the empty case.
+clean="$(printf '%s' "$sub_id" | tr -c 'a-zA-Z0-9' '-' | cut -c1-50 | sed 's/^-*//; s/-*$//')"
+name="lnrent${clean:+-$clean}"
+
+# Reuse an existing droplet for this subscription if one is already tagged (idempotent).
+existing="$(curl -fsS "${AUTH[@]}" "${API}/droplets?tag_name=${tag}" | jq -r '.droplets[0].id // empty')"
+if [ -n "$existing" ]; then
+  droplet_id="$existing"
+else
+  # debian cloud images ship root with an EXPIRED password (last-change=0 "must change"), so PAM
+  # forces a change on first login, breaking key-only non-interactive SSH. chpasswd.expire=false does
+  # NOT clear the last-change=0 sentinel; a `chage` runcmd (reset last-change, disable max-age +
+  # account expiry) does, giving clean key-only root login. ssh_pwauth=false keeps it key-only.
+  user_data="$(printf '#cloud-config\ndisable_root: false\nssh_pwauth: false\nssh_authorized_keys:\n  - %s\nruncmd:\n  - chage -d 1 -M -1 -E -1 root\n' "$ssh_pubkey")"
+  body="$(jq -n --arg name "$name" --arg region "$REGION" --arg size "$SIZE" --arg image "$IMAGE" \
+            --arg ud "$user_data" --arg tag "$tag" \
+            '{name:$name, region:$region, size:$size, image:$image, user_data:$ud,
+              ssh_keys:[], tags:["lnrent",$tag], backups:false, ipv6:false, monitoring:true}')"
+  droplet_id="$(curl -fsS "${AUTH[@]}" -X POST "${API}/droplets" -d "$body" | jq -r '.droplet.id // empty')"
+  [ -n "$droplet_id" ] || err "DigitalOcean droplet create returned no id"
+fi
+
+# Poll for active + a public IPv4 (<=100s, within the 120s per-hook budget).
+ip=""
+for _ in $(seq 1 20); do
+  d="$(curl -fsS "${AUTH[@]}" "${API}/droplets/${droplet_id}")"
+  status="$(jq -r '.droplet.status' <<<"$d")"
+  ip="$(jq -r '[.droplet.networks.v4[]? | select(.type=="public") | .ip_address][0] // empty' <<<"$d")"
+  [ "$status" = "active" ] && [ -n "$ip" ] && break
+  sleep 5
+done
+[ -n "$ip" ] || err "droplet ${droplet_id} not active with a public IPv4 in time (will retry)"
+
+jq -n --arg ip "$ip" --argjson id "$droplet_id" \
+  '{payload:{host:$ip, port:22, user:"root"}, handles:{droplet_id:$id}}'

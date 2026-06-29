@@ -1,0 +1,45 @@
+[service]
+id = "do-vps"
+name = "Cloud VPS (DigitalOcean)"
+summary = "A dedicated cloud VPS with root SSH. 1 vCPU / 1 GB / 25 GB."
+version = "0.1.0"
+category = ["vps", "compute"]
+
+# Operator sets real pricing; this is an example (~one small droplet/month).
+[pricing]
+amount_sat = 30000
+period = "30d"
+renew_lead = "7d"
+retention = "7d"
+
+# backend `cloud-*` is honored by recipe validation as-is (no daemon change). The hooks
+# call the DigitalOcean REST API; the droplet size/region/image come from the daemon env
+# ($DO_REGION/$DO_SIZE/$DO_IMAGE, defaults baked in the hooks). `resources` must roughly
+# match $DO_SIZE for honest capacity/pricing.
+[provisioning]
+backend = "cloud-do"
+isolation = "vm"
+tier = "2"
+resources = { cpu = 1, mem_mb = 1024, disk_gb = 25 }
+
+[os]
+supports = ["debian"]
+
+# The buyer brings their SSH public key; the provision hook injects it via cloud-init.
+[[params]]
+key = "ssh_pubkey"
+label = "Your SSH public key"
+type = "string"
+required = true
+
+[[operation]]
+name = "status"
+label = "VPS status"
+kind = "request"
+hook = "status"
+
+[[operation]]
+name = "restart"
+label = "Reboot the VPS"
+kind = "request"
+hook = "restart"

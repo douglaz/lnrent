@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# DO VPS destroy hook (lnrent recipes/do-vps). SPEC §7.2.
+# Deletes the droplet for this subscription. IDEMPOTENT: a missing droplet (404) is success, so a
+# re-run / boot-recovery / post-failure cleanup never errors. Stops DO billing (delete frees the VM).
+set -euo pipefail
+err() { echo "{\"error\":$(jq -Rn --arg m "$1" '$m')}"; exit 1; }
+: "${DO_TOKEN:?DO_TOKEN not set}"
+API="https://api.digitalocean.com/v2"; AUTH=(-H "Authorization: Bearer ${DO_TOKEN}")
+input="$(cat)"
+sub_id="$(jq -r '.subscription.id // .instance.subscription_id // empty' <<<"$input")"
+id="$(jq -r '.handles.droplet_id // .instance.handles.droplet_id // empty' <<<"$input")"
+if [ -z "$id" ] && [ -n "$sub_id" ]; then
+  id="$(curl -fsS "${AUTH[@]}" "${API}/droplets?tag_name=sub:${sub_id}" | jq -r '.droplets[0].id // empty')"
+fi
+if [ -n "$id" ]; then
+  code="$(curl -sS -o /dev/null -w '%{http_code}' "${AUTH[@]}" -X DELETE "${API}/droplets/${id}")"
+  [ "$code" = "204" ] || [ "$code" = "404" ] || err "droplet ${id} delete returned HTTP ${code}"
+fi
+echo '{"destroyed":true}'

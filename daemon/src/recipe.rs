@@ -375,6 +375,17 @@ hook = "get-config"
             .expect("wireguard recipe should validate");
     }
 
+    // The shipped do-vps (DigitalOcean) recipe passes validation: all 5 lifecycle hooks + the
+    // status/restart op hooks exist + are executable; backend=cloud-do / isolation=vm / tier=2 / os ok.
+    #[test]
+    fn do_vps_recipe_validates() {
+        let dir = format!("{}/../recipes/do-vps", env!("CARGO_MANIFEST_DIR"));
+        Recipe::load(&dir)
+            .expect("load do-vps recipe")
+            .validate()
+            .expect("do-vps recipe should validate");
+    }
+
     #[test]
     fn validate_rejects_unknown_backend_isolation_tier_os() {
         for mutate in [
