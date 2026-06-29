@@ -15,6 +15,8 @@ use lnrentd::backends::{MockPayment, PaymentBackend};
 use lnrentd::backup;
 use lnrentd::clock::{Clock, SystemClock};
 use lnrentd::config::{self, BootstrapInput, PaymentMode, RawConfig};
+#[cfg(feature = "fedimint")]
+use lnrentd::fedimint_backend::FedimintPayment;
 use lnrentd::ipc::IpcError;
 use lnrentd::nostr_engine::NostrEngine;
 use lnrentd::recipe::Recipe;
@@ -156,6 +158,12 @@ async fn main() -> ExitCode {
 async fn run_daemon() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    // With the `fedimint` feature the dependency tree has BOTH rustls providers (aws-lc-rs from
+    // fedimint, ring from nostr), so rustls cannot auto-pick one — install aws-lc-rs as the process
+    // default BEFORE any TLS (the federation connection + the Nostr wss relays). Idempotent.
+    #[cfg(feature = "fedimint")]
+    fedimint_core::rustls::install_crypto_provider().await;
+
     // Bootstrap is idempotent on a re-run (reads back the persisted seed); it opens the state DB
     // ONCE and hands back the shared store handle (no double open).
     let input = BootstrapInput {
@@ -165,17 +173,17 @@ async fn run_daemon() -> Result<()> {
     };
     let mut raw = config::load_raw_config(input)
         .map_err(|e| anyhow::anyhow!("operator bootstrap failed: {} ({})", e.message, e.code))?;
-    // M1a is MockPayment only (FedimintPayment is a stub, backends.rs). Reject `fedimint` BEFORE
-    // bootstrap persists the operator row/seed: committing a `fedimint` row + `fedimint.json` would
-    // brick a later retry with `mock` (a `config_conflict`, since the federation invite is never
-    // silently repointed). The post-bootstrap check below still guards the inherited case (a
-    // re-bootstrap that omits the backend but already stored `fedimint`).
+    // Without the `fedimint` feature, FedimintPayment isn't compiled — reject `fedimint` BEFORE
+    // bootstrap persists the operator row/seed (committing a `fedimint` row + `fedimint.json` would
+    // brick a later `mock` retry, since the federation invite is never silently repointed). WITH the
+    // feature, fedimint is a supported backend (lnrent-o6p) and is allowed to bootstrap.
+    #[cfg(not(feature = "fedimint"))]
     if config::resolved_payment_backend(&raw)
         .map_err(|e| anyhow::anyhow!("operator bootstrap failed: {} ({})", e.message, e.code))?
         == PaymentMode::Fedimint
     {
         anyhow::bail!(
-            "payment_backend=fedimint is not supported in M1a (FedimintPayment is a stub); \
+            "payment_backend=fedimint requires building lnrentd with --features fedimint; \
              bootstrap with payment_backend=mock"
         );
     }
@@ -187,22 +195,23 @@ async fn run_daemon() -> Result<()> {
         "lnrentd state opened; store actor up (sole writer); operator identity ready"
     );
 
-    // M1a is MockPayment only — the Fedimint backend is a stub (lnrent-7fp.4, backends.rs). Fail
-    // clearly rather than silently mis-route money.
-    if operator.config.payment_backend == PaymentMode::Fedimint {
-        anyhow::bail!(
-            "payment_backend=fedimint is not supported in M1a (FedimintPayment is a stub); \
-             bootstrap with payment_backend=mock"
-        );
-    }
-    // Construct the CONCRETE MockPayment so the supervisor can keep its internal clock synced to the
-    // SystemClock (`set_now` is mock-only, not on the PaymentBackend trait). Seed it now too, so the
-    // very first invoice issued before the first maintenance tick already stamps a live expiry rather
-    // than a 1970 one (which reconcile would instantly expire).
-    let mock = Arc::new(MockPayment::new());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    mock.set_now(clock.now());
-    let payment: Arc<dyn PaymentBackend> = mock.clone();
+    // Select the payment backend. `mock` (the default) keeps an internal clock the supervisor syncs to
+    // SystemClock (`set_now` is mock-only, not on the trait) + is seeded NOW so the first invoice (before
+    // the first maintenance tick) stamps a live expiry rather than a 1970 one. `fedimint` (lnrent-o6p,
+    // behind `--features fedimint`) joins the configured federation; it uses real time -> NO clock-sync.
+    let (payment, mock_clock_sync): (Arc<dyn PaymentBackend>, Option<Arc<MockPayment>>) =
+        match operator.config.payment_backend {
+            PaymentMode::Mock => {
+                let mock = Arc::new(MockPayment::new());
+                mock.set_now(clock.now());
+                (mock.clone(), Some(mock))
+            }
+            PaymentMode::Fedimint => {
+                let backend = build_fedimint_backend(&operator, clock.clone()).await?;
+                (backend, None)
+            }
+        };
 
     // The operator's recipe (M1a single-recipe): only a recipe that PASSES validation is served.
     let recipes_dir = std::env::var("LNRENT_RECIPES_DIR").unwrap_or_else(|_| "./recipes".into());
@@ -219,7 +228,7 @@ async fn run_daemon() -> Result<()> {
     .context("connecting the operator Nostr engine")?;
 
     let sock = operator.config.data_dir.join("lnrent.sock");
-    let supervisor = Supervisor::build(
+    let mut supervisor = Supervisor::build(
         store,
         engine,
         payment,
@@ -228,14 +237,53 @@ async fn run_daemon() -> Result<()> {
         sock,
         Intervals::production(),
     )
-    .await?
-    .with_payment_clock_sync(move |now| mock.set_now(now));
+    .await?;
+    // The mock backend's internal clock is kept synced to SystemClock; the real Fedimint backend uses
+    // real time and needs no sync.
+    if let Some(mock) = mock_clock_sync {
+        supervisor = supervisor.with_payment_clock_sync(move |now| mock.set_now(now));
+    }
     let running = supervisor.start().await?;
 
     // Run until a termination signal, then shut down gracefully (drain in-flight + flush outbox).
     wait_for_term_signal().await;
     tracing::info!("lnrentd: termination signal received; shutting down");
     running.shutdown().await
+}
+
+/// Construct the real Fedimint payment backend for `payment_backend=fedimint` (lnrent-o6p go-live):
+/// join the configured federation with the operator's deterministic root secret and honor the
+/// configured gateway. Compiled only with `--features fedimint`; the non-feature build rejects
+/// `fedimint` at bootstrap, so its variant just fails clearly if ever reached.
+#[cfg(feature = "fedimint")]
+async fn build_fedimint_backend(
+    operator: &config::Operator,
+    clock: Arc<dyn Clock>,
+) -> Result<Arc<dyn PaymentBackend>> {
+    let fedi = operator
+        .config
+        .fedimint
+        .as_ref()
+        .context("payment_backend=fedimint requires a [fedimint] config (invite + gateway)")?;
+    let backend = FedimintPayment::join_or_open(
+        &fedi.invite,
+        &operator.config.data_dir,
+        operator.identity.fedimint_root_secret(),
+        Some(&fedi.gateway),
+        clock,
+    )
+    .await
+    .context("joining the configured Fedimint federation")?;
+    tracing::info!("fedimint payment backend joined; real ecash money path active");
+    Ok(Arc::new(backend))
+}
+
+#[cfg(not(feature = "fedimint"))]
+async fn build_fedimint_backend(
+    _operator: &config::Operator,
+    _clock: Arc<dyn Clock>,
+) -> Result<Arc<dyn PaymentBackend>> {
+    anyhow::bail!("payment_backend=fedimint requires building lnrentd with --features fedimint")
 }
 
 /// Load + validate the operator's recipe(s) and return the single one M1a serves (lowest id wins,

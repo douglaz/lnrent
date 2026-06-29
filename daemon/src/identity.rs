@@ -4,7 +4,7 @@
 //! - the **Nostr identity** — NIP-06 account 0 (`m/44'/1237'/0'/0/0`), the marketplace signer. In
 //!   M1a the single key IS the master AND the operational key (`master_pubkey == op_pubkey`,
 //!   `box_index = 0`); the master / per-box split is M5 (ADR-0004).
-//! - a **PROVISIONAL Fedimint client root secret** (the primary receive backend, ADR-0012) via
+//! - the **Fedimint client root secret** (the primary receive backend, ADR-0012; FINAL) via
 //!   HKDF-SHA256 over the SAME seed with info `lnrent:fedimint:v1` — a domain disjoint from the
 //!   NIP-06 paths, so the Nostr and Fedimint key spaces can't collide (§4.6). We only DERIVE the
 //!   bytes here; the real `fedimint-client` that consumes them is bead .4 (deferred). Bead .4 MUST
@@ -33,14 +33,15 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ipc::IpcError;
 
-/// The HKDF-SHA256 `info` string that domain-separates the (PROVISIONAL) Fedimint client root
-/// secret from the NIP-06 Nostr key paths (ADR-0004/0012, §4.6).
+/// The HKDF-SHA256 `info` string that domain-separates the Fedimint client root secret from the
+/// NIP-06 Nostr key paths (ADR-0004/0012, §4.6).
 ///
-/// PROVISIONAL for M1a: bead .4 MUST confirm this derivation matches what `fedimint-client` 0.11.1
-/// actually consumes for backup/recovery (e.g. a `DerivableSecret` root input vs a BIP-39 strategy)
-/// before any real ecash relies on it. This string — and the derived form — MAY change when .4
-/// lands. That is acceptable now because M1a runs on MockPayment: no real ecash exists yet, so this
-/// is NOT an immutable on-funds anchor. The `v1` suffix just versions the current provisional scheme.
+/// FINAL (lnrent-o6p): bead .4 confirmed this 32-byte secret is exactly what `fedimint-client` 0.11.1
+/// consumes — it is wrapped as the `DerivableSecret` root under `RootSecret::StandardDoubleDerive`
+/// (`fedimint_backend.rs`), proven live (receive + pay + backup/restore against a real federation).
+/// It is therefore the IMMUTABLE on-funds anchor: the operator's ecash position derives from the seed
+/// and this `info`, so it MUST NOT change once real funds exist (changing it would orphan the ecash).
+/// The seed is the BIP-39 mnemonic with an EMPTY passphrase; the `v1` suffix versions the scheme.
 pub const FEDIMINT_HKDF_INFO: &[u8] = b"lnrent:fedimint:v1";
 
 /// This Box's NIP-06 derivation account. M1a is single-key: account 0 is the master used directly
@@ -133,9 +134,9 @@ impl OperatorIdentity {
             .expect("a valid secp256k1 public key always bech32-encodes")
     }
 
-    /// The 32-byte PROVISIONAL Fedimint client root secret (ADR-0012, §4.6). Constructing the real
-    /// Fedimint client from it is bead .4 (deferred), which MUST first confirm this is the form
-    /// `fedimint-client` 0.11.1 consumes; this exposes only the deterministic secret.
+    /// The 32-byte Fedimint client root secret (ADR-0012, §4.6) — the FINAL on-funds anchor, wrapped
+    /// as the `fedimint-client` 0.11.1 `DerivableSecret` root (lnrent-7fp.4, proven live). Exposes
+    /// only the deterministic secret; see [`FEDIMINT_HKDF_INFO`].
     pub fn fedimint_root_secret(&self) -> &[u8; 32] {
         &self.fedimint_root_secret
     }
@@ -149,11 +150,11 @@ impl Drop for OperatorIdentity {
     }
 }
 
-/// HKDF-SHA256 the 64-byte BIP39 `seed` into the 32-byte PROVISIONAL Fedimint client root secret,
+/// HKDF-SHA256 the 64-byte BIP39 `seed` into the 32-byte Fedimint client root secret,
 /// domain-separated by [`FEDIMINT_HKDF_INFO`] (§4.6). No salt: the domain separation is carried
 /// entirely by the `info`, keeping the derivation a pure function of the seed so it reproduces the
-/// same bytes every time (the recoverability property ADR-0012 will rely on once bead .4 confirms
-/// this matches `fedimint-client` 0.11.1 — see [`FEDIMINT_HKDF_INFO`] for the provisional caveat).
+/// same bytes every time (the recoverability property ADR-0012 relies on; bead .4 confirmed this is
+/// what `fedimint-client` 0.11.1 consumes — see [`FEDIMINT_HKDF_INFO`], now the final on-funds anchor).
 fn derive_fedimint_root_secret(seed: &[u8]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(None, seed);
     let mut okm = [0u8; 32];
@@ -178,7 +179,7 @@ mod tests {
     /// The same key as an `npub` (NIP-19 bech32 of `EXPECTED_PUBKEY_HEX`).
     const EXPECTED_NPUB: &str = "npub1zutzeysacnf9rru6zqwmxd54mud0k44tst6l70ja5mhv8jjumytsd2x7nu";
     /// HKDF-SHA256(seed, info=`lnrent:fedimint:v1`) -> 32 bytes, for the SAME seed (account-0,
-    /// no passphrase). Pinned so the PROVISIONAL M1a derivation stays reproducible (a regression is
+    /// no passphrase). Pinned so the FINAL derivation stays reproducible (a regression is
     /// caught here); bead .4 may revise the scheme once it confirms the real `fedimint-client` form.
     const EXPECTED_FEDIMINT_SECRET_HEX: &str =
         "1da7529d570811568840fec01879cd4a28a3eda2806d04bded10940f16ab9e0d";
@@ -201,7 +202,7 @@ mod tests {
         assert_eq!(again.pubkey_hex(), id.pubkey_hex());
     }
 
-    // ADR-0012 / §4.6: the PROVISIONAL Fedimint client root secret HKDF-SHA256(seed,
+    // ADR-0012 / §4.6: the Fedimint client root secret HKDF-SHA256(seed,
     // `lnrent:fedimint:v1`) is deterministic and pinned (M1a), in a domain DISJOINT from the Nostr
     // key space. Bead .4 confirms/revises the scheme against the real fedimint-client (deferred).
     #[test]
