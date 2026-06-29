@@ -2235,3 +2235,175 @@ fn only_op_result(out: &RecordingOutbound) -> OpResult {
         other => panic!("expected op.result, got {other:?}"),
     }
 }
+
+// ==============================================================================================
+// do-vps: the WIRED supervisor provisions a REAL DigitalOcean VM end-to-end.
+// #[ignore]: needs /tmp/dotoken and creates a real (billed) droplet — torn down by a Drop reaper.
+// ==============================================================================================
+
+/// `instance.handles_json` for a subscription, parsed (the provision hook's returned handles).
+async fn instance_handles(store: &Store, sub_id: &str) -> serde_json::Value {
+    let id = sub_id.to_string();
+    let hj: Option<String> = store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT handles_json FROM instance WHERE subscription_id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+        .await
+        .unwrap();
+    hj.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Destroys the droplet tagged `sub:<id>` on drop (incl. panic) so a failed test never leaks a
+/// billing droplet — belt to the explicit destroy at the end of the happy path.
+struct DropletReaper {
+    tag: String,
+    token: String,
+}
+impl Drop for DropletReaper {
+    fn drop(&mut self) {
+        let script = format!(
+            r#"id=$(curl -fsS -H "Authorization: Bearer {t}" "https://api.digitalocean.com/v2/droplets?tag_name={g}" | jq -r '.droplets[0].id // empty'); [ -n "$id" ] && curl -sS -o /dev/null -X DELETE -H "Authorization: Bearer {t}" "https://api.digitalocean.com/v2/droplets/$id" || true"#,
+            t = self.token,
+            g = self.tag
+        );
+        let _ = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .status();
+    }
+}
+
+/// `(count, id)` of droplets on DO tagged `tag`, via the API (a Command, like the recipe hooks).
+fn do_droplets_by_tag(token: &str, tag: &str) -> (i64, String) {
+    let script = format!(
+        r#"curl -fsS -H "Authorization: Bearer {t}" "https://api.digitalocean.com/v2/droplets?tag_name={g}" | jq -r '"\(.droplets|length) \(.droplets[0].id // "")"'"#,
+        t = token,
+        g = tag
+    );
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("query DO");
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut it = s.split_whitespace();
+    let n: i64 = it.next().unwrap_or("0").parse().unwrap_or(0);
+    (n, it.next().unwrap_or("").to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "creates a real DigitalOcean droplet; needs /tmp/dotoken on the env"]
+async fn do_vps_full_order_provisions_a_real_droplet() {
+    let token = std::fs::read_to_string("/tmp/dotoken")
+        .expect("/tmp/dotoken (operator DO API token)")
+        .trim()
+        .to_string();
+    std::env::set_var("DO_TOKEN", &token); // the supervisor-spawned provision hook inherits this
+    std::env::set_var("DO_REGION", "nyc3");
+    std::env::set_var("DO_SIZE", "s-1vcpu-1gb");
+    std::env::set_var("DO_IMAGE", "debian-12-x64");
+
+    let recipe = Recipe::load(format!("{}/../recipes/do-vps", env!("CARGO_MANIFEST_DIR")))
+        .expect("load do-vps recipe");
+    let relay = mock_relay().await;
+    let url = relay.url().await.to_string();
+    let op = Keys::generate();
+    let buyer = Keys::generate();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let payment = Arc::new(MockPayment::new());
+    payment.set_now(START);
+    let clock = Arc::new(TestClock::new(START));
+    let _sup = start_supervisor(
+        &op,
+        &url,
+        store.clone(),
+        payment.clone(),
+        clock.clone(),
+        recipe.clone(),
+    )
+    .await;
+
+    // A full order for the do-vps listing, carrying the buyer's SSH key as a param.
+    let pubkey =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGPCj7pYy3w66ym0kNqJ8N5+zQg7gGpClH37rBGlVIK9 e2e";
+    let req_id = "dovps-e2e";
+    let intake = OrderIntake::new(
+        store.clone(),
+        payment.clone(),
+        clock.clone(),
+        recipe.clone(),
+        big_budget(),
+    );
+    let order = Msg::OrderRequest(OrderRequest {
+        id: req_id.into(),
+        listing_id: listing_coordinate(&op.public_key().to_hex(), "do-vps"),
+        params: serde_json::json!({ "ssh_pubkey": pubkey }),
+        refund_dest: None,
+    });
+    intake
+        .handle(buyer.public_key(), order, &RecordingOutbound::default())
+        .await
+        .expect("order intake commits");
+    let hex = buyer.public_key().to_hex();
+    let sub_id = format!("ord:{hex}:{req_id}");
+    let external_id = format!("order:{hex}:{req_id}");
+    let _reaper = DropletReaper {
+        tag: format!("sub:{sub_id}"),
+        token: token.clone(),
+    };
+
+    // Settle the order -> the supervisor's reconcile loop runs the do-vps provision hook, which
+    // creates a REAL droplet (real time, ~60-100s). Wait up to ~180s for ACTIVE.
+    payment.settle(&external_id, clock.now()).expect("settle");
+    let mut active = false;
+    for _ in 0..120 {
+        if sub_state(&store, &sub_id).await.as_deref() == Some("ACTIVE") {
+            active = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+    assert!(
+        active,
+        "sub did not reach ACTIVE — the real DO provision failed"
+    );
+
+    // Exactly one instance, recorded with a REAL droplet_id handle.
+    assert_eq!(instance_count(&store, &sub_id).await, 1, "one instance");
+    let handles = instance_handles(&store, &sub_id).await;
+    let droplet_id = handles
+        .get("droplet_id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    assert!(
+        droplet_id.is_number() || droplet_id.is_string(),
+        "instance carries a droplet_id handle, got {handles}"
+    );
+
+    // A provision.ready was delivered to the buyer (the access-details DM).
+    let (n_ready, ready_state) = provision_outbox(&store, &sub_id).await;
+    assert_eq!(n_ready, 1, "exactly one provision.ready");
+    assert_eq!(ready_state.as_deref(), Some("SENT"), "delivery SENT");
+
+    // The droplet REALLY exists on DigitalOcean (by tag), matching the recorded handle.
+    let (n_do, do_id) = do_droplets_by_tag(&token, &format!("sub:{sub_id}"));
+    assert_eq!(n_do, 1, "exactly one droplet on DO for this subscription");
+    assert_eq!(
+        do_id,
+        droplet_id
+            .as_i64()
+            .map(|x| x.to_string())
+            .or_else(|| droplet_id.as_str().map(|s| s.to_string()))
+            .unwrap_or_default(),
+        "the DO droplet id matches the recorded instance handle"
+    );
+
+    println!("DO-VPS E2E PASSED: order -> settle -> supervisor provisioned real droplet {do_id}, access delivered");
+    // (the DropletReaper destroys it on drop)
+}
