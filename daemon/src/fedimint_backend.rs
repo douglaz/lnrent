@@ -41,6 +41,7 @@ use fedimint_client::{Client, ClientHandleArc, OperationId, RootSecret};
 use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
+use fedimint_core::secp256k1::PublicKey;
 use fedimint_core::Amount;
 use fedimint_derive_secret::DerivableSecret;
 use fedimint_ln_client::{
@@ -100,6 +101,11 @@ pub struct FedimintPayment {
     index: Arc<Mutex<Connection>>,
     settle_tx: Mutex<Option<mpsc::Sender<Settlement>>>,
     clock: Arc<dyn Clock>,
+    /// The operator-configured gateway pubkey (`config.fedimint.gateway`), HONORED for BOTH invoice
+    /// creation and refunds rather than a random pick (codex o6p). `None` selects any available gateway
+    /// (tests / unset). `get_gateway(Some(id), false)` fails CLOSED if that gateway is unavailable, so a
+    /// misconfigured/offline gateway errors rather than silently routing money through a different one.
+    gateway: Option<PublicKey>,
     /// Serializes `create_invoice`'s check->mint->insert so two concurrent same-`external_id` callers
     /// can't both mint a gateway invoice (the loser would otherwise be stranded — absent from the
     /// index, never watched). Async so it can be held across the mint `.await` (codex P1).
@@ -116,11 +122,18 @@ impl FedimintPayment {
         invite_code: &str,
         data_dir: &Path,
         root_secret: &[u8; 32],
+        gateway: Option<&str>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
         let invite: InviteCode = invite_code
             .parse()
             .context("parsing federation invite code")?;
+        // Parse the configured gateway pubkey now (fail FAST on a malformed value) — honored for both
+        // receive + refund below; None = any available gateway (tests / unset).
+        let gateway = gateway
+            .map(PublicKey::from_str)
+            .transpose()
+            .context("parsing the configured fedimint gateway pubkey (config.fedimint.gateway)")?;
         let fed_dir = data_dir
             .join("fedimint")
             .join(invite.federation_id().to_string());
@@ -176,6 +189,7 @@ impl FedimintPayment {
             index: Arc::new(Mutex::new(conn)),
             settle_tx: Mutex::new(None),
             clock,
+            gateway,
             create_lock: tokio::sync::Mutex::new(()),
         };
 
@@ -316,10 +330,10 @@ impl PaymentBackend for FedimintPayment {
         // A gateway is REQUIRED for an externally-payable invoice (codex finding #1). get_gateway
         // refreshes the cache then picks one; Err if the federation has none registered.
         let gateway = ln
-            .get_gateway(None, false)
+            .get_gateway(self.gateway, false)
             .await
-            .context("selecting a lightning gateway")?
-            .context("federation has no available lightning gateway")?;
+            .context("selecting the configured lightning gateway")?
+            .context("the configured (or any) lightning gateway is unavailable")?;
 
         let desc = Description::new(memo.to_string())
             .map_err(|e| anyhow!("invalid invoice description: {e}"))?;
@@ -454,10 +468,10 @@ impl PaymentBackend for FedimintPayment {
             .get_first_module::<LightningClientModule>()
             .context("fedimint: no lightning module")?;
         let gateway = ln
-            .get_gateway(None, false)
+            .get_gateway(self.gateway, false)
             .await
-            .context("selecting a lightning gateway for the refund")?
-            .context("federation has no available lightning gateway")?;
+            .context("selecting the configured lightning gateway for the refund")?
+            .context("the configured (or any) lightning gateway is unavailable")?;
         let outgoing = ln
             .pay_bolt11_invoice(
                 Some(gateway),

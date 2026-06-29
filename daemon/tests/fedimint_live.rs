@@ -59,9 +59,10 @@ async fn fedimint_receive_and_pay_live() {
     let root_secret = [7u8; 32];
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
-    let backend = FedimintPayment::join_or_open(&invite, &data_dir, &root_secret, clock.clone())
-        .await
-        .expect("join the regtest federation");
+    let backend =
+        FedimintPayment::join_or_open(&invite, &data_dir, &root_secret, None, clock.clone())
+            .await
+            .expect("join the regtest federation");
 
     // --- watch FIRST so a freshly-created invoice gets a LIVE settlement task (pushes on Claimed) --
     let mut settlements = backend.watch().await.expect("open settlement stream");
@@ -161,9 +162,10 @@ async fn fedimint_pay_oplog_recovery_live() {
     let key = "refund-recover-1";
 
     // --- fund the client (~1000 sat ecash) so it can pay a refund out -----------------------------
-    let backend = FedimintPayment::join_or_open(&invite, &data_dir, &root_secret, clock.clone())
-        .await
-        .expect("join the regtest federation");
+    let backend =
+        FedimintPayment::join_or_open(&invite, &data_dir, &root_secret, None, clock.clone())
+            .await
+            .expect("join the regtest federation");
     let mut settlements = backend.watch().await.expect("open settlement stream");
     let inv = backend
         .create_invoice(1000, "recover-fund", 3600, "ext-recover-1")
@@ -209,9 +211,10 @@ async fn fedimint_pay_oplog_recovery_live() {
         assert_eq!(n, 1, "deleted exactly the one pay row (the crash window)");
     }
 
-    let backend2 = FedimintPayment::join_or_open(&invite, &data_dir, &root_secret, clock.clone())
-        .await
-        .expect("reopen + recover from oplog");
+    let backend2 =
+        FedimintPayment::join_or_open(&invite, &data_dir, &root_secret, None, clock.clone())
+            .await
+            .expect("reopen + recover from oplog");
     // Without recovery this would be Unknown (no row); recover_pay_from_oplog backfilled it.
     assert_ne!(
         backend2.payment_status_by_key(key).await.unwrap(),
@@ -250,9 +253,10 @@ async fn fedimint_backup_restore_preserves_ecash_live() {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
     // --- fund (~1000 sat ecash) + pay a 300-sat refund out under a known key ----------------------
-    let backend = FedimintPayment::join_or_open(&invite, &data_dir, &root_secret, clock.clone())
-        .await
-        .expect("join the regtest federation");
+    let backend =
+        FedimintPayment::join_or_open(&invite, &data_dir, &root_secret, None, clock.clone())
+            .await
+            .expect("join the regtest federation");
     let mut settlements = backend.watch().await.expect("open settlement stream");
     let inv = backend
         .create_invoice(1000, "bk-fund", 3600, "ext-bk-1")
@@ -296,9 +300,10 @@ async fn fedimint_backup_restore_preserves_ecash_live() {
     lnrentd::backup::restore(&dest, &restored, false).expect("restore into a fresh data dir");
 
     // --- reopen on the RESTORED dir: prior pay status survives + the ecash is still SPENDABLE -------
-    let backend2 = FedimintPayment::join_or_open(&invite, &restored, &root_secret, clock.clone())
-        .await
-        .expect("reopen the fedimint client from the restored backup");
+    let backend2 =
+        FedimintPayment::join_or_open(&invite, &restored, &root_secret, None, clock.clone())
+            .await
+            .expect("reopen the fedimint client from the restored backup");
     assert_eq!(
         backend2.payment_status_by_key("refund-bk-1").await.unwrap(),
         PayStatus::Succeeded,
@@ -327,4 +332,43 @@ async fn fedimint_backup_restore_preserves_ecash_live() {
     println!(
         "FEDIMINT BACKUP/RESTORE TEST PASSED — pay status preserved + ecash spendable after restore"
     );
+}
+
+/// PROOF that the operator-configured gateway is HONORED + fails CLOSED (lnrent-o6p step 1): a backend
+/// built with a gateway pubkey that is NOT a registered federation gateway must REFUSE to create an
+/// invoice rather than silently routing through some other gateway — which proves config.fedimint.gateway
+/// is actually used (the old code passed `get_gateway(None, …)` and ignored it). We use the secp256k1
+/// generator point G: a valid compressed pubkey that is certainly not a devimint gateway.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running devimint federation (FM_INVITE_CODE on the env)"]
+async fn fedimint_honors_configured_gateway_fail_closed_live() {
+    let invite = std::env::var("FM_INVITE_CODE")
+        .expect("FM_INVITE_CODE — run under `devimint dev-fed --exec`");
+    let data_dir = std::env::temp_dir().join(format!("lnrent-fedimint-gw-{}", std::process::id()));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let root_secret = [13u8; 32];
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    // secp256k1 generator G (valid compressed pubkey, certainly not a federation gateway).
+    let bogus_gw = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    let backend = FedimintPayment::join_or_open(
+        &invite,
+        &data_dir,
+        &root_secret,
+        Some(bogus_gw),
+        clock.clone(),
+    )
+    .await
+    .expect("join succeeds — the gateway is validated lazily at invoice/pay time, not at open");
+    // The configured (bogus) gateway is honored: there is no such gateway, so invoice creation fails
+    // closed rather than falling back to a random gateway.
+    let res = tokio::time::timeout(
+        Duration::from_secs(30),
+        backend.create_invoice(1000, "gw-honor", 3600, "ext-gw-1"),
+    )
+    .await
+    .expect("create_invoice returns within 30s");
+    let err =
+        res.expect_err("a non-gateway pubkey must fail CLOSED, not route through another gateway");
+    println!("FEDIMINT GATEWAY HONORING TEST PASSED — configured gateway is used + fails closed: {err:#}");
 }
