@@ -1,6 +1,8 @@
 //! lnrent control-plane library. Pure Rust, no LLM in the runtime path (SPEC.md §4.1).
 
 pub mod backends;
+/// COLD/OFFLINE operator backup + restore of the durable state (lnrent-7fp.14 PART A).
+pub mod backup;
 pub mod capture;
 pub mod clock;
 pub mod config;

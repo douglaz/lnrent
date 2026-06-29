@@ -12,6 +12,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use lnrentd::backends::{MockPayment, PaymentBackend};
+use lnrentd::backup;
 use lnrentd::clock::{Clock, SystemClock};
 use lnrentd::config::{self, BootstrapInput, PaymentMode, RawConfig};
 use lnrentd::ipc::IpcError;
@@ -38,6 +39,14 @@ enum Command {
     /// (precedence flags > env > file > stdin), then exit. Non-interactive: a structured error and a
     /// deterministic nonzero exit on failure, never a prompt (ADR-0014, §4.7).
     Bootstrap(BootstrapArgs),
+    /// COLD/OFFLINE backup of the STOPPED daemon's durable state (state DB + fedimint dir + config +
+    /// seed) into a fresh dir (lnrent-7fp.14). Stop the daemon first: this refuses to run if its IPC
+    /// socket is live. Non-interactive; `--json` summary; nonzero exit on error.
+    Backup(BackupArgs),
+    /// Restore a backup produced by `backup` into a data dir (lnrent-7fp.14). Restores into a
+    /// fresh/empty data dir by default; `--force` overwrites a non-empty one. Non-interactive;
+    /// `--json` summary; nonzero exit on error.
+    Restore(RestoreArgs),
 }
 
 /// The flag-sourced bootstrap layer (highest precedence). clap's own `env` support is deliberately
@@ -81,11 +90,55 @@ struct BootstrapArgs {
     json: bool,
 }
 
+/// `lnrentd backup` — COLD/OFFLINE backup of the stopped daemon's data dir.
+#[derive(Args)]
+struct BackupArgs {
+    /// The STOPPED daemon's data dir to back up. Env: LNRENT_DATA_DIR; else the `data_dir` from
+    /// `--config`/LNRENT_CONFIG; else ./data — resolved exactly as the daemon does.
+    #[arg(long)]
+    data_dir: Option<String>,
+    /// A TOML/JSON config file to resolve `data_dir` from (lower precedence than `--data-dir`/env),
+    /// so a `data_dir` set only in the daemon's config file targets the right dir. Env: LNRENT_CONFIG.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Destination directory for the backup set. Must be empty or not-yet-exist, and OUTSIDE the data
+    /// dir.
+    #[arg(long)]
+    dest: PathBuf,
+    /// Emit the machine-readable JSON summary / error instead of human text.
+    #[arg(long)]
+    json: bool,
+}
+
+/// `lnrentd restore` — restore a backup set into a data dir.
+#[derive(Args)]
+struct RestoreArgs {
+    /// The data dir to restore INTO (created if absent). Env: LNRENT_DATA_DIR; else the `data_dir`
+    /// from `--config`/LNRENT_CONFIG; else ./data — resolved exactly as the daemon does.
+    #[arg(long)]
+    data_dir: Option<String>,
+    /// A TOML/JSON config file to resolve `data_dir` from (lower precedence than `--data-dir`/env),
+    /// so a restore targets the SAME dir the daemon would open. Env: LNRENT_CONFIG.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// The backup directory produced by `lnrentd backup`.
+    #[arg(long = "from")]
+    from: PathBuf,
+    /// Overwrite a non-empty target data dir (default: refuse, to avoid clobbering live state).
+    #[arg(long)]
+    force: bool,
+    /// Emit the machine-readable JSON summary / error instead of human text.
+    #[arg(long)]
+    json: bool,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
         Some(Command::Bootstrap(args)) => run_bootstrap(args).await,
+        Some(Command::Backup(args)) => run_backup(args),
+        Some(Command::Restore(args)) => run_restore(args),
         None => match run_daemon().await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -306,6 +359,186 @@ async fn run_bootstrap(args: BootstrapArgs) -> ExitCode {
         }
         Err(e) => emit_bootstrap_error(&e, json),
     }
+}
+
+/// Resolve the operator data dir for the backup/restore CLIs the SAME way the daemon does — routed
+/// through `config::load_raw_config` so the precedence is byte-identical: an explicit `--data-dir`
+/// flag (highest), else `LNRENT_DATA_DIR`, else a `data_dir` set in the config file (`--config` flag,
+/// else `LNRENT_CONFIG`), else `./data`. Resolving the config-file layer matters on the money path:
+/// an operator who sets `data_dir` only in their config file would otherwise get a backup that errors
+/// ("no state DB at ./data") and a restore that silently populates the WRONG dir while leaving the
+/// real one untouched (review R2 P1). Never reads stdin, so an inherited pipe can't block. A blank
+/// value in any source is treated as unset.
+fn resolve_data_dir_arg(
+    flag: Option<String>,
+    config_path: Option<PathBuf>,
+) -> Result<PathBuf, IpcError> {
+    let input = BootstrapInput {
+        flags: RawConfig {
+            data_dir: flag,
+            ..RawConfig::default()
+        },
+        config_path,
+        read_stdin: false,
+    };
+    let raw = config::load_raw_config(input)?;
+    // Mirror the daemon's default (config::DEFAULT_DATA_DIR == "./data"); the OS resolves `./data`
+    // and a normalized `data` to the same directory, so lexical normalization is unnecessary here —
+    // what matters is targeting the same dir the daemon would.
+    Ok(PathBuf::from(
+        raw.data_dir
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "./data".to_string()),
+    ))
+}
+
+/// The headless `lnrentd backup` entrypoint (lnrent-7fp.14): COLD-copy the stopped daemon's durable
+/// state into a fresh dir. Refuses if a daemon's IPC socket is live (cold/offline only). Emits a
+/// structured `{ok, data|error}` summary; deterministic exit (0 success, nonzero on error).
+fn run_backup(args: BackupArgs) -> ExitCode {
+    let json = args.json;
+    let data_dir = match resolve_data_dir_arg(args.data_dir, args.config) {
+        Ok(dir) => dir,
+        Err(e) => {
+            return emit_op_error(json, "config_error", format!("{} ({})", e.message, e.code))
+        }
+    };
+    // Cold/offline only: a live IPC socket means a daemon is writing this data dir RIGHT NOW, so a
+    // copy of the open stores could be torn. Refuse rather than capture an inconsistent backup.
+    if backup::daemon_appears_running(&data_dir) {
+        return emit_op_error(
+            json,
+            "daemon_running",
+            format!(
+                "a daemon appears to be running against {} (its IPC socket {} is live); stop it \
+                 first — backup is COLD/OFFLINE only",
+                data_dir.display(),
+                data_dir.join("lnrent.sock").display()
+            ),
+        );
+    }
+    match backup::backup(&data_dir, &args.dest) {
+        Ok(m) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": true,
+                        "data": {
+                            "data_dir": data_dir.display().to_string(),
+                            "dest": args.dest.display().to_string(),
+                            "state_db": m.state_db,
+                            "fedimint_dir": m.fedimint_dir,
+                            "fedimint_config": m.fedimint_config,
+                            "operator_seed": m.operator_seed,
+                            "federations": m.federations,
+                        }
+                    })
+                );
+            } else {
+                println!(
+                    "backup complete: {} -> {}",
+                    data_dir.display(),
+                    args.dest.display()
+                );
+                println!("  state db:        yes");
+                println!("  fedimint dir:    {}", yes_no(m.fedimint_dir));
+                println!("  fedimint config: {}", yes_no(m.fedimint_config));
+                println!("  operator seed:   {}", yes_no(m.operator_seed));
+                if !m.federations.is_empty() {
+                    println!("  federations:     {}", m.federations.join(", "));
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => emit_op_error(json, "backup_failed", format!("{e:#}")),
+    }
+}
+
+/// The headless `lnrentd restore` entrypoint (lnrent-7fp.14): install a backup set into a data dir.
+/// Refuses a non-empty target without `--force`. Emits a structured `{ok, data|error}` summary;
+/// deterministic exit (0 success, nonzero on error).
+fn run_restore(args: RestoreArgs) -> ExitCode {
+    let json = args.json;
+    let data_dir = match resolve_data_dir_arg(args.data_dir, args.config) {
+        Ok(dir) => dir,
+        Err(e) => {
+            return emit_op_error(json, "config_error", format!("{} ({})", e.message, e.code))
+        }
+    };
+    // A live daemon on the TARGET would race the restore (and then run on half-overwritten state);
+    // refuse the same way backup does.
+    if backup::daemon_appears_running(&data_dir) {
+        return emit_op_error(
+            json,
+            "daemon_running",
+            format!(
+                "a daemon appears to be running against the restore target {} (its IPC socket {} \
+                 is live); stop it before restoring",
+                data_dir.display(),
+                data_dir.join("lnrent.sock").display()
+            ),
+        );
+    }
+    match backup::restore(&args.from, &data_dir, args.force) {
+        Ok(m) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": true,
+                        "data": {
+                            "from": args.from.display().to_string(),
+                            "data_dir": data_dir.display().to_string(),
+                            "state_db": m.state_db,
+                            "fedimint_dir": m.fedimint_dir,
+                            "fedimint_config": m.fedimint_config,
+                            "operator_seed": m.operator_seed,
+                            "federations": m.federations,
+                        }
+                    })
+                );
+            } else {
+                println!(
+                    "restore complete: {} -> {}",
+                    args.from.display(),
+                    data_dir.display()
+                );
+                println!("  state db:        yes");
+                println!("  fedimint dir:    {}", yes_no(m.fedimint_dir));
+                println!("  fedimint config: {}", yes_no(m.fedimint_config));
+                println!("  operator seed:   {}", yes_no(m.operator_seed));
+                if !m.federations.is_empty() {
+                    println!("  federations:     {}", m.federations.join(", "));
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => emit_op_error(json, "restore_failed", format!("{e:#}")),
+    }
+}
+
+fn yes_no(b: bool) -> &'static str {
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+/// Print a backup/restore failure as a structured `{ok:false, error:{code, message}}` to STDERR (so
+/// `--json` stdout stays clean) and return a nonzero exit. Mirrors the bootstrap error channel.
+fn emit_op_error(json: bool, code: &str, message: String) -> ExitCode {
+    if json {
+        eprintln!(
+            "{}",
+            serde_json::json!({ "ok": false, "error": { "code": code, "message": message } })
+        );
+    } else {
+        eprintln!("lnrentd: {message} ({code})");
+    }
+    ExitCode::FAILURE
 }
 
 /// Print a bootstrap failure as the structured `{code, message, retryable}` error (ADR-0014 §4.7) to

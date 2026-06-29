@@ -183,13 +183,10 @@ async fn fedimint_pay_oplog_recovery_live() {
         .or_else(|| dest.as_str())
         .expect("a bolt11 from fedimint-cli ln-invoice")
         .to_string();
-    tokio::time::timeout(
-        Duration::from_secs(90),
-        backend.pay(&dest_bolt11, 400, key),
-    )
-    .await
-    .expect("pay completes within 90s")
-    .expect("pay 400 sat out");
+    tokio::time::timeout(Duration::from_secs(90), backend.pay(&dest_bolt11, 400, key))
+        .await
+        .expect("pay completes within 90s")
+        .expect("pay 400 sat out");
     assert_eq!(
         backend.payment_status_by_key(key).await.unwrap(),
         PayStatus::Succeeded,
