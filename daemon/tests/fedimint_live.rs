@@ -231,3 +231,100 @@ async fn fedimint_pay_oplog_recovery_live() {
 
     println!("FEDIMINT PAY OPLOG RECOVERY TEST PASSED — crash-window pay row recovered + resolved");
 }
+
+/// PROOF that a COLD backup/restore preserves the ecash position across box death (lnrent-7fp.14 PART B
+/// — the live half of the test design). Receive ecash + pay a refund, then back up the STOPPED data
+/// dir, restore it into a FRESH data dir, reopen `FedimintPayment` there, and assert the prior pay
+/// status survived AND the recovered ecash is still SPENDABLE (a second refund pays out). The offline
+/// test (tests/backup.rs) proves the file-level round-trip; only a real federation can prove the
+/// fedimint POSITION is live after restore.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running devimint federation (FM_INVITE_CODE on the env)"]
+async fn fedimint_backup_restore_preserves_ecash_live() {
+    let invite = std::env::var("FM_INVITE_CODE")
+        .expect("FM_INVITE_CODE — run under `devimint dev-fed --exec`");
+    let pid = std::process::id();
+    let data_dir = std::env::temp_dir().join(format!("lnrent-fedimint-bk-src-{pid}"));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let root_secret = [11u8; 32];
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
+    // --- fund (~1000 sat ecash) + pay a 300-sat refund out under a known key ----------------------
+    let backend = FedimintPayment::join_or_open(&invite, &data_dir, &root_secret, clock.clone())
+        .await
+        .expect("join the regtest federation");
+    let mut settlements = backend.watch().await.expect("open settlement stream");
+    let inv = backend
+        .create_invoice(1000, "bk-fund", 3600, "ext-bk-1")
+        .await
+        .expect("create gateway bolt11 invoice");
+    fedimint_cli(&["ln-pay", &inv.bolt11]);
+    tokio::time::timeout(Duration::from_secs(90), settlements.recv())
+        .await
+        .expect("a settlement arrives within 90s")
+        .expect("settlement channel open");
+    let dest1 = fedimint_cli(&["ln-invoice", "--amount", "300000"]);
+    let dest1_bolt11 = dest1
+        .get("invoice")
+        .and_then(|v| v.as_str())
+        .or_else(|| dest1.as_str())
+        .expect("a bolt11 from fedimint-cli ln-invoice")
+        .to_string();
+    tokio::time::timeout(
+        Duration::from_secs(90),
+        backend.pay(&dest1_bolt11, 300, "refund-bk-1"),
+    )
+    .await
+    .expect("pay completes within 90s")
+    .expect("pay 300 sat out");
+    assert_eq!(
+        backend.payment_status_by_key("refund-bk-1").await.unwrap(),
+        PayStatus::Succeeded,
+        "the first refund Succeeded before backup"
+    );
+
+    // --- BOX DEATH: stop the daemon (drop the backend -> rocksdb closes). backup() needs a state DB
+    //     present, so create a minimal valid lnrent.sqlite (this test has no daemon store; the offline
+    //     test covers state-DB reproduction — here the focus is the fedimint position). -------------
+    drop(settlements);
+    drop(backend);
+    rusqlite::Connection::open(data_dir.join("lnrent.sqlite"))
+        .expect("create a stub state DB so backup() has one to capture");
+    let dest = std::env::temp_dir().join(format!("lnrent-fedimint-bk-dest-{pid}"));
+    let restored = std::env::temp_dir().join(format!("lnrent-fedimint-bk-restored-{pid}"));
+    lnrentd::backup::backup(&data_dir, &dest).expect("cold backup of the stopped data dir");
+    lnrentd::backup::restore(&dest, &restored, false).expect("restore into a fresh data dir");
+
+    // --- reopen on the RESTORED dir: prior pay status survives + the ecash is still SPENDABLE -------
+    let backend2 = FedimintPayment::join_or_open(&invite, &restored, &root_secret, clock.clone())
+        .await
+        .expect("reopen the fedimint client from the restored backup");
+    assert_eq!(
+        backend2.payment_status_by_key("refund-bk-1").await.unwrap(),
+        PayStatus::Succeeded,
+        "the prior refund's status survived the backup/restore"
+    );
+    let dest2 = fedimint_cli(&["ln-invoice", "--amount", "200000"]);
+    let dest2_bolt11 = dest2
+        .get("invoice")
+        .and_then(|v| v.as_str())
+        .or_else(|| dest2.as_str())
+        .expect("a bolt11 from fedimint-cli ln-invoice")
+        .to_string();
+    tokio::time::timeout(
+        Duration::from_secs(90),
+        backend2.pay(&dest2_bolt11, 200, "refund-bk-2"),
+    )
+    .await
+    .expect("pay completes within 90s")
+    .expect("the restored ecash is spendable");
+    assert_eq!(
+        backend2.payment_status_by_key("refund-bk-2").await.unwrap(),
+        PayStatus::Succeeded,
+        "a second refund pays out from the RESTORED ecash position"
+    );
+
+    println!(
+        "FEDIMINT BACKUP/RESTORE TEST PASSED — pay status preserved + ecash spendable after restore"
+    );
+}
