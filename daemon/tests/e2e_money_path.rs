@@ -2407,3 +2407,163 @@ async fn do_vps_full_order_provisions_a_real_droplet() {
     println!("DO-VPS E2E PASSED: order -> settle -> supervisor provisioned real droplet {do_id}, access delivered");
     // (the DropletReaper destroys it on drop)
 }
+
+/// The stored bolt11 for an order/renewal invoice, by `external_id`.
+#[cfg(feature = "fedimint")]
+async fn invoice_bolt11(store: &Store, external_id: &str) -> Option<String> {
+    let id = external_id.to_string();
+    store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT bolt11 FROM invoice WHERE external_id=?1",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+        })
+        .await
+        .unwrap()
+}
+
+// ==============================================================================================
+// REAL MONEY end-to-end: a 1-sat do-vps order paid with REAL ecash from a REAL wallet on a LIVE
+// federation -> the wired Supervisor provisions a REAL DigitalOcean VM. The o6p go-live, proven.
+// #[ignore] + --features fedimint; needs LNRENT_REAL_INVITE + LNRENT_PAYER_WALLET + /tmp/dotoken.
+// ==============================================================================================
+#[cfg(feature = "fedimint")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "REAL Fedimint payment (LNRENT_REAL_INVITE + LNRENT_PAYER_WALLET) + a real DO droplet (/tmp/dotoken)"]
+async fn do_vps_real_payment_provisions_a_real_vm() {
+    let invite = std::env::var("LNRENT_REAL_INVITE").expect("LNRENT_REAL_INVITE");
+    let wallet = std::env::var("LNRENT_PAYER_WALLET").expect("LNRENT_PAYER_WALLET");
+    let cli = std::env::var("LNRENT_FEDIMINT_CLI")
+        .unwrap_or_else(|_| format!("{}/bin/fedimint-cli", std::env::var("HOME").unwrap()));
+    let gateway = std::env::var("LNRENT_GATEWAY").ok();
+    let token = std::fs::read_to_string("/tmp/dotoken")
+        .expect("/tmp/dotoken")
+        .trim()
+        .to_string();
+    std::env::set_var("DO_TOKEN", &token);
+    std::env::set_var("DO_REGION", "nyc3");
+    std::env::set_var("DO_SIZE", "s-1vcpu-1gb");
+    std::env::set_var("DO_IMAGE", "debian-12-x64");
+
+    // A 1-sat do-vps (override the price so the cheap order is payable from a small wallet).
+    let mut recipe = Recipe::load(format!("{}/../recipes/do-vps", env!("CARGO_MANIFEST_DIR")))
+        .expect("load do-vps");
+    recipe.pricing.amount_sat = 1;
+
+    // The REAL Fedimint backend, joined to the live federation (fresh daemon client).
+    let data_dir = std::env::temp_dir().join(format!("lnrent-realflow-{}", std::process::id()));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let fedi_secret = [43u8; 32];
+    let clock: Arc<dyn Clock> = Arc::new(lnrentd::clock::SystemClock);
+    let payment: Arc<dyn PaymentBackend> = Arc::new(
+        lnrentd::fedimint_backend::FedimintPayment::join_or_open(
+            &invite,
+            &data_dir,
+            &fedi_secret,
+            gateway.as_deref(),
+            clock.clone(),
+        )
+        .await
+        .expect("join the live federation"),
+    );
+
+    // The wired supervisor with the REAL backend (real clock, no mock clock-sync).
+    let relay = mock_relay().await;
+    let url = relay.url().await.to_string();
+    let op = Keys::generate();
+    let buyer = Keys::generate();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let engine = engine_for(&op, &url, store.clone()).await;
+    let _sup = Supervisor::build(
+        store.clone(),
+        engine,
+        payment.clone(),
+        clock.clone(),
+        recipe.clone(),
+        temp_sock(),
+        fast_intervals(),
+    )
+    .await
+    .expect("build supervisor")
+    .start()
+    .await
+    .expect("start supervisor");
+
+    // Place a 1-sat do-vps order (with the ssh_pubkey param) -> a REAL Fedimint invoice is minted.
+    let pubkey =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGPCj7pYy3w66ym0kNqJ8N5+zQg7gGpClH37rBGlVIK9 realflow";
+    let req_id = "realflow";
+    let intake = OrderIntake::new(
+        store.clone(),
+        payment.clone(),
+        clock.clone(),
+        recipe.clone(),
+        big_budget(),
+    );
+    let order = Msg::OrderRequest(OrderRequest {
+        id: req_id.into(),
+        listing_id: listing_coordinate(&op.public_key().to_hex(), "do-vps"),
+        params: serde_json::json!({ "ssh_pubkey": pubkey }),
+        refund_dest: None,
+    });
+    intake
+        .handle(buyer.public_key(), order, &RecordingOutbound::default())
+        .await
+        .expect("order intake commits");
+    let hex = buyer.public_key().to_hex();
+    let sub_id = format!("ord:{hex}:{req_id}");
+    let external_id = format!("order:{hex}:{req_id}");
+    let _reaper = DropletReaper {
+        tag: format!("sub:{sub_id}"),
+        token: token.clone(),
+    };
+
+    // Read the order's REAL bolt11 and pay it with the funded wallet.
+    let bolt11 = invoice_bolt11(&store, &external_id)
+        .await
+        .expect("order invoice has a bolt11");
+    eprintln!("paying the order's 1-sat invoice with the wallet: {bolt11}");
+    let out = std::process::Command::new(&cli)
+        .env("FM_CLIENT_DIR", &wallet)
+        .args(["ln-pay", &bolt11])
+        .output()
+        .expect("spawn fedimint-cli ln-pay");
+    assert!(
+        out.status.success(),
+        "wallet ln-pay failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The daemon settles the REAL payment -> captures -> provisions a real DO VM -> delivers.
+    let mut active = false;
+    for _ in 0..150 {
+        if sub_state(&store, &sub_id).await.as_deref() == Some("ACTIVE") {
+            active = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+    assert!(active, "sub did not reach ACTIVE after the real payment");
+    assert_eq!(instance_count(&store, &sub_id).await, 1, "one instance");
+    let handles = instance_handles(&store, &sub_id).await;
+    let droplet_id = handles
+        .get("droplet_id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    assert!(
+        droplet_id.is_number() || droplet_id.is_string(),
+        "instance carries a droplet_id handle: {handles}"
+    );
+    let (n_ready, ready_state) = provision_outbox(&store, &sub_id).await;
+    assert_eq!(n_ready, 1, "one provision.ready");
+    assert_eq!(ready_state.as_deref(), Some("SENT"), "delivery SENT");
+    let (n_do, do_id) = do_droplets_by_tag(&token, &format!("sub:{sub_id}"));
+    assert_eq!(n_do, 1, "the droplet exists on DO");
+
+    eprintln!("REAL-MONEY E2E PASSED: 1-sat order -> wallet paid a real Fedimint invoice -> supervisor provisioned real droplet {do_id} -> access delivered");
+}
