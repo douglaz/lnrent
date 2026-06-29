@@ -96,9 +96,11 @@ CREATE TABLE IF NOT EXISTS refund_attempt (  -- durable refund ledger (ADR-0009,
   attempts           INTEGER,
   -- refund-dest RESOLVER (lnrent-ug8): the concrete bolt11 a LN-address/LNURL `dest` resolved to,
   -- cached so a retry re-pays the SAME invoice. `resolution_gen` (0 = bolt11 pass-through, no
-  -- resolution; 1+ once resolved) binds each (re-)resolution to its OWN pay key
-  -- `refund:<external_id>:g<gen>` so retries never double-pay and only a CURRENT-gen Failed+expired
-  -- invoice is ever re-resolved (the codex P0 fix, §6.6).
+  -- resolution; 1+ once resolved) binds each (re-)resolution to its OWN pay key: gen 0 is the BARE
+  -- `refund:<external_id>` (the key a pre-ug8 binary paid bolt11 refunds under, so a legacy refund
+  -- dedups on the same key — lnrent-4gt), gen>=1 is `refund:<external_id>:g<gen>`. Retries never
+  -- double-pay and only a CURRENT-gen Failed+expired invoice is ever re-resolved (the codex P0 fix,
+  -- §6.6).
   resolved_bolt11    TEXT,
   resolved_expiry    INTEGER,
   resolution_gen     INTEGER NOT NULL DEFAULT 0,
@@ -218,7 +220,9 @@ const M3_SUSPEND_NOT_BEFORE: &str =
 /// `refund_attempt`. `resolved_bolt11`/`resolved_expiry` cache the concrete bolt11 the resolver
 /// produced for an LN-address/LNURL `dest` (the buyer is offline at refund time, §6.6), and
 /// `resolution_gen` (0 = bolt11 pass-through; 1+ once resolved) binds each (re-)resolution to its OWN
-/// backend pay key `refund:<external_id>:g<gen>` so a retry never double-pays and only a CURRENT-gen
+/// backend pay key — gen 0 is the bare `refund:<external_id>` (the key a pre-ug8 binary paid bolt11
+/// refunds under, so a legacy refund dedups on it — lnrent-4gt), gen>=1 is `refund:<external_id>:g<gen>`
+/// — so a retry never double-pays and only a CURRENT-gen
 /// Failed+expired invoice is ever re-resolved. Mirrors the §11 schema (added to the `refund_attempt`
 /// CREATE TABLE above), so — like `suspend_not_before` — a fresh DB applies the CREATE first and this
 /// ALTER is a tolerated duplicate, while a legacy DB gets the ALTER. Appended — never edit a shipped

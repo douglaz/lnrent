@@ -52,7 +52,7 @@ const MAX_REFUND_ATTEMPTS: i64 = 5;
 const RESOLUTION_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How long a refund may sit PENDING — repeatedly deferred WITHOUT a `pay` (a transient resolution
-/// failure or a legacy in-flight wait, neither of which bumps the pay-attempts cap) — before every
+/// failure, which does not bump the pay-attempts cap) — before every
 /// drive logs an operator-LOUD error. A buyer endpoint stuck transiently-broken forever (always
 /// 5xx / timeout / DNS failure) would otherwise retry silently with nobody notified and the buyer
 /// never refunded; this surfaces it for operator action while STILL retrying, so a recovered endpoint
@@ -68,7 +68,7 @@ pub struct RefundReport {
     pub sent: usize,
     /// A recoverable setback left the row `PENDING` for the next drive: either a definitive `pay`
     /// failure (`attempts` bumped, climbing toward [`MAX_REFUND_ATTEMPTS`]), or a NON-pay defer — a
-    /// transient resolution failure or a legacy in-flight bare-key wait (`attempts` UNCHANGED, since
+    /// transient resolution failure (`attempts` UNCHANGED, since
     /// no `pay` was attempted). Both are counted here.
     pub retried: usize,
     /// Refunds that hit [`MAX_REFUND_ATTEMPTS`] and were parked `FAILED` with a loud error log.
@@ -117,7 +117,8 @@ enum Outcome {
 
 /// What [`Refunder::plan_payment`] decided to do this drive (before any `pay`).
 enum PlanOutcome {
-    /// Pay `bolt11` with the generation-bound key `refund:<external_id>:g<gen>`.
+    /// Pay `bolt11` with the generation-bound key from [`gen_key`] (gen 0 = the bare
+    /// `refund:<external_id>`; gen>=1 = `refund:<external_id>:g<gen>`).
     Pay { bolt11: String, gen: i64 },
     /// The CURRENT generation already settled — record SENT without paying.
     AlreadySent,
@@ -146,10 +147,27 @@ impl From<ResolveError> for PlanError {
 
 /// The generation-bound idempotency key handed to `pay()` / `payment_status_by_key()`. The
 /// `refund_attempt.idempotency_key` column stays the STABLE ledger/UNIQUE anchor
-/// (`refund:<external_id>`); only the value the BACKEND sees is gen-suffixed, so each (re-)resolution
-/// gets its own backend payment row + status (lnrent-ug8 codex P0 fix).
+/// (`refund:<external_id>`); only the value the BACKEND sees is gen-suffixed for gen>=1, so each LNURL
+/// (re-)resolution gets its own backend payment row + status (lnrent-ug8 codex P0 fix).
+///
+/// GEN 0 (bolt11 pass-through / not-yet-resolved) is the BARE `refund:<external_id>` — the SAME key a
+/// pre-ug8 binary paid bolt11 refunds under. So an in-flight or completed legacy bolt11 refund dedups
+/// against the new binary's gen-0 pay on the IDENTICAL key (no upgrade double-pay, lnrent-4gt). GEN>=1
+/// (resolved LNURL) keeps the `:g<gen>` suffix.
+///
+/// The intermediate ug8 scheme suffixed gen 0 as `refund:<external_id>:g0`; 4gt drops that suffix
+/// (this fn). There is NO `:g0`-vs-bare upgrade double-pay window (review P1) because no deployed
+/// binary has ever paid a REAL refund under EITHER key: the only money-moving backend (Fedimint) is
+/// still o6p-gated and unwired in main.rs — and o6p is BLOCKED by this bead — while MockPayment moves
+/// no money. The bare-key gen-0 convention is therefore fixed BEFORE the first real-money release, so
+/// a live `:g0` payment can never exist for a bare-key gen-0 pay to double up against. The fuller
+/// legacy-upgrade reasoning (incl. the LN-address caveat) lives at the `process()` legacy-safety block.
 fn gen_key(external_id: &str, gen: i64) -> String {
-    format!("refund:{external_id}:g{gen}")
+    if gen == 0 {
+        format!("refund:{external_id}")
+    } else {
+        format!("refund:{external_id}:g{gen}")
+    }
 }
 
 impl Refunder {
@@ -215,61 +233,22 @@ impl Refunder {
                 .await;
         };
 
-        // Legacy fast-skip + in-flight guard (upgrade safety, lnrent-ug8). A PRE-ug8 binary paid under
-        // the STABLE key `refund:<external_id>` (the column value), NOT the gen-suffixed key this code
-        // now hands to the backend, which does NOT dedup a gen-bound payment against the bare-key one.
-        // So before resolving/paying a row the new resolver has NOT yet touched (`resolved_bolt11 IS
-        // NULL`), consult the legacy bare key:
-        //  - Succeeded -> the old binary already paid (and maybe crashed before recording SENT):
-        //    record SENT WITHOUT a second pay.
-        //  - Pending -> the old binary's pay is STILL in flight. Starting a new gen-bound payment now
-        //    could DOUBLE-pay once the legacy one settles, so WAIT: leave the row PENDING (recoverable)
-        //    until the bare key terminalizes, then the gen-bound path below takes over.
-        // Safe on fresh DBs and resolved rows: the new binary never writes the bare key (it always
-        // suffixes `:g<gen>`), so a never-paid row reads Unknown here (never Succeeded/Pending) and
-        // this is a no-op; a resolved row (`resolved_bolt11` set) was created by THIS binary, so the
-        // gen-bound status in `plan_payment` is authoritative and the bare key is irrelevant.
-        if row.resolved_bolt11.is_none() {
-            match self
-                .payment
-                .payment_status_by_key(&row.idempotency_key)
-                .await
-            {
-                Ok(PayStatus::Succeeded) => return self.finish_sent(&row, None, amount, now).await,
-                Ok(PayStatus::Pending) => {
-                    tracing::warn!(
-                        refund = %row.id,
-                        "legacy bare-key refund payment in flight; deferring to it (no new pay)"
-                    );
-                    return self.commit_resolution_retry(&row, now).await;
-                }
-                // A status-lookup ERROR is NOT a no-record Unknown: the legacy bare-key payment could
-                // be in flight or already Succeeded but momentarily unqueryable. Paying under the new
-                // gen-suffixed key would NOT dedup against it, so an upgrade/restart could issue a
-                // SECOND refund. Treat the error as unsafe-to-pay — leave the row PENDING and retry the
-                // lookup next drive, exactly like the current-generation lookup path (review P1).
-                Err(e) => {
-                    tracing::warn!(
-                        refund = %row.id,
-                        error = %e,
-                        "legacy bare-key refund status lookup failed; deferring (no new pay)"
-                    );
-                    return self.commit_resolution_retry(&row, now).await;
-                }
-                // Failed: a legacy attempt that terminally failed — safe to take the gen-bound path.
-                // Unknown: AMBIGUOUS. Usually a fresh row (no backend record), but per the
-                // PaymentBackend contract `Unknown` can ALSO be an in-flight, unconfirmable legacy
-                // payment. Falling through then pays a gen-suffixed key that the legacy bare-key
-                // payment can't dedup against -> a double-refund if the old one later settles. This is
-                // SAFE with MockPayment (deterministic, never returns an in-flight Unknown), and is
-                // precisely why enabling Fedimint (lnrent-o6p) is GATED on the fedimint_pay oplog
-                // recovery, which disambiguates `Unknown` into a real status. Until then, fresh rows
-                // must NOT stall (deferring every Unknown would mean no refund ever pays), so we fall
-                // through; the residual upgrade-with-in-flight-legacy double-pay is a documented o6p
-                // prerequisite (review P1), not a live risk on this branch.
-                Ok(PayStatus::Unknown | PayStatus::Failed) => {}
-            }
-        }
+        // Legacy upgrade safety (lnrent-4gt): a pre-ug8 binary paid the raw `dest` under the BARE
+        // `refund:<external_id>` key with NO form detection. Gen 0 IS that bare key now (see
+        // `gen_key`), so a legacy BOLT11 refund takes the NORMAL gen-0 path below on the SAME key the
+        // old binary used — the `already_paid` fast-skip short-circuits a completed legacy refund
+        // (record SENT, no re-pay), and otherwise `pay(bare)` re-enters / re-awaits the in-flight
+        // legacy op (the backend dedups on the key). No mismatched-key double-pay, so ug8's special
+        // bare-key fall-through is gone.
+        //
+        // CAVEAT for a future o6p/Fedimint implementer (review P2): this bare-key dedup covers the
+        // BOLT11 legacy path ONLY. A pre-ug8 binary ran no form detection, so an LN-ADDRESS `dest`
+        // would in principle also have been paid under the bare key — but the new binary RESOLVES an
+        // LN-address to a fresh bolt11 under `:g1`, whose `:g1` key does NOT dedup against any bare-key
+        // payment. That is SAFE here, not COVERED, for two reasons: (a) a real LN backend rejects a
+        // non-bolt11 `dest`, so no LIVE legacy LN-address payment can exist; and (b) no money has moved
+        // yet at all — Fedimint is o6p-gated/unwired and MockPayment moves no money. Do NOT assume
+        // LN-address legacy upgrades are deduped if that ever changes.
 
         // Decide the bolt11 + generation to pay (resolving + persisting if needed), BEFORE pay().
         let (bolt11, gen) = match self
@@ -730,8 +709,8 @@ impl Refunder {
     }
 
     /// A recoverable NON-pay setback that must NOT consume the pay-attempts cap (codex P2): a
-    /// transient resolution failure (a flaky LNURL endpoint while the buyer is offline), or waiting on
-    /// a legacy in-flight bare-key payment across an upgrade. No `pay` was attempted, so `attempts` is
+    /// transient resolution failure (a flaky LNURL endpoint while the buyer is offline). No `pay` was
+    /// attempted, so `attempts` is
     /// left UNCHANGED — only definitive PAY failures climb toward [`MAX_REFUND_ATTEMPTS`]. The row
     /// STAYS `PENDING` (never terminal) and is retried next drive; this touches `updated_at` and
     /// journals a retry for the audit trail, guarded on the row still being `PENDING` (a lost CAS is a
@@ -895,8 +874,8 @@ mod tests {
     /// `Unknown` to model ambiguous in-flight errors. `mark_paid(key)` seeds a key as
     /// already-settled (the crash-after-pay fast-skip). Faithful to a real backend, a key it has
     /// NEVER seen (never paid, never `pay()`-attempted, no explicit override) reports `Unknown`, not
-    /// the global `failed_status` — so the legacy bare-key guard only fires for a key a (legacy) pay
-    /// actually touched. Methods the refunder never calls are `unimplemented!()`. (MockPayment can't
+    /// the global `failed_status` — so the idempotency / in-flight checks only treat a key as failed
+    /// when a `pay` for it actually failed. Methods the refunder never calls are `unimplemented!()`. (MockPayment can't
     /// simulate a `pay` failure, and we must not edit backends.rs to add one.)
     #[derive(Default)]
     struct TestPayment {
@@ -1515,19 +1494,20 @@ mod tests {
         );
     }
 
-    // Upgrade safety (lnrent-ug8): a PRE-ug8 binary paid under the STABLE key `refund:<external_id>`
-    // (no `:g<gen>` suffix) and crashed before recording SENT. The new gen-bound key would miss that
-    // backend record and re-pay — a DOUBLE refund. The legacy fast-skip honors a Succeeded on the
-    // bare stable key: the row records SENT with NO second pay and NO resolution.
+    // Upgrade safety (lnrent-4gt): a PRE-ug8 binary paid a bolt11 refund under the BARE
+    // `refund:<external_id>` key and crashed before recording SENT. Gen 0 IS that bare key now, so the
+    // legacy bolt11 refund takes the NORMAL gen-0 path and the `already_paid` fast-skip honors the
+    // Succeeded on the SAME key: the row records SENT with NO second pay and NO resolution.
     #[tokio::test]
     async fn legacy_stable_key_paid_before_upgrade_is_not_double_paid() {
         let store = mem_store();
         let payment = Arc::new(TestPayment::new());
-        payment.mark_paid("refund:order:sub-1"); // the OLD binary paid the bare stable key, pre-crash
+        payment.mark_paid("refund:order:sub-1"); // the OLD binary paid the bare gen-0 key, pre-crash
         let clock = TestClock::new(1_000);
         let resolver = Arc::new(TestResolver::new(10_000));
+        let bolt11 = crate::refund_resolver::mint_bolt11(500_000, "meta", 1_000, 86_400);
         seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
-        seed_refund(&store, "sub-1", Some(LN_ADDR), Some(500)).await;
+        seed_refund(&store, "sub-1", Some(&bolt11), Some(500)).await;
         seed_reservation(&store, "sub-1").await;
 
         let report = refunder_with(&store, &payment, &clock, resolver.clone())
@@ -1661,10 +1641,11 @@ mod tests {
 
     // ---- the generation gate (lnrent-ug8 codex P0 fix) ----------------------
 
-    // A bolt11 `dest` is paid DIRECTLY with the gen-0 key — no resolution, the resolver is never
-    // called, and resolution_gen stays 0.
+    // A bolt11 `dest` is paid DIRECTLY under the gen-0 key, which is the BARE `refund:<external_id>`
+    // (NOT `:g0`) — the SAME key a pre-ug8 binary paid bolt11 refunds under (lnrent-4gt). No
+    // resolution, the resolver is never called, and resolution_gen stays 0.
     #[tokio::test]
-    async fn bolt11_dest_pays_generation_zero_without_resolving() {
+    async fn bolt11_dest_pays_generation_zero_under_bare_key() {
         let store = mem_store();
         let payment = Arc::new(TestPayment::new());
         let clock = TestClock::new(1_000);
@@ -1681,8 +1662,12 @@ mod tests {
         assert_eq!(report.sent, 1);
         assert_eq!(resolver.calls(), 0, "a bolt11 dest is never resolved");
         assert!(
-            payment.was_paid("refund:order:sub-1:g0"),
-            "paid with the gen-0 key"
+            payment.was_paid("refund:order:sub-1"),
+            "paid under the BARE gen-0 key (not `:g0`)"
+        );
+        assert!(
+            !payment.was_paid("refund:order:sub-1:g0"),
+            "gen 0 never suffixes `:g0`"
         );
         let (resolved, gen) = resolution_of(&store, "ref-order:sub-1").await;
         assert_eq!(resolved, None, "no resolved_bolt11 for a bolt11 dest");
@@ -2119,86 +2104,50 @@ mod tests {
         );
     }
 
-    // Upgrade safety (lnrent-ug8): a PRE-ug8 binary submitted pay under the BARE stable key and it is
-    // STILL in flight (Pending) when the new binary boots. Because the backend does NOT dedup a
-    // gen-bound payment against the bare-key one, starting a new payment now could DOUBLE-pay once the
-    // legacy one settles. The new binary must DEFER: leave the row PENDING (no new pay, no resolve, no
-    // cap burn) until the bare key terminalizes — then resume normally (here: it settles -> SENT).
+    // Upgrade safety (lnrent-4gt): a PRE-ug8 binary submitted a bolt11 refund pay under the BARE
+    // `refund:<external_id>` key and it is STILL in flight (Pending) when the new binary boots. Gen 0
+    // IS that bare key now, so the new binary must NOT defer-and-strand it — it RE-ENTERS pay() on the
+    // SAME bare key, the refund reaches SENT, and a second drive is a no-op (the row is SENT) — no
+    // double-pay. NOTE (review P3): this asserts the gen-0 path takes the NORMAL pay flow (no
+    // defer/strand), NOT the backend-level dedup of an in-flight op. The mock's status override
+    // (Pending) and its `paid` map are independent, so `pay()` here simply records the bare-key
+    // payment; the real dedup-against-an-in-flight-op guarantee belongs to the Fedimint backend and is
+    // exercised in fedimint_live (lnrent-4gt PART 2), not by this mock.
     #[tokio::test]
-    async fn legacy_bare_key_in_flight_defers_until_terminal() {
+    async fn legacy_bare_key_pending_bolt11_reenters_pay() {
         let store = mem_store();
         let payment = Arc::new(TestPayment::new());
-        payment.set_key_status("refund:order:sub-1", PayStatus::Pending); // legacy pay in flight
+        payment.set_key_status("refund:order:sub-1", PayStatus::Pending); // legacy bolt11 pay in flight
         let clock = TestClock::new(1_000);
         let resolver = Arc::new(TestResolver::new(10_000));
+        let bolt11 = crate::refund_resolver::mint_bolt11(500_000, "meta", 1_000, 86_400);
         seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
-        seed_refund(&store, "sub-1", Some(LN_ADDR), Some(500)).await;
+        seed_refund(&store, "sub-1", Some(&bolt11), Some(500)).await;
         let r = refunder_with(&store, &payment, &clock, resolver.clone());
 
-        // While the legacy bare-key payment is Pending: defer. No pay, no resolve, no cap burn.
-        let report = r.drive().await.unwrap();
-        assert_eq!(report.retried, 1);
-        assert_eq!(payment.pay_calls(), 0, "never starts a parallel payment");
-        assert_eq!(resolver.calls(), 0, "never resolves while deferring");
-        let (status, attempts, _) = refund_row(&store, "ref-order:sub-1").await;
-        assert_eq!(status, "PENDING");
-        assert_eq!(attempts, 0, "deferring does not burn the pay-attempts cap");
-
-        // The legacy payment settles on the bare key -> the next drive records SENT without re-paying.
-        payment.set_key_status("refund:order:sub-1", PayStatus::Succeeded);
+        // The gen-0 path re-enters pay() on the bare key (it does NOT defer and strand the refund).
         let report = r.drive().await.unwrap();
         assert_eq!(report.sent, 1);
-        assert_eq!(payment.pay_calls(), 0, "the legacy refund is never re-paid");
-        assert_eq!(resolver.calls(), 0, "and never (re-)resolved");
+        assert_eq!(payment.pay_calls(), 1, "re-enters pay() on the bare key");
+        assert_eq!(resolver.calls(), 0, "a bolt11 dest is never resolved");
+        assert!(
+            payment.was_paid("refund:order:sub-1"),
+            "paid under the bare gen-0 key the legacy binary used"
+        );
         let (status, _, _) = refund_row(&store, "ref-order:sub-1").await;
         assert_eq!(status, "SENT");
+
+        // A second drive is a no-op: the row is SENT, so it is never re-listed and never double-paid.
+        let report = r.drive().await.unwrap();
+        assert_eq!(report, RefundReport::default(), "second drive is a no-op");
+        assert_eq!(
+            payment.pay_calls(),
+            1,
+            "never double-pays the legacy refund"
+        );
         assert_eq!(
             refund_outbox_statuses(&store).await,
             vec!["sent".to_string()]
-        );
-    }
-
-    // Upgrade safety (review P1): for an UNRESOLVED row (`resolved_bolt11 IS NULL`, the pre-ug8 shape),
-    // a FAILED status LOOKUP on the legacy bare key must NOT fall through to a gen-bound pay(). The old
-    // bare-key payment could be in flight or already Succeeded but momentarily unqueryable, and a new
-    // gen-suffixed key would not dedup against it — a double refund. The drive must DEFER: leave the
-    // row PENDING (no pay, no resolve, no cap burn) and retry the lookup next drive. Contrast
-    // `status_lookup_error_is_transient_never_reresolves`, which covers the SAME error on an
-    // already-RESOLVED row (the per-generation lookup path).
-    #[tokio::test]
-    async fn legacy_bare_key_lookup_error_defers_without_paying() {
-        let store = mem_store();
-        let payment = Arc::new(TestPayment::new());
-        payment.set_status_lookup_fails(true); // the legacy bare key is momentarily unqueryable
-        let clock = TestClock::new(1_000);
-        let resolver = Arc::new(TestResolver::new(10_000));
-        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
-        seed_refund(&store, "sub-1", Some(LN_ADDR), Some(500)).await; // unresolved: resolved_bolt11 NULL
-
-        let report = refunder_with(&store, &payment, &clock, resolver.clone())
-            .drive()
-            .await
-            .unwrap();
-
-        assert_eq!(
-            report.retried, 1,
-            "an unqueryable legacy bare key leaves the row PENDING"
-        );
-        assert_eq!(
-            payment.pay_calls(),
-            0,
-            "never pays under a gen key while the legacy bare key is unqueryable (no double-refund)"
-        );
-        assert_eq!(
-            resolver.calls(),
-            0,
-            "defers before even planning the payment — never resolves"
-        );
-        let (status, attempts, _) = refund_row(&store, "ref-order:sub-1").await;
-        assert_eq!(status, "PENDING");
-        assert_eq!(
-            attempts, 0,
-            "a failed legacy lookup is not a pay attempt; the cap is untouched"
         );
     }
 }

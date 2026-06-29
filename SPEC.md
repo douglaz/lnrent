@@ -684,9 +684,16 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
   (`refund:<external_id>`) stored in `refund_attempt.idempotency_key` (**`UNIQUE`**); the
   settlement transaction does `INSERT ... ON CONFLICT(idempotency_key) DO NOTHING`, so a
   redelivered settlement creates **exactly one** `refund_attempt` row (the **ledger** key dedups
-  the row). The **outbound `pay`** key is **generation-bound** — `refund:<external_id>:g<gen>`,
-  where `<gen>` = `refund_attempt.resolution_gen` (0 = bolt11 pass-through / not-yet-resolved,
-  1+ = each LNURL (re-)resolution). The resolver re-resolves an expired-AND-definitively-`Failed`
+  the row). The **outbound `pay`** key is **generation-bound**, where `<gen>` =
+  `refund_attempt.resolution_gen`: gen 0 (bolt11 pass-through / not-yet-resolved) is the **bare**
+  `refund:<external_id>`, and gen>=1 (each LNURL (re-)resolution) is `refund:<external_id>:g<gen>`.
+  Gen 0 deliberately reuses the bare key a pre-ug8 binary paid bolt11 refunds under, so an in-flight
+  or completed legacy **bolt11** refund dedups against the new binary's gen-0 pay on the identical key
+  — no upgrade double-pay (lnrent-4gt). (This dedup covers the bolt11 legacy path only: an LN-address
+  `dest` resolves to a fresh bolt11 under `:g1`, which does **not** dedup against a bare-key payment —
+  safe because a real LN backend rejects a non-bolt11 `dest` and no money-moving backend has shipped
+  yet, but a future Fedimint implementer must not assume LN-address legacy upgrades are deduped.)
+  The resolver re-resolves an expired-AND-definitively-`Failed`
   invoice to a fresh bolt11 under the next generation; binding `pay`'s key to the generation keeps
   each generation's idempotency separate and stops a stale generation from re-paying (lnrent-ug8).
 - **Issuance ordering (the `bolt11` comes from the backend, so it can't be cached before the
