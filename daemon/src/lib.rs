@@ -17,6 +17,7 @@ pub mod provision;
 pub mod recipe;
 pub mod reconcile;
 pub mod refund;
+pub mod refund_resolver;
 pub mod reservation;
 pub mod runner;
 pub mod store;

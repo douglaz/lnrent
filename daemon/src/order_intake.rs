@@ -116,6 +116,30 @@ impl OrderIntake {
                 .await;
         }
 
+        // 2a-bis. VALIDATE the refund_dest FORMAT (shape only, NO HTTP — the LNURL fetch is a
+        //     refund-time step) BEFORE any reservation/invoice/subscription write, so a BOLT12 offer
+        //     or a malformed address is rejected up front rather than parking the refund FAILED days
+        //     later (lnrent-ug8). OPTIONAL: a buyer may omit it; only a present, non-empty value is
+        //     checked. A bad shape is a permanent (non-retryable) request error, carrying no order_id.
+        if let Some(dest) = req
+            .refund_dest
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+        {
+            if let Err(e) = crate::refund_resolver::validate_dest_format(dest) {
+                return self
+                    .fail_order(
+                        &sender,
+                        &req.id,
+                        None,
+                        refund_dest_invalid(&e.to_string()),
+                        out,
+                    )
+                    .await;
+            }
+        }
+
         // 2b. PRICE check: the referenced listing must still be the current, ACTIVE one for this
         //     recipe at the published price — a stale/unknown price is `price_changed` (§5.4).
         let listing = self.load_listing(&req.listing_id).await?;
@@ -825,6 +849,15 @@ fn price_changed() -> WireError {
         retryable: false,
     }
 }
+// refund_dest is BOLT12 / malformed (lnrent-ug8). A permanent request error: the buyer must resend a
+// supported refund destination (a Lightning address or a bolt11).
+fn refund_dest_invalid(message: &str) -> WireError {
+    WireError {
+        code: "refund_dest_invalid".into(),
+        message: message.into(),
+        retryable: false,
+    }
+}
 fn capacity_full() -> WireError {
     WireError {
         code: "capacity_full".into(),
@@ -994,6 +1027,15 @@ mod tests {
             listing_id: listing_id.into(),
             params,
             refund_dest: None,
+        })
+    }
+
+    fn order_with_refund(id: &str, listing_id: &str, refund_dest: &str) -> Msg {
+        Msg::OrderRequest(OrderRequest {
+            id: id.into(),
+            listing_id: listing_id.into(),
+            params: json!({}),
+            refund_dest: Some(refund_dest.to_string()),
         })
     }
 
@@ -1609,6 +1651,142 @@ mod tests {
             crate::capture::Capture::RefundDue,
             "capture refunds a settlement at/after the credited boundary — consistent with the dropped renew"
         );
+    }
+
+    // lnrent-ug8: refund_dest FORMAT is validated at order time, BEFORE any reservation/invoice/sub
+    // write. A BOLT12 offer (unsupported) or a malformed dest is rejected with a structured
+    // `refund_dest_invalid` error and leaves NO dangling state; a supported LN-address commits the
+    // order normally; omitting refund_dest (None) is allowed.
+    #[tokio::test]
+    async fn order_time_validates_refund_dest_format() {
+        let recipe = dummy_recipe();
+        let listing_id = "30402:op:dummy-1";
+
+        // BOLT12 offer -> rejected, no dangling sub/reservation, no order_id on the error.
+        {
+            let store = mem_store();
+            seed_listing(
+                &store,
+                listing_id,
+                "dummy",
+                recipe.pricing.amount_sat as i64,
+            )
+            .await;
+            let handler = intake(
+                store.clone(),
+                Arc::new(MockPayment::new()),
+                TestClock::new(1000),
+                recipe.clone(),
+                budget_with_room(),
+            );
+            let out = RecordingOutbound::default();
+            handler
+                .handle(
+                    Keys::generate().public_key(),
+                    order_with_refund("rd-bolt12", listing_id, "lno1pqps7sjqpgz"),
+                    &out,
+                )
+                .await
+                .unwrap();
+            let err = expect_order_error(&out);
+            assert_eq!(err.error.code, "refund_dest_invalid");
+            assert!(!err.error.retryable);
+            assert!(
+                err.order_id.is_none(),
+                "a format failure carries no order_id"
+            );
+            assert_eq!(count(&store, "SELECT count(*) FROM subscription").await, 0);
+            assert_eq!(
+                count(
+                    &store,
+                    "SELECT count(*) FROM reservation WHERE state='HELD'"
+                )
+                .await,
+                0,
+                "no reservation is held for a rejected order"
+            );
+        }
+
+        // An `lnurl1` decoding to a non-HTTPS URL -> rejected up front (it would only park the refund
+        // FAILED at resolve time otherwise, review P2). Proves the order path runs the stricter
+        // `validate_dest_format`, not the bare bech32-decoding `detect_form`.
+        {
+            let http_lnurl = bech32::encode::<bech32::Bech32>(
+                bech32::Hrp::parse("lnurl").unwrap(),
+                "http://example.com/lnurlp/u".as_bytes(),
+            )
+            .unwrap();
+            let store = mem_store();
+            seed_listing(
+                &store,
+                listing_id,
+                "dummy",
+                recipe.pricing.amount_sat as i64,
+            )
+            .await;
+            let handler = intake(
+                store.clone(),
+                Arc::new(MockPayment::new()),
+                TestClock::new(1000),
+                recipe.clone(),
+                budget_with_room(),
+            );
+            let out = RecordingOutbound::default();
+            handler
+                .handle(
+                    Keys::generate().public_key(),
+                    order_with_refund("rd-lnurl-http", listing_id, &http_lnurl),
+                    &out,
+                )
+                .await
+                .unwrap();
+            let err = expect_order_error(&out);
+            assert_eq!(err.error.code, "refund_dest_invalid");
+            assert_eq!(count(&store, "SELECT count(*) FROM subscription").await, 0);
+        }
+
+        // A supported Lightning address -> the order commits to a PENDING sub.
+        {
+            let store = mem_store();
+            seed_listing(
+                &store,
+                listing_id,
+                "dummy",
+                recipe.pricing.amount_sat as i64,
+            )
+            .await;
+            let handler = intake(
+                store.clone(),
+                Arc::new(MockPayment::new()),
+                TestClock::new(1000),
+                recipe.clone(),
+                budget_with_room(),
+            );
+            let out = RecordingOutbound::default();
+            handler
+                .handle(
+                    Keys::generate().public_key(),
+                    order_with_refund("rd-addr", listing_id, "alice@example.com"),
+                    &out,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(out.only().1, Msg::OrderInvoice(_)),
+                "a valid refund_dest commits the order"
+            );
+            let refund_dest: Option<String> = store
+                .read(|c| {
+                    Ok(c.query_row(
+                        "SELECT refund_dest FROM subscription WHERE state='PENDING'",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .await
+                .unwrap();
+            assert_eq!(refund_dest.as_deref(), Some("alice@example.com"));
+        }
     }
 
     /// Seed a standalone OPEN renewal invoice (no daemon issuance), so a capture-consistency check

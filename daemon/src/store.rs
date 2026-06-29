@@ -94,6 +94,14 @@ CREATE TABLE IF NOT EXISTS refund_attempt (  -- durable refund ledger (ADR-0009,
   backend_payment_id TEXT,           -- from pay(), once known
   status             TEXT NOT NULL,  -- PENDING (durable intent; retry pay(key) safely on restart) | SENT | FAILED
   attempts           INTEGER,
+  -- refund-dest RESOLVER (lnrent-ug8): the concrete bolt11 a LN-address/LNURL `dest` resolved to,
+  -- cached so a retry re-pays the SAME invoice. `resolution_gen` (0 = bolt11 pass-through, no
+  -- resolution; 1+ once resolved) binds each (re-)resolution to its OWN pay key
+  -- `refund:<external_id>:g<gen>` so retries never double-pay and only a CURRENT-gen Failed+expired
+  -- invoice is ever re-resolved (the codex P0 fix, §6.6).
+  resolved_bolt11    TEXT,
+  resolved_expiry    INTEGER,
+  resolution_gen     INTEGER NOT NULL DEFAULT 0,
   created_at         INTEGER,
   updated_at         INTEGER
 );
@@ -206,11 +214,32 @@ CREATE INDEX IF NOT EXISTS seen_message_seen_at_idx ON seen_message(seen_at);
 const M3_SUSPEND_NOT_BEFORE: &str =
     "ALTER TABLE subscription ADD COLUMN suspend_not_before INTEGER;";
 
+/// Migration 4 (lnrent-ug8): the refund-dest RESOLVER's generation-bound idempotency columns on
+/// `refund_attempt`. `resolved_bolt11`/`resolved_expiry` cache the concrete bolt11 the resolver
+/// produced for an LN-address/LNURL `dest` (the buyer is offline at refund time, §6.6), and
+/// `resolution_gen` (0 = bolt11 pass-through; 1+ once resolved) binds each (re-)resolution to its OWN
+/// backend pay key `refund:<external_id>:g<gen>` so a retry never double-pays and only a CURRENT-gen
+/// Failed+expired invoice is ever re-resolved. Mirrors the §11 schema (added to the `refund_attempt`
+/// CREATE TABLE above), so — like `suspend_not_before` — a fresh DB applies the CREATE first and this
+/// ALTER is a tolerated duplicate, while a legacy DB gets the ALTER. Appended — never edit a shipped
+/// migration.
+const M4_REFUND_RESOLUTION: &str = "
+ALTER TABLE refund_attempt ADD COLUMN resolved_bolt11 TEXT;
+ALTER TABLE refund_attempt ADD COLUMN resolved_expiry INTEGER;
+ALTER TABLE refund_attempt ADD COLUMN resolution_gen INTEGER NOT NULL DEFAULT 0;
+";
+
 /// Ordered migrations (lnrent-7fp.3): index `i` upgrades the DB from schema version `i` to
 /// `i+1`. Version 1 is the §11 schema; version 2 adds `seen_message` (lnrent-7fp.5); version 3 adds
-/// `subscription.suspend_not_before` (lnrent-7fp.22). A future schema change appends a new entry of
-/// `ALTER`/`CREATE` statements; **never edit a shipped migration**.
-const MIGRATIONS: &[&str] = &[SCHEMA, M2_SEEN_MESSAGE, M3_SUSPEND_NOT_BEFORE];
+/// `subscription.suspend_not_before` (lnrent-7fp.22); version 4 adds the `refund_attempt` resolver
+/// columns (lnrent-ug8). A future schema change appends a new entry of `ALTER`/`CREATE` statements;
+/// **never edit a shipped migration**.
+const MIGRATIONS: &[&str] = &[
+    SCHEMA,
+    M2_SEEN_MESSAGE,
+    M3_SUSPEND_NOT_BEFORE,
+    M4_REFUND_RESOLUTION,
+];
 
 /// The target schema version this binary expects (= number of migrations).
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -226,6 +255,13 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                 && has_column(conn, "subscription", "suspend_not_before")?
             {
                 // Fresh DBs apply the current CREATE TABLE first; legacy v2 DBs get the ALTER.
+            } else if current == 3 && is_duplicate_refund_resolution(&e) {
+                // Fresh DBs already have the resolver columns from the §11 schema, so the FIRST ALTER
+                // in the M4 batch is a duplicate — and `execute_batch` aborts at that first duplicate.
+                // A crash that applied only SOME of the three columns (user_version still 3) would
+                // re-enter here with the rest still missing, so add each MISSING column individually:
+                // a partially-applied migration self-heals instead of failing startup (review P2).
+                ensure_refund_resolution_columns(conn)?;
             } else {
                 return Err(e.into());
             }
@@ -243,6 +279,44 @@ fn is_duplicate_suspend_not_before(e: &rusqlite::Error) -> bool {
         rusqlite::Error::SqliteFailure(_, Some(msg))
             if msg.contains("duplicate column name: suspend_not_before")
     )
+}
+
+fn is_duplicate_refund_resolution(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(_, Some(msg))
+            if msg.contains("duplicate column name: resolved_bolt11")
+                || msg.contains("duplicate column name: resolved_expiry")
+                || msg.contains("duplicate column name: resolution_gen")
+    )
+}
+
+/// Idempotently add the lnrent-ug8 resolver columns to `refund_attempt`, one at a time, skipping any
+/// that already exist. SQLite has no `ADD COLUMN IF NOT EXISTS` and `execute_batch` aborts at the
+/// first duplicate, so the M4 batch alone can't complete a PARTIALLY-applied migration (a crash
+/// between two of its ALTERs leaves `user_version` at 3 with some columns present and some missing).
+/// This per-column add does: re-running M4 after such a crash adds only the still-missing columns,
+/// so startup self-heals rather than failing on the leading duplicate (review P2).
+fn ensure_refund_resolution_columns(conn: &Connection) -> Result<()> {
+    for (col, ddl) in [
+        (
+            "resolved_bolt11",
+            "ALTER TABLE refund_attempt ADD COLUMN resolved_bolt11 TEXT",
+        ),
+        (
+            "resolved_expiry",
+            "ALTER TABLE refund_attempt ADD COLUMN resolved_expiry INTEGER",
+        ),
+        (
+            "resolution_gen",
+            "ALTER TABLE refund_attempt ADD COLUMN resolution_gen INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        if !has_column(conn, "refund_attempt", col)? {
+            conn.execute_batch(ddl)?;
+        }
+    }
+    Ok(())
 }
 
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -440,6 +514,38 @@ mod tests {
             seen, 1,
             "the later migration created seen_message on the legacy DB"
         );
+    }
+
+    // A crash BETWEEN the M4 batch's ALTERs leaves user_version at 3 with some resolver columns
+    // present and some missing. Re-running migrate() must add only the still-missing columns and
+    // reach the current version — not abort on the leading duplicate (review P2). migrate at v3 runs
+    // ONLY M4, which touches just refund_attempt, so the partial table is all we need to set up.
+    #[test]
+    fn migrate_recovers_partially_applied_refund_resolution() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE refund_attempt (id TEXT PRIMARY KEY, status TEXT, resolved_bolt11 TEXT);
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        assert!(has_column(&conn, "refund_attempt", "resolved_bolt11").unwrap());
+        assert!(!has_column(&conn, "refund_attempt", "resolved_expiry").unwrap());
+        assert!(!has_column(&conn, "refund_attempt", "resolution_gen").unwrap());
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap(),
+            SCHEMA_VERSION,
+            "migrate reaches the current version after recovering the partial M4"
+        );
+        for col in ["resolved_bolt11", "resolved_expiry", "resolution_gen"] {
+            assert!(
+                has_column(&conn, "refund_attempt", col).unwrap(),
+                "{col} present after recovery"
+            );
+        }
     }
 
     fn mem_store() -> Store {

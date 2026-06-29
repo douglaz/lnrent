@@ -343,7 +343,7 @@ NIP-17 private DM between the buyer and operator pubkeys:
 
 | type | direction | payload |
 |--|--|--|
-| `order.request`   | buyer -> operator | `id` (unique request id), `listing_id`, validated `params`, `refund_dest` (BOLT12 offer or Lightning address) |
+| `order.request`   | buyer -> operator | `id` (unique request id), `listing_id`, validated `params`, `refund_dest` (Lightning address/LNURL or bolt11; BOLT12 deferred) |
 | `order.invoice`   | operator -> buyer | `request_id` (= the `order.request` `id`), `order_id`, `bolt11`, `amount_sat`, `period`, `expires_at` |
 | `order.error`     | operator -> buyer | `request_id`, `order_id` (optional — absent for a pre-order validation failure), `error` `{ code, message, retryable }` with `code` in `capacity_full` / `params_invalid` / `price_changed` / `unavailable` / `rejected` — same nested `error` shape as `op.result`, so a buyer agent branches uniformly |
 | `provision.ready` | operator -> buyer | `subscription_id`, `payload` (the credentials) |
@@ -627,10 +627,13 @@ provision succeeds (ADR-0003). Two consequences:
   capacity for the order (§9.3) so concurrent orders cannot race the last slot. Most
   provision failures are caught here, before any money moves.
 - **Capture-then-refund on failure.** If `provision` still fails after capture, the
-  daemon refunds. The buyer supplies a `refund_dest` in `order.request` (a BOLT12
-  offer, preferred, or a Lightning address), which the daemon pushes to via phoenixd
-  `payoffer` / `paylnaddress`. If the refund payment itself fails, the subscription
-  stays `REFUND_DUE` and the operator is alerted.
+  daemon refunds. The buyer supplies a `refund_dest` in `order.request`. **v1 supports a
+  Lightning address / LNURL — resolved to a fresh bolt11 at refund time via LNURL-pay
+  (lnrent-ug8) — or a bolt11 pass-through; a BOLT12 offer is rejected as unsupported**
+  (deferred: it needs onion-message offer-fetch the Fedimint gateway can't yet service).
+  The resolver is backend-agnostic (it lives in the refund path, ahead of `pay()`, not in
+  any backend) and is activated alongside the Fedimint backend (lnrent-o6p). If the refund
+  payment itself fails, the subscription stays `REFUND_DUE` and the operator is alerted.
 
 Operators who require true provision-then-capture atomicity can run an **LND payment
 backend** (native hold invoices) instead of phoenixd. That backend is a later option,
@@ -680,8 +683,12 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
   A **settled-but-terminal refund** likewise uses a deterministic refund key
   (`refund:<external_id>`) stored in `refund_attempt.idempotency_key` (**`UNIQUE`**); the
   settlement transaction does `INSERT ... ON CONFLICT(idempotency_key) DO NOTHING`, so a
-  redelivered settlement creates **exactly one** `refund_attempt` row (the key dedups both the
-  outbound `pay` AND the ledger row).
+  redelivered settlement creates **exactly one** `refund_attempt` row (the **ledger** key dedups
+  the row). The **outbound `pay`** key is **generation-bound** — `refund:<external_id>:g<gen>`,
+  where `<gen>` = `refund_attempt.resolution_gen` (0 = bolt11 pass-through / not-yet-resolved,
+  1+ = each LNURL (re-)resolution). The resolver re-resolves an expired-AND-definitively-`Failed`
+  invoice to a fresh bolt11 under the next generation; binding `pay`'s key to the generation keeps
+  each generation's idempotency separate and stops a stale generation from re-paying (lnrent-ug8).
 - **Issuance ordering (the `bolt11` comes from the backend, so it can't be cached before the
   call):** the daemon derives `external_id` per the class above, calls
   `create_invoice(external_id)` (which the backend makes **idempotent on `external_id`** — a
@@ -1102,7 +1109,7 @@ CREATE TABLE subscription (
   recipe_id TEXT, listing_id TEXT, instance_id TEXT, buyer_pubkey TEXT,
   state TEXT,                        -- see §6.3 (PENDING|PROVISIONING|ACTIVE|SUSPENDED|TERMINATED|EXPIRED|CANCELLED|REFUND_DUE|REFUNDED)
   params_json TEXT,                  -- validated buyer params
-  refund_dest TEXT,                  -- BOLT12 offer or Lightning address, for refunds
+  refund_dest TEXT,                  -- Lightning address/LNURL or bolt11 (BOLT12 deferred), for refunds (§6.4)
   -- backend handles live on `instance` (instance_id), not duplicated here
   period_s INTEGER, renew_lead_s INTEGER, retention_s INTEGER,   -- copied from the listing at order time
   paid_through INTEGER,              -- hard expiry; service interrupted after this

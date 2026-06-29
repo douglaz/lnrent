@@ -3640,7 +3640,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bech32",
  "bip39",
+ "bitcoin",
  "clap",
  "fedimint-client",
  "fedimint-connectors",
@@ -3652,12 +3654,15 @@ dependencies = [
  "fedimint-rocksdb",
  "fedimint-wallet-client",
  "futures-util",
+ "hex",
  "hkdf",
  "libc",
+ "lightning-invoice",
  "lnrent-wire",
  "nostr",
  "nostr-relay-builder",
  "nostr-sdk",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3666,6 +3671,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "zeroize",
 ]
 
