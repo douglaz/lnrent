@@ -219,7 +219,37 @@ impl FedimintPayment {
             );
         }
 
+        me.log_readiness().await;
         Ok(me)
+    }
+
+    /// On open, log a one-line readiness summary for operators (lnrent-o6p step 2): the ecash balance
+    /// and whether the CONFIGURED gateway is reachable. A zero balance or an unreachable gateway logs at
+    /// WARN (refunds would fail / strand) so an unfunded or misconfigured operator notices at boot.
+    /// Observability ONLY — enables no payment and never fails open (a query error is logged, not fatal).
+    /// The per-pending-refund exposure comparison needs the store and is wired in the supervisor (o6p).
+    async fn log_readiness(&self) {
+        let balance_sat = match self.client.get_balance_for_btc().await {
+            Ok(a) => a.msats / 1000,
+            Err(e) => {
+                tracing::warn!(error = %e, "fedimint: could not query ecash balance at startup");
+                return;
+            }
+        };
+        let gateway_ok = match self.client.get_first_module::<LightningClientModule>() {
+            Ok(ln) => matches!(ln.get_gateway(self.gateway, false).await, Ok(Some(_))),
+            Err(_) => false,
+        };
+        if balance_sat == 0 || !gateway_ok {
+            tracing::warn!(
+                balance_sat,
+                gateway_ok,
+                "fedimint NOT fully ready: zero ecash balance and/or the configured gateway is \
+                 unreachable — refunds will fail until the operator funds ecash + the gateway is online"
+            );
+        } else {
+            tracing::info!(balance_sat, gateway_ok, "fedimint ready");
+        }
     }
 
     /// Await a refund payment to a terminal state, recording the outcome in the pay index and
