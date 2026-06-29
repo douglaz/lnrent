@@ -1464,8 +1464,8 @@ async fn boot_catches_up_a_settlement_missed_while_down() {
     .await;
     seed_reservation(&store, &sub_id, "HELD").await;
     payment
-        .settle(&ext, clock.now())
-        .expect("mark paid at backend (no watcher)");
+        .settle_recovered(&ext)
+        .expect("mark paid at backend (RECOVERY: settled-while-down, no watcher/live ts)");
 
     let _sup = start_supervisor(
         &op,

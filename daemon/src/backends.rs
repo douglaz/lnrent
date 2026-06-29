@@ -47,6 +47,13 @@ pub trait PaymentBackend: Send + Sync {
         external_id: &str, // binds settlement -> order (ADR-0009); deterministic per invoice class (§6.6)
     ) -> Result<Invoice>;
     async fn lookup(&self, id: &str) -> Result<PaymentStatus>;
+    /// Invoice status PLUS the backend's observed-LIVE settled_at. `Some(ts)` is returned ONLY for a
+    /// settlement the backend observed live (its true time is known); `None` for a not-paid invoice
+    /// OR a RECOVERY settlement (settled while the daemon was down, so the true time is unknown). The
+    /// supervisor's settlement catch-up uses `Some(ts)` EXACTLY and caps only on `None` — so a late
+    /// LIVE payment refunds (capture's g5p gate) instead of being stamped just-in-window and wrongly
+    /// provisioned (lnrent-zwk). `lookup()` stays the status-only seam reconcile uses (unchanged).
+    async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)>;
     /// Outbound payment, used for refunds. **Idempotent on `idempotency_key`**: calling twice
     /// with the same key never pays twice (ADR-0009, SPEC §6.6). Returns a backend payment id.
     async fn pay(&self, dest: &str, amount_sat: u64, idempotency_key: &str) -> Result<String>;
@@ -159,6 +166,9 @@ impl PaymentBackend for FedimintPayment {
     async fn lookup(&self, _id: &str) -> Result<PaymentStatus> {
         bail!("fedimint.lookup not implemented (M0 stub)")
     }
+    async fn lookup_settlement(&self, _id: &str) -> Result<(PaymentStatus, Option<i64>)> {
+        bail!("fedimint.lookup_settlement not implemented (M0 stub)")
+    }
     async fn pay(&self, _dest: &str, _amount_sat: u64, _idempotency_key: &str) -> Result<String> {
         bail!("fedimint.pay not implemented (M0 stub)")
     }
@@ -188,6 +198,7 @@ pub struct MockPayment {
 struct MockState {
     invoices: HashMap<String, Invoice>, // external_id -> Invoice (idempotency anchor)
     paid: HashSet<String>,              // external_ids observed settled
+    settled_at: HashMap<String, i64>,   // external_id -> LIVE settled ts (None on recovery)
     payments: HashMap<String, String>,  // refund idempotency_key -> backend payment id
     seq: u64,
     now: i64, // mock wall clock; create_invoice stamps absolute expiry, lookup honors it
@@ -206,9 +217,10 @@ impl MockPayment {
         self.state.lock().unwrap().now = now;
     }
 
-    /// Drive a settlement for a previously-created invoice (by `external_id`): mark it paid and,
-    /// if a `watch()` stream is open, push the `Settlement`. Returns the Settlement so a caller
-    /// can also hand it straight to capture. Errors if no such invoice was created.
+    /// Drive a LIVE settlement for a previously-created invoice (by `external_id`): mark it paid,
+    /// record the real `settled_at` (so `lookup_settlement` can surface it), and, if a `watch()`
+    /// stream is open, push the `Settlement`. Returns the Settlement so a caller can also hand it
+    /// straight to capture. Errors if no such invoice was created.
     pub fn settle(&self, external_id: &str, settled_at: i64) -> Result<Settlement> {
         let mut st = self.state.lock().unwrap();
         let inv = st
@@ -217,6 +229,7 @@ impl MockPayment {
             .ok_or_else(|| anyhow::anyhow!("mock: no invoice for external_id {external_id}"))?
             .clone();
         st.paid.insert(external_id.to_string());
+        st.settled_at.insert(external_id.to_string(), settled_at);
         let s = Settlement {
             invoice_id: inv.id,
             external_id: external_id.to_string(),
@@ -227,6 +240,20 @@ impl MockPayment {
             let _ = tx.try_send(s.clone());
         }
         Ok(s)
+    }
+
+    /// Mark a previously-created invoice paid as a RECOVERY settlement: it was settled while the
+    /// daemon was DOWN, so the backend has NO live timestamp (`lookup_settlement` reports `None` and
+    /// the supervisor catch-up must cap conservatively). Unlike [`settle`](Self::settle) it records
+    /// no live ts and does NOT push on the `watch()` stream (there was no watcher). Errors if no such
+    /// invoice was created.
+    pub fn settle_recovered(&self, external_id: &str) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        if !st.invoices.contains_key(external_id) {
+            bail!("mock: no invoice for external_id {external_id}");
+        }
+        st.paid.insert(external_id.to_string());
+        Ok(())
     }
 }
 
@@ -264,6 +291,19 @@ impl PaymentBackend for MockPayment {
             Some(inv) if st.now >= inv.expires_at => Ok(PaymentStatus::Expired), // past its expiry
             Some(_) => Ok(PaymentStatus::Open),
             None => Ok(PaymentStatus::Expired), // unknown id -> gone
+        }
+    }
+    async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
+        let st = self.state.lock().unwrap();
+        match st.invoices.values().find(|inv| inv.id == id) {
+            // Paid: surface the LIVE ts (`settle`) — `None` for a recovery settle (`settle_recovered`).
+            Some(inv) if st.paid.contains(&inv.external_id) => Ok((
+                PaymentStatus::Paid,
+                st.settled_at.get(&inv.external_id).copied(),
+            )),
+            Some(inv) if st.now >= inv.expires_at => Ok((PaymentStatus::Expired, None)),
+            Some(_) => Ok((PaymentStatus::Open, None)),
+            None => Ok((PaymentStatus::Expired, None)),
         }
     }
     async fn pay(&self, _dest: &str, _amount_sat: u64, idempotency_key: &str) -> Result<String> {

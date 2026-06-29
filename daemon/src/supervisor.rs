@@ -1030,23 +1030,35 @@ async fn settlement_catch_up(
         suspend_not_before,
     ) in open
     {
-        match payment.lookup(&inv_id).await {
-            Ok(PaymentStatus::Paid) => {
+        match payment.lookup_settlement(&inv_id).await {
+            Ok((PaymentStatus::Paid, observed)) => {
                 let now = clock.now();
-                // Latest in-window settle time the recovered payment can carry: the invoice expiry (the
-                // order gate, capture refunds at settled_at >= expires_at), and for a renewal ALSO the
-                // CREDITED resumable boundary `B = max(paid_through, suspend_not_before) + retention_s`
-                // (the SAME boundary capture's renewal refund gate honors, §6.5, lnrent-7fp.22). Cap by
-                // the binding one, so a renewal paid in time but recovered late isn't stamped past the
-                // credited boundary and wrongly capped — capping at the RAW `paid_through + retention_s`
-                // would extend `paid_through` from a too-early `settled_at` for a credited sub.
-                let renewal_boundary = match (kind.as_str(), paid_through, retention_s) {
-                    ("renewal", Some(pt), Some(ret)) => {
-                        Some(pt.max(suspend_not_before.unwrap_or(pt)) + ret)
+                // A LIVE-observed settlement carries its TRUE time (`Some`): use it EXACTLY, so a late
+                // live payment is refunded by capture's g5p gate (settled_at >= expires_at) instead of
+                // being stamped just-in-window and wrongly provisioned (lnrent-zwk). A RECOVERY
+                // settlement (`None`: settled while the daemon was down, true time unknown) keeps the
+                // conservative in-window cap below — we must never over-credit or fabricate a refund.
+                let settled_at = match observed {
+                    Some(real) => real,
+                    None => {
+                        // Latest in-window settle time the recovered payment can carry: the invoice
+                        // expiry (the order gate, capture refunds at settled_at >= expires_at), and for
+                        // a renewal ALSO the CREDITED resumable boundary
+                        // `B = max(paid_through, suspend_not_before) + retention_s` (the SAME boundary
+                        // capture's renewal refund gate honors, §6.5, lnrent-7fp.22). Cap by the binding
+                        // one, so a renewal paid in time but recovered late isn't stamped past the
+                        // credited boundary and wrongly capped — capping at the RAW
+                        // `paid_through + retention_s` would extend `paid_through` from a too-early
+                        // `settled_at` for a credited sub.
+                        let renewal_boundary = match (kind.as_str(), paid_through, retention_s) {
+                            ("renewal", Some(pt), Some(ret)) => {
+                                Some(pt.max(suspend_not_before.unwrap_or(pt)) + ret)
+                            }
+                            _ => None,
+                        };
+                        recovered_settled_at(now, min_opt(expires_at, renewal_boundary))
                     }
-                    _ => None,
                 };
-                let settled_at = recovered_settled_at(now, min_opt(expires_at, renewal_boundary));
                 let settlement = Settlement {
                     invoice_id: inv_id,
                     external_id: external_id.clone(),
@@ -1074,12 +1086,13 @@ async fn settlement_catch_up(
     Ok(caught)
 }
 
-/// `PaymentBackend::lookup` tells us that an OPEN invoice is already paid but does not expose the
-/// backend's paid timestamp. On catch-up after the local invoice expiry, using `now` would fabricate
-/// a too-late settlement and refund a payment the backend had already marked paid while reconcile
-/// deliberately kept the invoice OPEN for capture. Use the latest in-window timestamp (the binding
-/// `cap`: the invoice expiry, and for a renewal also the effective credited retention boundary)
-/// instead; live settlements still carry their exact backend timestamp.
+/// When `PaymentBackend::lookup_settlement` reports an invoice paid WITHOUT a live timestamp
+/// (`None` — settled while the daemon was down, so the true time is unknown), catch-up cannot trust
+/// `now`: after the local invoice expiry, using `now` would fabricate a too-late settlement and
+/// refund a payment the backend had already marked paid while reconcile deliberately kept the invoice
+/// OPEN for capture. Use the latest in-window timestamp (the binding `cap`: the invoice expiry, and
+/// for a renewal also the effective credited retention boundary) instead. A LIVE-observed settlement
+/// (`Some`) bypasses this entirely and carries its exact backend timestamp (lnrent-zwk).
 fn recovered_settled_at(now: i64, cap: Option<i64>) -> i64 {
     match cap {
         Some(c) if now >= c => c.saturating_sub(1),
@@ -1283,7 +1296,7 @@ mod tests {
             })
             .await
             .unwrap();
-        mock.settle("renew:auto:s1:1000", 1234).unwrap(); // paid at backend (time ignored on recovery)
+        mock.settle_recovered("renew:auto:s1:1000").unwrap(); // RECOVERY: settled-while-down, no live ts
 
         let payment: Arc<dyn PaymentBackend> = mock.clone();
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1600));
@@ -1363,7 +1376,7 @@ mod tests {
             })
             .await
             .unwrap();
-        mock.settle("renew:auto:s1:1000", 1234).unwrap();
+        mock.settle_recovered("renew:auto:s1:1000").unwrap(); // RECOVERY: settled-while-down, no live ts
 
         let payment: Arc<dyn PaymentBackend> = mock.clone();
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1600));
@@ -1418,5 +1431,149 @@ mod tests {
             "the renewal consumed the just-installed downtime-credit floor"
         );
         assert_eq!(refunds, 0);
+    }
+
+    // lnrent-zwk regression: settlement catch-up must honor a LIVE settled_at. A late LIVE-paid order
+    // (true settled_at >= invoice expiry) must be REFUNDED by catch-up via capture's g5p gate — NOT
+    // provisioned via a fabricated capped timestamp. A RECOVERY-paid order (settled while down, no
+    // live ts) still uses the conservative in-window cap and PROVISIONS. Same store, same clock, same
+    // expiry — only the settlement PROVENANCE differs.
+    #[tokio::test]
+    async fn settlement_catch_up_refunds_late_live_order_but_caps_recovery() {
+        use crate::backends::MockPayment;
+        use crate::clock::TestClock;
+        use crate::store::migrate;
+        use rusqlite::{params, Connection};
+
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let store = Store::spawn(conn);
+
+        let mock = Arc::new(MockPayment::new());
+        mock.set_now(0); // both order invoices expire at 0 + 1000 = 1000
+        let live = mock
+            .create_invoice(1000, "lnrent order live", 1000, "order:live")
+            .await
+            .unwrap();
+        let rec = mock
+            .create_invoice(1000, "lnrent order rec", 1000, "order:rec")
+            .await
+            .unwrap();
+        let (live_inv, live_exp) = (live.id.clone(), live.expires_at);
+        let (rec_inv, rec_exp) = (rec.id.clone(), rec.expires_at);
+        assert_eq!(live_exp, 1000);
+        assert_eq!(rec_exp, 1000);
+
+        store
+            .transaction(move |tx| {
+                for (sub, inv_id, ext, exp) in [
+                    ("s_live", live_inv.as_str(), "order:live", live_exp),
+                    ("s_rec", rec_inv.as_str(), "order:rec", rec_exp),
+                ] {
+                    tx.execute(
+                        "INSERT INTO subscription
+                            (id, state, period_s, renew_lead_s, retention_s, next_deadline, created_at, updated_at)
+                         VALUES (?1,'PENDING',100,10,500,1000,0,0)",
+                        params![sub],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO invoice
+                            (id, subscription_id, external_id, kind, amount_sat, status, expires_at, issued_at)
+                         VALUES (?1,?2,?3,'order',1000,'OPEN',?4,0)",
+                        params![inv_id, sub, ext, exp],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // s_live: a LIVE settlement records the real ts (here AT the expiry boundary -> the g5p gate).
+        mock.settle("order:live", 1000).unwrap();
+        // s_rec: a RECOVERY settlement — paid at the backend, but the true time is unknown.
+        mock.settle_recovered("order:rec").unwrap();
+
+        // Catch-up runs well after the expiry. The recovered order is stamped expires_at-1 (=999) by the
+        // conservative cap and provisions; the live order must use its real ts (1000) and refund.
+        let payment: Arc<dyn PaymentBackend> = mock.clone();
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1500));
+        settlement_catch_up(&store, &payment, &clock).await.unwrap();
+
+        #[allow(clippy::type_complexity)]
+        let (live_state, live_refunds, live_settled, rec_state, rec_refunds, rec_settled): (
+            String,
+            i64,
+            i64,
+            String,
+            i64,
+            i64,
+        ) = store
+            .read(|c| {
+                let live_state = c.query_row(
+                    "SELECT state FROM subscription WHERE id='s_live'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let live_refunds: i64 = c.query_row(
+                    "SELECT count(*) FROM refund_attempt WHERE subscription_id='s_live'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let live_settled: i64 = c.query_row(
+                    "SELECT settled_at FROM invoice WHERE external_id='order:live'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let rec_state = c.query_row(
+                    "SELECT state FROM subscription WHERE id='s_rec'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let rec_refunds: i64 = c.query_row(
+                    "SELECT count(*) FROM refund_attempt WHERE subscription_id='s_rec'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let rec_settled: i64 = c.query_row(
+                    "SELECT settled_at FROM invoice WHERE external_id='order:rec'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok((
+                    live_state,
+                    live_refunds,
+                    live_settled,
+                    rec_state,
+                    rec_refunds,
+                    rec_settled,
+                ))
+            })
+            .await
+            .unwrap();
+
+        // LIVE late payment: stamped with the REAL ts (1000), refunded via g5p, NEVER provisioned.
+        assert_eq!(
+            live_settled, 1000,
+            "the late LIVE order keeps its real settled_at exactly, not a capped one"
+        );
+        assert_eq!(
+            live_state, "PENDING",
+            "a late LIVE order is refunded (state untouched), not moved toward provisioning"
+        );
+        assert_eq!(
+            live_refunds, 1,
+            "the late LIVE order has exactly one refund intent"
+        );
+
+        // RECOVERY payment: conservative in-window cap (999) -> provisioned, no refund.
+        assert_eq!(
+            rec_settled, 999,
+            "a recovered order is capped to expires_at-1 (true time unknown)"
+        );
+        assert_eq!(
+            rec_state, "PROVISIONING",
+            "a recovered order keeps the conservative cap and provisions"
+        );
+        assert_eq!(rec_refunds, 0, "no refund for an in-window recovered order");
     }
 }

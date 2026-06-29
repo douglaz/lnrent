@@ -367,6 +367,21 @@ impl PaymentBackend for FedimintPayment {
         }
     }
 
+    async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
+        match idx_get_settlement_by_invoice_id(&self.index, id)? {
+            // `settled_at` is Some ONLY for a LIVE Claimed (`run_receive_task` live=true); a cached/
+            // recovery Claimed left it NULL -> None, so the supervisor catch-up caps conservatively.
+            Some((status, expires_at, settled_at)) => Ok(if status == "PAID" {
+                (PaymentStatus::Paid, settled_at)
+            } else if self.clock.now() >= expires_at {
+                (PaymentStatus::Expired, None)
+            } else {
+                (PaymentStatus::Open, None)
+            }),
+            None => Ok((PaymentStatus::Expired, None)), // unknown id -> gone (mirrors MockPayment)
+        }
+    }
+
     async fn pay(&self, dest: &str, amount_sat: u64, idempotency_key: &str) -> Result<String> {
         // Idempotent on the key: a SUCCEEDED key never re-pays; a PENDING key re-awaits the SAME
         // operation (a crash mid-pay resumes — fedimint persists the op); a FAILED key (the prior LN
@@ -673,6 +688,30 @@ fn idx_get_status_by_invoice_id(
             "SELECT status, expires_at FROM fedimint_invoice WHERE invoice_id = ?1",
             params![id],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Like [`idx_get_status_by_invoice_id`] but ALSO surfaces the stored `settled_at` (NULL for OPEN or
+/// for a cached/recovery Claimed; `Some(ts)` only for a LIVE Claimed) — the provenance the supervisor
+/// catch-up needs to use a live time exactly vs. cap a recovery (lnrent-zwk).
+fn idx_get_settlement_by_invoice_id(
+    index: &Mutex<Connection>,
+    id: &str,
+) -> Result<Option<(String, i64, Option<i64>)>> {
+    let conn = index.lock().unwrap();
+    let row = conn
+        .query_row(
+            "SELECT status, expires_at, settled_at FROM fedimint_invoice WHERE invoice_id = ?1",
+            params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
         )
         .optional()?;
     Ok(row)

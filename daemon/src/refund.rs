@@ -1023,6 +1023,9 @@ mod tests {
         async fn lookup(&self, _: &str) -> Result<PaymentStatus> {
             unimplemented!("refunder never looks up invoices")
         }
+        async fn lookup_settlement(&self, _: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            unimplemented!("refunder never looks up invoices")
+        }
         async fn payment_status(&self, _: &str) -> Result<PayStatus> {
             unimplemented!("refunder checks by key, not id")
         }
