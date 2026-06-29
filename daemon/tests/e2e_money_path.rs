@@ -1713,6 +1713,19 @@ async fn boot_records_an_already_paid_refund_without_double_pay() {
             .await
             .unwrap();
     }
+    // INV-3 provenance: the PAID order invoice this refund derives from (capture/provision write a
+    // refund row only strictly downstream of a received payment; the seeded amount 100 matches).
+    seed_invoice(
+        &store,
+        &format!("inv-{ext}"),
+        &sub_id,
+        &ext,
+        "order",
+        "PAID",
+        None,
+        Some(START),
+    )
+    .await;
     // The backend already paid this key before the crash (the fast-skip path must NOT pay again).
     let pre_pay_id = payment
         .pay("lnaddr@buyer", 100, &idem_key)

@@ -14,3 +14,4 @@
 .beads/*.db
 .beads/*.db-wal
 .beads/*.db-shm
+.rb-lite/

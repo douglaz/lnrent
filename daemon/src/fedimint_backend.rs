@@ -333,6 +333,143 @@ impl FedimintPayment {
         pay_idx_upsert(&self.index, key, "(preflight-failed)", "FAILED", "ln")?;
         anyhow::bail!(msg)
     }
+
+    /// The shared refund-pay engine behind [`PaymentBackend::pay`] and
+    /// [`PaymentBackend::pay_refund_capped`]. Idempotent on the key (SUCCEEDED never re-pays; PENDING
+    /// re-awaits the SAME operation; FAILED/absent starts fresh). When `gross_cap` is `Some(received)`
+    /// it enforces the final INV-1 cap against the SAME gateway object used to start the payment, so a
+    /// NEW outbound op whose payout + advertised fee exceeds the received gross is refused before any
+    /// money moves (spec §3.1). `None` (the plain `pay`) skips the cap.
+    async fn pay_inner(
+        &self,
+        dest: &str,
+        amount_sat: u64,
+        idempotency_key: &str,
+        gross_cap: Option<u64>,
+    ) -> Result<String> {
+        // Idempotent on the key: a SUCCEEDED key never re-pays; a PENDING key re-awaits the SAME
+        // operation (a crash mid-pay resumes — fedimint persists the op); a FAILED key (the prior LN
+        // attempt was refunded back to us, so no funds left) or an absent key initiates a fresh
+        // attempt. fedimint additionally dedups per invoice payment-hash internally.
+        if let Some((op_hex, status, kind)) = pay_idx_get(&self.index, idempotency_key)? {
+            match status.as_str() {
+                "SUCCEEDED" => return Ok(op_hex),
+                "PENDING" => {
+                    let op = OperationId::from_str(&op_hex)
+                        .map_err(|e| anyhow!("invalid stored pay operation id: {e}"))?;
+                    let pt = if kind == "internal" {
+                        PayType::Internal(op)
+                    } else {
+                        PayType::Lightning(op)
+                    };
+                    return self.await_pay_bounded(pt, idempotency_key).await;
+                }
+                _ => {} // FAILED -> re-attempt below (the prior payment refunded; not a double-pay)
+            }
+        }
+
+        // Structural preflight failures (bad bolt11, no amount, amount mismatch) happen before any
+        // operation exists. Park them as a FAILED key row so payment_status_by_key reports Failed and
+        // the Refunder parks the refund for an operator rather than retrying a bad dest forever
+        // (codex P2). .4c is bolt11-only; the LNURL/BOLT12 resolver is a separate bead.
+        let invoice = match Bolt11Invoice::from_str(dest) {
+            Ok(i) => i,
+            Err(e) => {
+                return self
+                    .fail_pay_preflight(idempotency_key, format!("refund bolt11 parse error: {e}"))
+                    .await
+            }
+        };
+        let inv_msat = match invoice.amount_milli_satoshis() {
+            Some(a) => a,
+            None => {
+                return self
+                    .fail_pay_preflight(idempotency_key, "refund bolt11 has no amount".to_string())
+                    .await
+            }
+        };
+        // Checked msat conversion (spec §3.1 overflow discipline): an auto-pay amount whose msat form
+        // would overflow u64 is parked for manual handling, never saturated/wrapped.
+        let pay_msat = match amount_sat.checked_mul(1000) {
+            Some(m) => m,
+            None => {
+                return self
+                    .fail_pay_preflight(
+                        idempotency_key,
+                        format!("refund amount {amount_sat} sat overflows u64 msats"),
+                    )
+                    .await
+            }
+        };
+        if inv_msat != pay_msat {
+            return self
+                .fail_pay_preflight(
+                    idempotency_key,
+                    format!("refund bolt11 amount {inv_msat} msat != owed {pay_msat} msat"),
+                )
+                .await;
+        }
+
+        let ln = self
+            .client
+            .get_first_module::<LightningClientModule>()
+            .context("fedimint: no lightning module")?;
+        let gateway = ln
+            .get_gateway(self.gateway, false)
+            .await
+            .context("selecting the configured lightning gateway for the refund")?
+            .context("the configured (or any) lightning gateway is unavailable")?;
+        // Final INV-1 cap preflight (spec §3.1): quoting and paying are separate awaits, so re-check
+        // the cap here against the SAME gateway object we pass into pay_bolt11_invoice — refuse to
+        // START a new outbound op whose payout + advertised fee would exceed the received gross. The
+        // fee MUST be Fedimint's ACTUAL fee ([`gateway_fee_msat`], mirroring RoutingFees::to_amount),
+        // not the naive floor(x*ppm/1e6) — see that helper. All msat arithmetic is widened to u128.
+        if let Some(gross_sat) = gross_cap {
+            let fees = gateway.fees;
+            let pay_msat_u128 = u128::from(pay_msat);
+            let over_cap = match gateway_fee_msat(
+                u64::from(fees.base_msat),
+                u64::from(fees.proportional_millionths),
+                pay_msat_u128,
+            ) {
+                Some(fee_msat) => pay_msat_u128 + fee_msat > u128::from(gross_sat) * 1000,
+                None => true, // an unpayable (>100%) schedule: never start an over-gross op
+            };
+            if over_cap {
+                return self
+                    .fail_pay_preflight(
+                        idempotency_key,
+                        format!(
+                            "refund payout {amount_sat} sat + gateway fee exceeds the {gross_sat} sat \
+                             received (INV-1 cap)"
+                        ),
+                    )
+                    .await;
+            }
+        }
+        let outgoing = ln
+            .pay_bolt11_invoice(
+                Some(gateway),
+                invoice,
+                json!({ "lnrent_idempotency_key": idempotency_key }),
+            )
+            .await
+            .context("initiating refund payment")?;
+
+        let kind = if matches!(outgoing.payment_type, PayType::Internal(_)) {
+            "internal"
+        } else {
+            "ln"
+        };
+        let op_hex = outgoing.payment_type.operation_id().fmt_full().to_string();
+        // Crash window: a crash between pay_bolt11_invoice committing and this upsert leaves no key
+        // row -> payment_status_by_key=Unknown. recover_pay_from_oplog (on open, symmetric to
+        // recover_index_from_oplog) backfills the row from the oplog extra_meta so the next pay(key)
+        // re-awaits the OP directly rather than re-parsing the maybe-expired bolt11 (lnrent-4gt).
+        pay_idx_upsert(&self.index, idempotency_key, &op_hex, "PENDING", kind)?;
+        self.await_pay_bounded(outgoing.payment_type, idempotency_key)
+            .await
+    }
 }
 
 #[async_trait]
@@ -440,89 +577,45 @@ impl PaymentBackend for FedimintPayment {
     }
 
     async fn pay(&self, dest: &str, amount_sat: u64, idempotency_key: &str) -> Result<String> {
-        // Idempotent on the key: a SUCCEEDED key never re-pays; a PENDING key re-awaits the SAME
-        // operation (a crash mid-pay resumes — fedimint persists the op); a FAILED key (the prior LN
-        // attempt was refunded back to us, so no funds left) or an absent key initiates a fresh
-        // attempt. fedimint additionally dedups per invoice payment-hash internally.
-        if let Some((op_hex, status, kind)) = pay_idx_get(&self.index, idempotency_key)? {
-            match status.as_str() {
-                "SUCCEEDED" => return Ok(op_hex),
-                "PENDING" => {
-                    let op = OperationId::from_str(&op_hex)
-                        .map_err(|e| anyhow!("invalid stored pay operation id: {e}"))?;
-                    let pt = if kind == "internal" {
-                        PayType::Internal(op)
-                    } else {
-                        PayType::Lightning(op)
-                    };
-                    return self.await_pay_bounded(pt, idempotency_key).await;
-                }
-                _ => {} // FAILED -> re-attempt below (the prior payment refunded; not a double-pay)
-            }
-        }
+        // No gross context here (legacy/internal callers): pay the requested amount with the standard
+        // key idempotency and NO INV-1 cap. The Refunder uses pay_refund_capped when it knows the
+        // gross, so the cap is enforced on the money path (spec §3.1).
+        self.pay_inner(dest, amount_sat, idempotency_key, None)
+            .await
+    }
 
-        // Structural preflight failures (bad bolt11, no amount, amount mismatch) happen before any
-        // operation exists. Park them as a FAILED key row so payment_status_by_key reports Failed and
-        // the Refunder parks the refund for an operator rather than retrying a bad dest forever
-        // (codex P2). .4c is bolt11-only; the LNURL/BOLT12 resolver is a separate bead.
-        let invoice = match Bolt11Invoice::from_str(dest) {
-            Ok(i) => i,
-            Err(e) => {
-                return self
-                    .fail_pay_preflight(idempotency_key, format!("refund bolt11 parse error: {e}"))
-                    .await
-            }
-        };
-        let inv_msat = match invoice.amount_milli_satoshis() {
-            Some(a) => a,
-            None => {
-                return self
-                    .fail_pay_preflight(idempotency_key, "refund bolt11 has no amount".to_string())
-                    .await
-            }
-        };
-        if inv_msat != amount_sat.saturating_mul(1000) {
-            return self
-                .fail_pay_preflight(
-                    idempotency_key,
-                    format!(
-                        "refund bolt11 amount {inv_msat} msat != owed {} msat",
-                        amount_sat.saturating_mul(1000)
-                    ),
-                )
-                .await;
-        }
-
+    /// INV-1 fee-bearing quote (spec §3.1): the largest whole-sat payout for `gross_sat` whose payout
+    /// plus the configured gateway's advertised fee fits inside `gross_sat`. Read-only — never mints,
+    /// pays, or mutates.
+    async fn refund_net_sat(&self, gross_sat: u64) -> Result<u64> {
         let ln = self
             .client
             .get_first_module::<LightningClientModule>()
             .context("fedimint: no lightning module")?;
+        // The SAME configured gateway the refund pay will use — its advertised fee schedule is the
+        // operator's exposure. A gateway that cannot be read is a TRANSIENT quote failure (Err), never
+        // dust/Ok(0), so the Refunder leaves the row PENDING instead of parking it (spec §3.1).
         let gateway = ln
             .get_gateway(self.gateway, false)
             .await
-            .context("selecting the configured lightning gateway for the refund")?
+            .context("selecting the configured lightning gateway for the refund fee quote")?
             .context("the configured (or any) lightning gateway is unavailable")?;
-        let outgoing = ln
-            .pay_bolt11_invoice(
-                Some(gateway),
-                invoice,
-                json!({ "lnrent_idempotency_key": idempotency_key }),
-            )
-            .await
-            .context("initiating refund payment")?;
+        let fees = gateway.fees;
+        Ok(net_payout_sat(
+            u64::from(fees.base_msat),
+            u64::from(fees.proportional_millionths),
+            gross_sat,
+        ))
+    }
 
-        let kind = if matches!(outgoing.payment_type, PayType::Internal(_)) {
-            "internal"
-        } else {
-            "ln"
-        };
-        let op_hex = outgoing.payment_type.operation_id().fmt_full().to_string();
-        // Crash window: a crash between pay_bolt11_invoice committing and this upsert leaves no key
-        // row -> payment_status_by_key=Unknown. recover_pay_from_oplog (on open, symmetric to
-        // recover_index_from_oplog) backfills the row from the oplog extra_meta so the next pay(key)
-        // re-awaits the OP directly rather than re-parsing the maybe-expired bolt11 (lnrent-4gt).
-        pay_idx_upsert(&self.index, idempotency_key, &op_hex, "PENDING", kind)?;
-        self.await_pay_bounded(outgoing.payment_type, idempotency_key)
+    async fn pay_refund_capped(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        gross_sat: u64,
+        idempotency_key: &str,
+    ) -> Result<String> {
+        self.pay_inner(bolt11, amount_sat, idempotency_key, Some(gross_sat))
             .await
     }
 
@@ -966,5 +1059,233 @@ fn map_pay_status(s: Option<String>) -> PayStatus {
         Some("FAILED") => PayStatus::Failed,
         Some("PENDING") => PayStatus::Pending,
         _ => PayStatus::Unknown,
+    }
+}
+
+/// The gateway's advertised fee in MSATS for an outgoing payment of `pay_msat`, computed EXACTLY as
+/// Fedimint applies it when funding the outgoing contract — `RoutingFees::to_amount`
+/// (fedimint-ln-common `config.rs`), used at `LightningClientModule::pay_bolt11_invoice` as
+/// `contract_amount = invoice_amount + to_amount(invoice_amount)` (fedimint-ln-client `lib.rs`). The
+/// formula is `base_msat + (ppm>0 ? payment_msat / (1_000_000 / ppm) : 0)`, with INTEGER division on
+/// BOTH steps. This MUST be mirrored byte-for-byte rather than the algebraically tempting
+/// `payment*ppm/1_000_000`: when `ppm` does not divide `1_000_000` the truncated divisor makes the
+/// REAL fee strictly larger, so the naive form would under-quote the cap and let a refund spend more
+/// than the gross received — an INV-1 drain (review P1). Returns `None` when the schedule is unpayable:
+/// `ppm > 1_000_000` (a >100% proportional fee) divides to a zero `fee_percent`, which Fedimint itself
+/// would hit as `payment.msats / 0`; the caller treats it as "no positive payout fits", never zero fee.
+fn gateway_fee_msat(base_msat: u64, ppm: u64, pay_msat: u128) -> Option<u128> {
+    let base = u128::from(base_msat);
+    if ppm == 0 {
+        return Some(base); // no proportional component
+    }
+    let fee_percent = 1_000_000u128 / u128::from(ppm);
+    if fee_percent == 0 {
+        return None; // ppm > 1_000_000: Fedimint's `payment.msats / 0` — unpayable
+    }
+    Some(base + pay_msat / fee_percent)
+}
+
+/// The largest whole-sat refund payout `n` for a `gross_sat` received amount such that the total
+/// outlay — payout plus the gateway's advertised fee on that payout — never exceeds `gross_sat`
+/// (INV-1, spec §3.1). The fee is Fedimint's ACTUAL fee ([`gateway_fee_msat`]); by contract `n == 0`
+/// is NO payment, hence zero payout AND zero fee, so `valid(0)` is always true and the result is
+/// well-defined even when `base_msat > gross_sat*1000` (the empty-set case a naive predicate would
+/// produce). Returns `0` only for true dust (no positive whole-sat payout fits), including any
+/// unpayable >100% schedule. All msat/fee arithmetic is widened to `u128` so `pay_msat = n*1000`
+/// cannot overflow; the result is a binary search of the monotone `valid` predicate — NOT the
+/// closed-form msat inverse, which under-floors (e.g. base=0, ppm=1, gross=1 is payable at 1 sat, but
+/// the closed form yields 0 sats).
+fn net_payout_sat(base_msat: u64, ppm: u64, gross_sat: u64) -> u64 {
+    let r_msat = u128::from(gross_sat) * 1000;
+    // valid(n): pay_msat(n) + fee_msat(n) <= R_msat, all widened. valid(0) is unconditionally true.
+    let valid = |n: u64| -> bool {
+        if n == 0 {
+            return true;
+        }
+        let pay_msat = u128::from(n) * 1000;
+        match gateway_fee_msat(base_msat, ppm, pay_msat) {
+            Some(fee_msat) => pay_msat + fee_msat <= r_msat,
+            None => false, // unpayable fee schedule -> no positive payout fits
+        }
+    };
+    // Largest n in [0, gross_sat] satisfying the monotone-decreasing predicate; lo is always valid.
+    let mut lo = 0u64;
+    let mut hi = gross_sat;
+    while lo < hi {
+        // Upper mid (lo < mid <= hi): guarantees progress when valid(mid) sets lo=mid, and avoids the
+        // `hi - lo + 1` overflow when gross_sat == u64::MAX.
+        let mid = hi - (hi - lo) / 2;
+        if valid(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+#[cfg(test)]
+mod net_payout_tests {
+    //! INV-1 fee-deduction unit tests (spec §5). The whole module is `#[cfg(feature = "fedimint")]`
+    //! (see lib.rs), so these run under `cargo test -p lnrentd --features fedimint`. `net_payout_sat`
+    //! is pure (no gateway / federation), so it needs no live federation.
+    use super::net_payout_sat;
+
+    /// The gateway fee on a payout of `n` whole sats, in msats — an INDEPENDENT restatement of
+    /// Fedimint's `RoutingFees::to_amount` (NOT a call into the production helper), so the property
+    /// assertions cross-check `net_payout_sat` against the real fee rule: `base + payment/(1e6/ppm)`
+    /// with integer division on both steps (`n == 0` is no payment, hence no fee). A `ppm > 1_000_000`
+    /// schedule divides to a zero `fee_percent` (Fedimint would divide-by-zero); model it as an
+    /// unpayable `u128::MAX` fee so no positive payout is ever valid.
+    fn fee_msat(base_msat: u64, ppm: u64, n_sat: u64) -> u128 {
+        if n_sat == 0 {
+            return 0;
+        }
+        let pay_msat = u128::from(n_sat) * 1000;
+        let base = u128::from(base_msat);
+        if ppm == 0 {
+            return base;
+        }
+        let fee_percent = 1_000_000u128 / u128::from(ppm);
+        if fee_percent == 0 {
+            return u128::MAX; // unpayable >100% schedule
+        }
+        base + pay_msat / fee_percent
+    }
+
+    /// Total outlay (payout + fee) in msats for a payout of `n` whole sats. `saturating_add` so the
+    /// `u128::MAX` unpayable-fee sentinel can't overflow the sum (it stays > any real `r_msat`).
+    fn outlay_msat(base_msat: u64, ppm: u64, n_sat: u64) -> u128 {
+        (u128::from(n_sat) * 1000).saturating_add(fee_msat(base_msat, ppm, n_sat))
+    }
+
+    /// The two INV-1 invariants for every `(base, ppm, gross)`: the chosen net fits the gross, and
+    /// `net + 1` does NOT — unless `net == gross` already (the no-fee ceiling).
+    fn assert_maximal(base_msat: u64, ppm: u64, gross_sat: u64) {
+        let net = net_payout_sat(base_msat, ppm, gross_sat);
+        let r_msat = u128::from(gross_sat) * 1000;
+        assert!(net <= gross_sat, "net {net} exceeds gross {gross_sat}");
+        assert!(
+            outlay_msat(base_msat, ppm, net) <= r_msat,
+            "net {net} outlay exceeds gross {gross_sat} (base={base_msat}, ppm={ppm})"
+        );
+        if net < gross_sat {
+            assert!(
+                outlay_msat(base_msat, ppm, net + 1) > r_msat,
+                "net+1 ({}) should violate the cap (base={base_msat}, ppm={ppm}, gross={gross_sat})",
+                net + 1
+            );
+        }
+    }
+
+    // {base=0, ppm=0}: net == gross for every gross (the MockPayment-equivalent default path).
+    #[test]
+    fn no_fee_pays_full_gross() {
+        for gross in [0u64, 1, 2, 1000, 2_100_000_000_000_000] {
+            assert_eq!(net_payout_sat(0, 0, gross), gross);
+            assert_maximal(0, 0, gross);
+        }
+    }
+
+    // {base>0, ppm=0}: a flat base fee reserved off the top; sub-sat remainders are absorbed.
+    #[test]
+    fn flat_base_fee_only() {
+        // gross = 1000 sat = 1_000_000 msat; base = 1500 msat. valid(999)=999000+1500>1e6 (no),
+        // valid(998)=998000+1500<=1e6 (yes) -> net 998.
+        assert_eq!(net_payout_sat(1500, 0, 1000), 998);
+        assert_maximal(1500, 0, 1000);
+        // base = exactly 1 sat (1000 msat) -> net = gross - 1.
+        assert_eq!(net_payout_sat(1000, 0, 1000), 999);
+        assert_maximal(1000, 0, 1000);
+    }
+
+    // {base=0, ppm>0}.
+    #[test]
+    fn proportional_fee_only() {
+        assert_maximal(0, 1000, 1_000_000); // 0.1%
+        assert_maximal(0, 5000, 50_000);
+        assert_maximal(0, 1, 1); // the rounding-regression boundary
+    }
+
+    // {base>0, ppm>0}.
+    #[test]
+    fn base_and_proportional() {
+        for &(base, ppm, gross) in &[
+            (1000u64, 1000u64, 1_000_000u64),
+            (2000, 500, 100_000),
+            (1, 1, 1),
+            (1, 1, 2),
+            (1234, 5678, 9_999_999),
+        ] {
+            assert_maximal(base, ppm, gross);
+        }
+    }
+
+    // u32-max base/ppm. A huge flat base dwarfs a small gross (dust). A `ppm > 1_000_000` schedule is
+    // a >100% proportional fee: Fedimint's to_amount divides `1_000_000/ppm` to 0, so the fee is
+    // effectively unbounded and NO positive payout fits, at ANY gross (not just a small one). A large
+    // flat base still leaves most of a large gross payable.
+    #[test]
+    fn u32_max_base_and_ppm() {
+        let max = u64::from(u32::MAX);
+        assert_eq!(net_payout_sat(max, 0, 1000), 0, "huge flat base -> dust");
+        assert_maximal(max, 0, 1000);
+        assert_eq!(net_payout_sat(0, max, 1000), 0, "ppm > 1e6 -> unpayable");
+        assert_eq!(
+            net_payout_sat(0, max, 2_100_000_000_000_000),
+            0,
+            "ppm > 1e6 is unpayable even at a large gross (unbounded fee, not just small-gross dust)"
+        );
+        assert_maximal(0, max, 1000);
+        assert_maximal(0, max, 2_100_000_000_000_000);
+        // A large flat base still leaves most of a large gross payable.
+        assert!(net_payout_sat(max, 0, 2_100_000_000_000_000) > 0);
+        assert_maximal(max, 0, 2_100_000_000_000_000);
+    }
+
+    // Large `gross_sat` where the widened intermediates (`pay_msat = n*1000` and `r_msat = gross*1000`)
+    // overflow a u64 (~1.8e19): u128 widening keeps `valid(n)` exact. ppm <= 1_000_000 so a real
+    // nonzero payout is chosen — that is what actually drives the large `pay_msat / fee_percent`
+    // division (the corrected to_amount form divides, so the overflow risk moved off the ppm product).
+    #[test]
+    fn large_gross_overflows_u64_intermediates() {
+        assert_maximal(0, 1000, 10_000_000_000_000_000); // 1e16 sat, 0.1%
+        assert_maximal(1000, 1000, u64::MAX); // r_msat = u64::MAX*1000 overflows u64
+        assert_maximal(u64::from(u32::MAX), 1_000_000, u64::MAX); // 100% proportional + max flat base
+    }
+
+    // Exact dust classification by the whole-sat predicate (spec §3.1 dust boundary examples).
+    #[test]
+    fn dust_boundaries() {
+        // base=999 msat, ppm=0, gross=1 sat: 1 sat + 999 msat > 1 sat received -> dust.
+        assert_eq!(net_payout_sat(999, 0, 1), 0);
+        // base=2000 msat, ppm=0, gross=1 sat: base alone exceeds R_msat -> only n==0 fits -> dust.
+        assert_eq!(net_payout_sat(2000, 0, 1), 0);
+        // gross=0 is always dust regardless of the schedule.
+        assert_eq!(net_payout_sat(0, 0, 0), 0);
+        assert_eq!(net_payout_sat(500, 100, 0), 0);
+    }
+
+    // Regression: base=0, ppm=1, gross=1 sat returns 1 (fee(1 sat) = floor(1000/1e6) = 0, so 1 sat is
+    // payable). The closed-form msat-inverse `floor(max(0,R-base)*1e6/(1e6+ppm)/1000)` floors to 0
+    // here — proving the exact whole-sat binary search is used as the final value, not the closed form.
+    #[test]
+    fn rounding_regression_closed_form_not_used() {
+        assert_eq!(net_payout_sat(0, 1, 1), 1);
+        assert_maximal(0, 1, 1);
+    }
+
+    // P1 regression: a ppm that does NOT divide 1_000_000 charges MORE than the naive
+    // floor(x*ppm/1e6). Fedimint's to_amount uses fee_percent = 1_000_000/ppm (integer), so for
+    // ppm=600_000 fee_percent=1 and the proportional fee is the WHOLE payment again (100%), not 60%.
+    // net must therefore cap at 500 (outlay 2*500 = 1000 sat == the 1000-sat gross), NOT the 625 a
+    // naive 60% model would allow — paying 625 would debit 625 + 625 = 1250 sat against a 1000-sat
+    // gross, an INV-1 drain. This is the exact defect review P1 found.
+    #[test]
+    fn nondividing_ppm_uses_actual_fee_not_naive_product() {
+        assert_eq!(net_payout_sat(0, 600_000, 1000), 500);
+        assert_maximal(0, 600_000, 1000);
+        // The naive model's answer (625) over-drains under the ACTUAL fee schedule.
+        assert!(outlay_msat(0, 600_000, 625) > u128::from(1000u64) * 1000);
     }
 }

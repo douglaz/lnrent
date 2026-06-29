@@ -23,11 +23,13 @@
 //! DM is ENQUEUED as a `PENDING` outbox row under a STABLE id (the OutboxSender, lnrent-7fp.10,
 //! publishes it); a re-drive never double-enqueues.
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use rusqlite::{params, Transaction};
+use lightning_invoice::Bolt11Invoice;
+use rusqlite::{params, OptionalExtension, Transaction};
 
 use lnrent_wire::{BillingRefund, Msg};
 
@@ -118,10 +120,18 @@ enum Outcome {
 /// What [`Refunder::plan_payment`] decided to do this drive (before any `pay`).
 enum PlanOutcome {
     /// Pay `bolt11` with the generation-bound key from [`gen_key`] (gen 0 = the bare
-    /// `refund:<external_id>`; gen>=1 = `refund:<external_id>:g<gen>`).
-    Pay { bolt11: String, gen: i64 },
-    /// The CURRENT generation already settled — record SENT without paying.
-    AlreadySent,
+    /// `refund:<external_id>`; gen>=1 = `refund:<external_id>:g<gen>`). `pay_sat` is the exact
+    /// fee-adjusted payout (INV-1): `net_cap` for a freshly resolved invoice, or the persisted/direct
+    /// invoice's own whole-sat amount on a re-await or bolt11 pass-through. It is NOT the gross.
+    Pay {
+        bolt11: String,
+        gen: i64,
+        pay_sat: u64,
+    },
+    /// The CURRENT generation already settled — record SENT without paying. `pay_sat` is the amount
+    /// that generation actually paid (the persisted/direct invoice's own whole-sat figure), so the
+    /// "sent" DM reports the NET delivered, never the gross (review P2).
+    AlreadySent { pay_sat: u64 },
     /// The row is no longer `PENDING` (a concurrent terminalizer won the status CAS as we resolved),
     /// so the resolution persist matched 0 rows. Do NOT pay: paying an UNPERSISTED invoice would
     /// reintroduce the double-pay window the generation-bound model exists to close. Drop to a Noop
@@ -143,6 +153,15 @@ impl From<ResolveError> for PlanError {
             ResolveError::Transient(m) => PlanError::Transient(m),
         }
     }
+}
+
+/// The result of the INV-3 provenance check (spec §3.3). `Ok(received)` carries the gross sats the
+/// order actually received (positive, and equal to `refund_attempt.amount_sat`). `Forbidden(reason)`
+/// means there is no matching received payment — or the received amount is missing/non-positive, or it
+/// mismatches the refund row — so the refund MUST park FAILED and never pay.
+enum ProvenanceCheck {
+    Ok(u64),
+    Forbidden(String),
 }
 
 /// The generation-bound idempotency key handed to `pay()` / `payment_status_by_key()`. The
@@ -220,16 +239,35 @@ impl Refunder {
     /// CURRENT-gen Failed+expired invoice is ever re-resolved.
     async fn process(&self, row: RefundRow) -> Result<Outcome> {
         let now = self.clock.now();
-        // NULL amount is tolerated (provision records NULL when the order invoice had no amount):
-        // refund 0 rather than panic. A negative figure is clamped for the same reason.
-        let amount = row.amount_sat.unwrap_or(0).max(0) as u64;
         let external_id = external_id_of(&row);
+
+        // INV-3 PROVENANCE GUARD FIRST (spec §3.3): a refund MUST correspond to a payment actually
+        // received for this order, and the stored gross MUST match that received amount. No provenance,
+        // a missing/non-positive received amount, or a row-vs-provenance mismatch parks FAILED at ERROR
+        // — never pay, never clamp to 0. Both production writers (capture::refund_intent,
+        // provision::RefundDueWrite) are downstream of received-payment handling; this execution-time
+        // guard is the enforcement, not their position in the pipeline.
+        //
+        // Running this BEFORE the already-paid fast-skip below is deliberate and spec-mandated
+        // (provenance-FIRST): a refund that somehow PAID without provenance is a serious invariant
+        // violation that must park + alert the operator, not silently record SENT. That state is
+        // unreachable in production — both writers create provenance upstream of (or in the same txn
+        // as) the received payment — so a genuinely-paid refund always HAS provenance and is never
+        // wrongly flipped to FAILED (review P3).
+        let received = match self.verify_refund_provenance(&row, &external_id).await? {
+            ProvenanceCheck::Ok(received) => received,
+            ProvenanceCheck::Forbidden(reason) => {
+                // The stored figure is the refund's recorded gross (0 when NULL/negative) — used only
+                // for the failed DM; the refund parks without paying.
+                let stored = row.amount_sat.unwrap_or(0).max(0) as u64;
+                return self.commit_park_failed(&row, stored, now, &reason).await;
+            }
+        };
 
         // A MISSING destination can never be paid: park FAILED immediately (no pay, no retry cap).
         let Some(dest) = row.dest.as_deref().map(str::trim).filter(|d| !d.is_empty()) else {
-            tracing::error!(refund = %row.id, "refund has no destination; parking FAILED");
             return self
-                .commit_structural_failure(&row, amount, now, "no destination")
+                .commit_park_failed(&row, received, now, "no destination")
                 .await;
         };
 
@@ -250,56 +288,72 @@ impl Refunder {
         // yet at all — Fedimint is o6p-gated/unwired and MockPayment moves no money. Do NOT assume
         // LN-address legacy upgrades are deduped if that ever changes.
 
-        // Decide the bolt11 + generation to pay (resolving + persisting if needed), BEFORE pay().
-        let (bolt11, gen) = match self
-            .plan_payment(&row, &external_id, dest, amount, now)
+        // Decide the bolt11 + generation + fee-adjusted pay amount (resolving/quoting + persisting if
+        // needed), BEFORE pay(). `received` is the GROSS liability; `pay_sat` is the INV-1 payout.
+        let (bolt11, gen, pay_sat) = match self
+            .plan_payment(&row, &external_id, dest, received, now)
             .await
         {
-            Ok(PlanOutcome::Pay { bolt11, gen }) => (bolt11, gen),
-            Ok(PlanOutcome::AlreadySent) => return self.finish_sent(&row, None, amount, now).await,
+            Ok(PlanOutcome::Pay {
+                bolt11,
+                gen,
+                pay_sat,
+            }) => (bolt11, gen, pay_sat),
+            Ok(PlanOutcome::AlreadySent { pay_sat }) => {
+                return self.finish_sent(&row, None, pay_sat, now).await
+            }
             // The row was terminalized between resolve and the resolution persist (0 rows updated):
             // never pay an unpersisted invoice. A no-op this drive (review P3).
             Ok(PlanOutcome::Skip) => return Ok(Outcome::Noop),
-            // STRUCTURAL: BOLT12 / malformed / amount-or-hash mismatch / HTTPS/SSRF violation — can
-            // never settle, so park FAILED immediately (mirrors the missing-dest path), NOT the
-            // capped pay-Failed path.
+            // STRUCTURAL: BOLT12 / malformed / amount-or-hash mismatch / HTTPS/SSRF violation, a fixed
+            // bolt11 above the fee-adjusted cap, or a true dust refund (net_cap==0) — none can be
+            // auto-paid without operator loss, so park FAILED immediately (mirrors the missing-dest
+            // path), NOT the capped pay-Failed path.
             Err(PlanError::Structural(reason)) => {
-                tracing::warn!(refund = %row.id, %reason, "refund destination is unresolvable; parking FAILED");
-                return self
-                    .commit_structural_failure(&row, amount, now, &reason)
-                    .await;
+                tracing::warn!(refund = %row.id, %reason, "refund cannot be auto-paid; parking FAILED");
+                return self.commit_park_failed(&row, received, now, &reason).await;
             }
-            // TRANSIENT: DNS/TLS/timeout/5xx — leave PENDING (never terminal) and retry next drive.
-            // No `pay` was attempted, so this must NOT consume the pay-attempts cap (codex P2):
-            // resolution flakiness while the buyer is offline must not starve the real payment of its
-            // retry budget. Use the resolution-retry path (attempts UNCHANGED), not commit_pay_failure.
+            // TRANSIENT: DNS/TLS/timeout/5xx, or a gateway/quote outage — leave PENDING (never terminal)
+            // and retry next drive. No `pay` was attempted, so this must NOT consume the pay-attempts
+            // cap (codex P2): resolution/quote flakiness while the buyer is offline must not starve the
+            // real payment of its retry budget. Use the resolution-retry path (attempts UNCHANGED).
             Err(PlanError::Transient(reason)) => {
-                tracing::warn!(refund = %row.id, %reason, "refund resolution failed transiently; row stays PENDING");
+                tracing::warn!(refund = %row.id, %reason, "refund resolution/quote failed transiently; row stays PENDING");
                 return self.commit_resolution_retry(&row, now).await;
             }
         };
 
         let key = gen_key(&external_id, gen);
         // Fast-skip: this generation already settled (e.g. a crash after pay but before the SENT
-        // bookkeeping committed). Record SENT WITHOUT paying again. Only `Succeeded` skips.
+        // bookkeeping committed). Record SENT WITHOUT paying again. Only `Succeeded` skips. The DM
+        // reports the net `pay_sat` that went out, not the gross (review P2).
         if self.already_paid(&key).await {
-            return self.finish_sent(&row, None, amount, now).await;
+            return self.finish_sent(&row, None, pay_sat, now).await;
         }
 
-        match self.payment.pay(&bolt11, amount, &key).await {
+        // INV-1: pay the fee-adjusted `pay_sat` (<= net cap), bounded by `received` so the backend's
+        // final cap preflight refuses any over-gross outlay. `refund_attempt.amount_sat` stays the GROSS
+        // received amount (`received`); only the payout — and the buyer-facing "sent" DM (review P2) —
+        // is reduced by the gateway fee.
+        tracing::debug!(refund = %row.id, gross = received, net_pay = pay_sat, gen, "paying capped refund");
+        match self
+            .payment
+            .pay_refund_capped(&bolt11, pay_sat, received, &key)
+            .await
+        {
             Ok(backend_payment_id) => {
-                self.finish_sent(&row, Some(backend_payment_id), amount, now)
+                self.finish_sent(&row, Some(backend_payment_id), pay_sat, now)
                     .await
             }
             Err(e) => match self.status_by_key_after_error(&key).await {
-                PayStatus::Succeeded => self.finish_sent(&row, None, amount, now).await,
+                PayStatus::Succeeded => self.finish_sent(&row, None, pay_sat, now).await,
                 PayStatus::Failed => {
                     tracing::warn!(
                         refund = %row.id,
                         error = %e,
                         "refund pay failed definitively; row stays PENDING until retry cap"
                     );
-                    self.commit_pay_failure(&row, amount, now, true).await
+                    self.commit_pay_failure(&row, received, now, true).await
                 }
                 status @ (PayStatus::Pending | PayStatus::Unknown) => {
                     tracing::warn!(
@@ -308,7 +362,7 @@ impl Refunder {
                         ?status,
                         "refund pay failed ambiguously; row stays PENDING for recovery"
                     );
-                    self.commit_pay_failure(&row, amount, now, false).await
+                    self.commit_pay_failure(&row, received, now, false).await
                 }
             },
         }
@@ -333,21 +387,60 @@ impl Refunder {
         row: &RefundRow,
         external_id: &str,
         dest: &str,
-        amount: u64,
+        received: u64,
         now: i64,
     ) -> Result<PlanOutcome, PlanError> {
-        // bolt11 pass-through: pay it directly, generation stays 0 (no resolution).
+        // bolt11 pass-through (gen 0): the dest IS the payable invoice. The operator cannot rewrite a
+        // buyer's fixed amount, so pay the invoice's OWN whole-sat amount; the cap only gates whether a
+        // NEW payment may start (spec §3.1).
         if matches!(detect_form(dest)?, DestForm::Bolt11) {
-            return Ok(PlanOutcome::Pay {
-                bolt11: dest.to_string(),
-                gen: 0,
-            });
+            let bolt11_sat = parse_whole_sat(dest).map_err(PlanError::Structural)?;
+            let key = gen_key(external_id, 0);
+            // STATUS-FIRST: a started gen-0 op (Succeeded/Pending) is re-awaited with NO re-quote, so a
+            // gateway-down quote can never strand an in-flight/settled gen-0. Only a NEW gen-0 payment
+            // (absent -> Unknown, or a returned-funds Failed) quotes the cap.
+            let st = self
+                .payment
+                .payment_status_by_key(&key)
+                .await
+                .map_err(|e| {
+                    PlanError::Transient(format!("refund status lookup for {key} failed: {e}"))
+                })?;
+            return match st {
+                PayStatus::Succeeded => Ok(PlanOutcome::AlreadySent {
+                    pay_sat: bolt11_sat,
+                }),
+                PayStatus::Pending => Ok(PlanOutcome::Pay {
+                    bolt11: dest.to_string(),
+                    gen: 0,
+                    pay_sat: bolt11_sat,
+                }),
+                PayStatus::Unknown | PayStatus::Failed => {
+                    let net_cap = self.quote_net_cap(received).await?;
+                    if bolt11_sat > net_cap {
+                        return Err(PlanError::Structural(format!(
+                            "buyer's fixed bolt11 ({bolt11_sat} sat) exceeds the fee-adjusted refund cap ({net_cap} sat)"
+                        )));
+                    }
+                    Ok(PlanOutcome::Pay {
+                        bolt11: dest.to_string(),
+                        gen: 0,
+                        pay_sat: bolt11_sat,
+                    })
+                }
+            };
         }
 
-        let owed_msat = amount.saturating_mul(1000);
         match row.resolved_bolt11.as_deref() {
-            // Never resolved -> generation 1: resolve, PERSIST (committed), then pay g1.
+            // Never resolved -> generation 1, a NEW payment: quote the INV-1 cap, resolve a bolt11 for
+            // EXACTLY that net cap, PERSIST (committed), then pay g1 for the net amount.
             None => {
+                let net_cap = self.quote_net_cap(received).await?;
+                let owed_msat = net_cap.checked_mul(1000).ok_or_else(|| {
+                    PlanError::Structural(format!(
+                        "refund net amount {net_cap} sat overflows u64 msats"
+                    ))
+                })?;
                 let resolved = self.resolve_dest(dest, owed_msat, now).await?;
                 if !self.persist_resolution(&row.id, &resolved, 1, now).await? {
                     return Ok(PlanOutcome::Skip);
@@ -355,9 +448,12 @@ impl Refunder {
                 Ok(PlanOutcome::Pay {
                     bolt11: resolved.bolt11,
                     gen: 1,
+                    pay_sat: net_cap,
                 })
             }
-            // Already resolved -> branch on the CURRENT generation's status.
+            // Already resolved -> branch on the CURRENT generation's status. The quote is touched ONLY
+            // on the re-resolve (new-payment) arm, so neither a fee change nor a gateway outage can
+            // re-price or strand an existing generation (spec §3.1).
             Some(bolt11) => {
                 let gen = row.resolution_gen;
                 let key = gen_key(external_id, gen);
@@ -375,15 +471,19 @@ impl Refunder {
                     })?;
                 let expired = now >= row.resolved_expiry.unwrap_or(0);
                 match st {
-                    PayStatus::Succeeded => Ok(PlanOutcome::AlreadySent),
+                    // The persisted invoice's own whole-sat amount is what was paid; fall back to the
+                    // gross for a non-bolt11 pass-through dest (mock) that has no parseable amount.
+                    PayStatus::Succeeded => Ok(PlanOutcome::AlreadySent {
+                        pay_sat: parse_whole_sat(bolt11).unwrap_or(received),
+                    }),
                     // RE-RESOLVE — the ONLY case that mints a new payment_hash — fires only when the
                     // CURRENT generation can NEVER settle: a DEFINITE `Failed` that is ALSO past its
                     // persisted expiry. Failed means the prior HTLC terminally resolved (funds
                     // returned); expired means the invoice itself can no longer be paid. With no
-                    // outstanding payment, a fresh payment_hash cannot double up. Bump the gen, resolve
-                    // fresh, PERSIST (committed), then pay the new gen. (Were we to keep re-paying the
-                    // dead invoice it would never settle and the refund would strand PENDING until the
-                    // cap parks it FAILED — re-resolving recovers it instead, review P2.)
+                    // outstanding payment, a fresh payment_hash cannot double up. This is a NEW payment,
+                    // so it is also where a fresh INV-1 cap is quoted (a fee change between generations
+                    // is still bounded by the same `received` gross). Bump the gen, resolve fresh,
+                    // PERSIST (committed), then pay the new gen for the new net cap.
                     //
                     // `Unknown` is DELIBERATELY excluded here (review P1): per the
                     // [`crate::backends::PayStatus`] contract it is an in-flight payment that "can be
@@ -393,6 +493,12 @@ impl Refunder {
                     // can match against the still-live old one — a double refund. Unknown falls through
                     // to REUSE below, and only re-resolves once it has become a definite Failed.
                     PayStatus::Failed if expired => {
+                        let net_cap = self.quote_net_cap(received).await?;
+                        let owed_msat = net_cap.checked_mul(1000).ok_or_else(|| {
+                            PlanError::Structural(format!(
+                                "refund net amount {net_cap} sat overflows u64 msats"
+                            ))
+                        })?;
                         let next_gen = gen + 1;
                         let resolved = self.resolve_dest(dest, owed_msat, now).await?;
                         if !self
@@ -404,23 +510,128 @@ impl Refunder {
                         Ok(PlanOutcome::Pay {
                             bolt11: resolved.bolt11,
                             gen: next_gen,
+                            pay_sat: net_cap,
                         })
                     }
-                    // Everything else re-pays the SAME persisted invoice with the SAME gen (the
-                    // backend dedups on the stable payment_hash, so this never double-pays): a payment
-                    // still in flight (Pending); an in-flight/crash-window payment that can't be
-                    // confirmed (Unknown — REUSED whether expired or not, the P1 fix above); or a
-                    // returned-funds retry of an unexpired invoice (Failed, unexpired). We never
-                    // re-resolve while the persisted invoice could still settle.
+                    // Everything else RE-AWAITS the SAME persisted invoice with its PERSISTED pay amount
+                    // and the SAME gen (the backend dedups on the stable payment_hash, so this never
+                    // double-pays): a payment still in flight (Pending); an in-flight/crash-window
+                    // payment that can't be confirmed (Unknown — REUSED whether expired or not, the P1
+                    // fix above); or a returned-funds retry of an unexpired invoice (Failed, unexpired).
+                    // The pay amount is the persisted invoice's own whole-sat figure (NO re-quote). A
+                    // production resolver always persists a real bolt11, so the parse recovers that
+                    // generation's net cap; a non-bolt11 pass-through dest (mock backend) falls back to
+                    // the gross, which the backend's final cap preflight still bounds — so it can never
+                    // overpay.
                     PayStatus::Pending | PayStatus::Unknown | PayStatus::Failed => {
+                        let pay_sat = parse_whole_sat(bolt11).unwrap_or(received);
                         Ok(PlanOutcome::Pay {
                             bolt11: bolt11.to_string(),
                             gen,
+                            pay_sat,
                         })
                     }
                 }
             }
         }
+    }
+
+    /// Quote the INV-1 net cap for a NEW refund payment (spec §3.1): the largest fee-adjusted whole-sat
+    /// payout for `received`. `Ok(0)` (true dust — no positive whole-sat payout plus fee fits inside the
+    /// gross) is a STRUCTURAL park (FAILED, never retried). An `Err` (gateway unreadable / quote
+    /// failure) is TRANSIENT (row stays PENDING, retried next drive) — NOT dust, so a gateway outage
+    /// never parks a real liability as if it were unrefundable.
+    async fn quote_net_cap(&self, received: u64) -> Result<u64, PlanError> {
+        match self.payment.refund_net_sat(received).await {
+            Ok(0) => Err(PlanError::Structural(
+                "received amount below the network fee; cannot auto-refund without operator loss"
+                    .to_string(),
+            )),
+            Ok(net) => Ok(net),
+            Err(e) => Err(PlanError::Transient(format!(
+                "refund fee quote failed: {e}"
+            ))),
+        }
+    }
+
+    /// INV-3 provenance guard (spec §3.3): a refund MUST correspond to a payment received for its
+    /// order. Valid provenance is either an `invoice` row for `external_id` showing received funds
+    /// (`status='PAID'` OR `settled_at IS NOT NULL` — a LATE settlement stamps `settled_at` on an
+    /// already-terminal/EXPIRED invoice without flipping it back to PAID), or a settle-refund
+    /// `event_log` entry for unmatched/orphan settlements that have no invoice row. The received amount
+    /// comes from that source and MUST equal the refund row's gross `amount_sat`; no provenance, a
+    /// missing/non-positive received amount, or a mismatch is `Forbidden` -> park FAILED.
+    ///
+    /// The exact `==` is safe across both creation sites today: provision's refund row and its
+    /// provenance amount are read from the SAME invoice row, and capture's matched-settlement row
+    /// amount equals the invoice amount because Lightning pays a bolt11 in full (settlement_amount ==
+    /// invoice_amount). A future partial/over-payment path would have to revisit this equality before a
+    /// legitimate refund could survive the guard (review P3).
+    async fn verify_refund_provenance(
+        &self,
+        row: &RefundRow,
+        external_id: &str,
+    ) -> Result<ProvenanceCheck> {
+        let received = match self.lookup_received_amount(external_id).await? {
+            Some(a) if a > 0 => a as u64,
+            Some(_) => {
+                return Ok(ProvenanceCheck::Forbidden(format!(
+                    "refund without matching received payment — forbidden: provenance for {external_id} has a non-positive received amount"
+                )))
+            }
+            None => {
+                return Ok(ProvenanceCheck::Forbidden(format!(
+                    "refund without matching received payment — forbidden: no received-payment provenance for {external_id}"
+                )))
+            }
+        };
+        match row.amount_sat {
+            Some(a) if a == received as i64 => Ok(ProvenanceCheck::Ok(received)),
+            Some(a) => Ok(ProvenanceCheck::Forbidden(format!(
+                "refund without matching received payment — forbidden: refund amount {a} != received {received} for {external_id}"
+            ))),
+            None => Ok(ProvenanceCheck::Forbidden(format!(
+                "refund without matching received payment — forbidden: refund row has no amount but {received} was received for {external_id}"
+            ))),
+        }
+    }
+
+    /// The received gross sats for `external_id` from provenance: the paid/settled invoice first, else a
+    /// settle-refund journal entry (unmatched/orphan settlements that have no invoice row). `None` when
+    /// no provenance exists OR the source carries no usable amount.
+    async fn lookup_received_amount(&self, external_id: &str) -> Result<Option<i64>> {
+        let ext = external_id.to_string();
+        self.store
+            .read(move |c| {
+                // (1) Invoice provenance — received funds for this external_id. When an invoice row
+                // exists its amount decides (a NULL amount -> non-positive -> FAILED); we do NOT fall
+                // back to the journal, which only covers the no-invoice (unmatched/orphan) case.
+                let inv: Option<Option<i64>> = c
+                    .query_row(
+                        "SELECT amount_sat FROM invoice
+                          WHERE external_id=?1 AND (status='PAID' OR settled_at IS NOT NULL)",
+                        params![ext],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(amount) = inv {
+                    return Ok(amount);
+                }
+                // (2) Settle-refund journal provenance (the unmatched/orphan settlement families).
+                let j: Option<Option<i64>> = c
+                    .query_row(
+                        "SELECT json_extract(detail_json, '$.amount_sat') FROM event_log
+                          WHERE kind IN ('settle_unmatched_refund', 'settle_terminal_refund',
+                                         'settle_orphan_refund', 'settle_expired_refund')
+                            AND json_extract(detail_json, '$.external_id') = ?1
+                          ORDER BY id LIMIT 1",
+                        params![ext],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                Ok(j.flatten())
+            })
+            .await
     }
 
     /// Resolve `dest` to a bolt11, mapping a [`ResolveError`] to a [`PlanError`]. Bounded by a
@@ -500,15 +711,18 @@ impl Refunder {
     }
 
     /// Commit the SENT bookkeeping and map the CAS outcome to a counter (a lost race is a `Noop`).
+    /// `paid_sat` is the NET amount actually delivered to the buyer (after the gateway fee, or a
+    /// below-cap direct bolt11) — it is what the "sent" DM reports, distinct from the gross
+    /// `refund_attempt.amount_sat` ledger figure, which this never rewrites (review P2 / AC-9).
     async fn finish_sent(
         &self,
         row: &RefundRow,
         backend_payment_id: Option<String>,
-        amount: u64,
+        paid_sat: u64,
         now: i64,
     ) -> Result<Outcome> {
         if self
-            .commit_sent(row, backend_payment_id, amount, now)
+            .commit_sent(row, backend_payment_id, paid_sat, now)
             .await?
         {
             Ok(Outcome::Sent)
@@ -525,14 +739,16 @@ impl Refunder {
         &self,
         row: &RefundRow,
         backend_payment_id: Option<String>,
-        amount: u64,
+        paid_sat: u64,
         now: i64,
     ) -> Result<bool> {
         let external_id = external_id_of(row);
         let outbox_id = format!("outbox:refund:{external_id}");
+        // The "sent" DM carries the NET amount delivered (`paid_sat`), not the gross liability — a
+        // fee-deducted or below-cap refund must not tell the buyer the full gross went out (review P2).
         let payload = serde_json::to_string(&Msg::BillingRefund(BillingRefund {
             subscription_id: row.subscription_id.clone().unwrap_or_default(),
-            amount_sat: amount,
+            amount_sat: paid_sat,
             status: "sent".to_string(),
         }))?;
         let id = row.id.clone();
@@ -577,11 +793,13 @@ impl Refunder {
             .await
     }
 
-    /// Structurally unsendable rows (a missing destination, or a `dest` the resolver rejects as
-    /// permanent — BOLT12 / malformed / amount-or-hash mismatch / HTTPS/SSRF violation) are parked
-    /// `FAILED` immediately, NOT via the capped pay-Failed path. No payment was attempted, the sub is
-    /// left in `REFUND_DUE`, and the reservation is NOT released.
-    async fn commit_structural_failure(
+    /// Park a refund `FAILED` immediately in ONE txn (status->FAILED, bump attempts, enqueue the failed
+    /// DM + journal), NOT via the capped pay-Failed path. No payment was attempted, the sub is left in
+    /// `REFUND_DUE`, and the reservation is NOT released. Shared by every "can never be auto-paid"
+    /// reason: a missing destination, a permanently-unresolvable `dest` (BOLT12 / malformed /
+    /// amount-or-hash mismatch / HTTPS/SSRF violation), a fixed bolt11 above the fee-adjusted cap, a
+    /// true dust refund, and an INV-3 provenance violation. The operator-loud ERROR carries `reason`.
+    async fn commit_park_failed(
         &self,
         row: &RefundRow,
         amount: u64,
@@ -627,7 +845,7 @@ impl Refunder {
                 refund = %row.id,
                 subscription = row.subscription_id.as_deref().unwrap_or(""),
                 %reason,
-                "refund parked FAILED (structural, unresolvable destination)"
+                "refund parked FAILED — manual handling required"
             );
         }
         Ok(outcome)
@@ -788,6 +1006,23 @@ impl Refunder {
             })
             .await
     }
+}
+
+/// Parse a bolt11's amount as a WHOLE number of sats (spec §3.1). `Err` if the invoice is amountless
+/// or its amount is not a whole sat (sub-sat msats) — neither is payable by the sat-only backends.
+/// Used for the gen-0 pass-through (the buyer's fixed invoice) and to recover a persisted resolved
+/// invoice's pay amount on a re-await.
+fn parse_whole_sat(bolt11: &str) -> Result<u64, String> {
+    let inv = Bolt11Invoice::from_str(bolt11).map_err(|e| format!("bolt11 parse error: {e}"))?;
+    let msat = inv
+        .amount_milli_satoshis()
+        .ok_or_else(|| "bolt11 has no amount".to_string())?;
+    if msat % 1000 != 0 {
+        return Err(format!(
+            "bolt11 amount {msat} msat is not a whole number of sats"
+        ));
+    }
+    Ok(msat / 1000)
 }
 
 /// The stable `external_id` the row was keyed on — strip `refund:` off the idempotency key (or
@@ -1110,7 +1345,10 @@ mod tests {
             .unwrap();
     }
 
-    /// Seed a PENDING refund_attempt row exactly as capture/provision would have written it upstream.
+    /// Seed a PENDING refund_attempt row exactly as capture/provision would have written it upstream,
+    /// PLUS its INV-3 provenance: a PAID `order` invoice for the same external_id with the same amount
+    /// (capture/provision only ever write a refund strictly downstream of a received payment). The
+    /// driving tests need provenance or the execution-time guard would (correctly) park them FAILED.
     async fn seed_refund(store: &Store, sub_id: &str, dest: Option<&str>, amount: Option<i64>) {
         let external_id = format!("order:{sub_id}");
         let (sub_id, dest) = (sub_id.to_string(), dest.map(|d| d.to_string()));
@@ -1129,10 +1367,38 @@ mod tests {
                         format!("refund:{external_id}"),
                     ],
                 )?;
+                seed_paid_invoice_txn(tx, &external_id, &sub_id, "PAID", Some(30), amount)?;
                 Ok(())
             })
             .await
             .unwrap();
+    }
+
+    /// Insert a received-payment `order` invoice (the INV-3 provenance source) in `tx`. `status` /
+    /// `settled_at` model the provenance variants: a normal PAID capture, or a LATE settlement that
+    /// stamped `settled_at` on an already-terminal (e.g. EXPIRED) invoice without flipping it to PAID.
+    fn seed_paid_invoice_txn(
+        tx: &Transaction,
+        external_id: &str,
+        sub_id: &str,
+        status: &str,
+        settled_at: Option<i64>,
+        amount: Option<i64>,
+    ) -> rusqlite::Result<()> {
+        tx.execute(
+            "INSERT INTO invoice
+                (id, subscription_id, external_id, kind, amount_sat, status, settled_at, issued_at)
+             VALUES (?1, ?2, ?3, 'order', ?4, ?5, ?6, 0)",
+            params![
+                format!("inv-{external_id}"),
+                sub_id,
+                external_id,
+                amount,
+                status,
+                settled_at,
+            ],
+        )?;
+        Ok(())
     }
 
     /// Seed a PENDING refund_attempt that has ALREADY been resolved to `resolved_bolt11` at
@@ -1172,6 +1438,8 @@ mod tests {
                         gen,
                     ],
                 )?;
+                // INV-3 provenance, as for seed_refund: a PAID order invoice with the same amount.
+                seed_paid_invoice_txn(tx, &external_id, &sub_id, "PAID", Some(30), Some(amount))?;
                 Ok(())
             })
             .await
@@ -1258,6 +1526,46 @@ mod tests {
                 other => panic!("expected billing.refund, got {}", other.type_str()),
             })
             .collect()
+    }
+
+    /// Every `billing.refund` outbox payload as `(status, amount_sat)` — for asserting the amount the
+    /// buyer is told, not just the status (review P2).
+    async fn refund_outbox(store: &Store) -> Vec<(String, u64)> {
+        let payloads: Vec<String> = store
+            .read(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT payload_json FROM outbox WHERE msg_type='billing.refund' ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        payloads
+            .iter()
+            .map(|p| match serde_json::from_str::<Msg>(p).unwrap() {
+                Msg::BillingRefund(b) => (b.status, b.amount_sat),
+                other => panic!("expected billing.refund, got {}", other.type_str()),
+            })
+            .collect()
+    }
+
+    /// The gross `amount_sat` ledger figure of a refund row (must stay the received amount, never the
+    /// fee-deducted payout — AC-9).
+    async fn refund_amount(store: &Store, id: &str) -> Option<i64> {
+        let id = id.to_string();
+        store
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT amount_sat FROM refund_attempt WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap()
     }
 
     // ---- tests --------------------------------------------------------------
@@ -1618,9 +1926,11 @@ mod tests {
         );
     }
 
-    // NULL amount_sat (provision recorded no amount) is tolerated: refund 0, never panic.
+    // INV-3 (spec §3.3): a NULL refund amount (provision recorded no order amount) has no determinable
+    // received figure, so it can no longer be auto-paid. It parks FAILED instead of refunding a guessed
+    // 0 (the pre-hardening behavior); the seeded provenance invoice also has a NULL amount.
     #[tokio::test]
-    async fn null_amount_is_tolerated() {
+    async fn null_amount_parks_failed_under_inv3() {
         let store = mem_store();
         let payment = Arc::new(TestPayment::new());
         let clock = TestClock::new(1_000);
@@ -1629,13 +1939,13 @@ mod tests {
 
         let report = refunder(&store, &payment, &clock).drive().await.unwrap();
 
-        assert_eq!(report.sent, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(payment.pay_calls(), 0, "a NULL-amount refund never pays");
         let (status, _, _) = refund_row(&store, "ref-order:sub-1").await;
-        assert_eq!(status, "SENT");
-        // The DM carries the 0 default rather than crashing on the NULL.
+        assert_eq!(status, "FAILED");
         assert_eq!(
             refund_outbox_statuses(&store).await,
-            vec!["sent".to_string()]
+            vec!["failed".to_string()]
         );
     }
 
@@ -2148,6 +2458,386 @@ mod tests {
         assert_eq!(
             refund_outbox_statuses(&store).await,
             vec!["sent".to_string()]
+        );
+    }
+
+    // ---- INV-1 fee-deduction idempotency (spec §3.1 / §5) -------------------
+
+    /// A fee-aware backend for the INV-1 cap/idempotency tests: `refund_net_sat` returns a configurable
+    /// net cap and COUNTS its calls (so a test can prove a re-await never re-quotes), and
+    /// `pay_refund_capped` records `key -> paid amount`, dedups on the key, and counts pay calls.
+    #[derive(Default)]
+    struct FeeQuotePayment {
+        inner: Mutex<FeeQuoteState>,
+    }
+    #[derive(Default)]
+    struct FeeQuoteState {
+        net: u64,
+        net_calls: usize,
+        key_status: HashMap<String, PayStatus>,
+        paid: HashMap<String, u64>, // gen key -> amount actually paid
+        pay_calls: usize,
+        seq: u64,
+    }
+    impl FeeQuotePayment {
+        fn new(net: u64) -> Self {
+            Self {
+                inner: Mutex::new(FeeQuoteState {
+                    net,
+                    ..Default::default()
+                }),
+            }
+        }
+        fn set_net(&self, net: u64) {
+            self.inner.lock().unwrap().net = net;
+        }
+        fn set_key_status(&self, key: &str, s: PayStatus) {
+            self.inner
+                .lock()
+                .unwrap()
+                .key_status
+                .insert(key.to_string(), s);
+        }
+        fn net_calls(&self) -> usize {
+            self.inner.lock().unwrap().net_calls
+        }
+        fn paid_amount(&self, key: &str) -> Option<u64> {
+            self.inner.lock().unwrap().paid.get(key).copied()
+        }
+    }
+    #[async_trait]
+    impl PaymentBackend for FeeQuotePayment {
+        async fn refund_net_sat(&self, _gross_sat: u64) -> Result<u64> {
+            let mut st = self.inner.lock().unwrap();
+            st.net_calls += 1;
+            Ok(st.net)
+        }
+        async fn pay_refund_capped(
+            &self,
+            _bolt11: &str,
+            amount_sat: u64,
+            _gross_sat: u64,
+            idempotency_key: &str,
+        ) -> Result<String> {
+            let mut st = self.inner.lock().unwrap();
+            st.pay_calls += 1;
+            if st.paid.contains_key(idempotency_key) {
+                return Ok(format!("fee-pay-{idempotency_key}")); // idempotent on the key
+            }
+            let n = st.seq;
+            st.seq += 1;
+            st.paid.insert(idempotency_key.to_string(), amount_sat);
+            Ok(format!("fee-pay-{n}"))
+        }
+        async fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus> {
+            let st = self.inner.lock().unwrap();
+            Ok(if st.paid.contains_key(idempotency_key) {
+                PayStatus::Succeeded
+            } else if let Some(s) = st.key_status.get(idempotency_key) {
+                *s
+            } else {
+                PayStatus::Unknown
+            })
+        }
+        async fn pay(&self, dest: &str, amount_sat: u64, idempotency_key: &str) -> Result<String> {
+            self.pay_refund_capped(dest, amount_sat, amount_sat, idempotency_key)
+                .await
+        }
+        async fn create_invoice(&self, _: u64, _: &str, _: u32, _: &str) -> Result<Invoice> {
+            unimplemented!("refunder never receives")
+        }
+        async fn lookup(&self, _: &str) -> Result<PaymentStatus> {
+            unimplemented!()
+        }
+        async fn lookup_settlement(&self, _: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            unimplemented!()
+        }
+        async fn payment_status(&self, _: &str) -> Result<PayStatus> {
+            unimplemented!()
+        }
+        async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+            unimplemented!()
+        }
+    }
+
+    // A PENDING/Unknown generation is re-awaited with its PERSISTED pay amount and NEVER re-quotes the
+    // gateway, so a fee change between drives can neither re-price nor double-pay it. The persisted
+    // gen-1 invoice is 500 sat; the fee then "rises" so a fresh quote would cap at 400, but the
+    // in-flight gen-1 reuses 500 with no re-quote and no resolve.
+    #[tokio::test]
+    async fn inv1_pending_generation_reuses_persisted_amount_no_requote() {
+        let store = mem_store();
+        let payment = Arc::new(FeeQuotePayment::new(500));
+        payment.set_key_status("refund:order:sub-1:g1", PayStatus::Pending); // gen-1 in flight
+        let clock = TestClock::new(200);
+        let resolver = Arc::new(TestResolver::new(10_000));
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        let b = crate::refund_resolver::mint_bolt11(500_000, "meta", 1_000, 86_400); // 500 sat
+        seed_refund_resolved(&store, "sub-1", LN_ADDR, 500, &b, 10_000, 1).await;
+
+        payment.set_net(400); // a FRESH quote would now cap lower; a re-await must ignore it.
+        let report = Refunder::with_resolver(
+            store.clone(),
+            payment.clone(),
+            Arc::new(clock.clone()),
+            resolver.clone(),
+        )
+        .drive()
+        .await
+        .unwrap();
+
+        assert_eq!(report.sent, 1);
+        assert_eq!(payment.net_calls(), 0, "a re-await never re-quotes the fee");
+        assert_eq!(resolver.calls(), 0, "and never re-resolves");
+        assert_eq!(
+            payment.paid_amount("refund:order:sub-1:g1"),
+            Some(500),
+            "reused the persisted 500-sat invoice, not the new 400 cap"
+        );
+    }
+
+    // Only a DEFINITE Failed+expired generation re-resolves, and THAT is the one place a fresh cap is
+    // quoted — so a lower post-change fee yields a new lower-net invoice at the next generation.
+    #[tokio::test]
+    async fn inv1_failed_expired_generation_requotes_new_cap() {
+        let store = mem_store();
+        let payment = Arc::new(FeeQuotePayment::new(400)); // the new (lower) cap
+        payment.set_key_status("refund:order:sub-1:g1", PayStatus::Failed);
+        let clock = TestClock::new(200); // past the seeded expiry 100 -> expired
+        let resolver = Arc::new(TestResolver::new(10_000));
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        let b = crate::refund_resolver::mint_bolt11(500_000, "meta", 1_000, 86_400);
+        seed_refund_resolved(&store, "sub-1", LN_ADDR, 500, &b, 100, 1).await;
+
+        let report = Refunder::with_resolver(
+            store.clone(),
+            payment.clone(),
+            Arc::new(clock.clone()),
+            resolver.clone(),
+        )
+        .drive()
+        .await
+        .unwrap();
+
+        assert_eq!(report.sent, 1);
+        assert_eq!(
+            payment.net_calls(),
+            1,
+            "a Failed+expired gen quotes a fresh cap"
+        );
+        assert_eq!(resolver.calls(), 1, "and re-resolves a new invoice");
+        let (_, gen) = resolution_of(&store, "ref-order:sub-1").await;
+        assert_eq!(gen, 2, "generation bumped");
+        assert_eq!(
+            payment.paid_amount("refund:order:sub-1:g2"),
+            Some(400),
+            "paid the NEW 400-sat cap, not the old 500"
+        );
+    }
+
+    // Review P2: a below-cap direct bolt11 (400 sat) for a 500-sat gross refund pays 400, and the
+    // "sent" DM reports the NET 400 delivered — NOT the 500 gross. The refund_attempt.amount_sat ledger
+    // figure stays the gross 500 (AC-9: gross and net are distinct quantities).
+    #[tokio::test]
+    async fn sent_dm_reports_net_paid_not_gross() {
+        let store = mem_store();
+        let payment = Arc::new(TestPayment::new());
+        let clock = TestClock::new(1_000);
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        let bolt11 = crate::refund_resolver::mint_bolt11(400_000, "meta", 1_000, 86_400); // 400 sat
+        seed_refund(&store, "sub-1", Some(&bolt11), Some(500)).await; // gross 500
+        seed_reservation(&store, "sub-1").await;
+
+        let report = refunder(&store, &payment, &clock).drive().await.unwrap();
+
+        assert_eq!(report.sent, 1);
+        assert_eq!(payment.pay_calls(), 1);
+        assert_eq!(
+            refund_outbox(&store).await,
+            vec![("sent".to_string(), 400)],
+            "the DM reports the net 400 paid, not the 500 gross"
+        );
+        assert_eq!(
+            refund_amount(&store, "ref-order:sub-1").await,
+            Some(500),
+            "the gross liability ledger figure is unchanged by the fee deduction"
+        );
+    }
+
+    // ---- INV-3 provenance guard (spec §3.3 / §5) ----------------------------
+
+    /// Seed ONLY the PENDING refund_attempt row (NO provenance) — for the INV-3 guard tests.
+    async fn seed_refund_no_provenance(
+        store: &Store,
+        sub_id: &str,
+        dest: Option<&str>,
+        amount: Option<i64>,
+    ) {
+        let external_id = format!("order:{sub_id}");
+        let (sub_id, dest) = (sub_id.to_string(), dest.map(|d| d.to_string()));
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO refund_attempt
+                        (id, subscription_id, dest, amount_sat, idempotency_key, status, attempts,
+                         created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'PENDING', 0, 0, 0)",
+                    params![
+                        format!("ref-{external_id}"),
+                        sub_id,
+                        dest,
+                        amount,
+                        format!("refund:{external_id}"),
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    // A refund with NO received-payment provenance is parked FAILED, never paid.
+    #[tokio::test]
+    async fn inv3_no_provenance_parks_failed() {
+        let store = mem_store();
+        let payment = Arc::new(TestPayment::new());
+        let clock = TestClock::new(1_000);
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        seed_refund_no_provenance(&store, "sub-1", Some(LN_ADDR), Some(500)).await;
+
+        let report = refunder(&store, &payment, &clock).drive().await.unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(payment.pay_calls(), 0, "no provenance never pays");
+        let (status, _, _) = refund_row(&store, "ref-order:sub-1").await;
+        assert_eq!(status, "FAILED");
+        assert_eq!(
+            refund_outbox_statuses(&store).await,
+            vec!["failed".to_string()]
+        );
+    }
+
+    // A refund whose row amount mismatches the received amount is parked FAILED (never pay a guessed
+    // gross): the order received 500 but the refund row claims 400.
+    #[tokio::test]
+    async fn inv3_amount_mismatch_parks_failed() {
+        let store = mem_store();
+        let payment = Arc::new(TestPayment::new());
+        let clock = TestClock::new(1_000);
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        seed_refund_no_provenance(&store, "sub-1", Some(LN_ADDR), Some(400)).await;
+        store
+            .transaction(move |tx| {
+                seed_paid_invoice_txn(tx, "order:sub-1", "sub-1", "PAID", Some(30), Some(500))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let report = refunder(&store, &payment, &clock).drive().await.unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(payment.pay_calls(), 0, "an amount mismatch never pays");
+        let (status, _, _) = refund_row(&store, "ref-order:sub-1").await;
+        assert_eq!(status, "FAILED");
+    }
+
+    // Provenance via settled_at on an already-terminal (EXPIRED) invoice — the LATE-settlement case
+    // (capture stamps settled_at without flipping the invoice back to PAID). The refund IS paid.
+    #[tokio::test]
+    async fn inv3_late_terminal_settled_provenance_is_accepted() {
+        let store = mem_store();
+        let payment = Arc::new(TestPayment::new());
+        let clock = TestClock::new(1_000);
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        seed_refund_no_provenance(&store, "sub-1", Some(LN_ADDR), Some(500)).await;
+        store
+            .transaction(move |tx| {
+                // status EXPIRED (not PAID) but settled_at set -> still received-payment provenance.
+                seed_paid_invoice_txn(tx, "order:sub-1", "sub-1", "EXPIRED", Some(30), Some(500))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let report = refunder(&store, &payment, &clock).drive().await.unwrap();
+
+        assert_eq!(
+            report.sent, 1,
+            "settled_at provenance is accepted even when status != PAID"
+        );
+        assert_eq!(payment.pay_calls(), 1);
+        let (status, _, _) = refund_row(&store, "ref-order:sub-1").await;
+        assert_eq!(status, "SENT");
+    }
+
+    // Provenance via a settle-refund event_log entry for an unmatched/orphan settlement (no invoice
+    // row). The refund IS paid against the journal's recorded amount.
+    #[tokio::test]
+    async fn inv3_settle_refund_journal_provenance_is_accepted() {
+        let store = mem_store();
+        let payment = Arc::new(TestPayment::new());
+        let clock = TestClock::new(1_000);
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        seed_refund_no_provenance(&store, "sub-1", Some(LN_ADDR), Some(500)).await;
+        store
+            .transaction(move |tx| {
+                let detail = serde_json::json!({
+                    "external_id": "order:sub-1",
+                    "amount_sat": 500,
+                    "settled_at": 30,
+                })
+                .to_string();
+                tx.execute(
+                    "INSERT INTO event_log (subscription_id, kind, detail_json, at)
+                     VALUES (?1, 'settle_unmatched_refund', ?2, 0)",
+                    params!["sub-1", detail],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let report = refunder(&store, &payment, &clock).drive().await.unwrap();
+
+        assert_eq!(
+            report.sent, 1,
+            "a settle-refund journal entry is valid provenance"
+        );
+        let (status, _, _) = refund_row(&store, "ref-order:sub-1").await;
+        assert_eq!(status, "SENT");
+    }
+
+    // INV-3 SOURCE AUDIT (spec §3.3): the ONLY production writers of refund_attempt are
+    // capture.rs::refund_intent and provision.rs::RefundDueWrite. Any other production
+    // `INTO refund_attempt` would let a refund row exist without going through the received-payment
+    // path; this fails the build so a future writer must reuse a central site or update the spec + the
+    // provenance guard intentionally. Test code (trailing `#[cfg(test)]` modules) and the schema /
+    // migrations (CREATE/ALTER TABLE — no `INTO`) are excluded.
+    #[test]
+    fn only_known_sites_insert_refund_attempt() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let allowed = ["capture.rs", "provision.rs"];
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            // Production code only — drop everything from the first `#[cfg(test)]` onward (every module
+            // keeps its tests in a trailing `#[cfg(test)]` mod). `INTO refund_attempt` matches every
+            // INSERT form but not CREATE/ALTER TABLE (no `INTO`).
+            let production = src.split("#[cfg(test)]").next().unwrap_or("");
+            let fname = path.file_name().unwrap().to_str().unwrap().to_string();
+            if production.contains("INTO refund_attempt") && !allowed.contains(&fname.as_str()) {
+                offenders.push(fname);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "unexpected production `INTO refund_attempt` writer(s): {offenders:?}; only \
+             capture.rs::refund_intent and provision.rs::RefundDueWrite may create refund rows (INV-3)"
         );
     }
 }

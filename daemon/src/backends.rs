@@ -57,6 +57,30 @@ pub trait PaymentBackend: Send + Sync {
     /// Outbound payment, used for refunds. **Idempotent on `idempotency_key`**: calling twice
     /// with the same key never pays twice (ADR-0009, SPEC §6.6). Returns a backend payment id.
     async fn pay(&self, dest: &str, amount_sat: u64, idempotency_key: &str) -> Result<String>;
+    /// The maximum NET whole-sat amount this backend can auto-send for a refund of `gross_sat`, after
+    /// reserving the outbound fee so total outlay never exceeds what was received (INV-1, anti-drain;
+    /// `docs/specs/refund-money-path-hardening.md` §3.1). Returns `Ok(0)` ONLY for true dust — no
+    /// positive whole-sat payout plus its fee fits inside `gross_sat`. Quote/operability failures (for
+    /// example no reachable gateway) are `Err`/transient, NOT `Ok(0)`. Read-only; never mints or pays.
+    /// Default: no fee (returns `gross_sat`) — correct for `MockPayment` and any internal-only backend.
+    async fn refund_net_sat(&self, gross_sat: u64) -> Result<u64> {
+        Ok(gross_sat)
+    }
+    /// Idempotent refund pay with a final INV-1 cap check before any NEW backend operation. Existing
+    /// `SUCCEEDED`/`PENDING` operations for `idempotency_key` are re-awaited exactly as [`pay`](Self::pay).
+    /// For a NEW operation the backend MUST refuse to start if
+    /// `amount_sat*1000 + fee(amount_sat*1000) > gross_sat*1000` (spec §3.1). Default: delegate to
+    /// `pay` — mock/internal backends charge no fee, so the cap holds with `amount_sat == gross_sat`.
+    async fn pay_refund_capped(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        gross_sat: u64,
+        idempotency_key: &str,
+    ) -> Result<String> {
+        let _ = gross_sat; // the default backend charges no fee; the cap is the caller's quote
+        self.pay(bolt11, amount_sat, idempotency_key).await
+    }
     /// Status of an outbound payment by its backend id (ADR-0009 refund ledger).
     async fn payment_status(&self, payment_id: &str) -> Result<PayStatus>;
     /// Check an in-flight refund by its idempotency key after a crash (SPEC §6.6). An
