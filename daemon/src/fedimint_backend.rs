@@ -192,6 +192,19 @@ impl FedimintPayment {
             );
         }
 
+        // Symmetric backfill for OUTBOUND pays (lnrent-4gt): a crash in pay()'s window (op committed,
+        // fedimint_pay row not yet upserted) would otherwise leave a refund key Unknown, so pay(key)
+        // would re-parse the maybe-expired bolt11 and fail instead of re-awaiting the op. FAIL-CLOSED.
+        let recovered_pay = recover_pay_from_oplog(&me.client, &me.index)
+            .await
+            .context("fedimint: oplog pay recovery failed; refusing to start")?;
+        if recovered_pay > 0 {
+            tracing::info!(
+                backfilled = recovered_pay,
+                "fedimint: recovered pay index rows from oplog"
+            );
+        }
+
         Ok(me)
     }
 
@@ -460,12 +473,10 @@ impl PaymentBackend for FedimintPayment {
             "ln"
         };
         let op_hex = outgoing.payment_type.operation_id().fmt_full().to_string();
-        // Crash window (codex P1, deferred): a crash between pay_bolt11_invoice committing and this
-        // upsert leaves no key row -> payment_status_by_key=Unknown -> the Refunder retries pay(key).
-        // For .4c (bolt11-only, fixed refund_dest) fedimint's per-payment-hash dedup prevents a
-        // double-pay on that retry. Once the LNURL/BOLT12 resolver lands (a retry could resolve a
-        // FRESH bolt11) this must recover fedimint_pay from the oplog extra_meta on open, symmetric
-        // to recover_index_from_oplog.
+        // Crash window: a crash between pay_bolt11_invoice committing and this upsert leaves no key
+        // row -> payment_status_by_key=Unknown. recover_pay_from_oplog (on open, symmetric to
+        // recover_index_from_oplog) backfills the row from the oplog extra_meta so the next pay(key)
+        // re-awaits the OP directly rather than re-parsing the maybe-expired bolt11 (lnrent-4gt).
         pay_idx_upsert(&self.index, idempotency_key, &op_hex, "PENDING", kind)?;
         self.await_pay_bounded(outgoing.payment_type, idempotency_key)
             .await
@@ -643,6 +654,70 @@ async fn recover_index_from_oplog(
                     .unwrap_or(0),
             };
             idx_insert(index, &inv, &op_hex)?;
+            backfilled += 1;
+        }
+        last = page.last().map(|(k, _)| *k);
+        if count < 100 {
+            break;
+        }
+    }
+    Ok(backfilled)
+}
+
+/// Symmetric to [`recover_index_from_oplog`] but for OUTBOUND pays (lnrent-4gt). A crash in [`pay`]'s
+/// window — between `pay_bolt11_invoice` committing the fedimint operation and `pay_idx_upsert`
+/// persisting the local row — leaves the idempotency key with NO `fedimint_pay` row, so
+/// `payment_status_by_key` reports `Unknown`. The Refunder's next `pay(key)` would then re-parse the
+/// original bolt11 (which may have EXPIRED in the meantime) and fail before discovering the in-flight
+/// op. Backfilling the row (the op id + ln/internal kind) from the oplog `extra_meta` on open lets
+/// `pay(key)` take its early path and re-await the OPERATION directly. Backfilled as `PENDING`; the
+/// next `pay(key)` reconstructs the `PayType` from (op, kind) and resolves it to terminal. IDEMPOTENT
+/// (skips keys already indexed); an undecodable oplog entry is logged + skipped (matching the receive
+/// side); `join_or_open` is fail-closed on a pass-level error (refuses to start).
+async fn recover_pay_from_oplog(
+    client: &ClientHandleArc,
+    index: &Arc<Mutex<Connection>>,
+) -> Result<usize> {
+    let log = client.operation_log();
+    let mut backfilled = 0usize;
+    let mut last = None;
+    loop {
+        let page = log.paginate_operations_rev(100, last).await;
+        let count = page.len();
+        if count == 0 {
+            break;
+        }
+        for (key, entry) in &page {
+            if entry.operation_module_kind() != fedimint_ln_common::KIND.as_str() {
+                continue;
+            }
+            let meta: LightningOperationMeta = match entry.try_meta() {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(error = %e, "fedimint: skipping oplog entry with undecodable ln meta (pay recovery)");
+                    continue;
+                }
+            };
+            let LightningOperationMetaVariant::Pay(pay) = &meta.variant else {
+                continue;
+            };
+            let Some(idk) = meta
+                .extra_meta
+                .get("lnrent_idempotency_key")
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            if pay_idx_status_by_key(index, idk)?.is_some() {
+                continue;
+            }
+            let op_hex = key.operation_id.fmt_full().to_string();
+            let kind = if pay.is_internal_payment {
+                "internal"
+            } else {
+                "ln"
+            };
+            pay_idx_upsert(index, idk, &op_hex, "PENDING", kind)?;
             backfilled += 1;
         }
         last = page.last().map(|(k, _)| *k);

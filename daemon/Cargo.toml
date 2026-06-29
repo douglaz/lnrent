@@ -110,3 +110,6 @@ nostr-relay-builder = "0.44"
 # recoverable signing + sha256 hashes. Already compiled as a `lightning-invoice` dependency; the
 # dev-dep just makes the InvoiceBuilder usable from tests. Default features include `secp-recovery`.
 bitcoin = "0.32"
+# Directly DELETE a fedimint_pay index row in the fedimint_live oplog-recovery test, to simulate the
+# pay() crash window (op committed, local row not yet upserted). Same version as the daemon dep.
+rusqlite = { version = "0.31", features = ["bundled"] }

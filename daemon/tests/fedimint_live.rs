@@ -130,3 +130,107 @@ async fn fedimint_receive_and_pay_live() {
 
     println!("FEDIMINT LIVE TEST PASSED — received 1000 sat, paid 500 sat out (idempotent)");
 }
+
+/// Find the lnrent-owned `lnrent_index.db` under `data_dir/fedimint/<federation_id>/`.
+fn find_index_db(data_dir: &std::path::Path) -> std::path::PathBuf {
+    let fed_root = data_dir.join("fedimint");
+    for entry in std::fs::read_dir(&fed_root).expect("read fedimint dir") {
+        let db = entry.expect("dir entry").path().join("lnrent_index.db");
+        if db.exists() {
+            return db;
+        }
+    }
+    panic!("lnrent_index.db not found under {fed_root:?}");
+}
+
+/// PROOF of the pay-side oplog recovery (lnrent-4gt PART 2): a crash in `pay()`'s window (the fedimint
+/// op committed but the local `fedimint_pay` row not yet persisted) leaves the refund key reporting
+/// `Unknown`; on reopen, `recover_pay_from_oplog` backfills the row from the oplog `extra_meta` so the
+/// next `pay(key)` re-awaits the OPERATION (not the maybe-expired bolt11) and resolves to terminal.
+/// We simulate the crash by DELETING the persisted pay row, then reopening the backend.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running devimint federation (FM_INVITE_CODE on the env)"]
+async fn fedimint_pay_oplog_recovery_live() {
+    let invite = std::env::var("FM_INVITE_CODE")
+        .expect("FM_INVITE_CODE — run under `devimint dev-fed --exec`");
+    let data_dir =
+        std::env::temp_dir().join(format!("lnrent-fedimint-recover-{}", std::process::id()));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let root_secret = [9u8; 32];
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let key = "refund-recover-1";
+
+    // --- fund the client (~1000 sat ecash) so it can pay a refund out -----------------------------
+    let backend = FedimintPayment::join_or_open(&invite, &data_dir, &root_secret, clock.clone())
+        .await
+        .expect("join the regtest federation");
+    let mut settlements = backend.watch().await.expect("open settlement stream");
+    let inv = backend
+        .create_invoice(1000, "recover-fund", 3600, "ext-recover-1")
+        .await
+        .expect("create gateway bolt11 invoice");
+    fedimint_cli(&["ln-pay", &inv.bolt11]);
+    tokio::time::timeout(Duration::from_secs(90), settlements.recv())
+        .await
+        .expect("a settlement arrives within 90s")
+        .expect("settlement channel open");
+
+    // --- pay a refund out under `key` -------------------------------------------------------------
+    let dest = fedimint_cli(&["ln-invoice", "--amount", "400000"]); // 400 sat
+    let dest_bolt11 = dest
+        .get("invoice")
+        .and_then(|v| v.as_str())
+        .or_else(|| dest.as_str())
+        .expect("a bolt11 from fedimint-cli ln-invoice")
+        .to_string();
+    tokio::time::timeout(
+        Duration::from_secs(90),
+        backend.pay(&dest_bolt11, 400, key),
+    )
+    .await
+    .expect("pay completes within 90s")
+    .expect("pay 400 sat out");
+    assert_eq!(
+        backend.payment_status_by_key(key).await.unwrap(),
+        PayStatus::Succeeded,
+        "the refund key is Succeeded before the simulated crash"
+    );
+
+    // --- simulate the crash window: close the backend, DELETE the pay row (so the key would report
+    //     Unknown), then reopen so recover_pay_from_oplog backfills it from the oplog ---------------
+    drop(settlements);
+    drop(backend);
+    let index_db = find_index_db(&data_dir);
+    {
+        let conn = rusqlite::Connection::open(&index_db).expect("open lnrent_index.db");
+        let n = conn
+            .execute(
+                "DELETE FROM fedimint_pay WHERE idempotency_key = ?1",
+                rusqlite::params![key],
+            )
+            .expect("delete the pay row");
+        assert_eq!(n, 1, "deleted exactly the one pay row (the crash window)");
+    }
+
+    let backend2 = FedimintPayment::join_or_open(&invite, &data_dir, &root_secret, clock.clone())
+        .await
+        .expect("reopen + recover from oplog");
+    // Without recovery this would be Unknown (no row); recover_pay_from_oplog backfilled it.
+    assert_ne!(
+        backend2.payment_status_by_key(key).await.unwrap(),
+        PayStatus::Unknown,
+        "oplog recovery backfilled the pay row (no longer Unknown)"
+    );
+    // Re-driving pay(key) re-awaits the recovered OP (not the bolt11) and reaches terminal Succeeded.
+    backend2
+        .pay(&dest_bolt11, 400, key)
+        .await
+        .expect("re-await via the recovered op");
+    assert_eq!(
+        backend2.payment_status_by_key(key).await.unwrap(),
+        PayStatus::Succeeded,
+        "the recovered refund resolves to Succeeded via the op"
+    );
+
+    println!("FEDIMINT PAY OPLOG RECOVERY TEST PASSED — crash-window pay row recovered + resolved");
+}
