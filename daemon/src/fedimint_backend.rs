@@ -223,32 +223,39 @@ impl FedimintPayment {
         Ok(me)
     }
 
-    /// On open, log a one-line readiness summary for operators (lnrent-o6p step 2): the ecash balance
-    /// and whether the CONFIGURED gateway is reachable. A zero balance or an unreachable gateway logs at
-    /// WARN (refunds would fail / strand) so an unfunded or misconfigured operator notices at boot.
-    /// Observability ONLY — enables no payment and never fails open (a query error is logged, not fatal).
-    /// The per-pending-refund exposure comparison needs the store and is wired in the supervisor (o6p).
+    /// On open, log a one-line Fedimint operability summary: the ecash balance and whether the
+    /// CONFIGURED gateway is reachable. A zero balance is fine when the daemon has no liabilities; the
+    /// supervisor owns the money-readiness warning because it can see the store. This backend-level log
+    /// warns only when the gateway is unreachable, since that blocks invoice creation and refunds.
+    /// Observability ONLY — enables no payment and never fails open.
     async fn log_readiness(&self) {
-        let balance_sat = match self.client.get_balance_for_btc().await {
-            Ok(a) => a.msats / 1000,
+        let balance_msat = match self.available_balance_msat().await {
+            Ok(msat) => msat,
             Err(e) => {
-                tracing::warn!(error = %e, "fedimint: could not query ecash balance at startup");
-                return;
+                tracing::info!(error = %e, "fedimint: could not query ecash balance at startup");
+                None
             }
         };
-        let gateway_ok = match self.client.get_first_module::<LightningClientModule>() {
-            Ok(ln) => matches!(ln.get_gateway(self.gateway, false).await, Ok(Some(_))),
-            Err(_) => false,
+        let gateway_ok = match self.refund_gateway_ready().await {
+            Ok(ok) => ok,
+            Err(e) => {
+                tracing::info!(error = %e, "fedimint: could not query configured gateway at startup");
+                false
+            }
         };
-        if balance_sat == 0 || !gateway_ok {
+        tracing::info!(
+            balance_msat = ?balance_msat,
+            balance_sat = ?balance_msat.map(|msat| msat / 1000),
+            gateway_ok,
+            "fedimint readiness"
+        );
+        if fedimint_readiness_warns(balance_msat, gateway_ok) {
             tracing::warn!(
-                balance_sat,
+                balance_msat = ?balance_msat,
+                balance_sat = ?balance_msat.map(|msat| msat / 1000),
                 gateway_ok,
-                "fedimint NOT fully ready: zero ecash balance and/or the configured gateway is \
-                 unreachable — refunds will fail until the operator funds ecash + the gateway is online"
+                "fedimint gateway unreachable: cannot create invoices or pay refunds"
             );
-        } else {
-            tracing::info!(balance_sat, gateway_ok, "fedimint ready");
         }
     }
 
@@ -608,6 +615,41 @@ impl PaymentBackend for FedimintPayment {
         ))
     }
 
+    async fn refund_required_outlay_msat(
+        &self,
+        gross_sat: u64,
+        pay_sat: Option<u64>,
+    ) -> Result<u128> {
+        let ln = self
+            .client
+            .get_first_module::<LightningClientModule>()
+            .context("fedimint: no lightning module")?;
+        let gateway = ln
+            .get_gateway(self.gateway, false)
+            .await
+            .context("selecting the configured lightning gateway for the refund liquidity check")?
+            .context("the configured (or any) lightning gateway is unavailable")?;
+        let fees = gateway.fees;
+        let pay_sat = pay_sat.unwrap_or_else(|| {
+            net_payout_sat(
+                u64::from(fees.base_msat),
+                u64::from(fees.proportional_millionths),
+                gross_sat,
+            )
+        });
+        if pay_sat == 0 {
+            return Ok(0);
+        }
+        let pay_msat = u128::from(pay_sat) * 1000;
+        let fee_msat = gateway_fee_msat(
+            u64::from(fees.base_msat),
+            u64::from(fees.proportional_millionths),
+            pay_msat,
+        )
+        .unwrap_or(u128::MAX);
+        Ok(pay_msat.saturating_add(fee_msat))
+    }
+
     async fn pay_refund_capped(
         &self,
         bolt11: &str,
@@ -630,6 +672,22 @@ impl PaymentBackend for FedimintPayment {
             &self.index,
             idempotency_key,
         )?))
+    }
+
+    async fn payment_started_by_key(&self, idempotency_key: &str) -> Result<bool> {
+        Ok(pay_idx_status_by_key(&self.index, idempotency_key)?.is_some())
+    }
+
+    async fn available_balance_msat(&self) -> Result<Option<u64>> {
+        Ok(Some(self.client.get_balance_for_btc().await?.msats))
+    }
+
+    async fn refund_gateway_ready(&self) -> Result<bool> {
+        let ln = self
+            .client
+            .get_first_module::<LightningClientModule>()
+            .context("fedimint: no lightning module")?;
+        Ok(ln.get_gateway(self.gateway, false).await?.is_some())
     }
 
     async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
@@ -1124,6 +1182,10 @@ fn net_payout_sat(base_msat: u64, ppm: u64, gross_sat: u64) -> u64 {
     lo
 }
 
+fn fedimint_readiness_warns(_balance_msat: Option<u64>, gateway_ok: bool) -> bool {
+    !gateway_ok
+}
+
 #[cfg(test)]
 mod net_payout_tests {
     //! INV-1 fee-deduction unit tests (spec §5). The whole module is `#[cfg(feature = "fedimint")]`
@@ -1287,5 +1349,12 @@ mod net_payout_tests {
         assert_maximal(0, 600_000, 1000);
         // The naive model's answer (625) over-drains under the ACTUAL fee schedule.
         assert!(outlay_msat(0, 600_000, 625) > u128::from(1000u64) * 1000);
+    }
+
+    #[test]
+    fn readiness_warns_on_gateway_only_not_zero_balance() {
+        assert!(!super::fedimint_readiness_warns(Some(0), true));
+        assert!(!super::fedimint_readiness_warns(Some(1_500), true));
+        assert!(super::fedimint_readiness_warns(Some(0), false));
     }
 }

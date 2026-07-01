@@ -17,12 +17,14 @@
 //! outbox-drain) woken on an interval AND on settlement/reconcile nudges.
 
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use lightning_invoice::Bolt11Invoice;
 use lnrent_wire::Msg;
 use nostr_sdk::PublicKey;
 use rusqlite::OptionalExtension;
@@ -30,7 +32,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::backends::{PaymentBackend, PaymentStatus, Settlement};
+use crate::backends::{PayStatus, PaymentBackend, PaymentStatus, Settlement};
 use crate::capture::{capture, Capture};
 use crate::clock::Clock;
 use crate::ipc;
@@ -42,7 +44,9 @@ use crate::recipe::Recipe;
 use crate::reconcile::Reconciler;
 use crate::refund::Refunder;
 use crate::reservation::Budget;
-use crate::store::Store;
+use crate::store::{
+    RefundAttemptLiability, RefundReadinessLiability, RefundReadinessSource, Store,
+};
 
 /// The loop cadences (injected so tests run in milliseconds and deterministically). Production
 /// defaults: reconcile every 60s (§6.5), maintenance every 5s.
@@ -410,6 +414,7 @@ impl Supervisor {
 
         self.publish_and_upsert_listing().await?;
         self.boot_recovery().await?;
+        log_refund_readiness(&self.store, &self.payment).await;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         // Wakes the single maintenance loop immediately on settlement/reconcile work.
@@ -961,9 +966,221 @@ async fn maintenance_pass(
     if let Err(e) = refunder.drive().await {
         tracing::error!(error = %format!("{e:#}"), "maintenance: refund drive failed");
     }
+    log_refund_readiness(store, payment).await;
     if let Err(e) = outbox.drain_once(engine).await {
         tracing::error!(error = %format!("{e:#}"), "maintenance: outbox drain failed");
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefundReadinessReport {
+    liability_count: usize,
+    gross_liability_sat: u128,
+    required_msat: u128,
+    balance_msat: Option<u64>,
+    gateway_ok: bool,
+    parked_count: usize,
+    warning: Option<RefundReadinessWarning>,
+}
+
+impl Default for RefundReadinessReport {
+    fn default() -> Self {
+        Self {
+            liability_count: 0,
+            gross_liability_sat: 0,
+            required_msat: 0,
+            balance_msat: None,
+            gateway_ok: true,
+            parked_count: 0,
+            warning: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefundReadinessWarning {
+    GatewayUnavailable,
+    InsufficientBalance,
+    ParkedManual,
+}
+
+async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) {
+    let report = match refund_readiness_report(store, payment).await {
+        Ok(report) => report,
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "refund readiness check failed");
+            return;
+        }
+    };
+    if report.liability_count == 0 {
+        return;
+    }
+
+    match report.warning {
+        Some(RefundReadinessWarning::GatewayUnavailable) => tracing::warn!(
+            liabilities = report.liability_count,
+            gross_liability_sat = %report.gross_liability_sat,
+            required_outlay_msat = %report.required_msat,
+            balance_msat = ?report.balance_msat,
+            gateway_ok = report.gateway_ok,
+            parked_count = report.parked_count,
+            "refund readiness warning: gateway unreachable: cannot create invoices or pay refunds"
+        ),
+        Some(RefundReadinessWarning::InsufficientBalance) => tracing::warn!(
+            liabilities = report.liability_count,
+            gross_liability_sat = %report.gross_liability_sat,
+            required_outlay_msat = %report.required_msat,
+            balance_msat = ?report.balance_msat,
+            gateway_ok = report.gateway_ok,
+            parked_count = report.parked_count,
+            "refund readiness warning: available balance is below required refund outlay"
+        ),
+        Some(RefundReadinessWarning::ParkedManual) => tracing::warn!(
+            liabilities = report.liability_count,
+            gross_liability_sat = %report.gross_liability_sat,
+            required_outlay_msat = %report.required_msat,
+            balance_msat = ?report.balance_msat,
+            gateway_ok = report.gateway_ok,
+            parked_count = report.parked_count,
+            "refund readiness warning: parked refund liabilities require manual handling"
+        ),
+        None => tracing::info!(
+            liabilities = report.liability_count,
+            gross_liability_sat = %report.gross_liability_sat,
+            required_outlay_msat = %report.required_msat,
+            balance_msat = ?report.balance_msat,
+            gateway_ok = report.gateway_ok,
+            parked_count = report.parked_count,
+            "refund liabilities covered"
+        ),
+    }
+}
+
+async fn refund_readiness_report(
+    store: &Store,
+    payment: &Arc<dyn PaymentBackend>,
+) -> Result<RefundReadinessReport> {
+    let liabilities = store.refund_readiness_liabilities().await?;
+    if liabilities.is_empty() {
+        return Ok(RefundReadinessReport::default());
+    }
+
+    let gateway_ok = match payment.refund_gateway_ready().await {
+        Ok(ok) => ok,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "refund readiness: gateway readiness query failed");
+            false
+        }
+    };
+    let balance_msat = match payment.available_balance_msat().await {
+        Ok(balance) => balance,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "refund readiness: balance query failed");
+            None
+        }
+    };
+
+    let mut report = RefundReadinessReport {
+        liability_count: liabilities.len(),
+        gross_liability_sat: 0,
+        required_msat: 0,
+        balance_msat,
+        gateway_ok,
+        parked_count: 0,
+        warning: None,
+    };
+
+    for liability in &liabilities {
+        report.gross_liability_sat += u128::from(liability.gross_sat);
+        match &liability.source {
+            RefundReadinessSource::RefundAttempt(refund) => {
+                if refund.status == "FAILED" {
+                    report.parked_count += 1;
+                    continue;
+                }
+                if refund.status != "PENDING" {
+                    continue;
+                }
+                match pending_refund_required_msat(liability, refund, payment).await {
+                    Ok(msat) => report.required_msat = report.required_msat.saturating_add(msat),
+                    Err(e) => tracing::warn!(
+                        external_id = %liability.external_id,
+                        error = %format!("{e:#}"),
+                        "refund readiness: could not price pending refund liability"
+                    ),
+                }
+            }
+            RefundReadinessSource::PaidUndeliveredOrder
+            | RefundReadinessSource::UnreconciledSettlement => {
+                report.required_msat = report
+                    .required_msat
+                    .saturating_add(u128::from(liability.gross_sat) * 1000);
+            }
+        }
+    }
+
+    report.warning = if !report.gateway_ok {
+        Some(RefundReadinessWarning::GatewayUnavailable)
+    } else if report
+        .balance_msat
+        .is_some_and(|balance| u128::from(balance) < report.required_msat)
+    {
+        Some(RefundReadinessWarning::InsufficientBalance)
+    } else if report.parked_count > 0 {
+        Some(RefundReadinessWarning::ParkedManual)
+    } else {
+        None
+    };
+    Ok(report)
+}
+
+async fn pending_refund_required_msat(
+    liability: &RefundReadinessLiability,
+    refund: &RefundAttemptLiability,
+    payment: &Arc<dyn PaymentBackend>,
+) -> Result<u128> {
+    if let Some(bolt11) = refund.resolved_bolt11.as_deref() {
+        let key = refund_generation_key(&liability.external_id, refund.resolution_gen);
+        match payment.payment_status_by_key(&key).await? {
+            PayStatus::Succeeded | PayStatus::Pending => return Ok(0),
+            PayStatus::Unknown if payment.payment_started_by_key(&key).await? => return Ok(0),
+            PayStatus::Unknown | PayStatus::Failed => {}
+        }
+        let pay_sat = parse_whole_sat(bolt11).unwrap_or(liability.gross_sat);
+        return payment
+            .refund_required_outlay_msat(liability.gross_sat, Some(pay_sat))
+            .await;
+    }
+
+    if let Some(pay_sat) = refund.dest.as_deref().and_then(parse_whole_sat) {
+        let key = refund_generation_key(&liability.external_id, 0);
+        match payment.payment_status_by_key(&key).await? {
+            PayStatus::Succeeded | PayStatus::Pending => return Ok(0),
+            PayStatus::Unknown if payment.payment_started_by_key(&key).await? => return Ok(0),
+            PayStatus::Unknown | PayStatus::Failed => {}
+        }
+        return payment
+            .refund_required_outlay_msat(liability.gross_sat, Some(pay_sat))
+            .await;
+    }
+
+    payment
+        .refund_required_outlay_msat(liability.gross_sat, None)
+        .await
+}
+
+fn refund_generation_key(external_id: &str, gen: i64) -> String {
+    if gen == 0 {
+        format!("refund:{external_id}")
+    } else {
+        format!("refund:{external_id}:g{gen}")
+    }
+}
+
+fn parse_whole_sat(bolt11: &str) -> Option<u64> {
+    let invoice = Bolt11Invoice::from_str(bolt11).ok()?;
+    let msat = invoice.amount_milli_satoshis()?;
+    (msat % 1000 == 0).then_some(msat / 1000)
 }
 
 /// Settlement catch-up: capture any settlement the live `watch()` stream missed. A settlement can be
@@ -1194,6 +1411,523 @@ fn duration_secs(s: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::Invoice;
+    use crate::store::migrate;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::mpsc;
+
+    #[derive(Default)]
+    struct ReadinessPayment {
+        balance_msat: StdMutex<Option<u64>>,
+        gateway_ok: StdMutex<bool>,
+        statuses: StdMutex<HashMap<String, PayStatus>>,
+        started: StdMutex<HashSet<String>>,
+        required_by_gross: StdMutex<HashMap<u64, u128>>,
+    }
+
+    impl ReadinessPayment {
+        fn new(balance_msat: Option<u64>, gateway_ok: bool) -> Self {
+            Self {
+                balance_msat: StdMutex::new(balance_msat),
+                gateway_ok: StdMutex::new(gateway_ok),
+                statuses: StdMutex::new(HashMap::new()),
+                started: StdMutex::new(HashSet::new()),
+                required_by_gross: StdMutex::new(HashMap::new()),
+            }
+        }
+
+        fn set_status(&self, key: &str, status: PayStatus) {
+            self.statuses
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), status);
+        }
+
+        fn set_started(&self, key: &str) {
+            self.started.lock().unwrap().insert(key.to_string());
+        }
+
+        fn set_required(&self, gross_sat: u64, required_msat: u128) {
+            self.required_by_gross
+                .lock()
+                .unwrap()
+                .insert(gross_sat, required_msat);
+        }
+    }
+
+    #[async_trait]
+    impl PaymentBackend for ReadinessPayment {
+        async fn create_invoice(&self, _: u64, _: &str, _: u32, _: &str) -> Result<Invoice> {
+            unimplemented!("readiness tests do not create invoices")
+        }
+
+        async fn lookup(&self, _: &str) -> Result<PaymentStatus> {
+            unimplemented!("readiness tests do not look up inbound invoices")
+        }
+
+        async fn lookup_settlement(&self, _: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            unimplemented!("readiness tests do not look up settlements")
+        }
+
+        async fn pay(&self, _: &str, _: u64, _: &str) -> Result<String> {
+            unimplemented!("readiness tests do not pay")
+        }
+
+        async fn refund_required_outlay_msat(
+            &self,
+            gross_sat: u64,
+            pay_sat: Option<u64>,
+        ) -> Result<u128> {
+            Ok(self
+                .required_by_gross
+                .lock()
+                .unwrap()
+                .get(&gross_sat)
+                .copied()
+                .unwrap_or_else(|| u128::from(pay_sat.unwrap_or(gross_sat)) * 1000))
+        }
+
+        async fn payment_status(&self, _: &str) -> Result<PayStatus> {
+            unimplemented!("readiness tests check by key")
+        }
+
+        async fn payment_status_by_key(&self, key: &str) -> Result<PayStatus> {
+            Ok(*self
+                .statuses
+                .lock()
+                .unwrap()
+                .get(key)
+                .unwrap_or(&PayStatus::Unknown))
+        }
+
+        async fn payment_started_by_key(&self, key: &str) -> Result<bool> {
+            Ok(self.started.lock().unwrap().contains(key))
+        }
+
+        async fn available_balance_msat(&self) -> Result<Option<u64>> {
+            Ok(*self.balance_msat.lock().unwrap())
+        }
+
+        async fn refund_gateway_ready(&self) -> Result<bool> {
+            Ok(*self.gateway_ok.lock().unwrap())
+        }
+
+        async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+            unimplemented!("readiness tests do not watch settlements")
+        }
+    }
+
+    fn mem_store() -> Store {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        Store::spawn(conn)
+    }
+
+    fn readiness_payment(balance_msat: Option<u64>, gateway_ok: bool) -> Arc<dyn PaymentBackend> {
+        Arc::new(ReadinessPayment::new(balance_msat, gateway_ok))
+    }
+
+    async fn readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) -> RefundReadinessReport {
+        refund_readiness_report(store, payment).await.unwrap()
+    }
+
+    async fn seed_subscription(store: &Store, id: &str, state: &str) {
+        let (id, state) = (id.to_string(), state.to_string());
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO subscription (id, state, buyer_pubkey, created_at, updated_at)
+                     VALUES (?1, ?2, 'buyer', 0, 0)",
+                    rusqlite::params![id, state],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_invoice(
+        store: &Store,
+        sub_id: &str,
+        external_id: &str,
+        kind: &str,
+        amount_sat: i64,
+        status: &str,
+        settled_at: Option<i64>,
+        applied_at: Option<i64>,
+    ) {
+        let (sub_id, external_id, kind, status) = (
+            sub_id.to_string(),
+            external_id.to_string(),
+            kind.to_string(),
+            status.to_string(),
+        );
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO invoice
+                        (id, subscription_id, external_id, kind, amount_sat, status,
+                         settled_at, applied_at, issued_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+                    rusqlite::params![
+                        format!("inv-{external_id}"),
+                        sub_id,
+                        external_id,
+                        kind,
+                        amount_sat,
+                        status,
+                        settled_at,
+                        applied_at,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn seed_refund_attempt(
+        store: &Store,
+        sub_id: &str,
+        external_id: &str,
+        amount_sat: i64,
+        status: &str,
+        resolved_bolt11: Option<&str>,
+        resolution_gen: i64,
+    ) {
+        let (sub_id, external_id, status, resolved_bolt11) = (
+            sub_id.to_string(),
+            external_id.to_string(),
+            status.to_string(),
+            resolved_bolt11.map(str::to_string),
+        );
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO refund_attempt
+                        (id, subscription_id, dest, amount_sat, idempotency_key, status, attempts,
+                         resolved_bolt11, resolved_expiry, resolution_gen, created_at, updated_at)
+                     VALUES (?1, ?2, 'lnaddr@buyer', ?3, ?4, ?5, 0, ?6, 100, ?7, 0, 0)",
+                    rusqlite::params![
+                        format!("ref-{external_id}"),
+                        sub_id,
+                        amount_sat,
+                        format!("refund:{external_id}"),
+                        status,
+                        resolved_bolt11,
+                        resolution_gen,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_no_warning_at_zero_balance_with_zero_liability() {
+        let store = mem_store();
+        let payment = readiness_payment(Some(0), true);
+
+        let report = readiness(&store, &payment).await;
+
+        assert_eq!(report.liability_count, 0);
+        assert_eq!(report.warning, None);
+    }
+
+    #[tokio::test]
+    async fn readiness_warns_when_required_exceeds_balance() {
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "PROVISIONING").await;
+        seed_invoice(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            "order",
+            2,
+            "PAID",
+            Some(10),
+            Some(10),
+        )
+        .await;
+        let payment = readiness_payment(Some(1_999), true);
+
+        let report = readiness(&store, &payment).await;
+
+        assert_eq!(report.required_msat, 2_000);
+        assert_eq!(
+            report.warning,
+            Some(RefundReadinessWarning::InsufficientBalance)
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_warns_gateway_down_with_liabilities() {
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "PROVISIONING").await;
+        seed_invoice(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            "order",
+            1,
+            "PAID",
+            Some(10),
+            Some(10),
+        )
+        .await;
+        let payment = readiness_payment(Some(10_000), false);
+
+        let report = readiness(&store, &payment).await;
+
+        assert_eq!(
+            report.warning,
+            Some(RefundReadinessWarning::GatewayUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_ignores_old_paid_renewals_on_later_inactive_subscriptions() {
+        let store = mem_store();
+        for (sub_id, state) in [("sub-s", "SUSPENDED"), ("sub-t", "TERMINATED")] {
+            seed_subscription(&store, sub_id, state).await;
+            seed_invoice(
+                &store,
+                sub_id,
+                &format!("renew:auto:{sub_id}:1000"),
+                "renewal",
+                1,
+                "PAID",
+                Some(900),
+                Some(900),
+            )
+            .await;
+        }
+        let payment = readiness_payment(Some(0), true);
+
+        let report = readiness(&store, &payment).await;
+
+        assert_eq!(report.liability_count, 0);
+        assert_eq!(report.warning, None);
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_parked_failed_refunds_as_manual_liabilities() {
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "REFUND_DUE").await;
+        seed_invoice(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            "order",
+            2,
+            "PAID",
+            Some(10),
+            Some(10),
+        )
+        .await;
+        seed_refund_attempt(&store, "sub-1", "order:sub-1", 2, "FAILED", None, 0).await;
+        let payment = readiness_payment(Some(10_000), true);
+
+        let report = readiness(&store, &payment).await;
+
+        assert_eq!(report.gross_liability_sat, 2);
+        assert_eq!(report.required_msat, 0);
+        assert_eq!(report.parked_count, 1);
+        assert_eq!(report.warning, Some(RefundReadinessWarning::ParkedManual));
+    }
+
+    #[tokio::test]
+    async fn readiness_compares_balance_in_msats_exactly() {
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "REFUND_DUE").await;
+        seed_invoice(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            "order",
+            2,
+            "PAID",
+            Some(10),
+            Some(10),
+        )
+        .await;
+        seed_refund_attempt(&store, "sub-1", "order:sub-1", 2, "PENDING", None, 0).await;
+        let payment = Arc::new(ReadinessPayment::new(Some(1_500), true));
+        payment.set_required(2, 1_500);
+        let payment: Arc<dyn PaymentBackend> = payment;
+
+        let report = readiness(&store, &payment).await;
+
+        assert_eq!(report.required_msat, 1_500);
+        assert_eq!(report.balance_msat, Some(1_500));
+        assert_eq!(report.warning, None);
+    }
+
+    #[tokio::test]
+    async fn readiness_in_flight_pending_generation_does_not_inflate_required() {
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "REFUND_DUE").await;
+        seed_invoice(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            "order",
+            2,
+            "PAID",
+            Some(10),
+            Some(10),
+        )
+        .await;
+        seed_refund_attempt(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            2,
+            "PENDING",
+            Some("persisted-bolt11"),
+            1,
+        )
+        .await;
+        let payment = Arc::new(ReadinessPayment::new(Some(0), true));
+        payment.set_status("refund:order:sub-1:g1", PayStatus::Pending);
+        payment.set_required(2, 2_000);
+        let payment: Arc<dyn PaymentBackend> = payment;
+
+        let report = readiness(&store, &payment).await;
+
+        assert_eq!(report.gross_liability_sat, 2);
+        assert_eq!(report.required_msat, 0);
+        assert_eq!(report.warning, None);
+    }
+
+    #[tokio::test]
+    async fn readiness_unknown_without_started_attempt_still_requires_liquidity() {
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "REFUND_DUE").await;
+        seed_invoice(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            "order",
+            2,
+            "PAID",
+            Some(10),
+            Some(10),
+        )
+        .await;
+        seed_refund_attempt(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            2,
+            "PENDING",
+            Some("persisted-bolt11"),
+            1,
+        )
+        .await;
+        let payment = Arc::new(ReadinessPayment::new(Some(0), true));
+        payment.set_status("refund:order:sub-1:g1", PayStatus::Unknown);
+        payment.set_required(2, 2_000);
+        let payment: Arc<dyn PaymentBackend> = payment;
+
+        let report = readiness(&store, &payment).await;
+
+        assert_eq!(report.required_msat, 2_000);
+        assert_eq!(
+            report.warning,
+            Some(RefundReadinessWarning::InsufficientBalance)
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_in_flight_unknown_started_key_does_not_inflate_required() {
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "REFUND_DUE").await;
+        seed_invoice(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            "order",
+            2,
+            "PAID",
+            Some(10),
+            Some(10),
+        )
+        .await;
+        seed_refund_attempt(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            2,
+            "PENDING",
+            Some("persisted-bolt11"),
+            1,
+        )
+        .await;
+        let payment = Arc::new(ReadinessPayment::new(Some(0), true));
+        payment.set_status("refund:order:sub-1:g1", PayStatus::Unknown);
+        payment.set_started("refund:order:sub-1:g1");
+        payment.set_required(2, 2_000);
+        let payment: Arc<dyn PaymentBackend> = payment;
+
+        let report = readiness(&store, &payment).await;
+
+        assert_eq!(report.gross_liability_sat, 2);
+        assert_eq!(report.required_msat, 0);
+        assert_eq!(report.warning, None);
+    }
+
+    #[tokio::test]
+    async fn readiness_dedups_paid_pending_order_against_unreconciled_settlement() {
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "PENDING").await;
+        seed_invoice(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            "order",
+            1,
+            "PAID",
+            Some(10),
+            None,
+        )
+        .await;
+        let payment = readiness_payment(Some(1_000), true);
+
+        let report = readiness(&store, &payment).await;
+
+        assert_eq!(report.liability_count, 1);
+        assert_eq!(report.gross_liability_sat, 1);
+        assert_eq!(report.required_msat, 1_000);
+        assert_eq!(report.warning, None);
+    }
+
+    #[tokio::test]
+    async fn readiness_sent_refund_blocks_terminal_invoice_residual_bucket() {
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "EXPIRED").await;
+        seed_invoice(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            "order",
+            2,
+            "EXPIRED",
+            Some(10),
+            None,
+        )
+        .await;
+        seed_refund_attempt(&store, "sub-1", "order:sub-1", 2, "SENT", None, 0).await;
+        let payment = readiness_payment(Some(0), true);
+
+        let report = readiness(&store, &payment).await;
+
+        assert_eq!(report.liability_count, 0);
+        assert_eq!(report.warning, None);
+    }
 
     #[test]
     fn recovered_settle_time_is_capped_to_the_binding_in_window_boundary() {

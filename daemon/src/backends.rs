@@ -66,6 +66,20 @@ pub trait PaymentBackend: Send + Sync {
     async fn refund_net_sat(&self, gross_sat: u64) -> Result<u64> {
         Ok(gross_sat)
     }
+    /// Exact backend outlay needed NOW to start an automated refund payment. `pay_sat=Some(_)` is for
+    /// a fixed/direct or persisted resolved invoice; `None` asks the backend to price a fresh net cap.
+    /// Default backends charge no outbound fee, so the outlay is just the payout in msats.
+    async fn refund_required_outlay_msat(
+        &self,
+        gross_sat: u64,
+        pay_sat: Option<u64>,
+    ) -> Result<u128> {
+        let pay_sat = match pay_sat {
+            Some(pay_sat) => pay_sat,
+            None => self.refund_net_sat(gross_sat).await?,
+        };
+        Ok(u128::from(pay_sat) * 1000)
+    }
     /// Idempotent refund pay with a final INV-1 cap check before any NEW backend operation. Existing
     /// `SUCCEEDED`/`PENDING` operations for `idempotency_key` are re-awaited exactly as [`pay`](Self::pay).
     /// For a NEW operation the backend MUST refuse to start if
@@ -86,6 +100,20 @@ pub trait PaymentBackend: Send + Sync {
     /// Check an in-flight refund by its idempotency key after a crash (SPEC §6.6). An
     /// optimization only — retrying `pay(key)` is always safe (the key dedups).
     async fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus>;
+    /// Whether this key has durable evidence of a started outbound operation. This disambiguates
+    /// `PayStatus::Unknown` for readiness: no record still needs liquidity; an unqueryable started
+    /// operation has already committed funds.
+    async fn payment_started_by_key(&self, _idempotency_key: &str) -> Result<bool> {
+        Ok(false)
+    }
+    /// Spendable balance in msats, or `None` for backends without an observable balance.
+    async fn available_balance_msat(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+    /// Whether the backend can currently price and pay refunds.
+    async fn refund_gateway_ready(&self) -> Result<bool> {
+        Ok(true)
+    }
     /// Stream of settled payments (push). `Settlement.external_id` carries the order id
     /// (SPEC §6.1). M1a wires this to the Fedimint client settlement stream.
     async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>>;

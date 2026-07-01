@@ -7,8 +7,37 @@
 
 use anyhow::{anyhow, Result};
 use rusqlite::{Connection, Transaction};
+use std::collections::HashSet;
 use std::path::Path;
 use tokio::sync::{mpsc, oneshot};
+
+const SETTLE_REFUND_KINDS_SQL: &str = "'settle_unmatched_refund', 'settle_terminal_refund',
+                                         'settle_orphan_refund', 'settle_expired_refund'";
+
+/// A value-received/not-delivered row for the supervisor's refund-readiness check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefundReadinessLiability {
+    pub external_id: String,
+    pub gross_sat: u64,
+    pub source: RefundReadinessSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefundReadinessSource {
+    RefundAttempt(RefundAttemptLiability),
+    PaidUndeliveredOrder,
+    UnreconciledSettlement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefundAttemptLiability {
+    pub status: String,
+    pub idempotency_key: String,
+    pub dest: Option<String>,
+    pub resolved_bolt11: Option<String>,
+    pub resolved_expiry: Option<i64>,
+    pub resolution_gen: i64,
+}
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS operator (
@@ -411,6 +440,12 @@ impl Store {
         .await
     }
 
+    /// Liability set for INV-2 refund-readiness. Buckets are de-duplicated by `external_id` with
+    /// precedence: refund_attempt > paid-undelivered order > unreconciled settlement.
+    pub async fn refund_readiness_liabilities(&self) -> Result<Vec<RefundReadinessLiability>> {
+        self.read(load_refund_readiness_liabilities).await
+    }
+
     async fn run<T, F>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
@@ -427,6 +462,196 @@ impl Store {
         rrx.await
             .map_err(|_| anyhow!("store actor dropped the reply"))?
     }
+}
+
+fn load_refund_readiness_liabilities(conn: &Connection) -> Result<Vec<RefundReadinessLiability>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let refund_external_ids = load_refund_attempt_external_ids(conn)?;
+
+    let refund_sql = format!(
+        "WITH journal AS (
+             SELECT json_extract(detail_json, '$.external_id') AS external_id,
+                    CAST(json_extract(detail_json, '$.amount_sat') AS INTEGER) AS amount_sat
+               FROM event_log
+              WHERE kind IN ({SETTLE_REFUND_KINDS_SQL})
+              GROUP BY external_id
+         )
+         SELECT r.external_id,
+                COALESCE(i.amount_sat, journal.amount_sat) AS received_sat,
+                r.status, r.idempotency_key, r.dest, r.resolved_bolt11,
+                r.resolved_expiry, r.resolution_gen
+           FROM (
+                 SELECT *,
+                        CASE
+                          WHEN idempotency_key LIKE 'refund:%' THEN substr(idempotency_key, 8)
+                          WHEN id LIKE 'ref-%' THEN substr(id, 5)
+                          ELSE id
+                        END AS external_id
+                   FROM refund_attempt
+                  WHERE status <> 'SENT'
+                ) r
+           LEFT JOIN invoice i
+                  ON i.external_id = r.external_id
+                 AND (i.status = 'PAID' OR i.settled_at IS NOT NULL)
+           LEFT JOIN journal ON journal.external_id = r.external_id
+          ORDER BY r.created_at, r.id"
+    );
+    let mut stmt = conn.prepare(&refund_sql)?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<i64>>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<i64>>(6)?,
+            r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+        ))
+    })?;
+    for row in rows {
+        let (
+            external_id,
+            received_sat,
+            status,
+            idempotency_key,
+            dest,
+            resolved_bolt11,
+            resolved_expiry,
+            resolution_gen,
+        ) = row?;
+        let Some(gross_sat) = positive_sat(received_sat) else {
+            continue;
+        };
+        if seen.insert(external_id.clone()) {
+            out.push(RefundReadinessLiability {
+                external_id,
+                gross_sat,
+                source: RefundReadinessSource::RefundAttempt(RefundAttemptLiability {
+                    status,
+                    idempotency_key,
+                    dest,
+                    resolved_bolt11,
+                    resolved_expiry,
+                    resolution_gen,
+                }),
+            });
+        }
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT i.external_id, i.amount_sat
+           FROM invoice i
+           JOIN subscription s ON s.id = i.subscription_id
+          WHERE i.kind = 'order'
+            AND (i.status = 'PAID' OR i.settled_at IS NOT NULL)
+            AND s.state IN ('PENDING', 'PROVISIONING', 'REFUND_DUE')
+          ORDER BY i.issued_at, i.id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+    })?;
+    for row in rows {
+        let (external_id, amount_sat) = row?;
+        if refund_external_ids.contains(&external_id) {
+            continue;
+        }
+        let Some(gross_sat) = positive_sat(amount_sat) else {
+            continue;
+        };
+        if seen.insert(external_id.clone()) {
+            out.push(RefundReadinessLiability {
+                external_id,
+                gross_sat,
+                source: RefundReadinessSource::PaidUndeliveredOrder,
+            });
+        }
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT i.external_id, i.amount_sat
+           FROM invoice i
+           LEFT JOIN subscription s ON s.id = i.subscription_id
+          WHERE i.settled_at IS NOT NULL
+            AND i.applied_at IS NULL
+            AND COALESCE(i.kind, '') <> 'renewal'
+            AND COALESCE(s.state, '') NOT IN ('ACTIVE', 'REFUNDED')
+          ORDER BY i.settled_at, i.id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+    })?;
+    for row in rows {
+        let (external_id, amount_sat) = row?;
+        if refund_external_ids.contains(&external_id) {
+            continue;
+        }
+        let Some(gross_sat) = positive_sat(amount_sat) else {
+            continue;
+        };
+        if seen.insert(external_id.clone()) {
+            out.push(RefundReadinessLiability {
+                external_id,
+                gross_sat,
+                source: RefundReadinessSource::UnreconciledSettlement,
+            });
+        }
+    }
+
+    let journal_sql = format!(
+        "SELECT json_extract(e.detail_json, '$.external_id') AS external_id,
+                CAST(json_extract(e.detail_json, '$.amount_sat') AS INTEGER) AS amount_sat
+           FROM event_log e
+           LEFT JOIN subscription s ON s.id = e.subscription_id
+          WHERE e.kind IN ({SETTLE_REFUND_KINDS_SQL})
+            AND COALESCE(s.state, '') NOT IN ('ACTIVE', 'REFUNDED')
+          GROUP BY external_id
+          ORDER BY e.id"
+    );
+    let mut stmt = conn.prepare(&journal_sql)?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+    })?;
+    for row in rows {
+        let (external_id, amount_sat) = row?;
+        if refund_external_ids.contains(&external_id) {
+            continue;
+        }
+        let Some(gross_sat) = positive_sat(amount_sat) else {
+            continue;
+        };
+        if seen.insert(external_id.clone()) {
+            out.push(RefundReadinessLiability {
+                external_id,
+                gross_sat,
+                source: RefundReadinessSource::UnreconciledSettlement,
+            });
+        }
+    }
+
+    Ok(out)
+}
+
+fn load_refund_attempt_external_ids(conn: &Connection) -> Result<HashSet<String>> {
+    let mut ids = HashSet::new();
+    let mut stmt = conn.prepare(
+        "SELECT CASE
+                  WHEN idempotency_key LIKE 'refund:%' THEN substr(idempotency_key, 8)
+                  WHEN id LIKE 'ref-%' THEN substr(id, 5)
+                  ELSE id
+                END
+           FROM refund_attempt",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    for row in rows {
+        ids.insert(row?);
+    }
+    Ok(ids)
+}
+
+fn positive_sat(amount: Option<i64>) -> Option<u64> {
+    amount.and_then(|a| (a > 0).then_some(a as u64))
 }
 
 #[cfg(test)]
