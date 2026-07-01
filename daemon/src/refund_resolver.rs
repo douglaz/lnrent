@@ -85,9 +85,8 @@ pub enum DestForm {
     Lnurl(String),
 }
 
-/// The seam the [`crate::refund::Refunder`] resolves through, just before `pay()`. The production
-/// [`Resolver`] does real LNURL-pay HTTP; tests inject a fake; the default-backend daemon uses
-/// [`PassThroughResolver`].
+/// The seam the [`crate::refund::Refunder`] resolves through, just before `pay()`. Production injects
+/// [`Resolver`] for real LNURL-pay HTTP; tests inject fakes or [`PassThroughResolver`].
 #[async_trait]
 pub trait RefundResolver: Send + Sync {
     /// Resolve `dest` to a payable bolt11 for `owed_msat`, where `now` is the wall clock (unix secs)
@@ -211,10 +210,10 @@ fn decode_lnurl(d: &str) -> Result<String, ResolveError> {
 }
 
 /// A no-resolution resolver: returns the raw `dest` verbatim as the bolt11, with no expiry. The
-/// DEFAULT for [`crate::refund::Refunder::new`] because the v1 daemon's `MockPayment` backend accepts
-/// any `pay(dest)` string — only a REAL backend (Fedimint, lnrent-o6p) needs a concrete bolt11, and
-/// that bead injects the real [`Resolver`] via [`crate::refund::Refunder::with_resolver`]. Keeping
-/// this as the default preserves the mock money path (and its e2e suite) backend-faithfully.
+/// DEFAULT for [`crate::refund::Refunder::new`] because mock payment backends accept any
+/// `pay(dest)` string. Production daemon wiring injects the real [`Resolver`] via
+/// [`crate::refund::Refunder::with_resolver`]; passthrough stays available for focused tests and
+/// mock harnesses.
 pub struct PassThroughResolver;
 
 #[async_trait]
@@ -281,9 +280,8 @@ pub struct Resolver {
 }
 
 impl Resolver {
-    /// Production resolver: HTTPS-only, SSRF guard ON. Built by the enable-fedimint wiring
-    /// (lnrent-o6p) and injected via [`crate::refund::Refunder::with_resolver`]; the default daemon
-    /// (MockPayment) uses [`PassThroughResolver`].
+    /// Production resolver: HTTPS-only, SSRF guard ON. The daemon injects this through
+    /// [`crate::refund::Refunder::with_resolver`].
     pub fn new() -> Self {
         Self::build(false)
     }

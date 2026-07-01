@@ -27,6 +27,7 @@ use lnrentd::clock::{Clock, TestClock};
 use lnrentd::ipc::{self, Reply};
 use lnrentd::nostr_engine::NostrEngine;
 use lnrentd::recipe::Recipe;
+use lnrentd::refund_resolver::PassThroughResolver;
 use lnrentd::store::Store;
 use lnrentd::supervisor::{Intervals, RunningSupervisor, Supervisor};
 
@@ -147,6 +148,7 @@ async fn start_supervisor(
         engine,
         payment,
         clock,
+        Arc::new(PassThroughResolver),
         recipe,
         sock.clone(),
         fast_intervals(),

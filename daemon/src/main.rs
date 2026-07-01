@@ -20,6 +20,7 @@ use lnrentd::fedimint_backend::FedimintPayment;
 use lnrentd::ipc::IpcError;
 use lnrentd::nostr_engine::NostrEngine;
 use lnrentd::recipe::Recipe;
+use lnrentd::refund_resolver::Resolver;
 use lnrentd::supervisor::{Intervals, Supervisor};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -233,6 +234,7 @@ async fn run_daemon() -> Result<()> {
         engine,
         payment,
         clock,
+        Arc::new(Resolver::new()),
         recipe,
         sock,
         Intervals::production(),

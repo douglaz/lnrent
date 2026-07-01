@@ -43,6 +43,7 @@ use lnrentd::nostr_engine::{NostrEngine, OpHandler, OrderHandler, Outbound};
 use lnrentd::op_dispatch::OpDispatch;
 use lnrentd::order_intake::OrderIntake;
 use lnrentd::recipe::Recipe;
+use lnrentd::refund_resolver::PassThroughResolver;
 use lnrentd::reservation::Budget;
 use lnrentd::store::Store;
 use lnrentd::supervisor::{Intervals, RunningSupervisor, Supervisor};
@@ -154,6 +155,7 @@ async fn start_supervisor_with_sock(
         engine,
         payment,
         clock,
+        Arc::new(PassThroughResolver),
         recipe,
         sock.clone(),
         fast_intervals(),
@@ -2496,6 +2498,7 @@ async fn do_vps_real_payment_provisions_a_real_vm() {
         engine,
         payment.clone(),
         clock.clone(),
+        Arc::new(PassThroughResolver),
         recipe.clone(),
         temp_sock(),
         fast_intervals(),

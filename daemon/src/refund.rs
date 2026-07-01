@@ -191,16 +191,14 @@ fn gen_key(external_id: &str, gen: i64) -> String {
 
 impl Refunder {
     /// Construct a Refunder with the DEFAULT [`PassThroughResolver`]: it pays the raw `dest`, which is
-    /// correct for the v1 daemon's `MockPayment` backend (it accepts any `pay(dest)` string). A REAL
-    /// backend (Fedimint) needs a concrete bolt11; the enable-fedimint wiring (lnrent-o6p) injects the
-    /// production [`crate::refund_resolver::Resolver`] via [`Refunder::with_resolver`]. The supervisor
-    /// (lnrent-7fp.21) calls this 3-arg form, so its signature is fixed.
+    /// useful for focused tests and mock backends that accept any `pay(dest)` string. Production
+    /// daemon wiring injects [`crate::refund_resolver::Resolver`] via [`Refunder::with_resolver`].
     pub fn new(store: Store, payment: Arc<dyn PaymentBackend>, clock: Arc<dyn Clock>) -> Self {
         Self::with_resolver(store, payment, clock, Arc::new(PassThroughResolver))
     }
 
-    /// Construct a Refunder with an explicit refund-dest resolver — the seam the enable-fedimint
-    /// wiring (lnrent-o6p) uses to inject the real LNURL-pay [`crate::refund_resolver::Resolver`].
+    /// Construct a Refunder with an explicit refund-dest resolver — the seam production wiring uses to
+    /// inject the real LNURL-pay [`crate::refund_resolver::Resolver`].
     pub fn with_resolver(
         store: Store,
         payment: Arc<dyn PaymentBackend>,
@@ -1145,6 +1143,7 @@ mod tests {
         // Per-key status OVERRIDE (the generation gate seeds e.g. `:g1`->Failed, `:g2`->Unknown to
         // prove status is read per-generation). Consulted before the global `failed_status` default.
         key_status: HashMap<String, PayStatus>,
+        pay_dest: HashMap<String, String>,
         // Keys `pay()` was attempted on (even if it errored). Only these fall back to `failed_status`;
         // a never-attempted key reports `Unknown`, as a real backend would for a key it never recorded.
         attempted: HashSet<String>,
@@ -1197,6 +1196,9 @@ mod tests {
         fn was_paid(&self, key: &str) -> bool {
             self.inner.lock().unwrap().paid.contains_key(key)
         }
+        fn paid_dest(&self, key: &str) -> Option<String> {
+            self.inner.lock().unwrap().pay_dest.get(key).cloned()
+        }
         /// pay() settles the key (so `payment_status_by_key` -> Succeeded) but still returns Err —
         /// the ambiguous in-flight-timeout case where the refund went out yet `pay` reported failure.
         fn set_settle_then_fail(&self, settle_then_fail: bool) {
@@ -1216,15 +1218,12 @@ mod tests {
 
     #[async_trait]
     impl PaymentBackend for TestPayment {
-        async fn pay(
-            &self,
-            _dest: &str,
-            _amount_sat: u64,
-            idempotency_key: &str,
-        ) -> Result<String> {
+        async fn pay(&self, dest: &str, _amount_sat: u64, idempotency_key: &str) -> Result<String> {
             let mut st = self.inner.lock().unwrap();
             st.pay_calls += 1;
             st.attempted.insert(idempotency_key.to_string());
+            st.pay_dest
+                .insert(idempotency_key.to_string(), dest.to_string());
             if st.settle_then_fail {
                 // The refund actually settled on the key, but pay() reports an error: a
                 // re-query of the key must now read Succeeded so the row records SENT, not FAILED.
@@ -2048,6 +2047,70 @@ mod tests {
         let (resolved, gen) = resolution_of(&store, "ref-order:sub-1").await;
         assert_eq!(resolved.as_deref(), Some("resolved-bolt11-1"));
         assert_eq!(gen, 1, "first resolution is generation 1");
+    }
+
+    #[tokio::test]
+    async fn injected_resolver_result_is_paid_for_ln_address_refund() {
+        struct RecordingResolver {
+            bolt11: String,
+            calls: Mutex<Vec<(String, u64, i64)>>,
+        }
+
+        #[async_trait]
+        impl RefundResolver for RecordingResolver {
+            async fn resolve(
+                &self,
+                dest: &str,
+                owed_msat: u64,
+                now: i64,
+            ) -> Result<Resolved, ResolveError> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((dest.to_string(), owed_msat, now));
+                Ok(Resolved {
+                    bolt11: self.bolt11.clone(),
+                    expiry: 10_000,
+                })
+            }
+        }
+
+        let store = mem_store();
+        let payment = Arc::new(TestPayment::new());
+        let clock = TestClock::new(1_000);
+        let bolt11 = crate::refund_resolver::mint_bolt11(500_000, "meta", 1_000, 86_400);
+        let resolver = Arc::new(RecordingResolver {
+            bolt11: bolt11.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        seed_refund(&store, "sub-1", Some(LN_ADDR), Some(500)).await;
+
+        let report = refunder_with(&store, &payment, &clock, resolver.clone())
+            .drive()
+            .await
+            .unwrap();
+
+        assert_eq!(report.sent, 1);
+        {
+            let calls = resolver.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0.as_str(), LN_ADDR);
+            assert_eq!(calls[0].1, 500_000);
+            assert_eq!(calls[0].2, 1_000);
+        }
+        assert_eq!(
+            payment.paid_dest("refund:order:sub-1:g1").as_deref(),
+            Some(bolt11.as_str()),
+            "payment backend receives the resolved bolt11, not the raw LN-address"
+        );
+        assert_ne!(
+            payment.paid_dest("refund:order:sub-1:g1").as_deref(),
+            Some(LN_ADDR)
+        );
+        let (resolved, gen) = resolution_of(&store, "ref-order:sub-1").await;
+        assert_eq!(resolved.as_deref(), Some(bolt11.as_str()));
+        assert_eq!(gen, 1);
     }
 
     // THE GATE — gen-A Failed AND past its expiry -> RE-RESOLVE to gen-B (a NEW invoice), persist the

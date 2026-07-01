@@ -43,6 +43,7 @@ use crate::provision::{DeliveryResendOrderHandler, OutboxSender, Provisioner};
 use crate::recipe::Recipe;
 use crate::reconcile::Reconciler;
 use crate::refund::Refunder;
+use crate::refund_resolver::RefundResolver;
 use crate::reservation::Budget;
 use crate::store::{
     RefundAttemptLiability, RefundReadinessLiability, RefundReadinessSource, Store,
@@ -143,11 +144,13 @@ impl Supervisor {
     /// Construct the wired supervisor from the injected seams. The engine must already be connected
     /// ([`NostrEngine::connect`]); the store must be opened ONCE and shared. Sources the order-intake
     /// [`Budget`] + box id from the `box` row, or a bounded logged fallback.
+    #[allow(clippy::too_many_arguments)]
     pub async fn build(
         store: Store,
         engine: NostrEngine,
         payment: Arc<dyn PaymentBackend>,
         clock: Arc<dyn Clock>,
+        resolver: Arc<dyn RefundResolver>,
         recipe: Recipe,
         sock_path: PathBuf,
         intervals: Intervals,
@@ -187,7 +190,12 @@ impl Supervisor {
             recipe.clone(),
             box_id,
         ));
-        let refunder = Arc::new(Refunder::new(store.clone(), payment.clone(), clock.clone()));
+        let refunder = Arc::new(Refunder::with_resolver(
+            store.clone(),
+            payment.clone(),
+            clock.clone(),
+            resolver,
+        ));
         let reconciler = Arc::new(Reconciler::new(
             store.clone(),
             payment.clone(),

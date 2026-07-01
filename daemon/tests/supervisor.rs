@@ -35,6 +35,7 @@ use lnrentd::ipc::{self, Reply};
 use lnrentd::nostr_engine::{NostrEngine, OrderHandler};
 use lnrentd::order_intake::OrderIntake;
 use lnrentd::recipe::Recipe;
+use lnrentd::refund_resolver::PassThroughResolver;
 use lnrentd::reservation::Budget;
 use lnrentd::store::Store;
 use lnrentd::supervisor::{supervise, Backoff, Intervals, RunningSupervisor, Supervisor};
@@ -113,6 +114,7 @@ async fn start_supervisor(
         engine,
         payment,
         clock,
+        Arc::new(PassThroughResolver),
         dummy_recipe(),
         sock.clone(),
         fast_intervals(),
