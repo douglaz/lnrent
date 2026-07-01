@@ -2284,7 +2284,7 @@ struct DropletReaper {
 impl Drop for DropletReaper {
     fn drop(&mut self) {
         let script = format!(
-            r#"id=$(curl -fsS -H "Authorization: Bearer {t}" "https://api.digitalocean.com/v2/droplets?tag_name={g}" | jq -r '.droplets[0].id // empty'); [ -n "$id" ] && curl -sS -o /dev/null -X DELETE -H "Authorization: Bearer {t}" "https://api.digitalocean.com/v2/droplets/$id" || true"#,
+            r#"id=$(curl -fsS -H "Authorization: Bearer {t}" --get --data-urlencode "tag_name={g}" "https://api.digitalocean.com/v2/droplets" | jq -r '.droplets[0].id // empty'); [ -n "$id" ] && curl -sS -o /dev/null -X DELETE -H "Authorization: Bearer {t}" "https://api.digitalocean.com/v2/droplets/$id" || true"#,
             t = self.token,
             g = self.tag
         );
@@ -2298,7 +2298,7 @@ impl Drop for DropletReaper {
 /// `(count, id)` of droplets on DO tagged `tag`, via the API (a Command, like the recipe hooks).
 fn do_droplets_by_tag(token: &str, tag: &str) -> (i64, String) {
     let script = format!(
-        r#"curl -fsS -H "Authorization: Bearer {t}" "https://api.digitalocean.com/v2/droplets?tag_name={g}" | jq -r '"\(.droplets|length) \(.droplets[0].id // "")"'"#,
+        r#"curl -fsS -H "Authorization: Bearer {t}" --get --data-urlencode "tag_name={g}" "https://api.digitalocean.com/v2/droplets" | jq -r '"\(.droplets|length) \(.droplets[0].id // "")"'"#,
         t = token,
         g = tag
     );

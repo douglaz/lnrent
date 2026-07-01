@@ -37,8 +37,9 @@ tag="sub:${sub_id}"
 clean="$(printf '%s' "$sub_id" | tr -c 'a-zA-Z0-9' '-' | cut -c1-50 | sed 's/^-*//; s/-*$//')"
 name="lnrent${clean:+-$clean}"
 
-# Reuse an existing droplet for this subscription if one is already tagged (idempotent).
-existing="$(curl -fsS "${AUTH[@]}" "${API}/droplets?tag_name=${tag}" | jq -r '.droplets[0].id // empty')"
+# F4 assertion: this single `sub:${sub_id}` value is both the create tag and lookup tag; lookups
+# URL-encode tag_name so a URL-special request-id tail cannot alter the DO query.
+existing="$(curl -fsS "${AUTH[@]}" --get --data-urlencode "tag_name=${tag}" "${API}/droplets" | jq -r '.droplets[0].id // empty')"
 if [ -n "$existing" ]; then
   droplet_id="$existing"
 else

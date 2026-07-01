@@ -10,7 +10,8 @@ input="$(cat)"
 sub_id="$(jq -r '.subscription.id // .instance.subscription_id // empty' <<<"$input")"
 id="$(jq -r '.handles.droplet_id // .instance.handles.droplet_id // empty' <<<"$input")"
 if [ -z "$id" ] && [ -n "$sub_id" ]; then
-  id="$(curl -fsS "${AUTH[@]}" "${API}/droplets?tag_name=sub:${sub_id}" | jq -r '.droplets[0].id // empty')"
+  tag="sub:${sub_id}"
+  id="$(curl -fsS "${AUTH[@]}" --get --data-urlencode "tag_name=${tag}" "${API}/droplets" | jq -r '.droplets[0].id // empty')"
 fi
 if [ -n "$id" ]; then
   code="$(curl -sS -o /dev/null -w '%{http_code}' "${AUTH[@]}" -X DELETE "${API}/droplets/${id}")"

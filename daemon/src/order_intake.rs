@@ -81,8 +81,8 @@ impl OrderIntake {
         }
     }
 
-    /// The `order.request` flow (SPEC.md §6.6 ordering): dedup → refund-dest gate → validate →
-    /// reserve → invoice → one-transaction write → send after commit.
+    /// The `order.request` flow (SPEC.md §6.6 ordering): dedup → request-id gate →
+    /// refund-dest gate → validate → reserve → invoice → one-transaction write → send after commit.
     async fn handle_order(
         &self,
         sender: PublicKey,
@@ -94,6 +94,9 @@ impl OrderIntake {
         if let Some(cached) = self.cached_response(&sender, &req.id).await? {
             out.reply(&sender, &cached).await?;
             return Ok(());
+        }
+        if let Err(error) = validate_buyer_request_id_tail(&req.id) {
+            return self.fail_order(&sender, &req.id, None, error, out).await;
         }
 
         let now = self.clock.now();
@@ -968,6 +971,21 @@ fn enqueue_outbox(
 
 // The five `order.error` codes (§5.1) — the only ones this handler emits. `retryable` follows the
 // nature of the failure: a bad request is permanent, capacity / backend / store trouble is not.
+fn validate_buyer_request_id_tail(id: &str) -> std::result::Result<(), WireError> {
+    let valid_tail = !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'));
+    if valid_tail {
+        Ok(())
+    } else {
+        Err(params_invalid(
+            "request id must be 1..=128 chars using only [A-Za-z0-9_-]",
+        ))
+    }
+}
+
 fn validate_new_order_refund_dest(refund_dest: Option<&str>) -> std::result::Result<(), WireError> {
     let Some(dest) = refund_dest.map(str::trim).filter(|d| !d.is_empty()) else {
         return Err(refund_dest_invalid(
@@ -1502,6 +1520,56 @@ mod tests {
             assert!(err.order_id.is_none());
             assert_clean(&store).await;
         }
+    }
+
+    #[tokio::test]
+    async fn order_request_rejects_unsafe_request_id_before_derived_rows() {
+        let store = mem_store();
+        let recipe = dummy_recipe();
+        let listing_id = "30402:op:dummy-1";
+        seed_listing(
+            &store,
+            listing_id,
+            "dummy",
+            recipe.pricing.amount_sat as i64,
+        )
+        .await;
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1000),
+            recipe,
+            budget_with_room(),
+        );
+
+        let sender = Keys::generate().public_key();
+        let out = RecordingOutbound::default();
+        handler
+            .handle(sender, order("x&per_page=1", listing_id, json!({})), &out)
+            .await
+            .unwrap();
+        let err = expect_order_error(&out);
+        assert_eq!(err.request_id, "x&per_page=1");
+        assert_eq!(err.error.code, "params_invalid");
+        assert!(!err.error.retryable);
+        assert!(err.order_id.is_none());
+        assert_eq!(count(&store, "SELECT count(*) FROM subscription").await, 0);
+        assert_eq!(count(&store, "SELECT count(*) FROM invoice").await, 0);
+        assert_eq!(count(&store, "SELECT count(*) FROM reservation").await, 0);
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(sender, order("safe_Req-123", listing_id, json!({})), &out)
+            .await
+            .unwrap();
+        let inv = match out.only().1 {
+            Msg::OrderInvoice(i) => i,
+            other => panic!("expected order.invoice for safe id, got {other:?}"),
+        };
+        assert_eq!(inv.request_id, "safe_Req-123");
+        assert!(inv.order_id.ends_with(":safe_Req-123"));
+        assert_eq!(count(&store, "SELECT count(*) FROM subscription").await, 1);
+        assert_eq!(count(&store, "SELECT count(*) FROM reservation").await, 1);
     }
 
     // Test 3: soft_date or renew.request -> a renewal invoice is issued and billing.invoice is sent.
