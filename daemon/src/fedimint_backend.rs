@@ -25,7 +25,10 @@
 //!  - **Root secret** — lnrent's 32-byte secret (`identity.rs`) is wrapped as a fedimint
 //!    `DerivableSecret` (`new_root`) under `StandardDoubleDerive`, so the position is recoverable.
 
-use std::path::Path;
+use std::fs;
+use std::io::ErrorKind;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -66,6 +69,154 @@ const ROOT_SECRET_SALT: &[u8] = b"lnrent:fedimint:client:v1";
 /// `create_invoice`/`pay` (keyed by `external_id` / `idempotency_key`), separate from fedimint's
 /// rocksdb (codex finding #3).
 const INDEX_DB_FILE: &str = "lnrent_index.db";
+const CLIENT_DB_DIR: &str = "client.db";
+
+struct PreparedFedimintPaths {
+    client_db: PathBuf,
+    index_db: PathBuf,
+}
+
+/// Prepare + harden the lnrent-owned Fedimint paths BEFORE any RocksDB/sqlite open (spec F2). The
+/// confidentiality boundary is the **0700 directories** (`fedimint/`, `<federation>/`, `client.db/`):
+/// once they are owner-only, the note/wallet material inside is unreadable to co-tenant local users
+/// regardless of the umask-derived perms RocksDB (SST/LOG) and sqlite (`-wal`/`-shm`) give their own
+/// churned files — so the per-file 0600 on `lnrent_index.db`'s main file is belt-and-suspenders, not
+/// the load-bearing control. Each path is symlink-refused (lstat + O_NOFOLLOW re-open, `fchmod` on the
+/// fd so there is no chmod TOCTOU). NOTE: only each path's *final* component is O_NOFOLLOW-checked; an
+/// attacker who could swap an intermediate component (e.g. `fedimint/`) for a symlink already has write
+/// access to the operator's 0700 `data_dir` — i.e. is the service user/root — which is outside the
+/// co-tenant threat model this closes.
+fn prepare_fedimint_paths(data_dir: &Path, federation_id: &str) -> Result<PreparedFedimintPaths> {
+    let fedimint_dir = data_dir.join("fedimint");
+    prepare_private_dir(&fedimint_dir, "fedimint root dir")?;
+
+    let federation_dir = fedimint_dir.join(federation_id);
+    prepare_private_dir(&federation_dir, "fedimint federation dir")?;
+
+    let client_db = federation_dir.join(CLIENT_DB_DIR);
+    prepare_private_dir(&client_db, "fedimint client db dir")?;
+
+    let index_db = federation_dir.join(INDEX_DB_FILE);
+    prepare_private_file(&index_db, "fedimint lnrent index db")?;
+
+    Ok(PreparedFedimintPaths {
+        client_db,
+        index_db,
+    })
+}
+
+fn prepare_private_dir(path: &Path, what: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!("{what} {} must not be a symlink", path.display());
+            }
+            if !meta.file_type().is_dir() {
+                anyhow::bail!("{what} {} must be a directory", path.display());
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            match fs::DirBuilder::new().mode(0o700).create(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("creating {what} {}", path.display()))
+                }
+            }
+        }
+        Err(e) => return Err(e).with_context(|| format!("stat {what} {}", path.display())),
+    }
+    harden_private_dir(path, what)
+}
+
+fn harden_private_dir(path: &Path, what: &str) -> Result<()> {
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)
+        .map_err(|e| {
+            if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) {
+                anyhow!(
+                    "{what} {} must be a real directory, not a symlink",
+                    path.display()
+                )
+            } else {
+                anyhow!("opening {what} {} to harden perms: {e}", path.display())
+            }
+        })?;
+    let meta = handle
+        .metadata()
+        .with_context(|| format!("stat opened {what} {}", path.display()))?;
+    if !meta.file_type().is_dir() {
+        anyhow::bail!("{what} {} must be a directory", path.display());
+    }
+    handle
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("perms on {what} {}", path.display()))
+}
+
+fn prepare_private_file(path: &Path, what: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!("{what} {} must not be a symlink", path.display());
+            }
+            if !meta.file_type().is_file() {
+                anyhow::bail!("{what} {} must be a regular file", path.display());
+            }
+            harden_private_file(path, what)
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+            {
+                Ok(file) => file
+                    .set_permissions(fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("perms on {what} {}", path.display())),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    let meta = fs::symlink_metadata(path)
+                        .with_context(|| format!("stat {what} {}", path.display()))?;
+                    if meta.file_type().is_symlink() {
+                        anyhow::bail!("{what} {} must not be a symlink", path.display());
+                    }
+                    if !meta.file_type().is_file() {
+                        anyhow::bail!("{what} {} must be a regular file", path.display());
+                    }
+                    harden_private_file(path, what)
+                }
+                Err(e) => Err(e).with_context(|| format!("creating {what} {}", path.display())),
+            }
+        }
+        Err(e) => Err(e).with_context(|| format!("stat {what} {}", path.display())),
+    }
+}
+
+fn harden_private_file(path: &Path, what: &str) -> Result<()> {
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                anyhow!("{what} {} must not be a symlink", path.display())
+            } else {
+                anyhow!("opening {what} {} to harden perms: {e}", path.display())
+            }
+        })?;
+    let meta = handle
+        .metadata()
+        .with_context(|| format!("stat opened {what} {}", path.display()))?;
+    if !meta.file_type().is_file() {
+        anyhow::bail!("{what} {} must be a regular file", path.display());
+    }
+    handle
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("perms on {what} {}", path.display()))
+}
 
 /// Bound on how long `pay()` blocks awaiting a refund to a terminal state before returning and
 /// leaving the row PENDING (recoverable). Stops one stuck refund (gateway down, or a payment parked
@@ -134,12 +285,11 @@ impl FedimintPayment {
             .map(PublicKey::from_str)
             .transpose()
             .context("parsing the configured fedimint gateway pubkey (config.fedimint.gateway)")?;
-        let fed_dir = data_dir
-            .join("fedimint")
-            .join(invite.federation_id().to_string());
-        std::fs::create_dir_all(&fed_dir).context("creating fedimint data dir")?;
+        let federation_id = invite.federation_id().to_string();
+        let paths = prepare_fedimint_paths(data_dir, &federation_id)
+            .context("preparing fedimint data paths")?;
 
-        let db: Database = RocksDb::build(fed_dir.join("client.db"))
+        let db: Database = RocksDb::build(paths.client_db)
             .open()
             .await
             .context("opening fedimint client rocksdb")?
@@ -179,8 +329,7 @@ impl FedimintPayment {
                 .context("joining federation")?
         };
 
-        let conn =
-            Connection::open(fed_dir.join(INDEX_DB_FILE)).context("opening lnrent index db")?;
+        let conn = Connection::open(paths.index_db).context("opening lnrent index db")?;
         conn.execute_batch(INDEX_SCHEMA)
             .context("initialising lnrent index schema")?;
 
@@ -1184,6 +1333,95 @@ fn net_payout_sat(base_msat: u64, ppm: u64, gross_sat: u64) -> u64 {
 
 fn fedimint_readiness_warns(_balance_msat: Option<u64>, gateway_ok: bool) -> bool {
     !gateway_ok
+}
+
+#[cfg(test)]
+mod path_prep_tests {
+    use super::{prepare_fedimint_paths, CLIENT_DB_DIR, INDEX_DB_FILE};
+    use std::fs;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_data_dir(name: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "lnrent-fedimint-paths-{}-{name}-{n}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn file_mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn prepare_paths_hardens_children_under_preexisting_traversable_data_dir() {
+        let dir = temp_data_dir("perms");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let paths = prepare_fedimint_paths(&dir, "fed").expect("prepare fedimint paths");
+
+        let fedimint_dir = dir.join("fedimint");
+        let federation_dir = fedimint_dir.join("fed");
+        assert_eq!(file_mode(&dir), 0o755, "parent data dir is not chmod'ed");
+        assert_eq!(file_mode(&fedimint_dir), 0o700);
+        assert_eq!(file_mode(&federation_dir), 0o700);
+        assert_eq!(file_mode(&paths.client_db), 0o700);
+        assert_eq!(paths.client_db, federation_dir.join(CLIENT_DB_DIR));
+        assert_eq!(paths.index_db, federation_dir.join(INDEX_DB_FILE));
+        assert_eq!(file_mode(&paths.index_db), 0o600);
+        assert!(
+            !fs::symlink_metadata(&paths.index_db)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "index main file must not be a symlink"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_paths_refuses_symlinked_fedimint_owned_paths() {
+        assert_symlink_refused("fedimint-root", |dir, outside| {
+            symlink(outside, dir.join("fedimint")).unwrap();
+        });
+        assert_symlink_refused("federation-dir", |dir, outside| {
+            fs::create_dir_all(dir.join("fedimint")).unwrap();
+            symlink(outside, dir.join("fedimint/fed")).unwrap();
+        });
+        assert_symlink_refused("client-db", |dir, outside| {
+            fs::create_dir_all(dir.join("fedimint/fed")).unwrap();
+            symlink(outside, dir.join("fedimint/fed").join(CLIENT_DB_DIR)).unwrap();
+        });
+        assert_symlink_refused("index-db", |dir, outside| {
+            fs::create_dir_all(dir.join("fedimint/fed")).unwrap();
+            let target = outside.join("target.db");
+            fs::write(&target, b"outside").unwrap();
+            symlink(target, dir.join("fedimint/fed").join(INDEX_DB_FILE)).unwrap();
+        });
+    }
+
+    fn assert_symlink_refused(name: &str, setup: impl FnOnce(&Path, &Path)) {
+        let dir = temp_data_dir(name);
+        let outside = temp_data_dir(&format!("{name}-outside"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        setup(&dir, &outside);
+
+        assert!(
+            prepare_fedimint_paths(&dir, "fed").is_err(),
+            "symlinked {name} path must be refused"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
 }
 
 #[cfg(test)]
