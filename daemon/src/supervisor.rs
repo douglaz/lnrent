@@ -980,6 +980,9 @@ struct RefundReadinessReport {
     balance_msat: Option<u64>,
     gateway_ok: bool,
     parked_count: usize,
+    /// PENDING liabilities that could not be priced this pass (transient quote/gateway error). Their
+    /// cost is absent from `required_msat`, so coverage cannot be confirmed — forces a warning.
+    unpriceable_count: usize,
     warning: Option<RefundReadinessWarning>,
 }
 
@@ -992,6 +995,7 @@ impl Default for RefundReadinessReport {
             balance_msat: None,
             gateway_ok: true,
             parked_count: 0,
+            unpriceable_count: 0,
             warning: None,
         }
     }
@@ -1001,6 +1005,9 @@ impl Default for RefundReadinessReport {
 enum RefundReadinessWarning {
     GatewayUnavailable,
     InsufficientBalance,
+    /// A real PENDING liability could not be priced (its outlay is missing from `required_msat`), so
+    /// coverage cannot be confirmed — warn rather than falsely report "covered".
+    Unpriceable,
     ParkedManual,
 }
 
@@ -1043,6 +1050,16 @@ async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) 
             gateway_ok = report.gateway_ok,
             parked_count = report.parked_count,
             "refund readiness warning: parked refund liabilities require manual handling"
+        ),
+        Some(RefundReadinessWarning::Unpriceable) => tracing::warn!(
+            liabilities = report.liability_count,
+            gross_liability_sat = %report.gross_liability_sat,
+            required_outlay_msat = %report.required_msat,
+            balance_msat = ?report.balance_msat,
+            gateway_ok = report.gateway_ok,
+            parked_count = report.parked_count,
+            unpriceable_count = report.unpriceable_count,
+            "refund readiness warning: a pending refund liability could not be priced; coverage unconfirmed"
         ),
         None => tracing::info!(
             liabilities = report.liability_count,
@@ -1087,6 +1104,7 @@ async fn refund_readiness_report(
         balance_msat,
         gateway_ok,
         parked_count: 0,
+        unpriceable_count: 0,
         warning: None,
     };
 
@@ -1103,11 +1121,14 @@ async fn refund_readiness_report(
                 }
                 match pending_refund_required_msat(liability, refund, payment).await {
                     Ok(msat) => report.required_msat = report.required_msat.saturating_add(msat),
-                    Err(e) => tracing::warn!(
-                        external_id = %liability.external_id,
-                        error = %format!("{e:#}"),
-                        "refund readiness: could not price pending refund liability"
-                    ),
+                    Err(e) => {
+                        report.unpriceable_count += 1;
+                        tracing::warn!(
+                            external_id = %liability.external_id,
+                            error = %format!("{e:#}"),
+                            "refund readiness: could not price pending refund liability"
+                        );
+                    }
                 }
             }
             RefundReadinessSource::PaidUndeliveredOrder
@@ -1126,6 +1147,11 @@ async fn refund_readiness_report(
         .is_some_and(|balance| u128::from(balance) < report.required_msat)
     {
         Some(RefundReadinessWarning::InsufficientBalance)
+    } else if report.unpriceable_count > 0 {
+        // A pending liability we could not price (e.g. a transient quote failure while the gateway
+        // reported ready) is missing from required_msat, so coverage cannot be confirmed — warn
+        // rather than report "covered" and silently suppress a real liability (codex P2).
+        Some(RefundReadinessWarning::Unpriceable)
     } else if report.parked_count > 0 {
         Some(RefundReadinessWarning::ParkedManual)
     } else {
@@ -1424,6 +1450,7 @@ mod tests {
         statuses: StdMutex<HashMap<String, PayStatus>>,
         started: StdMutex<HashSet<String>>,
         required_by_gross: StdMutex<HashMap<u64, u128>>,
+        fail_pricing: StdMutex<bool>,
     }
 
     impl ReadinessPayment {
@@ -1434,7 +1461,12 @@ mod tests {
                 statuses: StdMutex::new(HashMap::new()),
                 started: StdMutex::new(HashSet::new()),
                 required_by_gross: StdMutex::new(HashMap::new()),
+                fail_pricing: StdMutex::new(false),
             }
+        }
+
+        fn set_pricing_fails(&self, fails: bool) {
+            *self.fail_pricing.lock().unwrap() = fails;
         }
 
         fn set_status(&self, key: &str, status: PayStatus) {
@@ -1479,6 +1511,9 @@ mod tests {
             gross_sat: u64,
             pay_sat: Option<u64>,
         ) -> Result<u128> {
+            if *self.fail_pricing.lock().unwrap() {
+                anyhow::bail!("simulated transient refund quote failure");
+            }
             Ok(self
                 .required_by_gross
                 .lock()
@@ -1801,6 +1836,48 @@ mod tests {
         assert_eq!(report.gross_liability_sat, 2);
         assert_eq!(report.required_msat, 0);
         assert_eq!(report.warning, None);
+    }
+
+    #[tokio::test]
+    async fn readiness_unpriceable_pending_liability_warns_not_covered() {
+        // Gateway reports ready and the balance is ample, but pricing this PENDING refund fails
+        // transiently. Its cost is then absent from required_msat, so coverage cannot be confirmed —
+        // the report MUST warn (Unpriceable) rather than fall through to "covered" and silently
+        // suppress a real liability (codex P2).
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "REFUND_DUE").await;
+        seed_invoice(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            "order",
+            2,
+            "PAID",
+            Some(10),
+            Some(10),
+        )
+        .await;
+        seed_refund_attempt(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            2,
+            "PENDING",
+            Some("persisted-bolt11"),
+            1,
+        )
+        .await;
+        let payment = Arc::new(ReadinessPayment::new(Some(1_000_000), true));
+        // The prior pay op returned funds (Failed) so a NEW pay must be priced — and pricing fails.
+        payment.set_status("refund:order:sub-1:g1", PayStatus::Failed);
+        payment.set_pricing_fails(true);
+        let payment: Arc<dyn PaymentBackend> = payment;
+
+        let report = readiness(&store, &payment).await;
+
+        assert_eq!(report.unpriceable_count, 1);
+        assert_eq!(report.required_msat, 0);
+        assert_eq!(report.warning, Some(RefundReadinessWarning::Unpriceable));
     }
 
     #[tokio::test]

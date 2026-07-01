@@ -406,11 +406,29 @@ impl Refunder {
                 .map_err(|e| {
                     PlanError::Transient(format!("refund status lookup for {key} failed: {e}"))
                 })?;
+            // Unknown but the op actually STARTED (crash window: pay_bolt11_invoice committed before the
+            // index row was written) is an in-flight refund that may yet settle — re-await it on the SAME
+            // key/payment-hash (fedimint dedups), NEVER re-quote, or a gateway outage / fee rise could
+            // strand a payment that can still land (codex P2). Only a not-started Unknown or a
+            // returned-funds Failed quotes the cap for a genuinely new payment.
+            let started_unknown = matches!(st, PayStatus::Unknown)
+                && self
+                    .payment
+                    .payment_started_by_key(&key)
+                    .await
+                    .map_err(|e| {
+                        PlanError::Transient(format!("refund started-check for {key}: {e}"))
+                    })?;
             return match st {
                 PayStatus::Succeeded => Ok(PlanOutcome::AlreadySent {
                     pay_sat: bolt11_sat,
                 }),
                 PayStatus::Pending => Ok(PlanOutcome::Pay {
+                    bolt11: dest.to_string(),
+                    gen: 0,
+                    pay_sat: bolt11_sat,
+                }),
+                _ if started_unknown => Ok(PlanOutcome::Pay {
                     bolt11: dest.to_string(),
                     gen: 0,
                     pay_sat: bolt11_sat,
@@ -1132,6 +1150,8 @@ mod tests {
         failed_status: Option<PayStatus>,
         settle_then_fail: bool, // pay() records the settlement but returns Err (ambiguous timeout)
         status_lookup_fails: bool, // payment_status_by_key returns Err (an unqueryable backend)
+        started: HashSet<String>, // keys payment_started_by_key reports as an in-flight (oplog) op
+        net_cap: Option<u64>, // refund_net_sat override (the fee-adjusted cap); None => full gross
     }
 
     impl TestPayment {
@@ -1159,6 +1179,15 @@ mod tests {
                 .unwrap()
                 .key_status
                 .insert(key.to_string(), status);
+        }
+        /// Report `key` as a STARTED-but-maybe-unrecorded op (fedimint's crash window) so an `Unknown`
+        /// status is treated as in-flight by `payment_started_by_key`.
+        fn set_started(&self, key: &str) {
+            self.inner.lock().unwrap().started.insert(key.to_string());
+        }
+        /// Override the fee-adjusted net cap that `refund_net_sat` returns.
+        fn set_net_cap(&self, net_sat: u64) {
+            self.inner.lock().unwrap().net_cap = Some(net_sat);
         }
         /// Whether a `pay` (or `mark_paid`) ever recorded this key.
         fn was_paid(&self, key: &str) -> bool {
@@ -1239,6 +1268,12 @@ mod tests {
         }
         async fn lookup_settlement(&self, _: &str) -> Result<(PaymentStatus, Option<i64>)> {
             unimplemented!("refunder never looks up invoices")
+        }
+        async fn payment_started_by_key(&self, idempotency_key: &str) -> Result<bool> {
+            Ok(self.inner.lock().unwrap().started.contains(idempotency_key))
+        }
+        async fn refund_net_sat(&self, gross_sat: u64) -> Result<u64> {
+            Ok(self.inner.lock().unwrap().net_cap.unwrap_or(gross_sat))
         }
         async fn payment_status(&self, _: &str) -> Result<PayStatus> {
             unimplemented!("refunder checks by key, not id")
@@ -2661,6 +2696,37 @@ mod tests {
             refund_amount(&store, "ref-order:sub-1").await,
             Some(500),
             "the gross liability ledger figure is unchanged by the fee deduction"
+        );
+    }
+
+    /// A gen-0 direct-bolt11 refund whose status is Unknown but whose op ACTUALLY STARTED (fedimint
+    /// crash window) must be RE-AWAITED on the same key, NOT re-quoted. Even with the net cap now
+    /// BELOW the fixed bolt11 — which a re-quote path would park FAILED — the in-flight payment is
+    /// recovered and reaches SENT (codex P2: don't strand an in-flight refund on a gateway/fee change).
+    #[tokio::test]
+    async fn gen0_unknown_started_reawaits_without_requote() {
+        let store = mem_store();
+        let payment = Arc::new(TestPayment::new());
+        let clock = TestClock::new(1_000);
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        let bolt11 = crate::refund_resolver::mint_bolt11(400_000, "meta", 1_000, 86_400); // 400 sat
+        seed_refund(&store, "sub-1", Some(&bolt11), Some(500)).await; // gross 500
+        seed_reservation(&store, "sub-1").await;
+        // Unknown but the op actually started; the cap has since dropped to 100 (< the 400 bolt11), so a
+        // re-quote path would park FAILED for exceeding the cap.
+        payment.set_key_status("refund:order:sub-1", PayStatus::Unknown);
+        payment.set_started("refund:order:sub-1");
+        payment.set_net_cap(100);
+
+        let report = refunder(&store, &payment, &clock).drive().await.unwrap();
+
+        assert_eq!(
+            report.sent, 1,
+            "the in-flight gen-0 Unknown was re-awaited, not re-quoted/parked"
+        );
+        assert!(
+            payment.was_paid("refund:order:sub-1"),
+            "paid on the same gen-0 key"
         );
     }
 
