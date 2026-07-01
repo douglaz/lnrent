@@ -33,7 +33,9 @@ pub struct OrderRequest {
     pub listing_id: String,
     /// Validated order params (the listing's `params` schema, §7.1).
     pub params: Value,
-    /// BOLT12 offer or Lightning address for refunds (ADR-0003); absent if not supplied.
+    /// Refund destination — a re-resolvable Lightning address or HTTPS LNURL (ADR-0003). REQUIRED for
+    /// new orders: the daemon rejects a missing/empty value, a raw BOLT11, or a BOLT12 offer at intake
+    /// (spec F3/F6). Kept `Option` on the wire only so legacy rows / non-order messages deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refund_dest: Option<String>,
 }

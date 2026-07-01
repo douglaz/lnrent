@@ -205,7 +205,19 @@ async fn buyer_cli_drives_full_flow_over_a_real_operator() {
     assert!(found, "the published dummy listing is discovered: {env}");
 
     // 2. `order create` returns a bolt11 invoice (the buyer NEVER pays).
-    let (code, env) = run_buyer(&url, &op_hex, &key_file, &["order", "create", &coord]).await;
+    let (code, env) = run_buyer(
+        &url,
+        &op_hex,
+        &key_file,
+        &[
+            "order",
+            "create",
+            &coord,
+            "--refund-dest",
+            "refunds@example.com",
+        ],
+    )
+    .await;
     assert_eq!(code, 0, "order create exit 0: {env}");
     assert_eq!(env["ok"], serde_json::json!(true));
     let data = &env["data"];

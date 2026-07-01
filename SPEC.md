@@ -343,7 +343,7 @@ NIP-17 private DM between the buyer and operator pubkeys:
 
 | type | direction | payload |
 |--|--|--|
-| `order.request`   | buyer -> operator | `id` (unique request id), `listing_id`, validated `params`, `refund_dest` (Lightning address/LNURL or bolt11; BOLT12 deferred) |
+| `order.request`   | buyer -> operator | `id` (unique request id), `listing_id`, validated `params`, `refund_dest` (REQUIRED, re-resolvable Lightning address / HTTPS LNURL; raw bolt11 and BOLT12 rejected for new orders) |
 | `order.invoice`   | operator -> buyer | `request_id` (= the `order.request` `id`), `order_id`, `bolt11`, `amount_sat`, `period`, `expires_at` |
 | `order.error`     | operator -> buyer | `request_id`, `order_id` (optional — absent for a pre-order validation failure), `error` `{ code, message, retryable }` with `code` in `capacity_full` / `params_invalid` / `price_changed` / `unavailable` / `rejected` — same nested `error` shape as `op.result`, so a buyer agent branches uniformly |
 | `provision.ready` | operator -> buyer | `subscription_id`, `payload` (the credentials) |
@@ -627,10 +627,11 @@ provision succeeds (ADR-0003). Two consequences:
   capacity for the order (§9.3) so concurrent orders cannot race the last slot. Most
   provision failures are caught here, before any money moves.
 - **Capture-then-refund on failure.** If `provision` still fails after capture, the
-  daemon refunds. The buyer supplies a `refund_dest` in `order.request`. **v1 supports a
-  Lightning address / LNURL — resolved to a fresh bolt11 at refund time via LNURL-pay
-  (lnrent-ug8) — or a bolt11 pass-through; a BOLT12 offer is rejected as unsupported**
-  (deferred: it needs onion-message offer-fetch the Fedimint gateway can't yet service).
+  daemon refunds. A new `order.request` MUST supply a re-resolvable `refund_dest`. **v1 requires a
+  Lightning address / HTTPS LNURL — resolved to a fresh bolt11 at refund time via LNURL-pay
+  (lnrent-ug8). A raw bolt11 (it expires / can't be re-resolved for a later refund) and a BOLT12
+  offer are rejected at intake (spec F3/F6)** — the refunder keeps gen-0 bolt11 pass-through only for
+  pre-existing rows (deferred: BOLT12 needs onion-message offer-fetch the Fedimint gateway can't yet service).
   The resolver is backend-agnostic (it lives in the refund path, ahead of `pay()`, not in
   any backend) and is activated alongside the Fedimint backend (lnrent-o6p). If the refund
   payment itself fails, the subscription stays `REFUND_DUE` and the operator is alerted.
@@ -1116,7 +1117,7 @@ CREATE TABLE subscription (
   recipe_id TEXT, listing_id TEXT, instance_id TEXT, buyer_pubkey TEXT,
   state TEXT,                        -- see §6.3 (PENDING|PROVISIONING|ACTIVE|SUSPENDED|TERMINATED|EXPIRED|CANCELLED|REFUND_DUE|REFUNDED)
   params_json TEXT,                  -- validated buyer params
-  refund_dest TEXT,                  -- Lightning address/LNURL or bolt11 (BOLT12 deferred), for refunds (§6.4)
+  refund_dest TEXT,                  -- re-resolvable Lightning address/LNURL, REQUIRED for new orders (raw bolt11/BOLT12 rejected at intake); NULL only on legacy rows, for refunds (§6.4)
   -- backend handles live on `instance` (instance_id), not duplicated here
   period_s INTEGER, renew_lead_s INTEGER, retention_s INTEGER,   -- copied from the listing at order time
   paid_through INTEGER,              -- hard expiry; service interrupted after this

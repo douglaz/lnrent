@@ -112,10 +112,11 @@ pub fn detect_form(dest: &str) -> Result<DestForm, ResolveError> {
     if lower.starts_with("lnurl") {
         return Ok(DestForm::Lnurl(decode_lnurl(d)?));
     }
-    // BOLT12 offer: explicitly unsupported in v1 (deferred — gateway onion-message support).
+    // BOLT12 offer: explicitly unsupported in v1. It is the planned re-resolvable single-string
+    // refund destination once gateway onion-message support lands.
     if lower.starts_with("lno1") {
         return Err(ResolveError::Structural(
-            "BOLT12 offers are unsupported — use a Lightning address or a bolt11".into(),
+            "BOLT12 offers are unsupported — use a Lightning address or LNURL".into(),
         ));
     }
     // bolt11: must actually parse as a BOLT11 invoice (lnbc/lntb/lntbs/lnbcrt...).

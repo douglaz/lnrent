@@ -30,6 +30,7 @@ use crate::backends::PaymentBackend;
 use crate::clock::Clock;
 use crate::nostr_engine::{OrderHandler, Outbound};
 use crate::recipe::Recipe;
+use crate::refund_resolver::{detect_form, validate_dest_format, DestForm};
 use crate::reservation::{self, Budget, Request, Reserve};
 use crate::store::Store;
 
@@ -80,8 +81,8 @@ impl OrderIntake {
         }
     }
 
-    /// The `order.request` flow (SPEC.md §6.6 ordering): dedup → validate → reserve → invoice →
-    /// one-transaction write → send after commit.
+    /// The `order.request` flow (SPEC.md §6.6 ordering): dedup → refund-dest gate → validate →
+    /// reserve → invoice → one-transaction write → send after commit.
     async fn handle_order(
         &self,
         sender: PublicKey,
@@ -99,7 +100,15 @@ impl OrderIntake {
         let sender_hex = sender.to_hex();
         let order_id = format!("ord:{sender_hex}:{}", req.id);
 
-        // 2a. VALIDATE params against the recipe (§7.1). A pre-order failure carries NO order_id.
+        // 2a. REQUIRE a re-resolvable refund route BEFORE params/reservation/invoice/subscription
+        //     work. Raw BOLT11 is single-use and may be expired by refund time; BOLT12 is the future
+        //     re-resolvable single-string option once supported. This is a permanent request error,
+        //     carrying no order_id and leaving no dangling state.
+        if let Err(error) = validate_new_order_refund_dest(req.refund_dest.as_deref()) {
+            return self.fail_order(&sender, &req.id, None, error, out).await;
+        }
+
+        // 2b. VALIDATE params against the recipe (§7.1). A pre-order failure carries NO order_id.
         let Some(params_obj) = req.params.as_object() else {
             return self
                 .fail_order(
@@ -117,31 +126,7 @@ impl OrderIntake {
                 .await;
         }
 
-        // 2a-bis. VALIDATE the refund_dest FORMAT (shape only, NO HTTP — the LNURL fetch is a
-        //     refund-time step) BEFORE any reservation/invoice/subscription write, so a BOLT12 offer
-        //     or a malformed address is rejected up front rather than parking the refund FAILED days
-        //     later (lnrent-ug8). OPTIONAL: a buyer may omit it; only a present, non-empty value is
-        //     checked. A bad shape is a permanent (non-retryable) request error, carrying no order_id.
-        if let Some(dest) = req
-            .refund_dest
-            .as_deref()
-            .map(str::trim)
-            .filter(|d| !d.is_empty())
-        {
-            if let Err(e) = crate::refund_resolver::validate_dest_format(dest) {
-                return self
-                    .fail_order(
-                        &sender,
-                        &req.id,
-                        None,
-                        refund_dest_invalid(&e.to_string()),
-                        out,
-                    )
-                    .await;
-            }
-        }
-
-        // 2b. PRICE check: the referenced listing must still be the current, ACTIVE one for this
+        // 2c. PRICE check: the referenced listing must still be the current, ACTIVE one for this
         //     recipe at the published price — a stale/unknown price is `price_changed` (§5.4).
         let listing = self.load_listing(&req.listing_id).await?;
         let stale = match &listing {
@@ -983,6 +968,23 @@ fn enqueue_outbox(
 
 // The five `order.error` codes (§5.1) — the only ones this handler emits. `retryable` follows the
 // nature of the failure: a bad request is permanent, capacity / backend / store trouble is not.
+fn validate_new_order_refund_dest(refund_dest: Option<&str>) -> std::result::Result<(), WireError> {
+    let Some(dest) = refund_dest.map(str::trim).filter(|d| !d.is_empty()) else {
+        return Err(refund_dest_invalid(
+            "refund_dest is required; use a Lightning address or HTTPS LNURL",
+        ));
+    };
+
+    match detect_form(dest).map_err(|e| refund_dest_invalid(&e.to_string()))? {
+        DestForm::LnAddress { .. } | DestForm::Lnurl(_) => {
+            validate_dest_format(dest).map_err(|e| refund_dest_invalid(&e.to_string()))
+        }
+        DestForm::Bolt11 => Err(refund_dest_invalid(
+            "refund_dest must be re-resolvable (Lightning address or HTTPS LNURL), not a BOLT11 invoice",
+        )),
+    }
+}
+
 fn params_invalid(message: &str) -> WireError {
     WireError {
         code: "params_invalid".into(),
@@ -997,8 +999,8 @@ fn price_changed() -> WireError {
         retryable: false,
     }
 }
-// refund_dest is BOLT12 / malformed (lnrent-ug8). A permanent request error: the buyer must resend a
-// supported refund destination (a Lightning address or a bolt11).
+// refund_dest is missing, BOLT12, raw BOLT11, or malformed. A permanent request error: the buyer must
+// resend a re-resolvable destination (a Lightning address or HTTPS LNURL).
 fn refund_dest_invalid(message: &str) -> WireError {
     WireError {
         code: "refund_dest_invalid".into(),
@@ -1285,12 +1287,14 @@ mod tests {
             .unwrap()
     }
 
+    const REFUND_DEST: &str = "refunds@example.com";
+
     fn order(id: &str, listing_id: &str, params: serde_json::Value) -> Msg {
         Msg::OrderRequest(OrderRequest {
             id: id.into(),
             listing_id: listing_id.into(),
             params,
-            refund_dest: None,
+            refund_dest: Some(REFUND_DEST.to_string()),
         })
     }
 
@@ -2342,17 +2346,16 @@ mod tests {
         );
     }
 
-    // lnrent-ug8: refund_dest FORMAT is validated at order time, BEFORE any reservation/invoice/sub
-    // write. A BOLT12 offer (unsupported) or a malformed dest is rejected with a structured
-    // `refund_dest_invalid` error and leaves NO dangling state; a supported LN-address commits the
-    // order normally; omitting refund_dest (None) is allowed.
+    // lnrent-ug8/F3+F6: every new payable order must carry a re-resolvable refund_dest at intake,
+    // BEFORE params/reservation/invoice/sub writes. Missing, malformed, BOLT12, and raw BOLT11 are
+    // rejected with a structured `refund_dest_invalid` and leave no dangling state; a supported
+    // LN-address commits normally.
     #[tokio::test]
-    async fn order_time_validates_refund_dest_format() {
+    async fn order_time_requires_reresolvable_refund_dest() {
         let recipe = dummy_recipe();
         let listing_id = "30402:op:dummy-1";
 
-        // BOLT12 offer -> rejected, no dangling sub/reservation, no order_id on the error.
-        {
+        async fn seeded_handler(recipe: Recipe, listing_id: &str) -> (Store, OrderIntake) {
             let store = mem_store();
             seed_listing(
                 &store,
@@ -2365,26 +2368,28 @@ mod tests {
                 store.clone(),
                 Arc::new(MockPayment::new()),
                 TestClock::new(1000),
-                recipe.clone(),
+                recipe,
                 budget_with_room(),
             );
+            (store, handler)
+        }
+
+        async fn assert_rejected(recipe: Recipe, listing_id: &str, msg: Msg, want_code: &str) {
+            let (store, handler) = seeded_handler(recipe, listing_id).await;
             let out = RecordingOutbound::default();
             handler
-                .handle(
-                    Keys::generate().public_key(),
-                    order_with_refund("rd-bolt12", listing_id, "lno1pqps7sjqpgz"),
-                    &out,
-                )
+                .handle(Keys::generate().public_key(), msg, &out)
                 .await
                 .unwrap();
             let err = expect_order_error(&out);
-            assert_eq!(err.error.code, "refund_dest_invalid");
+            assert_eq!(err.error.code, want_code);
             assert!(!err.error.retryable);
             assert!(
                 err.order_id.is_none(),
-                "a format failure carries no order_id"
+                "a refund-dest failure carries no order_id"
             );
             assert_eq!(count(&store, "SELECT count(*) FROM subscription").await, 0);
+            assert_eq!(count(&store, "SELECT count(*) FROM invoice").await, 0);
             assert_eq!(
                 count(
                     &store,
@@ -2396,6 +2401,53 @@ mod tests {
             );
         }
 
+        // Missing refund_dest -> rejected before invoice/reservation/subscription writes.
+        assert_rejected(
+            recipe.clone(),
+            listing_id,
+            Msg::OrderRequest(OrderRequest {
+                id: "rd-missing".into(),
+                listing_id: listing_id.into(),
+                params: json!({}),
+                refund_dest: None,
+            }),
+            "refund_dest_invalid",
+        )
+        .await;
+
+        // Empty refund_dest is equivalent to missing.
+        assert_rejected(
+            recipe.clone(),
+            listing_id,
+            order_with_refund("rd-empty", listing_id, "  "),
+            "refund_dest_invalid",
+        )
+        .await;
+
+        // Raw BOLT11 -> rejected: durable orders require a re-resolvable route.
+        let bolt11 = crate::refund_resolver::mint_bolt11(
+            1_000,
+            r#"[["text/plain","lnrent refund"]]"#,
+            1_000,
+            3_600,
+        );
+        assert_rejected(
+            recipe.clone(),
+            listing_id,
+            order_with_refund("rd-bolt11", listing_id, &bolt11),
+            "refund_dest_invalid",
+        )
+        .await;
+
+        // BOLT12 offer -> rejected, no dangling sub/reservation, no order_id on the error.
+        assert_rejected(
+            recipe.clone(),
+            listing_id,
+            order_with_refund("rd-bolt12", listing_id, "lno1pqps7sjqpgz"),
+            "refund_dest_invalid",
+        )
+        .await;
+
         // An `lnurl1` decoding to a non-HTTPS URL -> rejected up front (it would only park the refund
         // FAILED at resolve time otherwise, review P2). Proves the order path runs the stricter
         // `validate_dest_format`, not the bare bech32-decoding `detect_form`.
@@ -2405,52 +2457,18 @@ mod tests {
                 "http://example.com/lnurlp/u".as_bytes(),
             )
             .unwrap();
-            let store = mem_store();
-            seed_listing(
-                &store,
+            assert_rejected(
+                recipe.clone(),
                 listing_id,
-                "dummy",
-                recipe.pricing.amount_sat as i64,
+                order_with_refund("rd-lnurl-http", listing_id, &http_lnurl),
+                "refund_dest_invalid",
             )
             .await;
-            let handler = intake(
-                store.clone(),
-                Arc::new(MockPayment::new()),
-                TestClock::new(1000),
-                recipe.clone(),
-                budget_with_room(),
-            );
-            let out = RecordingOutbound::default();
-            handler
-                .handle(
-                    Keys::generate().public_key(),
-                    order_with_refund("rd-lnurl-http", listing_id, &http_lnurl),
-                    &out,
-                )
-                .await
-                .unwrap();
-            let err = expect_order_error(&out);
-            assert_eq!(err.error.code, "refund_dest_invalid");
-            assert_eq!(count(&store, "SELECT count(*) FROM subscription").await, 0);
         }
 
-        // A supported Lightning address -> the order commits to a PENDING sub.
+        // A supported Lightning address -> the order commits to a PENDING sub and OPEN invoice.
         {
-            let store = mem_store();
-            seed_listing(
-                &store,
-                listing_id,
-                "dummy",
-                recipe.pricing.amount_sat as i64,
-            )
-            .await;
-            let handler = intake(
-                store.clone(),
-                Arc::new(MockPayment::new()),
-                TestClock::new(1000),
-                recipe.clone(),
-                budget_with_room(),
-            );
+            let (store, handler) = seeded_handler(recipe.clone(), listing_id).await;
             let out = RecordingOutbound::default();
             handler
                 .handle(
@@ -2463,6 +2481,15 @@ mod tests {
             assert!(
                 matches!(out.only().1, Msg::OrderInvoice(_)),
                 "a valid refund_dest commits the order"
+            );
+            assert_eq!(
+                count(
+                    &store,
+                    "SELECT count(*) FROM invoice WHERE kind='order' AND status='OPEN'"
+                )
+                .await,
+                1,
+                "a valid refund_dest mints the order invoice"
             );
             let refund_dest: Option<String> = store
                 .read(|c| {

@@ -338,7 +338,7 @@ async fn full_handshake_drives_settlement_through_to_provision_ready() {
         id: "req-1".into(),
         listing_id: coord,
         params: serde_json::json!({}),
-        refund_dest: None,
+        refund_dest: Some("refunds@example.com".to_string()),
     });
     let wrap = gift_wrap(&buyer_keys, &op_keys.public_key(), &order)
         .await
@@ -525,7 +525,7 @@ async fn crash_recovery_redrives_provisioning_without_duplication() {
             id: "rec-1".into(),
             listing_id: coord.clone(),
             params: serde_json::json!({}),
-            refund_dest: None,
+            refund_dest: Some("refunds@example.com".to_string()),
         });
         // Commits the PENDING sub + OPEN invoice (the order.invoice reply publishes via the engine).
         intake

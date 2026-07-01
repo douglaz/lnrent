@@ -56,6 +56,7 @@ const DEADLINE: Duration = Duration::from_secs(8);
 /// The TestClock start (unix secs). The mock order invoice expiry is `now + 1h`, so a settlement at
 /// `now` is well inside the window.
 const START: i64 = 1_000;
+const REFUND_DEST: &str = "refunds@example.com";
 
 // The dummy recipe's pricing timers, in seconds (recipes/dummy/recipe.toml: 30d / 7d / 7d).
 const PERIOD: i64 = 30 * 86_400; // 2_592_000
@@ -217,7 +218,7 @@ async fn place_order(
         id: req_id.into(),
         listing_id: listing_id.into(),
         params: serde_json::json!({}),
-        refund_dest: refund_dest.map(|s| s.to_string()),
+        refund_dest: Some(refund_dest.unwrap_or(REFUND_DEST).to_string()),
     });
     intake
         .handle(buyer.public_key(), order, &RecordingOutbound::default())
@@ -2359,7 +2360,7 @@ async fn do_vps_full_order_provisions_a_real_droplet() {
         id: req_id.into(),
         listing_id: listing_coordinate(&op.public_key().to_hex(), "do-vps"),
         params: serde_json::json!({ "ssh_pubkey": pubkey }),
-        refund_dest: None,
+        refund_dest: Some(REFUND_DEST.to_string()),
     });
     intake
         .handle(buyer.public_key(), order, &RecordingOutbound::default())
@@ -2524,7 +2525,7 @@ async fn do_vps_real_payment_provisions_a_real_vm() {
         id: req_id.into(),
         listing_id: listing_coordinate(&op.public_key().to_hex(), "do-vps"),
         params: serde_json::json!({ "ssh_pubkey": pubkey }),
-        refund_dest: None,
+        refund_dest: Some(REFUND_DEST.to_string()),
     });
     intake
         .handle(buyer.public_key(), order, &RecordingOutbound::default())

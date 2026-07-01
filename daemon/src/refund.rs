@@ -1741,10 +1741,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_destination_is_failed_without_pay() {
+    async fn legacy_null_destination_is_failed_without_pay() {
         let store = mem_store();
         let payment = Arc::new(TestPayment::new());
         let clock = TestClock::new(1_000);
+        // Legacy/manual-liability rows can predate the new order-intake refund_dest gate. They must
+        // still park loudly for operator handling rather than being retried or silently dropped.
         seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
         seed_refund(&store, "sub-1", None, Some(500)).await;
         seed_reservation(&store, "sub-1").await;

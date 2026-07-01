@@ -293,7 +293,15 @@ async fn buyer_cli_money_gate_golden_path() {
         &url,
         &op_hex,
         &key_file,
-        &["order", "create", &coord, "--request-id", "ord1"],
+        &[
+            "order",
+            "create",
+            &coord,
+            "--request-id",
+            "ord1",
+            "--refund-dest",
+            "refunds@example.com",
+        ],
     )
     .await;
     assert_eq!(code, 0, "order create exit 0: {env}");

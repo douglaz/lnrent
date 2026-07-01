@@ -510,7 +510,11 @@ mod tests {
 
         let c = client(&relay, &buyer, &clock, op.public_key());
         let got = c
-            .create_order("30402:op:dummy", json!({}), None)
+            .create_order(
+                "30402:op:dummy",
+                json!({}),
+                Some("refunds@example.com".into()),
+            )
             .await
             .expect("order.invoice");
 
@@ -537,7 +541,11 @@ mod tests {
 
         let c = client(&relay, &buyer, &clock, op.public_key());
         let got = c
-            .create_order("30402:op:dummy", json!({}), None)
+            .create_order(
+                "30402:op:dummy",
+                json!({}),
+                Some("refunds@example.com".into()),
+            )
             .await
             .expect("operator-correlated invoice wins");
 
@@ -558,7 +566,11 @@ mod tests {
 
         let c = client(&relay, &buyer, &clock, op.public_key());
         let got = c
-            .create_order("30402:op:dummy", json!({}), None)
+            .create_order(
+                "30402:op:dummy",
+                json!({}),
+                Some("refunds@example.com".into()),
+            )
             .await
             .expect("operator-correlated invoice wins");
 
