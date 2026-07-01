@@ -79,7 +79,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DeliveryCmd,
     },
-    /// Send sub.cancel (the operator does not yet act on it — not confirmed end-to-end).
+    /// Send sub.cancel. Fire-and-forget; confirmation arrives later as billing.notice.
     Cancel { sub_id: String },
     /// Management operations: `ops <sub> list`, or `ops <sub> <op> [--params-json …]`.
     Ops {
@@ -235,7 +235,7 @@ async fn run(cli: Cli) -> Result<Value, BuyerError> {
             Ok(json!({
                 "subscription_id": sub_id,
                 "sent": true,
-                "note": "sub.cancel sent; the operator routes but does not yet act on it (not confirmed end-to-end)",
+                "note": "sub.cancel sent; confirmation arrives later as billing.notice",
             }))
         }
         Cmd::Ops {

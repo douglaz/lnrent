@@ -261,8 +261,8 @@ impl<'a, R: Relay, S: NostrSigner, C: Clock> BuyerClient<'a, R, S, C> {
     }
 
     /// Send `sub.cancel` for `subscription_id` and return once it is published. Naturally idempotent
-    /// and fire-and-forget: the operator currently ROUTES but does NOT act on `sub.cancel`, so this
-    /// does NOT confirm end-to-end cancellation — the caller must say so.
+    /// and fire-and-forget: the operator confirms asynchronously with an unsolicited
+    /// `billing.notice`.
     pub async fn cancel(&self, subscription_id: &str) -> Result<(), BuyerError> {
         let request = self
             .wrap(Msg::SubCancel(SubCancel {

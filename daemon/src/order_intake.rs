@@ -22,7 +22,8 @@ use async_trait::async_trait;
 use rusqlite::{params, OptionalExtension};
 
 use lnrent_wire::{
-    BillingInvoice, Msg, OrderError, OrderInvoice, OrderRequest, PublicKey, RenewRequest, WireError,
+    BillingInvoice, BillingNotice, Msg, OrderError, OrderInvoice, OrderRequest, PublicKey,
+    RenewRequest, SubCancel, WireError,
 };
 
 use crate::backends::PaymentBackend;
@@ -361,6 +362,45 @@ impl OrderIntake {
         Ok(())
     }
 
+    /// The buyer `sub.cancel` flow: authorize by owner, then atomically mark the live/lapsing
+    /// subscription `CANCELLED`, preserving the already-paid termination deadline.
+    async fn handle_cancel(
+        &self,
+        sender: PublicKey,
+        cancel: SubCancel,
+        _out: &dyn Outbound,
+    ) -> Result<()> {
+        let sub_id = cancel.subscription_id;
+        let Some((buyer_hex, state)) = self.load_cancel_auth(&sub_id).await? else {
+            tracing::warn!(sub = %sub_id, "sub.cancel for unknown subscription — dropped");
+            return Ok(());
+        };
+        if buyer_hex != sender.to_hex() {
+            tracing::warn!(sub = %sub_id, "sub.cancel from a non-owner — dropped");
+            return Ok(());
+        }
+        if !matches!(state.as_str(), "ACTIVE" | "SUSPENDED") {
+            tracing::warn!(sub = %sub_id, %state, "sub.cancel for a non-cancellable state — dropped");
+            return Ok(());
+        }
+
+        let notice = Msg::BillingNotice(BillingNotice {
+            subscription_id: sub_id.clone(),
+            state: "CANCELLED".to_string(),
+            message:
+                "subscription cancelled; service runs until the paid period ends, then terminates"
+                    .to_string(),
+        });
+        let write = CancelWrite {
+            sub_id,
+            buyer_hex,
+            notice_json: serde_json::to_string(&notice)?,
+            now: self.clock.now(),
+        };
+        self.store.transaction(move |tx| write.write(tx)).await?;
+        Ok(())
+    }
+
     /// Issue the daemon soft-date auto-renewal invoice for `subscription_id` (no buyer request),
     /// where `cycle_anchor` is the `paid_through` being renewed — so one cycle yields one invoice
     /// via the deterministic `renew:auto:<sub>:<cycle_anchor>` external_id (§6.6). Sends
@@ -615,6 +655,27 @@ impl OrderIntake {
             .await
     }
 
+    /// Immutable owner plus a rough state gate for `sub.cancel`; the deadline is re-read inside the
+    /// cancel transaction because renewals/credits can move it concurrently.
+    async fn load_cancel_auth(&self, sub_id: &str) -> Result<Option<(String, String)>> {
+        let id = sub_id.to_string();
+        self.store
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT buyer_pubkey, state FROM subscription WHERE id = ?1",
+                    params![id],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                            r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        ))
+                    },
+                )
+                .optional()?)
+            })
+            .await
+    }
+
     async fn load_buyer(&self, sub_id: &str) -> Result<PublicKey> {
         let id = sub_id.to_string();
         let hex: Option<String> = self
@@ -640,8 +701,9 @@ impl OrderHandler for OrderIntake {
         match msg {
             Msg::OrderRequest(req) => self.handle_order(sender, req, out).await,
             Msg::RenewRequest(req) => self.handle_renew(sender, req, out).await,
-            // sub.cancel and delivery.resend.request are routed here by the engine but owned by
-            // other beads (cancellation; provisioning redelivery, lnrent-7fp.10) — out of scope.
+            Msg::SubCancel(req) => self.handle_cancel(sender, req, out).await,
+            // delivery.resend.request is routed here by the engine but owned by the supervisor's
+            // delivery wrapper (lnrent-7fp.10).
             _ => Ok(()),
         }
     }
@@ -833,6 +895,92 @@ impl RenewalWrite {
     }
 }
 
+/// Owned inputs for the atomic cancel write.
+struct CancelWrite {
+    sub_id: String,
+    buyer_hex: String,
+    notice_json: String,
+    now: i64,
+}
+
+impl CancelWrite {
+    /// Returns `true` when this call won the `ACTIVE`/`SUSPENDED -> CANCELLED` transition.
+    fn write(self, tx: &rusqlite::Transaction) -> Result<bool> {
+        let current: Option<(String, Option<i64>, Option<i64>)> = tx
+            .query_row(
+                "SELECT state, paid_through, next_deadline FROM subscription WHERE id = ?1",
+                params![&self.sub_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                        r.get(1)?,
+                        r.get(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((state, paid_through, next_deadline)) = current else {
+            return Ok(false);
+        };
+        let term_deadline = match state.as_str() {
+            "ACTIVE" => paid_through,
+            "SUSPENDED" => next_deadline,
+            _ => return Ok(false),
+        };
+        let Some(term_deadline) = term_deadline else {
+            return Ok(false);
+        };
+
+        let n = tx.execute(
+            "UPDATE subscription SET state='CANCELLED', next_deadline=?2, updated_at=?3
+             WHERE id=?1 AND state IN ('ACTIVE','SUSPENDED')",
+            params![&self.sub_id, term_deadline, self.now],
+        )?;
+        if n == 0 {
+            return Ok(false);
+        }
+        enqueue_outbox(
+            tx,
+            &format!("outbox:cancel-notice:{}:{term_deadline}", self.sub_id),
+            &self.buyer_hex,
+            &self.sub_id,
+            "billing.notice",
+            &self.notice_json,
+            self.now,
+        )?;
+        tx.execute(
+            "INSERT INTO event_log (subscription_id, kind, detail_json, at) VALUES (?1, 'order_intake_cancel', ?2, ?3)",
+            params![
+                &self.sub_id,
+                serde_json::json!({ "term_deadline": term_deadline }).to_string(),
+                self.now,
+            ],
+        )?;
+        Ok(true)
+    }
+}
+
+/// Enqueue a buyer DM as a `PENDING` outbox row. Stable ids make retries idempotent.
+#[allow(clippy::too_many_arguments)]
+fn enqueue_outbox(
+    tx: &rusqlite::Transaction,
+    id: &str,
+    recipient: &str,
+    sub_id: &str,
+    msg_type: &str,
+    payload_json: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO outbox
+            (id, recipient, subscription_id, msg_type, payload_json, state, attempts, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'PENDING', 0, ?6)
+         ON CONFLICT(id) DO NOTHING",
+        params![id, recipient, sub_id, msg_type, payload_json, now],
+    )?;
+    Ok(())
+}
+
 // The five `order.error` codes (§5.1) — the only ones this handler emits. `retryable` follows the
 // nature of the failure: a bad request is permanent, capacity / backend / store trouble is not.
 fn params_invalid(message: &str) -> WireError {
@@ -878,7 +1026,12 @@ mod tests {
     use super::*;
     use crate::clock::TestClock;
     use crate::store::{Store, SCHEMA};
-    use std::sync::Mutex;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    };
 
     use crate::backends::MockPayment;
     use lnrent_wire::Keys;
@@ -902,6 +1055,44 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         ))
         .expect("wireguard recipe")
+    }
+
+    /// A dummy-id recipe whose lifecycle hooks touch marker files, so cancel can prove it feeds the
+    /// existing reconcile destroy path.
+    fn marker_recipe() -> (Recipe, PathBuf, PathBuf) {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "lnrent-order-intake-cancel-{}-{seq}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let suspend_marker = dir.join("suspended");
+        let destroy_marker = dir.join("destroyed");
+        std::fs::write(
+            dir.join("suspend"),
+            format!(
+                "#!/usr/bin/env bash\ncat >/dev/null; touch '{}'; echo '{{\"ok\":true}}'\n",
+                suspend_marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("destroy"),
+            format!(
+                "#!/usr/bin/env bash\ncat >/dev/null; touch '{}'; echo '{{\"ok\":true}}'\n",
+                destroy_marker.display()
+            ),
+        )
+        .unwrap();
+        for hook in ["suspend", "destroy"] {
+            std::fs::set_permissions(dir.join(hook), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let mut recipe = dummy_recipe();
+        recipe.dir = dir;
+        (recipe, suspend_marker, destroy_marker)
     }
 
     fn budget_with_room() -> Budget {
@@ -1013,10 +1204,83 @@ mod tests {
             .unwrap();
     }
 
+    async fn seed_cancel_sub(
+        store: &Store,
+        id: &str,
+        buyer_hex: &str,
+        state: &str,
+        paid_through: Option<i64>,
+        next_deadline: Option<i64>,
+    ) {
+        let (id, buyer, state) = (id.to_string(), buyer_hex.to_string(), state.to_string());
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO subscription
+                        (id, recipe_id, buyer_pubkey, state, period_s, renew_lead_s, retention_s,
+                         paid_through, next_deadline, created_at, updated_at)
+                     VALUES (?1, 'dummy', ?2, ?3, 100, 10, 500, ?4, ?5, 0, 0)",
+                    params![id, buyer, state, paid_through, next_deadline],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn seed_reservation(store: &Store, order_id: &str) {
+        let order_id = order_id.to_string();
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO reservation
+                        (id, order_id, resources_json, ports_json, state, expires_at, created_at)
+                     VALUES (?1, ?2, '{\"cpu\":1}', '{\"count\":0}', 'HELD', 0, 0)",
+                    params![format!("res-{order_id}"), order_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
     async fn count(store: &Store, sql: &str) -> i64 {
         let sql = sql.to_string();
         store
             .read(move |c| Ok(c.query_row(&sql, [], |r| r.get(0))?))
+            .await
+            .unwrap()
+    }
+
+    async fn sub_state_and_deadline(store: &Store, id: &str) -> (String, Option<i64>) {
+        let id = id.to_string();
+        store
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT state, next_deadline FROM subscription WHERE id=?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn outbox_notices(store: &Store, sub_id: &str) -> Vec<(String, String, String)> {
+        let sub_id = sub_id.to_string();
+        store
+            .read(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT id, recipient, payload_json
+                       FROM outbox
+                      WHERE subscription_id=?1 AND msg_type='billing.notice'
+                      ORDER BY id",
+                )?;
+                let rows =
+                    stmt.query_map(params![sub_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                let notices = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(notices)
+            })
             .await
             .unwrap()
     }
@@ -1036,6 +1300,12 @@ mod tests {
             listing_id: listing_id.into(),
             params: json!({}),
             refund_dest: Some(refund_dest.to_string()),
+        })
+    }
+
+    fn cancel(sub_id: &str) -> Msg {
+        Msg::SubCancel(SubCancel {
+            subscription_id: sub_id.into(),
         })
     }
 
@@ -1431,6 +1701,425 @@ mod tests {
         assert_eq!(
             count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_owner_active_marks_cancelled_notifies_and_journals() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        seed_cancel_sub(
+            &store,
+            "sub-1",
+            &buyer_hex,
+            "ACTIVE",
+            Some(5000),
+            Some(4400),
+        )
+        .await;
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1234),
+            dummy_recipe(),
+            budget_with_room(),
+        );
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(buyer.public_key(), cancel("sub-1"), &out)
+            .await
+            .unwrap();
+
+        assert!(
+            out.messages().is_empty(),
+            "sub.cancel is fire-and-forget, no direct reply"
+        );
+        assert_eq!(
+            sub_state_and_deadline(&store, "sub-1").await,
+            ("CANCELLED".to_string(), Some(5000)),
+            "ACTIVE cancel terminates at paid_through, not a retention deadline"
+        );
+        let notices = outbox_notices(&store, "sub-1").await;
+        assert_eq!(notices.len(), 1, "exactly one cancel billing.notice");
+        assert_eq!(notices[0].0, "outbox:cancel-notice:sub-1:5000");
+        assert_eq!(notices[0].1, buyer_hex);
+        let notice = match serde_json::from_str::<Msg>(&notices[0].2).unwrap() {
+            Msg::BillingNotice(n) => n,
+            other => panic!("expected billing.notice payload, got {other:?}"),
+        };
+        assert_eq!(notice.subscription_id, "sub-1");
+        assert_eq!(notice.state, "CANCELLED");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM event_log WHERE kind='order_intake_cancel' AND subscription_id='sub-1'"
+            )
+            .await,
+            1,
+            "cancel is journaled"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_owner_suspended_keeps_existing_deadline() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        seed_cancel_sub(
+            &store,
+            "sub-1",
+            &buyer_hex,
+            "SUSPENDED",
+            Some(1000),
+            Some(1500),
+        )
+        .await;
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1234),
+            dummy_recipe(),
+            budget_with_room(),
+        );
+
+        handler
+            .handle(
+                buyer.public_key(),
+                cancel("sub-1"),
+                &RecordingOutbound::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sub_state_and_deadline(&store, "sub-1").await,
+            ("CANCELLED".to_string(), Some(1500)),
+            "SUSPENDED cancel keeps the retention deadline already on next_deadline"
+        );
+        assert_eq!(outbox_notices(&store, "sub-1").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_nonowner_is_silent_noop() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let stranger = Keys::generate();
+        seed_cancel_sub(
+            &store,
+            "sub-1",
+            &buyer.public_key().to_hex(),
+            "ACTIVE",
+            Some(5000),
+            Some(4400),
+        )
+        .await;
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1234),
+            dummy_recipe(),
+            budget_with_room(),
+        );
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(stranger.public_key(), cancel("sub-1"), &out)
+            .await
+            .unwrap();
+
+        assert!(out.messages().is_empty());
+        assert_eq!(
+            sub_state_and_deadline(&store, "sub-1").await,
+            ("ACTIVE".to_string(), Some(4400))
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM outbox").await,
+            0,
+            "non-owner cancel enqueues nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_terminal_and_non_cancellable_states_are_noops() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let states = [
+            "TERMINATED",
+            "CANCELLED",
+            "REFUND_DUE",
+            "EXPIRED",
+            "REFUNDED",
+            "PENDING",
+            "PROVISIONING",
+        ];
+        for state in states {
+            let sub_id = format!("sub-{state}");
+            seed_cancel_sub(&store, &sub_id, &buyer_hex, state, Some(1000), Some(1500)).await;
+        }
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1234),
+            dummy_recipe(),
+            budget_with_room(),
+        );
+
+        let out = RecordingOutbound::default();
+        for state in states {
+            handler
+                .handle(buyer.public_key(), cancel(&format!("sub-{state}")), &out)
+                .await
+                .unwrap();
+            assert_eq!(
+                sub_state_and_deadline(&store, &format!("sub-{state}")).await,
+                (state.to_string(), Some(1500)),
+                "{state} cancel is a no-op"
+            );
+        }
+        assert!(out.messages().is_empty());
+        assert_eq!(count(&store, "SELECT count(*) FROM outbox").await, 0);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM event_log WHERE kind='order_intake_cancel'"
+            )
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_duplicate_enqueues_one_notice_and_one_journal() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        seed_cancel_sub(
+            &store,
+            "sub-1",
+            &buyer_hex,
+            "ACTIVE",
+            Some(5000),
+            Some(4400),
+        )
+        .await;
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1234),
+            dummy_recipe(),
+            budget_with_room(),
+        );
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(buyer.public_key(), cancel("sub-1"), &out)
+            .await
+            .unwrap();
+        handler
+            .handle(buyer.public_key(), cancel("sub-1"), &out)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sub_state_and_deadline(&store, "sub-1").await,
+            ("CANCELLED".to_string(), Some(5000))
+        );
+        assert_eq!(outbox_notices(&store, "sub-1").await.len(), 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM event_log WHERE kind='order_intake_cancel'"
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_with_null_term_deadline_is_noop() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        seed_cancel_sub(
+            &store,
+            "active-null",
+            &buyer_hex,
+            "ACTIVE",
+            None,
+            Some(4400),
+        )
+        .await;
+        seed_cancel_sub(
+            &store,
+            "suspended-null",
+            &buyer_hex,
+            "SUSPENDED",
+            Some(1000),
+            None,
+        )
+        .await;
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1234),
+            dummy_recipe(),
+            budget_with_room(),
+        );
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(buyer.public_key(), cancel("active-null"), &out)
+            .await
+            .unwrap();
+        handler
+            .handle(buyer.public_key(), cancel("suspended-null"), &out)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sub_state_and_deadline(&store, "active-null").await,
+            ("ACTIVE".to_string(), Some(4400))
+        );
+        assert_eq!(
+            sub_state_and_deadline(&store, "suspended-null").await,
+            ("SUSPENDED".to_string(), None)
+        );
+        assert!(out.messages().is_empty());
+        assert_eq!(count(&store, "SELECT count(*) FROM outbox").await, 0);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM event_log WHERE kind='order_intake_cancel'"
+            )
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_active_sub_terminates_on_reconcile_deadline() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        seed_cancel_sub(&store, "sub-1", &buyer_hex, "ACTIVE", Some(1500), Some(900)).await;
+        seed_reservation(&store, "sub-1").await;
+        let (recipe, _suspend_marker, destroy_marker) = marker_recipe();
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1000),
+            recipe.clone(),
+            budget_with_room(),
+        );
+
+        handler
+            .handle(
+                buyer.public_key(),
+                cancel("sub-1"),
+                &RecordingOutbound::default(),
+            )
+            .await
+            .unwrap();
+        let reconciler =
+            crate::reconcile::Reconciler::new(store.clone(), Arc::new(MockPayment::new()), recipe);
+        let report = reconciler.reconcile_tick(1500).await.unwrap();
+
+        assert_eq!(report.terminated, 1);
+        assert_eq!(
+            sub_state_and_deadline(&store, "sub-1").await,
+            ("TERMINATED".to_string(), None)
+        );
+        assert!(destroy_marker.exists(), "destroy hook ran");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM reservation WHERE order_id='sub-1' AND state='RELEASED'"
+            )
+            .await,
+            1,
+            "reservation is released in the terminate txn"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_new_renewal_and_late_renewal_settlement_refunds() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        seed_cancel_sub(
+            &store,
+            "sub-1",
+            &buyer_hex,
+            "ACTIVE",
+            Some(5000),
+            Some(4400),
+        )
+        .await;
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1234),
+            dummy_recipe(),
+            budget_with_room(),
+        );
+        handler
+            .handle(
+                buyer.public_key(),
+                cancel("sub-1"),
+                &RecordingOutbound::default(),
+            )
+            .await
+            .unwrap();
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                Msg::RenewRequest(RenewRequest {
+                    id: "rr-after-cancel".into(),
+                    subscription_id: "sub-1".into(),
+                }),
+                &out,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.messages().is_empty(),
+            "renew.request after cancel is dropped"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
+            0,
+            "no new renewal invoice after cancel"
+        );
+
+        let ext = "renew:auto:sub-1:5000";
+        seed_open_renewal_invoice(&store, ext, "sub-1").await;
+        let outcome = crate::capture::capture(
+            &store,
+            crate::backends::Settlement {
+                invoice_id: format!("inv-{ext}"),
+                external_id: ext.to_string(),
+                amount_sat: dummy_recipe().pricing.amount_sat,
+                settled_at: 1234,
+            },
+            1234,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, crate::capture::Capture::RefundDue);
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM refund_attempt").await,
+            1,
+            "a renewal settlement on CANCELLED is refunded"
+        );
+        assert_eq!(
+            sub_state_and_deadline(&store, "sub-1").await,
+            ("CANCELLED".to_string(), Some(5000)),
+            "refund path does not resurrect the sub"
         );
     }
 
