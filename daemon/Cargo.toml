@@ -87,8 +87,10 @@ fedimint-wallet-client = { git = "file:///home/master/p/fedimint", tag = "v0.11.
 futures-util = { version = "0.3", optional = true }
 
 [features]
-# Compile the real Fedimint backend (daemon/src/fedimint_backend.rs). OFF by default so the M1a mock
-# money path + CI build without the heavy fedimint/rocksdb tree or a live federation.
+# Fedimint is ON by default (alpha/beta dogfood — the real ecash money path). Build with
+# --no-default-features for the mock-only M1a path (no fedimint/rocksdb tree, no live federation).
+default = ["fedimint"]
+# Compile the real Fedimint backend (daemon/src/fedimint_backend.rs).
 fedimint = [
     "dep:fedimint-client",
     "dep:fedimint-core",
