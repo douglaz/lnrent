@@ -38,6 +38,7 @@ use crate::store::Store;
 /// reservation is held until this same horizon, then released (§9.3). An internal default, not an
 /// operator config knob (scope: lnrent-7fp.17).
 const INVOICE_EXPIRY_S: u32 = 3600;
+const MIN_RENEWAL_INVOICE_EXPIRY_S: i64 = 60;
 
 /// The order-intake integrator: implements [`OrderHandler`] over the injected store, payment
 /// backend, clock, recipe, and host budget. Cheap to share behind an `Arc` (the engine holds it
@@ -329,9 +330,12 @@ impl OrderIntake {
                 tracing::warn!(sub = %req.subscription_id, "renew.request past the credited resumable window — dropped");
                 return Ok(());
             }
-            invoice_expiry_s =
-                u32::try_from((resumable_until - now).max(i64::from(INVOICE_EXPIRY_S)))
-                    .unwrap_or(u32::MAX);
+            let remaining = resumable_until - now;
+            if remaining < MIN_RENEWAL_INVOICE_EXPIRY_S {
+                tracing::warn!(sub = %req.subscription_id, remaining_s = remaining, "renew.request too close to the credited resumable window boundary — dropped");
+                return Ok(());
+            }
+            invoice_expiry_s = remaining.min(i64::from(INVOICE_EXPIRY_S)) as u32;
         }
         let due_at = paid_through.unwrap_or(now);
         let external_id = format!("renew:req:{}:{}", sender.to_hex(), req.id);
@@ -2256,7 +2260,8 @@ mod tests {
         // paid_through=1000, retention=500 -> raw boundary 1500. Credited floor 6000 ->
         // effective_suspend_at = max(1000, 6000) = 6000 -> credited boundary B = 6500. The sub is
         // still in its credited resumable window; now=2200 is in [1500, 6500): past the RAW boundary,
-        // before the CREDITED one. B is also more than the default 1h invoice expiry away.
+        // before the CREDITED one. B is also more than the default 1h invoice expiry away, so the
+        // default expiry is used.
         seed_renewable_sub(
             &store,
             "sub-1",
@@ -2300,10 +2305,10 @@ mod tests {
             bi.due_at, 1000,
             "due_at stays anchored to paid_through, never the credited floor"
         );
-        assert!(
-            bi.expires_at >= 6500,
-            "credited-window renewal invoice expires at {}, before B=6500",
-            bi.expires_at
+        assert_eq!(
+            bi.expires_at,
+            now + i64::from(INVOICE_EXPIRY_S),
+            "credited-window renewal invoice should keep the default expiry while it is before B"
         );
         let ext = format!("renew:req:{buyer_hex}:rr-credit");
         assert_eq!(
@@ -2338,6 +2343,95 @@ mod tests {
             count(&store, "SELECT count(*) FROM refund_attempt").await,
             0,
             "no refund for a settlement inside the credited window"
+        );
+    }
+
+    #[tokio::test]
+    async fn renew_request_caps_invoice_expiry_to_resumable_window_and_refuses_tiny_window() {
+        async fn issue_with_remaining(remaining: i64) -> (Store, RecordingOutbound, i64) {
+            let store = mem_store();
+            let payment = Arc::new(MockPayment::new());
+            let buyer = Keys::generate();
+            let buyer_hex = buyer.public_key().to_hex();
+            let paid_through = 1000;
+            let suspend_not_before = 10_000;
+            let retention_s = 500;
+            let resumable_until = suspend_not_before + retention_s;
+            let now = resumable_until - remaining;
+            seed_renewable_sub(
+                &store,
+                "sub-1",
+                &buyer_hex,
+                "SUSPENDED",
+                paid_through,
+                retention_s,
+                Some(suspend_not_before),
+            )
+            .await;
+            payment.set_now(now);
+            let handler = intake(
+                store.clone(),
+                payment,
+                TestClock::new(now),
+                dummy_recipe(),
+                budget_with_room(),
+            );
+            let out = RecordingOutbound::default();
+            handler
+                .handle(
+                    buyer.public_key(),
+                    Msg::RenewRequest(RenewRequest {
+                        id: format!("rr-{remaining}"),
+                        subscription_id: "sub-1".into(),
+                    }),
+                    &out,
+                )
+                .await
+                .unwrap();
+            (store, out, resumable_until)
+        }
+
+        let (store, out, resumable_until) = issue_with_remaining(120).await;
+        let (_, msg) = out.only();
+        let bi = match msg {
+            Msg::BillingInvoice(b) => b,
+            other => panic!("expected billing.invoice for short remaining window, got {other:?}"),
+        };
+        assert!(
+            bi.expires_at <= resumable_until,
+            "renewal invoice expires after resumable boundary: expires_at={}, B={}",
+            bi.expires_at,
+            resumable_until
+        );
+        assert_eq!(bi.expires_at, resumable_until);
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
+            1
+        );
+
+        let (store, out, resumable_until) =
+            issue_with_remaining(MIN_RENEWAL_INVOICE_EXPIRY_S).await;
+        let (_, msg) = out.only();
+        let bi = match msg {
+            Msg::BillingInvoice(b) => b,
+            other => panic!("expected billing.invoice at exact floor, got {other:?}"),
+        };
+        assert_eq!(bi.expires_at, resumable_until);
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
+            1,
+            "exact-floor remaining time is still issued"
+        );
+
+        let (store, out, _) = issue_with_remaining(MIN_RENEWAL_INVOICE_EXPIRY_S - 1).await;
+        assert!(
+            out.messages().is_empty(),
+            "below-floor renewal should be dropped with no reply"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
+            0,
+            "below-floor renewal should not issue an invoice"
         );
     }
 
