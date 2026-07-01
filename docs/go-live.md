@@ -2,8 +2,9 @@
 
 How an operator takes lnrent from "works on a test federation" to "taking real money on mainnet and
 renting real VMs." Every step below is the OPERATOR's own action with the OPERATOR's credentials —
-**lnrent moves no money and publishes nothing on its own.** Real payments are opt-in: without a
-`--features fedimint` build AND `payment_backend=fedimint` AND a `[fedimint]` config, nothing moves.
+**lnrent moves no money and publishes nothing on its own.** Real payments are opt-in at runtime: the Fedimint backend
+is compiled in by default, but without `payment_backend=fedimint` AND a `[fedimint]` config nothing moves
+(and a `--no-default-features` build drops the backend entirely).
 
 The code is go-live-ready (real Fedimint backend wired, refund path hardened, provisioning + the buyer
 and operator CLIs proven live end to end on a real federation). What remains is yours: pick a mainnet
@@ -34,8 +35,11 @@ There is no separate wallet key.
 
 ## 2. Build (with real payments)
 
+Real Fedimint payments are the **default build** — no feature flag needed (use `--no-default-features`
+only if you want a mock-only build):
+
 ```sh
-nix develop . --command cargo build --release -p lnrentd --features fedimint
+nix develop . --command cargo build --release -p lnrentd
 ```
 
 ## 3. Bootstrap the operator identity + config (persists the seed 0600 into the data dir)
