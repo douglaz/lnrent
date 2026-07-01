@@ -4,9 +4,11 @@
 //! This is the OPERATOR's agent surface: every reply is structured JSON (so an operator agent
 //! drives it), and it is never network-reachable (a UDS with owner-only perms, no HTTP/MCP).
 
+use crate::backends::PaymentBackend;
 use crate::clock::Clock;
 use crate::recipe::Recipe;
 use crate::store::Store;
+use crate::supervisor::{refund_readiness_report_with_probe, RefundReadinessProbe};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -22,6 +24,7 @@ use tokio::net::{UnixListener, UnixStream};
 pub enum Request {
     Status,
     Recipes,
+    Money,
     Subs,
     Sub { id: String },
     AdminSuspend { id: String },
@@ -78,11 +81,12 @@ pub async fn serve(
     store: Store,
     recipes: Arc<Vec<Recipe>>,
     clock: Arc<dyn Clock>,
+    payment: Arc<dyn PaymentBackend>,
     path: impl AsRef<Path>,
 ) -> Result<()> {
     // A signal that never fires: the loop only ends on a listener error.
     let (_never, rx) = tokio::sync::watch::channel(false);
-    serve_with_shutdown(store, recipes, clock, path, rx).await
+    serve_with_shutdown(store, recipes, clock, payment, path, rx).await
 }
 
 /// Like [`serve`] but stops accepting new connections once `shutdown` flips to `true`, returning
@@ -93,6 +97,7 @@ pub async fn serve_with_shutdown(
     store: Store,
     recipes: Arc<Vec<Recipe>>,
     clock: Arc<dyn Clock>,
+    payment: Arc<dyn PaymentBackend>,
     path: impl AsRef<Path>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
@@ -115,9 +120,14 @@ pub async fn serve_with_shutdown(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _addr) = accepted?;
-                let (store, recipes, clock) = (store.clone(), recipes.clone(), clock.clone());
+                let (store, recipes, clock, payment) = (
+                    store.clone(),
+                    recipes.clone(),
+                    clock.clone(),
+                    payment.clone(),
+                );
                 conns.spawn(async move {
-                    if let Err(e) = handle_conn(stream, store, recipes, clock).await {
+                    if let Err(e) = handle_conn(stream, store, recipes, clock, payment).await {
                         tracing::warn!(error = %e, "ipc connection error");
                     }
                 });
@@ -143,6 +153,7 @@ async fn handle_conn(
     store: Store,
     recipes: Arc<Vec<Recipe>>,
     clock: Arc<dyn Clock>,
+    payment: Arc<dyn PaymentBackend>,
 ) -> Result<()> {
     let (rd, mut wr) = stream.into_split();
     // Bounded read: cap the request frame so an over-long line can't exhaust memory.
@@ -154,7 +165,7 @@ async fn handle_conn(
         Reply::err("bad_request", "request too large or unterminated")
     } else {
         match serde_json::from_str::<Request>(line.trim()) {
-            Ok(req) => dispatch(req, &store, &recipes, &clock).await,
+            Ok(req) => dispatch(req, &store, &recipes, &clock, &payment).await,
             Err(e) => Reply::err("bad_request", format!("invalid request: {e}")),
         }
     };
@@ -171,6 +182,7 @@ pub async fn dispatch(
     store: &Store,
     recipes: &Arc<Vec<Recipe>>,
     clock: &Arc<dyn Clock>,
+    payment: &Arc<dyn PaymentBackend>,
 ) -> Reply {
     match req {
         Request::Status => match store
@@ -193,6 +205,16 @@ pub async fn dispatch(
                 .map(|r| json!({"id": r.service.id, "name": r.service.name, "version": r.service.version, "summary": r.service.summary}))
                 .collect();
             Reply::ok(json!(list))
+        }
+
+        Request::Money => {
+            let probe = RefundReadinessProbe::query(payment).await;
+            match refund_readiness_report_with_probe(store, payment, &probe).await {
+                Ok(report) => {
+                    Reply::ok(report.to_money_value(probe.balance_msat(), probe.gateway_ok()))
+                }
+                Err(e) => Reply::err("internal", e.to_string()),
+            }
         }
 
         Request::Subs => match store.read(query_subs).await {
@@ -344,8 +366,236 @@ pub async fn call(path: impl AsRef<Path>, req: Request) -> Result<Reply> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::{
+        Invoice, MockPayment, PayStatus, PaymentBackend, PaymentStatus, Settlement,
+    };
     use crate::store::{Store, SCHEMA};
+    use async_trait::async_trait;
     use rusqlite::Connection;
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::mpsc;
+
+    #[derive(Default)]
+    struct RecordingPayment {
+        balance_msat: StdMutex<Option<u64>>,
+        gateway_ok: StdMutex<bool>,
+        gateway_sequence: StdMutex<VecDeque<bool>>,
+        statuses: StdMutex<HashMap<String, PayStatus>>,
+        started: StdMutex<HashSet<String>>,
+        calls: StdMutex<Vec<&'static str>>,
+    }
+
+    impl RecordingPayment {
+        fn new(balance_msat: Option<u64>, gateway_ok: bool) -> Self {
+            Self {
+                balance_msat: StdMutex::new(balance_msat),
+                gateway_ok: StdMutex::new(gateway_ok),
+                gateway_sequence: StdMutex::new(VecDeque::new()),
+                statuses: StdMutex::new(HashMap::new()),
+                started: StdMutex::new(HashSet::new()),
+                calls: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn with_gateway_sequence(balance_msat: Option<u64>, gateway_ok: Vec<bool>) -> Self {
+            Self {
+                balance_msat: StdMutex::new(balance_msat),
+                gateway_ok: StdMutex::new(false),
+                gateway_sequence: StdMutex::new(VecDeque::from(gateway_ok)),
+                statuses: StdMutex::new(HashMap::new()),
+                started: StdMutex::new(HashSet::new()),
+                calls: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, call: &'static str) {
+            self.calls.lock().unwrap().push(call);
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl PaymentBackend for RecordingPayment {
+        async fn create_invoice(&self, _: u64, _: &str, _: u32, _: &str) -> Result<Invoice> {
+            self.record("create_invoice");
+            anyhow::bail!("money must not create invoices")
+        }
+
+        async fn lookup(&self, _: &str) -> Result<PaymentStatus> {
+            self.record("lookup");
+            anyhow::bail!("money must not look up inbound invoices")
+        }
+
+        async fn lookup_settlement(&self, _: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            self.record("lookup_settlement");
+            anyhow::bail!("money must not look up settlements")
+        }
+
+        async fn pay(&self, _: &str, _: u64, _: &str) -> Result<String> {
+            self.record("pay");
+            anyhow::bail!("money must not pay")
+        }
+
+        async fn refund_required_outlay_msat(
+            &self,
+            gross_sat: u64,
+            pay_sat: Option<u64>,
+        ) -> Result<u128> {
+            self.record("refund_required_outlay_msat");
+            Ok(u128::from(pay_sat.unwrap_or(gross_sat)) * 1000)
+        }
+
+        async fn pay_refund_capped(&self, _: &str, _: u64, _: u64, _: &str) -> Result<String> {
+            self.record("pay_refund_capped");
+            anyhow::bail!("money must not pay capped refunds")
+        }
+
+        async fn payment_status(&self, _: &str) -> Result<PayStatus> {
+            self.record("payment_status");
+            anyhow::bail!("money must not check by backend payment id")
+        }
+
+        async fn payment_status_by_key(&self, key: &str) -> Result<PayStatus> {
+            self.record("payment_status_by_key");
+            Ok(*self
+                .statuses
+                .lock()
+                .unwrap()
+                .get(key)
+                .unwrap_or(&PayStatus::Unknown))
+        }
+
+        async fn payment_started_by_key(&self, key: &str) -> Result<bool> {
+            self.record("payment_started_by_key");
+            Ok(self.started.lock().unwrap().contains(key))
+        }
+
+        async fn available_balance_msat(&self) -> Result<Option<u64>> {
+            self.record("available_balance_msat");
+            Ok(*self.balance_msat.lock().unwrap())
+        }
+
+        async fn refund_gateway_ready(&self) -> Result<bool> {
+            self.record("refund_gateway_ready");
+            if let Some(ok) = self.gateway_sequence.lock().unwrap().pop_front() {
+                return Ok(ok);
+            }
+            Ok(*self.gateway_ok.lock().unwrap())
+        }
+
+        async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+            self.record("watch");
+            anyhow::bail!("money must not watch settlements")
+        }
+    }
+
+    fn mem_store() -> Store {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        Store::spawn(conn)
+    }
+
+    async fn money_data(store: &Store, payment: &Arc<dyn PaymentBackend>) -> Value {
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let reply = dispatch(Request::Money, store, &recipes, &clock, payment).await;
+        assert!(reply.ok, "money reply should be ok: {:?}", reply.error);
+        reply.data.expect("money returns data")
+    }
+
+    async fn seed_pending_refund_liability(store: &Store) {
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO subscription (id, state, buyer_pubkey, created_at, updated_at)
+                     VALUES ('sub-1', 'REFUND_DUE', 'buyer', 0, 0)",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO invoice
+                        (id, subscription_id, external_id, kind, amount_sat, status,
+                         settled_at, applied_at, issued_at)
+                     VALUES ('inv-1', 'sub-1', 'order:sub-1', 'order', 2, 'PAID', 10, 10, 0)",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO refund_attempt
+                        (id, subscription_id, dest, amount_sat, idempotency_key, status, attempts,
+                         resolved_bolt11, resolved_expiry, resolution_gen, created_at, updated_at)
+                     VALUES
+                        ('ref-order:sub-1', 'sub-1', 'lnaddr@buyer', 2, 'refund:order:sub-1',
+                         'PENDING', 0, 'persisted-bolt11', 100, 1, 0, 0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn store_money_snapshot(store: &Store) -> Value {
+        store
+            .read(|c| {
+                let subscriptions = c
+                    .prepare("SELECT id, state, updated_at FROM subscription ORDER BY id")?
+                    .query_map([], |r| {
+                        Ok(json!({
+                            "id": r.get::<_, String>(0)?,
+                            "state": r.get::<_, Option<String>>(1)?,
+                            "updated_at": r.get::<_, Option<i64>>(2)?,
+                        }))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let invoices = c
+                    .prepare(
+                        "SELECT external_id, status, applied_at, settled_at FROM invoice ORDER BY id",
+                    )?
+                    .query_map([], |r| {
+                        Ok(json!({
+                            "external_id": r.get::<_, String>(0)?,
+                            "status": r.get::<_, Option<String>>(1)?,
+                            "applied_at": r.get::<_, Option<i64>>(2)?,
+                            "settled_at": r.get::<_, Option<i64>>(3)?,
+                        }))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let refunds = c
+                    .prepare(
+                        "SELECT id, status, attempts, backend_payment_id, resolved_bolt11,
+                                resolution_gen
+                           FROM refund_attempt
+                          ORDER BY id",
+                    )?
+                    .query_map([], |r| {
+                        Ok(json!({
+                            "id": r.get::<_, String>(0)?,
+                            "status": r.get::<_, String>(1)?,
+                            "attempts": r.get::<_, Option<i64>>(2)?,
+                            "backend_payment_id": r.get::<_, Option<String>>(3)?,
+                            "resolved_bolt11": r.get::<_, Option<String>>(4)?,
+                            "resolution_gen": r.get::<_, i64>(5)?,
+                        }))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let event_count: i64 =
+                    c.query_row("SELECT count(*) FROM event_log", [], |r| r.get(0))?;
+                let outbox_count: i64 =
+                    c.query_row("SELECT count(*) FROM outbox", [], |r| r.get(0))?;
+                Ok(json!({
+                    "subscriptions": subscriptions,
+                    "invoices": invoices,
+                    "refunds": refunds,
+                    "event_count": event_count,
+                    "outbox_count": outbox_count,
+                }))
+            })
+            .await
+            .unwrap()
+    }
 
     async fn serve_temp() -> (Store, std::path::PathBuf) {
         let conn = Connection::open_in_memory().unwrap();
@@ -366,8 +616,9 @@ mod tests {
         let sock = std::env::temp_dir().join(format!("lnrent-ipc-{}-{n}.sock", std::process::id()));
         let (s2, sock2) = (store.clone(), sock.clone());
         let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
         tokio::spawn(async move {
-            let _ = serve(s2, recipes, clock, &sock2).await;
+            let _ = serve(s2, recipes, clock, payment, &sock2).await;
         });
         // wait for bind
         for _ in 0..50 {
@@ -377,6 +628,115 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         (store, sock)
+    }
+
+    #[tokio::test]
+    async fn money_covered_zero_liabilities_with_mock_payment() {
+        let store = mem_store();
+        let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
+
+        let data = money_data(&store, &payment).await;
+
+        assert_eq!(data["ready"], json!(true));
+        assert_eq!(data["warning"], Value::Null);
+        assert_eq!(data["liability_count"], json!(0));
+        assert_eq!(data["balance_msat"], Value::Null);
+        assert_eq!(data["gateway_ok"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn money_covered_zero_liabilities_uses_direct_backend_probes() {
+        let store = mem_store();
+        let payment = Arc::new(RecordingPayment::new(Some(12_345), false));
+        let payment_dyn: Arc<dyn PaymentBackend> = payment.clone();
+
+        let data = money_data(&store, &payment_dyn).await;
+
+        assert_eq!(data["balance_msat"], json!(12_345));
+        assert_eq!(data["gateway_ok"], json!(false));
+        assert_eq!(data["ready"], json!(true));
+        assert_eq!(data["warning"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn money_uses_one_backend_probe_snapshot_for_display_and_readiness() {
+        let store = mem_store();
+        seed_pending_refund_liability(&store).await;
+        let payment = Arc::new(RecordingPayment::with_gateway_sequence(
+            Some(10_000),
+            vec![true, false],
+        ));
+        let payment_dyn: Arc<dyn PaymentBackend> = payment.clone();
+
+        let data = money_data(&store, &payment_dyn).await;
+
+        assert_eq!(data["gateway_ok"], json!(true));
+        assert_eq!(data["ready"], json!(true));
+        assert_eq!(data["warning"], Value::Null);
+        assert_eq!(
+            payment
+                .calls()
+                .iter()
+                .filter(|call| **call == "refund_gateway_ready")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn money_reports_uncovered_refund_liability() {
+        let store = mem_store();
+        seed_pending_refund_liability(&store).await;
+        let payment = Arc::new(RecordingPayment::new(Some(1), true));
+        let payment_dyn: Arc<dyn PaymentBackend> = payment;
+
+        let data = money_data(&store, &payment_dyn).await;
+
+        assert_eq!(data["ready"], json!(false));
+        assert_eq!(data["warning"], json!("InsufficientBalance"));
+        assert_eq!(data["liability_count"], json!(1));
+        assert_eq!(data["gross_liability_sat"], json!(2));
+        assert_eq!(data["required_msat"], json!(2_000));
+    }
+
+    #[tokio::test]
+    async fn money_is_readonly_for_store_and_payment_backend() {
+        let store = mem_store();
+        seed_pending_refund_liability(&store).await;
+        let before = store_money_snapshot(&store).await;
+        let payment = Arc::new(RecordingPayment::new(Some(10_000), true));
+        let payment_dyn: Arc<dyn PaymentBackend> = payment.clone();
+
+        let data = money_data(&store, &payment_dyn).await;
+
+        assert_eq!(data["ready"], json!(true));
+        assert_eq!(store_money_snapshot(&store).await, before);
+        let calls = payment.calls();
+        for required in [
+            "available_balance_msat",
+            "refund_gateway_ready",
+            "refund_required_outlay_msat",
+            "payment_status_by_key",
+            "payment_started_by_key",
+        ] {
+            assert!(
+                calls.contains(&required),
+                "missing read-only call {required}: {calls:?}"
+            );
+        }
+        for call in &calls {
+            assert!(
+                matches!(
+                    *call,
+                    "available_balance_msat"
+                        | "refund_gateway_ready"
+                        | "refund_required_outlay_msat"
+                        | "payment_status_by_key"
+                        | "payment_started_by_key"
+                ),
+                "money made a non-read-only payment call: {calls:?}"
+            );
+        }
     }
 
     #[tokio::test]

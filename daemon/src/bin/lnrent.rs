@@ -29,6 +29,8 @@ enum Cmd {
     Status,
     /// List loaded recipes.
     Recipes,
+    /// Show the daemon's ecash position: balance, gateway, and refund-liability coverage.
+    Money,
     /// List subscriptions.
     Subs,
     /// Inspect one subscription.
@@ -50,21 +52,28 @@ fn exit_for(err_code: &str) -> ExitCode {
     }
 }
 
+#[derive(Clone, Copy)]
+enum HumanRender {
+    Generic,
+    Money,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let req = match cli.cmd {
-        Cmd::Status => Request::Status,
-        Cmd::Recipes => Request::Recipes,
-        Cmd::Subs => Request::Subs,
-        Cmd::Sub { id } => Request::Sub { id },
-        Cmd::Suspend { id } => Request::AdminSuspend { id },
-        Cmd::Resume { id } => Request::AdminResume { id },
+    let (req, human_render) = match cli.cmd {
+        Cmd::Status => (Request::Status, HumanRender::Generic),
+        Cmd::Recipes => (Request::Recipes, HumanRender::Generic),
+        Cmd::Money => (Request::Money, HumanRender::Money),
+        Cmd::Subs => (Request::Subs, HumanRender::Generic),
+        Cmd::Sub { id } => (Request::Sub { id }, HumanRender::Generic),
+        Cmd::Suspend { id } => (Request::AdminSuspend { id }, HumanRender::Generic),
+        Cmd::Resume { id } => (Request::AdminResume { id }, HumanRender::Generic),
     };
     let sock = format!("{}/lnrent.sock", cli.data_dir);
 
     match ipc::call(&sock, req).await {
-        Ok(reply) => render(reply, cli.json),
+        Ok(reply) => render(reply, cli.json, human_render),
         Err(e) => {
             // The daemon isn't reachable — a structured, deterministic failure (retryable:
             // the daemon may come up). Errors go to stderr so `--json` stdout stays clean.
@@ -81,7 +90,7 @@ async fn main() -> ExitCode {
     }
 }
 
-fn render(reply: Reply, as_json: bool) -> ExitCode {
+fn render(reply: Reply, as_json: bool, human_render: HumanRender) -> ExitCode {
     if as_json {
         // Stable shape on success AND failure; errors go to stderr so piped `--json` stdout
         // stays clean for `| jq` (§4.7).
@@ -94,7 +103,10 @@ fn render(reply: Reply, as_json: bool) -> ExitCode {
     } else if reply.ok {
         match reply.data {
             Some(serde_json::Value::Null) | None => println!("ok"),
-            Some(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
+            Some(v) => match human_render {
+                HumanRender::Generic => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
+                HumanRender::Money => render_money_human(&v),
+            },
         }
     } else if let Some(err) = &reply.error {
         eprintln!("lnrent: {} ({})", err.message, err.code);
@@ -102,5 +114,52 @@ fn render(reply: Reply, as_json: bool) -> ExitCode {
     match &reply.error {
         Some(err) => exit_for(&err.code),
         None => ExitCode::SUCCESS,
+    }
+}
+
+fn render_money_human(v: &serde_json::Value) {
+    let balance = v
+        .get("balance_msat")
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| format!("{n} msat"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let gateway = if v
+        .get("gateway_ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        "ok"
+    } else {
+        "not ok"
+    };
+    let gross = v
+        .get("gross_liability_sat")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let required = v
+        .get("required_msat")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let parked = v
+        .get("parked_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let ready = v
+        .get("ready")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let warning = v.get("warning").and_then(serde_json::Value::as_str);
+
+    println!("Balance: {balance}");
+    println!("Gateway: {gateway}");
+    println!("Outstanding liabilities: {gross} sat gross, {required} msat required");
+    println!("Parked count: {parked}");
+    if ready {
+        println!("Status: \x1b[1mREADY\x1b[0m");
+    } else {
+        println!(
+            "Status: \x1b[1mNOT READY ({})\x1b[0m",
+            warning.unwrap_or("unknown")
+        );
     }
 }

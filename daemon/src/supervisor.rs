@@ -28,7 +28,7 @@ use lightning_invoice::Bolt11Invoice;
 use lnrent_wire::Msg;
 use nostr_sdk::PublicKey;
 use rusqlite::OptionalExtension;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio::task::{AbortHandle, JoinHandle};
 
@@ -429,14 +429,22 @@ impl Supervisor {
                 self.clock.clone(),
                 self.sock_path.clone(),
             );
+            let payment = self.payment.clone();
             tasks.push(tokio::spawn(supervise(
                 "ipc",
                 shutdown_rx.clone(),
                 RESTART_BACKOFF,
                 move |sd| {
-                    let (store, recipes, clock, sock) =
-                        (store.clone(), recipes.clone(), clock.clone(), sock.clone());
-                    async move { ipc::serve_with_shutdown(store, recipes, clock, &sock, sd).await }
+                    let (store, recipes, clock, payment, sock) = (
+                        store.clone(),
+                        recipes.clone(),
+                        clock.clone(),
+                        payment.clone(),
+                        sock.clone(),
+                    );
+                    async move {
+                        ipc::serve_with_shutdown(store, recipes, clock, payment, &sock, sd).await
+                    }
                 },
             )));
         }
@@ -973,7 +981,7 @@ async fn maintenance_pass(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RefundReadinessReport {
+pub(crate) struct RefundReadinessReport {
     liability_count: usize,
     gross_liability_sat: u128,
     required_msat: u128,
@@ -1004,8 +1012,72 @@ impl Default for RefundReadinessReport {
     }
 }
 
+impl RefundReadinessReport {
+    pub(crate) fn to_money_value(&self, balance_msat: Option<u64>, gateway_ok: bool) -> Value {
+        json!({
+            "balance_msat": balance_msat,
+            "gateway_ok": gateway_ok,
+            "liability_count": self.liability_count,
+            "gross_liability_sat": self.gross_liability_sat,
+            "required_msat": self.required_msat,
+            "parked_count": self.parked_count,
+            "ready": self.warning.is_none(),
+            "warning": self.warning.map(RefundReadinessWarning::as_str),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RefundReadinessProbe {
+    balance_msat: Option<u64>,
+    balance_error: Option<String>,
+    gateway_ok: bool,
+    gateway_error: Option<String>,
+}
+
+impl RefundReadinessProbe {
+    pub(crate) async fn query(payment: &Arc<dyn PaymentBackend>) -> Self {
+        let (gateway_ok, gateway_error) = match payment.refund_gateway_ready().await {
+            Ok(ok) => (ok, None),
+            Err(e) => (false, Some(format!("{e:#}"))),
+        };
+        let (balance_msat, balance_error) = match payment.available_balance_msat().await {
+            Ok(balance) => (balance, None),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        };
+
+        Self {
+            balance_msat,
+            balance_error,
+            gateway_ok,
+            gateway_error,
+        }
+    }
+
+    pub(crate) fn balance_msat(&self) -> Option<u64> {
+        self.balance_msat
+    }
+
+    pub(crate) fn gateway_ok(&self) -> bool {
+        self.gateway_ok
+    }
+
+    fn log_failures(&self) {
+        if let Some(e) = &self.gateway_error {
+            tracing::warn!(error = %e, "refund readiness: gateway readiness query failed");
+        }
+        // A local ecash balance failure is a catastrophic client signal when liabilities exist.
+        if let Some(e) = &self.balance_error {
+            tracing::error!(
+                error = %e,
+                "refund readiness: LOCAL ecash balance query FAILED — likely a corrupt/broken fedimint client; refund coverage CANNOT be verified"
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RefundReadinessWarning {
+pub(crate) enum RefundReadinessWarning {
     /// The local ecash balance query failed — catastrophic (a corrupt/broken client). Highest priority.
     BalanceQueryFailed,
     GatewayUnavailable,
@@ -1014,6 +1086,18 @@ enum RefundReadinessWarning {
     /// coverage cannot be confirmed — warn rather than falsely report "covered".
     Unpriceable,
     ParkedManual,
+}
+
+impl RefundReadinessWarning {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            RefundReadinessWarning::BalanceQueryFailed => "BalanceQueryFailed",
+            RefundReadinessWarning::GatewayUnavailable => "GatewayUnavailable",
+            RefundReadinessWarning::InsufficientBalance => "InsufficientBalance",
+            RefundReadinessWarning::Unpriceable => "Unpriceable",
+            RefundReadinessWarning::ParkedManual => "ParkedManual",
+        }
+    }
 }
 
 async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) {
@@ -1086,7 +1170,7 @@ async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) 
     }
 }
 
-async fn refund_readiness_report(
+pub(crate) async fn refund_readiness_report(
     store: &Store,
     payment: &Arc<dyn PaymentBackend>,
 ) -> Result<RefundReadinessReport> {
@@ -1095,36 +1179,39 @@ async fn refund_readiness_report(
         return Ok(RefundReadinessReport::default());
     }
 
-    let gateway_ok = match payment.refund_gateway_ready().await {
-        Ok(ok) => ok,
-        Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "refund readiness: gateway readiness query failed");
-            false
-        }
-    };
-    // The ecash balance is a LOCAL fedimint-client read; a failure is not a routine remote hiccup but a
-    // catastrophic signal (a corrupt / broken client), so it is logged loudly and forces a warning
-    // rather than being treated as "no balance concept" and silently skipped (operator guidance).
-    let (balance_msat, balance_query_failed) = match payment.available_balance_msat().await {
-        Ok(balance) => (balance, false),
-        Err(e) => {
-            tracing::error!(
-                error = %format!("{e:#}"),
-                "refund readiness: LOCAL ecash balance query FAILED — likely a corrupt/broken fedimint client; refund coverage CANNOT be verified"
-            );
-            (None, true)
-        }
-    };
+    let probe = RefundReadinessProbe::query(payment).await;
+    refund_readiness_report_from_liabilities(liabilities, payment, &probe).await
+}
+
+pub(crate) async fn refund_readiness_report_with_probe(
+    store: &Store,
+    payment: &Arc<dyn PaymentBackend>,
+    probe: &RefundReadinessProbe,
+) -> Result<RefundReadinessReport> {
+    let liabilities = store.refund_readiness_liabilities().await?;
+    if liabilities.is_empty() {
+        return Ok(RefundReadinessReport::default());
+    }
+
+    refund_readiness_report_from_liabilities(liabilities, payment, probe).await
+}
+
+async fn refund_readiness_report_from_liabilities(
+    liabilities: Vec<RefundReadinessLiability>,
+    payment: &Arc<dyn PaymentBackend>,
+    probe: &RefundReadinessProbe,
+) -> Result<RefundReadinessReport> {
+    probe.log_failures();
 
     let mut report = RefundReadinessReport {
         liability_count: liabilities.len(),
         gross_liability_sat: 0,
         required_msat: 0,
-        balance_msat,
-        gateway_ok,
+        balance_msat: probe.balance_msat,
+        gateway_ok: probe.gateway_ok,
         parked_count: 0,
         unpriceable_count: 0,
-        balance_query_failed,
+        balance_query_failed: probe.balance_error.is_some(),
         warning: None,
     };
 
