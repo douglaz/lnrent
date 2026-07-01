@@ -494,54 +494,58 @@ impl Refunder {
                     PayStatus::Succeeded => Ok(PlanOutcome::AlreadySent {
                         pay_sat: parse_whole_sat(bolt11).unwrap_or(received),
                     }),
-                    // RE-RESOLVE — the ONLY case that mints a new payment_hash — fires only when the
-                    // CURRENT generation can NEVER settle: a DEFINITE `Failed` that is ALSO past its
-                    // persisted expiry. Failed means the prior HTLC terminally resolved (funds
-                    // returned); expired means the invoice itself can no longer be paid. With no
-                    // outstanding payment, a fresh payment_hash cannot double up. This is a NEW payment,
-                    // so it is also where a fresh INV-1 cap is quoted (a fee change between generations
-                    // is still bounded by the same `received` gross). Bump the gen, resolve fresh,
-                    // PERSIST (committed), then pay the new gen for the new net cap.
+                    // RE-RESOLVE (the ONLY case that mints a new payment_hash) fires only on a DEFINITE
+                    // `Failed`: the prior HTLC terminally resolved (funds returned) OR the cap preflight
+                    // never started an op — either way nothing is outstanding, so a fresh payment_hash
+                    // cannot double up. Re-query the CURRENT gateway fee and re-resolve when the current
+                    // generation can never settle as-is: it is EXPIRED, or the (otherwise static) gateway
+                    // fee was RAISED by its operator so the persisted invoice — quoted at the old fee —
+                    // now exceeds the INV-1 cap and would fail the preflight on every retry (operator
+                    // guidance). Otherwise the failure is transient (a gateway blip) and REUSING the
+                    // persisted invoice on a plain retry is correct.
                     //
-                    // `Unknown` is DELIBERATELY excluded here (review P1): per the
-                    // [`crate::backends::PayStatus`] contract it is an in-flight payment that "can be
-                    // neither confirmed nor refuted", so the old HTLC may still settle even after the
-                    // invoice expires (the Fedimint crash-after-pay-commit window). Re-resolving there
-                    // would pay a NEW payment_hash that neither the gen-bound key nor the per-hash dedup
-                    // can match against the still-live old one — a double refund. Unknown falls through
-                    // to REUSE below, and only re-resolves once it has become a definite Failed.
-                    PayStatus::Failed if expired => {
-                        let net_cap = self.quote_net_cap(received).await?;
-                        let owed_msat = net_cap.checked_mul(1000).ok_or_else(|| {
-                            PlanError::Structural(format!(
-                                "refund net amount {net_cap} sat overflows u64 msats"
-                            ))
-                        })?;
-                        let next_gen = gen + 1;
-                        let resolved = self.resolve_dest(dest, owed_msat, now).await?;
-                        if !self
-                            .persist_resolution(&row.id, &resolved, next_gen, now)
-                            .await?
-                        {
-                            return Ok(PlanOutcome::Skip);
+                    // `Pending`/`Unknown` are NEVER re-quoted or re-resolved (review P1): per the
+                    // [`crate::backends::PayStatus`] contract `Unknown` is an in-flight payment that "can
+                    // be neither confirmed nor refuted" (the Fedimint crash-after-pay-commit window), so
+                    // the old HTLC may still settle; a new payment_hash there would double-refund. They
+                    // re-await the persisted invoice below with NO re-quote, so a gateway outage can never
+                    // strand an in-flight payment.
+                    PayStatus::Failed => {
+                        let net_cap = self.quote_net_cap(received).await?; // Err (gateway down) => Transient
+                        let persisted_sat = parse_whole_sat(bolt11).unwrap_or(received);
+                        if expired || persisted_sat > net_cap {
+                            let owed_msat = net_cap.checked_mul(1000).ok_or_else(|| {
+                                PlanError::Structural(format!(
+                                    "refund net amount {net_cap} sat overflows u64 msats"
+                                ))
+                            })?;
+                            let next_gen = gen + 1;
+                            let resolved = self.resolve_dest(dest, owed_msat, now).await?;
+                            if !self
+                                .persist_resolution(&row.id, &resolved, next_gen, now)
+                                .await?
+                            {
+                                return Ok(PlanOutcome::Skip);
+                            }
+                            Ok(PlanOutcome::Pay {
+                                bolt11: resolved.bolt11,
+                                gen: next_gen,
+                                pay_sat: net_cap,
+                            })
+                        } else {
+                            Ok(PlanOutcome::Pay {
+                                bolt11: bolt11.to_string(),
+                                gen,
+                                pay_sat: persisted_sat,
+                            })
                         }
-                        Ok(PlanOutcome::Pay {
-                            bolt11: resolved.bolt11,
-                            gen: next_gen,
-                            pay_sat: net_cap,
-                        })
                     }
-                    // Everything else RE-AWAITS the SAME persisted invoice with its PERSISTED pay amount
+                    // Pending or Unknown RE-AWAIT the SAME persisted invoice with its PERSISTED pay amount
                     // and the SAME gen (the backend dedups on the stable payment_hash, so this never
-                    // double-pays): a payment still in flight (Pending); an in-flight/crash-window
-                    // payment that can't be confirmed (Unknown — REUSED whether expired or not, the P1
-                    // fix above); or a returned-funds retry of an unexpired invoice (Failed, unexpired).
-                    // The pay amount is the persisted invoice's own whole-sat figure (NO re-quote). A
-                    // production resolver always persists a real bolt11, so the parse recovers that
-                    // generation's net cap; a non-bolt11 pass-through dest (mock backend) falls back to
-                    // the gross, which the backend's final cap preflight still bounds — so it can never
-                    // overpay.
-                    PayStatus::Pending | PayStatus::Unknown | PayStatus::Failed => {
+                    // double-pays). NO re-quote, so a gateway outage can't strand an in-flight payment. A
+                    // non-bolt11 pass-through dest (mock) falls back to the gross, which the backend's
+                    // final cap preflight still bounds — so it can never overpay.
+                    PayStatus::Pending | PayStatus::Unknown => {
                         let pay_sat = parse_whole_sat(bolt11).unwrap_or(received);
                         Ok(PlanOutcome::Pay {
                             bolt11: bolt11.to_string(),
@@ -2667,6 +2671,46 @@ mod tests {
             payment.paid_amount("refund:order:sub-1:g2"),
             Some(400),
             "paid the NEW 400-sat cap, not the old 500"
+        );
+    }
+
+    /// The gateway operator RAISED the (otherwise static) fee, so the persisted invoice — quoted at the
+    /// old fee (500 sat) — now exceeds the current 400-sat cap. Even though the invoice is NOT expired,
+    /// retrying it would fail the INV-1 cap preflight forever; so re-query the current fee and re-resolve
+    /// at the new 400-sat net, rather than parking the refund (codex final-gate P2 / operator guidance).
+    #[tokio::test]
+    async fn gen_failed_over_cap_reresolves_at_current_fee_even_unexpired() {
+        let store = mem_store();
+        let payment = Arc::new(FeeQuotePayment::new(400)); // the current (raised-fee) cap
+        payment.set_key_status("refund:order:sub-1:g1", PayStatus::Failed);
+        let clock = TestClock::new(200); // now=200 < the seeded expiry 10_000 -> NOT expired
+        let resolver = Arc::new(TestResolver::new(10_000));
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        let b = crate::refund_resolver::mint_bolt11(500_000, "meta", 1_000, 86_400); // 500 sat @ old fee
+        seed_refund_resolved(&store, "sub-1", LN_ADDR, 500, &b, 10_000, 1).await;
+
+        let report = Refunder::with_resolver(
+            store.clone(),
+            payment.clone(),
+            Arc::new(clock.clone()),
+            resolver.clone(),
+        )
+        .drive()
+        .await
+        .unwrap();
+
+        assert_eq!(report.sent, 1);
+        assert_eq!(
+            resolver.calls(),
+            1,
+            "re-resolved at the new fee despite the invoice not being expired"
+        );
+        let (_, gen) = resolution_of(&store, "ref-order:sub-1").await;
+        assert_eq!(gen, 2, "generation bumped to the new, cheaper invoice");
+        assert_eq!(
+            payment.paid_amount("refund:order:sub-1:g2"),
+            Some(400),
+            "paid the new 400-sat cap, not the stale over-cap 500"
         );
     }
 

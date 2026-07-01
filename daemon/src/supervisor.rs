@@ -983,6 +983,8 @@ struct RefundReadinessReport {
     /// PENDING liabilities that could not be priced this pass (transient quote/gateway error). Their
     /// cost is absent from `required_msat`, so coverage cannot be confirmed — forces a warning.
     unpriceable_count: usize,
+    /// The (local) ecash balance query itself failed — a catastrophic signal; forces a loud warning.
+    balance_query_failed: bool,
     warning: Option<RefundReadinessWarning>,
 }
 
@@ -996,6 +998,7 @@ impl Default for RefundReadinessReport {
             gateway_ok: true,
             parked_count: 0,
             unpriceable_count: 0,
+            balance_query_failed: false,
             warning: None,
         }
     }
@@ -1003,6 +1006,8 @@ impl Default for RefundReadinessReport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefundReadinessWarning {
+    /// The local ecash balance query failed — catastrophic (a corrupt/broken client). Highest priority.
+    BalanceQueryFailed,
     GatewayUnavailable,
     InsufficientBalance,
     /// A real PENDING liability could not be priced (its outlay is missing from `required_msat`), so
@@ -1024,6 +1029,14 @@ async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) 
     }
 
     match report.warning {
+        Some(RefundReadinessWarning::BalanceQueryFailed) => tracing::error!(
+            liabilities = report.liability_count,
+            gross_liability_sat = %report.gross_liability_sat,
+            required_outlay_msat = %report.required_msat,
+            gateway_ok = report.gateway_ok,
+            parked_count = report.parked_count,
+            "refund readiness ALARM: the LOCAL ecash balance query failed with liabilities outstanding — likely a corrupt/broken fedimint client; refund coverage cannot be verified, investigate immediately"
+        ),
         Some(RefundReadinessWarning::GatewayUnavailable) => tracing::warn!(
             liabilities = report.liability_count,
             gross_liability_sat = %report.gross_liability_sat,
@@ -1089,11 +1102,17 @@ async fn refund_readiness_report(
             false
         }
     };
-    let balance_msat = match payment.available_balance_msat().await {
-        Ok(balance) => balance,
+    // The ecash balance is a LOCAL fedimint-client read; a failure is not a routine remote hiccup but a
+    // catastrophic signal (a corrupt / broken client), so it is logged loudly and forces a warning
+    // rather than being treated as "no balance concept" and silently skipped (operator guidance).
+    let (balance_msat, balance_query_failed) = match payment.available_balance_msat().await {
+        Ok(balance) => (balance, false),
         Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "refund readiness: balance query failed");
-            None
+            tracing::error!(
+                error = %format!("{e:#}"),
+                "refund readiness: LOCAL ecash balance query FAILED — likely a corrupt/broken fedimint client; refund coverage CANNOT be verified"
+            );
+            (None, true)
         }
     };
 
@@ -1105,6 +1124,7 @@ async fn refund_readiness_report(
         gateway_ok,
         parked_count: 0,
         unpriceable_count: 0,
+        balance_query_failed,
         warning: None,
     };
 
@@ -1140,7 +1160,9 @@ async fn refund_readiness_report(
         }
     }
 
-    report.warning = if !report.gateway_ok {
+    report.warning = if report.balance_query_failed {
+        Some(RefundReadinessWarning::BalanceQueryFailed)
+    } else if !report.gateway_ok {
         Some(RefundReadinessWarning::GatewayUnavailable)
     } else if report
         .balance_msat
@@ -1451,6 +1473,7 @@ mod tests {
         started: StdMutex<HashSet<String>>,
         required_by_gross: StdMutex<HashMap<u64, u128>>,
         fail_pricing: StdMutex<bool>,
+        fail_balance: StdMutex<bool>,
     }
 
     impl ReadinessPayment {
@@ -1462,11 +1485,16 @@ mod tests {
                 started: StdMutex::new(HashSet::new()),
                 required_by_gross: StdMutex::new(HashMap::new()),
                 fail_pricing: StdMutex::new(false),
+                fail_balance: StdMutex::new(false),
             }
         }
 
         fn set_pricing_fails(&self, fails: bool) {
             *self.fail_pricing.lock().unwrap() = fails;
+        }
+
+        fn set_balance_query_fails(&self, fails: bool) {
+            *self.fail_balance.lock().unwrap() = fails;
         }
 
         fn set_status(&self, key: &str, status: PayStatus) {
@@ -1541,6 +1569,9 @@ mod tests {
         }
 
         async fn available_balance_msat(&self) -> Result<Option<u64>> {
+            if *self.fail_balance.lock().unwrap() {
+                anyhow::bail!("simulated local balance query failure");
+            }
             Ok(*self.balance_msat.lock().unwrap())
         }
 
@@ -1878,6 +1909,36 @@ mod tests {
         assert_eq!(report.unpriceable_count, 1);
         assert_eq!(report.required_msat, 0);
         assert_eq!(report.warning, Some(RefundReadinessWarning::Unpriceable));
+    }
+
+    #[tokio::test]
+    async fn readiness_local_balance_query_failure_alarms_not_covered() {
+        // The ecash balance is a LOCAL read; a failure is catastrophic. With a liability outstanding it
+        // must raise the highest-priority alarm, never fall through to "covered" (operator guidance).
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "PROVISIONING").await;
+        seed_invoice(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            "order",
+            2,
+            "PAID",
+            Some(10),
+            Some(10),
+        )
+        .await;
+        let payment = Arc::new(ReadinessPayment::new(Some(1_000_000), true));
+        payment.set_balance_query_fails(true);
+        let payment: Arc<dyn PaymentBackend> = payment;
+
+        let report = readiness(&store, &payment).await;
+
+        assert!(report.balance_query_failed);
+        assert_eq!(
+            report.warning,
+            Some(RefundReadinessWarning::BalanceQueryFailed)
+        );
     }
 
     #[tokio::test]
