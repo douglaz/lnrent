@@ -1,41 +1,93 @@
 # lnrent
 
-A VPS manager. Point it at a box (or a fleet) over SSH+sudo and manage everything on
-it: VMs, containers, networking, storage, and services. On top of management, rent
-any managed service to others on a Lightning-settled subscription discovered over
-Nostr. Operator-run, no central server, no AI in the serving path.
+Rent a server for sats. An operator runs `lnrentd`, publishes a service listing over Nostr, and
+anyone can discover it, order it, pay a Lightning/Fedimint invoice, and get a provisioned box back —
+no central server, no accounts, no AI in the serving path. Services are **recipes** (a manifest + a few
+lifecycle hooks), so the catalogue is open-ended; the first real one provisions DigitalOcean VPSs.
 
-First services: WireGuard VPN, VMs, Hermes agent, Fedimint guardian. Services are
-recipes, so the set is open-ended.
-
-- **Control plane:** `lnrentd` (Rust) — manages compute/network/storage/services,
-  payments, subscriptions, Nostr.
-- **Author-time tooling:** Claude skills — onboard, write recipes, manage, list, inspect.
+- **Control plane:** `lnrentd` (Rust) — orders, payments, subscriptions, provisioning, refunds, Nostr.
+- **Operator CLI:** `lnrent` — talks to a running daemon over a local IPC socket (status, subs, money).
+- **Buyer CLI:** `lnrent-buyer` — agent-grade; discovers listings and places orders over Nostr.
 
 ## Status
 
-Spec-stage, M0 skeleton in. Building toward **M1a** — the durable payment/order handshake
-(the riskiest part), proven with a trivial recipe, then a **web WASM buyer** for browser
-marketplace access. MVP wedge is thin VM rental (M1a handshake -> M1b VM Tier-0 -> M1c
-public exposure). **M0 (skeleton)** is in: domain types, subsystem traits
-(`ComputeBackend`/`NetworkBackend`/`PaymentBackend`), recipe loader, sqlite schema.
+The full rental path works and has been **proven live end to end**: a real buyer discovers a listing,
+orders it, pays a real Fedimint invoice from a real wallet, the daemon provisions a **real DigitalOcean
+droplet** and delivers SSH access over Nostr, and the buyer logs in — then can cancel, after which the
+box runs out its paid period and is torn down.
 
-Design: [SPEC.md](./SPEC.md) (v0.19) · glossary: [CONTEXT.md](./CONTEXT.md) · decisions:
-[docs/adr/](./docs/adr/) (0001-0009) · M1a work graph: `.beads/` (br, epic lnrent-7fp).
+Built and tested:
+- **Money path** — durable order → invoice → settlement → capture, with a **real Fedimint backend**
+  (opt-in, `--features fedimint`) or an in-memory mock (default). Refunds are hardened: fees are deducted
+  so the operator can't be drained, readiness only warns on real uncovered liabilities, and every refund
+  requires provenance.
+- **Provisioning** — recipe-hook driven; `do-vps` creates/destroys real DigitalOcean droplets end to end.
+- **Buyer lifecycle** — discover, order, pay (out of band), await credentials, renew, cancel, and invoke
+  recipe-declared management ops — all over NIP-17 DMs.
+- **Operator** — `lnrent status/recipes/subs/sub`, and `lnrent money` (ecash balance, gateway, refund
+  liability coverage).
+
+Not yet: a browser/GUI buyer, more compute providers (Hetzner, bring-your-own-host), and the mainnet
+go-live (real money is opt-in and gated on the operator finalizing their setup). See [SPEC.md](./SPEC.md).
 
 ## Build
 
+The workspace links a bundled RocksDB, so builds run inside the Nix devshell:
+
 ```sh
-cargo build
-cargo test
-LNRENT_DATA_DIR=./data LNRENT_RECIPES_DIR=./recipes cargo run --bin lnrentd
-cargo run --bin lnrent -- recipes
+nix develop . --command cargo build            # default (mock payment backend)
+nix develop . --command cargo test -p lnrentd
+nix develop . --command cargo build -p lnrentd --features fedimint   # real Fedimint payments
+```
+
+## Run
+
+**Operator daemon** (mock payments — no external services needed):
+
+```sh
+LNRENT_DATA_DIR=./data LNRENT_RECIPES_DIR=./recipes LNRENT_RELAYS=wss://relay.example \
+  nix develop . --command cargo run -p lnrentd --bin lnrentd
+```
+
+For **real Fedimint payments + real VMs**, build with `--features fedimint` and configure the federation
++ DigitalOcean token:
+
+```sh
+LNRENT_PAYMENT_BACKEND=fedimint LNRENT_FEDIMINT_INVITE=fed1… LNRENT_FEDIMINT_GATEWAY=<gateway_pubkey> \
+LNRENT_COMPUTE_BACKEND=cloud-do DO_TOKEN=<digitalocean_token> \
+LNRENT_MNEMONIC="…" LNRENT_DATA_DIR=./data LNRENT_RECIPES_DIR=./recipes LNRENT_RELAYS=wss://relay.example \
+  nix develop . --command cargo run -p lnrentd --features fedimint --bin lnrentd
+```
+
+**Operator CLI** (same `LNRENT_DATA_DIR` as the daemon — connects to its IPC socket):
+
+```sh
+LNRENT_DATA_DIR=./data nix develop . --command cargo run -p lnrentd --bin lnrent -- money
+#   subcommands: status · recipes · subs · sub <id> · money   (add --json for machine output)
+```
+
+**Buyer CLI** (talks to the operator over a relay; the buyer pays the returned invoice from their own
+wallet — the CLI never holds funds):
+
+```sh
+B="nix develop . --command cargo run -p lnrent-buyer-cli -- --relay wss://relay.example --operator <npub> --key-file buyer.nsec"
+$B identity new                       # create a buyer key
+$B listings                           # discover the operator's listings
+$B order create <30402:…:…> --params-json '{"ssh_pubkey":"ssh-ed25519 …"}'   # -> a bolt11 invoice
+#   ...pay the bolt11 from your wallet...
+$B order wait <order_id>              # -> access credentials (host/port/user)
+#   also: renew <sub> · cancel <sub> · ops <sub> <op> · delivery resend <sub>
 ```
 
 ## Layout
 
-- `daemon/` — Rust: `lnrentd` (control plane) + `lnrent` (operator CLI)
-- `clients/` — `core` (buyer-core lib) + `cli` (native buyer) + `web` (WASM SPA)
-- `recipes/` — service recipes (`wireguard/` so far: manifest + lifecycle hook stubs)
-- `docs/adr/` — ADRs (0001-0009); `docs/security/` — VM deployment + networking guidelines
-- `.beads/` — M1a work graph (br)
+- `daemon/` — `lnrentd` (control plane) + `lnrent` (operator CLI)
+- `wire/` — the Nostr wire codec: DM message types, NIP-99 listings, NIP-17 gift-wrap
+- `clients/core` — `lnrent-buyer-core` (buyer library); `clients/cli` — `lnrent-buyer` (native buyer)
+- `recipes/` — service recipes: `do-vps` (DigitalOcean VPS), `wireguard` (stub), `dummy` (tests)
+
+## Docs
+
+- Spec: [SPEC.md](./SPEC.md) (draft v0.29) · glossary: [CONTEXT.md](./CONTEXT.md)
+- Decisions: [docs/adr/](./docs/adr/) (0001-0015) · change specs: [docs/specs/](./docs/specs/)
+- Security/deployment notes: [docs/security/](./docs/security/)
