@@ -45,6 +45,7 @@ use crate::reconcile::Reconciler;
 use crate::refund::Refunder;
 use crate::refund_resolver::RefundResolver;
 use crate::reservation::Budget;
+use crate::resume::ResumeDriver;
 use crate::store::{
     RefundAttemptLiability, RefundReadinessLiability, RefundReadinessSource, Store,
 };
@@ -127,6 +128,7 @@ pub struct Supervisor {
     /// Management-op DMs; also owns the orphaned-RUNNING boot recovery.
     op_dispatch: Arc<OpDispatch>,
     provisioner: Arc<Provisioner>,
+    resume_driver: Arc<ResumeDriver>,
     refunder: Arc<Refunder>,
     reconciler: Arc<Reconciler>,
     sock_path: PathBuf,
@@ -190,6 +192,11 @@ impl Supervisor {
             recipe.clone(),
             box_id,
         ));
+        let resume_driver = Arc::new(ResumeDriver::new(
+            store.clone(),
+            clock.clone(),
+            recipe.clone(),
+        ));
         let refunder = Arc::new(Refunder::with_resolver(
             store.clone(),
             payment.clone(),
@@ -215,6 +222,7 @@ impl Supervisor {
             op_handler,
             inbound_drain,
             provisioner,
+            resume_driver,
             refunder,
             reconciler,
             sock_path,
@@ -338,7 +346,7 @@ impl Supervisor {
     /// idempotent; an error in one is logged and does not block the rest (the periodic loops will retry).
     async fn boot_recovery(&self) -> Result<()> {
         tracing::info!(
-            "boot recovery: op-dispatch -> downtime-credit -> settlement catch-up -> provision -> refund -> reconcile -> outbox"
+            "boot recovery: op-dispatch -> downtime-credit -> settlement catch-up -> provision -> resume -> refund -> reconcile -> outbox"
         );
 
         match self.op_dispatch.recover_interrupted_ops().await {
@@ -377,6 +385,12 @@ impl Supervisor {
             Ok(n) => tracing::info!(count = n, "boot recovery: provisioning re-driven"),
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "boot recovery: provision recovery failed")
+            }
+        }
+        match self.resume_driver.recover().await {
+            Ok(n) => tracing::info!(count = n, "boot recovery: resumes re-driven"),
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "boot recovery: resume recovery failed")
             }
         }
         match self.refunder.drive().await {
@@ -535,10 +549,11 @@ impl Supervisor {
             )));
         }
 
-        // -- Single serialized maintenance loop (clock sync + periodic settlement catch-up + provision + refund + outbox) --
+        // -- Single serialized maintenance loop (clock sync + periodic settlement catch-up + provision + resume + refund + outbox) --
         {
-            let (provisioner, refunder, payment, engine, store, clock, nudge2, sync) = (
+            let (provisioner, resume_driver, refunder, payment, engine, store, clock, nudge2, sync) = (
                 self.provisioner.clone(),
+                self.resume_driver.clone(),
                 self.refunder.clone(),
                 self.payment.clone(),
                 self.engine.clone(),
@@ -553,8 +568,19 @@ impl Supervisor {
                 shutdown_rx.clone(),
                 RESTART_BACKOFF,
                 move |sd| {
-                    let (provisioner, refunder, payment, engine, store, clock, nudge2, sync) = (
+                    let (
+                        provisioner,
+                        resume_driver,
+                        refunder,
+                        payment,
+                        engine,
+                        store,
+                        clock,
+                        nudge2,
+                        sync,
+                    ) = (
                         provisioner.clone(),
+                        resume_driver.clone(),
                         refunder.clone(),
                         payment.clone(),
                         engine.clone(),
@@ -566,6 +592,7 @@ impl Supervisor {
                     async move {
                         run_maintenance_loop(
                             provisioner,
+                            resume_driver,
                             refunder,
                             payment,
                             store,
@@ -844,7 +871,8 @@ async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
 }
 
 /// Settlement loop: drain the payment backend's settlement stream and `capture` each; after a
-/// `Captured`/`RefundDue` outcome NUDGE the maintenance loop so provision/refund runs promptly.
+/// `Captured`/`Resumed`/`RefundDue` outcome NUDGE the maintenance loop so provision/resume/refund
+/// runs promptly.
 async fn run_settlement_loop(
     mut rx: mpsc::Receiver<Settlement>,
     store: Store,
@@ -862,9 +890,9 @@ async fn run_settlement_loop(
                 };
                 let external = settlement.external_id.clone();
                 match capture(&store, settlement, clock.now()).await {
-                    Ok(Capture::Captured) | Ok(Capture::RefundDue) => {
-                        // Provisioning (Captured) or a refund (RefundDue) is now pending — wake the
-                        // maintenance loop instead of waiting for its interval.
+                    Ok(Capture::Captured) | Ok(Capture::Resumed) | Ok(Capture::RefundDue) => {
+                        // Provisioning, resume, or refund work is now pending — wake the maintenance
+                        // loop instead of waiting for its interval.
                         nudge.notify_one();
                     }
                     Ok(other) => tracing::debug!(external = %external, ?other, "settlement captured"),
@@ -907,11 +935,12 @@ async fn run_reconcile_loop(
 
 /// The SINGLE serialized maintenance loop: on each `interval` tick AND on every nudge, run one
 /// maintenance pass. Single-threaded by construction — the Provisioner is CAS-safe but duplicate
-/// concurrent drives could run recipe hooks before one loses the CAS, so provision driving stays on
-/// this one loop.
+/// concurrent drives could run recipe hooks before one loses the CAS; resume has the same hook
+/// shape, so both drivers stay on this one loop.
 #[allow(clippy::too_many_arguments)]
 async fn run_maintenance_loop(
     provisioner: Arc<Provisioner>,
+    resume_driver: Arc<ResumeDriver>,
     refunder: Arc<Refunder>,
     payment: Arc<dyn PaymentBackend>,
     store: Store,
@@ -933,6 +962,7 @@ async fn run_maintenance_loop(
         };
         maintenance_pass(
             &provisioner,
+            &resume_driver,
             &refunder,
             &payment,
             &store,
@@ -947,13 +977,15 @@ async fn run_maintenance_loop(
 }
 
 /// One serialized maintenance pass: keep the mock payment clock in step, periodically catch any
-/// missed settlements, drive PROVISIONING subs to ACTIVE/REFUND_DUE (+ finish failed cleanups), pay
-/// PENDING refunds, then deliver unsent DMs (provision.ready, billing.refund, suspend/terminate
+/// missed settlements, drive PROVISIONING subs to ACTIVE/REFUND_DUE (+ finish failed cleanups), drive
+/// RESUMING subs to ACTIVE or a detached renewal refund, pay PENDING refunds, then deliver unsent DMs
+/// (provision.ready, billing.refund, suspend/terminate
 /// notices). Each step is independently idempotent; an error in one is logged and does not block the
 /// others.
 #[allow(clippy::too_many_arguments)]
 async fn maintenance_pass(
     provisioner: &Provisioner,
+    resume_driver: &ResumeDriver,
     refunder: &Refunder,
     payment: &Arc<dyn PaymentBackend>,
     store: &Store,
@@ -978,6 +1010,9 @@ async fn maintenance_pass(
     }
     if let Err(e) = provisioner.recover().await {
         tracing::error!(error = %format!("{e:#}"), "maintenance: provision drive failed");
+    }
+    if let Err(e) = resume_driver.recover().await {
+        tracing::error!(error = %format!("{e:#}"), "maintenance: resume drive failed");
     }
     if let Err(e) = refunder.drive().await {
         tracing::error!(error = %format!("{e:#}"), "maintenance: refund drive failed");
@@ -1426,7 +1461,7 @@ async fn settlement_catch_up(
                     settled_at,
                 };
                 match capture(store, settlement, now).await {
-                    Ok(Capture::Captured | Capture::RefundDue) => caught += 1,
+                    Ok(Capture::Captured | Capture::Resumed | Capture::RefundDue) => caught += 1,
                     Ok(_) => {}
                     Err(e) => tracing::error!(
                         external = %external_id,

@@ -220,6 +220,13 @@ impl Reconciler {
                         report.noops += 1;
                     }
                 }
+                "RESUMING" => {
+                    tracing::debug!(
+                        sub = %d.id,
+                        "reconcile: RESUMING sub is owned by the resume driver — no-op"
+                    );
+                    report.noops += 1;
+                }
                 // Totality: PROVISIONING / EXPIRED / TERMINATED / REFUND_DUE / a stale cursor on an
                 // already-moved sub — no time transition. A logged no-op, never a panic/error.
                 other => {

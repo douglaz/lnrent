@@ -37,14 +37,18 @@ use tokio::time::timeout;
 use lnrent_wire::{
     listing_coordinate, Msg, OpRequest, OpResult, OpStatus, OrderRequest, RenewRequest,
 };
-use lnrentd::backends::{MockPayment, PaymentBackend};
+use lnrentd::backends::{MockPayment, PaymentBackend, Settlement};
+use lnrentd::capture::{capture, Capture};
 use lnrentd::clock::{Clock, TestClock};
 use lnrentd::nostr_engine::{NostrEngine, OpHandler, OrderHandler, Outbound};
 use lnrentd::op_dispatch::OpDispatch;
 use lnrentd::order_intake::OrderIntake;
 use lnrentd::recipe::Recipe;
+use lnrentd::reconcile::Reconciler;
+use lnrentd::refund::Refunder;
 use lnrentd::refund_resolver::PassThroughResolver;
 use lnrentd::reservation::Budget;
+use lnrentd::resume::{ResumeDriver, ResumeOutcome};
 use lnrentd::store::Store;
 use lnrentd::supervisor::{Intervals, RunningSupervisor, Supervisor};
 
@@ -502,6 +506,19 @@ where
     res.unwrap_or_else(|_| panic!("condition `{label}` not reached within {DEADLINE:?}"))
 }
 
+async fn wait_for_path(path: &Path, label: &str) {
+    timeout(DEADLINE, async {
+        loop {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("path `{label}` not observed within {DEADLINE:?}"));
+}
+
 /// Crash-sim stop: dropping [`RunningSupervisor`] aborts every supervised loop. Poll the IPC socket
 /// until its listener is gone so the test does not advance [`TestClock`] while the old supervisor is
 /// still accepting work. The other loops are aborted by the same drop path.
@@ -622,6 +639,41 @@ async fn seed_instance(store: &Store, sub_id: &str) {
             tx.execute(
                 "UPDATE subscription SET instance_id=?2 WHERE id=?1",
                 params![id, format!("inst:{id}")],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+async fn set_suspend_not_before(store: &Store, sub_id: &str, floor: i64) {
+    let id = sub_id.to_string();
+    store
+        .transaction(move |tx| {
+            tx.execute(
+                "UPDATE subscription SET suspend_not_before=?2 WHERE id=?1",
+                params![id, floor],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+async fn seed_legacy_renew_resume_event(store: &Store, sub_id: &str, external_id: &str) {
+    let (sub_id, external_id) = (sub_id.to_string(), external_id.to_string());
+    store
+        .transaction(move |tx| {
+            let detail = serde_json::json!({
+                "external_id": external_id,
+                "amount_sat": 100,
+                "settled_at": START - 10,
+            })
+            .to_string();
+            tx.execute(
+                "INSERT INTO event_log (subscription_id, kind, detail_json, at)
+                 VALUES (?1, 'renew_resume', ?2, ?3)",
+                params![sub_id, detail, START - 10],
             )?;
             Ok(())
         })
@@ -838,6 +890,693 @@ async fn renewal_extends_paid_through_by_one_period() {
         0,
         "a timely renewal never refunds"
     );
+}
+
+// ==============================================================================================
+// 2b. Suspended renewal resume: capture goes to RESUMING; the driver runs `resume` before ACTIVE.
+// ==============================================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn suspended_paid_renewal_runs_resume_hook_before_active() {
+    let buyer = Keys::generate();
+    let buyer_hex = buyer.public_key().to_hex();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let clock = Arc::new(TestClock::new(START));
+    let sub_id = "ord:resume:ok";
+    let previous_paid_through = 1_000;
+    let settled_at = 1_200;
+    let renewal_ext = "renew:resume:ok";
+
+    seed_subscription(
+        &store,
+        sub_id,
+        "SUSPENDED",
+        &buyer_hex,
+        Some(previous_paid_through),
+        Some(previous_paid_through + RETENTION),
+        Some("lnaddr@buyer"),
+    )
+    .await;
+    seed_instance(&store, sub_id).await;
+    seed_reservation(&store, sub_id, "CONSUMED").await;
+    let ready = Msg::ProvisionReady(lnrent_wire::ProvisionReady {
+        subscription_id: sub_id.to_string(),
+        payload: serde_json::json!({"credential": "already-delivered"}),
+    });
+    seed_pending_outbox(&store, sub_id, &buyer_hex, "provision.ready", &ready).await;
+    seed_invoice(
+        &store,
+        "inv-renew-resume-ok",
+        sub_id,
+        renewal_ext,
+        "renewal",
+        "OPEN",
+        None,
+        None,
+    )
+    .await;
+
+    let settlement = Settlement {
+        invoice_id: "inv-renew-resume-ok".to_string(),
+        external_id: renewal_ext.to_string(),
+        amount_sat: 100,
+        settled_at,
+    };
+    assert_eq!(
+        capture(&store, settlement, clock.now()).await.unwrap(),
+        Capture::Resumed
+    );
+
+    let new_paid_through = settled_at + PERIOD;
+    let new_soft = new_paid_through - RENEW_LEAD;
+    assert_eq!(
+        sub_state(&store, sub_id).await.as_deref(),
+        Some("RESUMING"),
+        "capture must not mark ACTIVE before the resume hook runs"
+    );
+    assert_eq!(
+        sub_times(&store, sub_id).await,
+        (Some(new_paid_through), Some(new_soft), Some(new_soft), None)
+    );
+
+    let (recipe, marker) = resume_marker_recipe("resume-ok");
+    let driver = ResumeDriver::new(store.clone(), clock.clone(), recipe);
+    assert_eq!(driver.drive(sub_id).await.unwrap(), ResumeOutcome::Active);
+
+    assert_eq!(sub_state(&store, sub_id).await.as_deref(), Some("ACTIVE"));
+    let hook_input: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+    assert_eq!(hook_input["subscription"]["id"], sub_id);
+    assert_eq!(hook_input["subscription"]["buyer_pubkey"], buyer_hex);
+    assert_eq!(hook_input["instance"]["id"], format!("inst:{sub_id}"));
+    assert_eq!(hook_input["instance"]["handles"], serde_json::json!({}));
+    assert_eq!(hook_input["handles"], serde_json::json!({}));
+    assert_eq!(event_count(&store, sub_id, "renew_resume").await, 1);
+    assert_eq!(event_count(&store, sub_id, "resume_active").await, 1);
+    assert_eq!(
+        provision_outbox(&store, sub_id).await.0,
+        1,
+        "resume must not enqueue another provision.ready"
+    );
+    assert_eq!(refund_row(&store, sub_id).await.1, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn permanent_resume_failure_refunds_renewal_and_restores_suspended_timers() {
+    let buyer = Keys::generate();
+    let buyer_hex = buyer.public_key().to_hex();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let payment = Arc::new(MockPayment::new());
+    let clock = Arc::new(TestClock::new(START));
+    let sub_id = "ord:resume:fail";
+    let previous_paid_through = 1_000;
+    let previous_floor = 1_300;
+    let previous_next_deadline = previous_floor + RETENTION;
+    let settled_at = 1_500;
+    let renewal_ext = "renew:resume:fail";
+
+    seed_subscription(
+        &store,
+        sub_id,
+        "SUSPENDED",
+        &buyer_hex,
+        Some(previous_paid_through),
+        Some(previous_next_deadline),
+        Some("lnaddr@buyer"),
+    )
+    .await;
+    set_suspend_not_before(&store, sub_id, previous_floor).await;
+    seed_instance(&store, sub_id).await;
+    seed_reservation(&store, sub_id, "CONSUMED").await;
+    seed_legacy_renew_resume_event(&store, sub_id, "renew:resume:legacy").await;
+    seed_invoice(
+        &store,
+        "inv-renew-resume-fail",
+        sub_id,
+        renewal_ext,
+        "renewal",
+        "OPEN",
+        None,
+        None,
+    )
+    .await;
+    let settlement = Settlement {
+        invoice_id: "inv-renew-resume-fail".to_string(),
+        external_id: renewal_ext.to_string(),
+        amount_sat: 100,
+        settled_at,
+    };
+    assert_eq!(
+        capture(&store, settlement, clock.now()).await.unwrap(),
+        Capture::Resumed
+    );
+    assert_eq!(sub_state(&store, sub_id).await.as_deref(), Some("RESUMING"));
+
+    let driver = ResumeDriver::new(store.clone(), clock.clone(), failing_resume_recipe());
+    assert_eq!(
+        driver.drive(sub_id).await.unwrap(),
+        ResumeOutcome::SuspendedRefundPending
+    );
+    assert_eq!(
+        driver.drive(sub_id).await.unwrap(),
+        ResumeOutcome::Skipped,
+        "a second drive after the CAS resolves cannot duplicate the refund"
+    );
+
+    assert_eq!(
+        sub_state(&store, sub_id).await.as_deref(),
+        Some("SUSPENDED"),
+        "resume failure restores SUSPENDED, not REFUND_DUE/REFUNDED"
+    );
+    assert_eq!(
+        sub_times(&store, sub_id).await,
+        (
+            Some(previous_paid_through),
+            Some(previous_paid_through - RENEW_LEAD),
+            Some(previous_next_deadline),
+            Some(previous_floor)
+        )
+    );
+    assert_eq!(instance_count(&store, sub_id).await, 1);
+    assert_eq!(
+        reservation_state(&store, sub_id).await.as_deref(),
+        Some("CONSUMED"),
+        "resume failure leaves the existing capacity reservation intact"
+    );
+    let refund: (
+        i64,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    ) = store
+        .read({
+            let sub_id = sub_id.to_string();
+            move |c| {
+                Ok(c.query_row(
+                    "SELECT count(*), max(status), max(amount_sat), max(id), max(idempotency_key)
+                       FROM refund_attempt
+                      WHERE subscription_id=?1",
+                    params![sub_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )?)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(refund.0, 1, "exactly one detached renewal refund");
+    assert_eq!(refund.1.as_deref(), Some("PENDING"));
+    assert_eq!(refund.2, Some(100));
+    assert_eq!(refund.3.as_deref(), Some("ref-renew:resume:fail"));
+    assert_eq!(refund.4.as_deref(), Some("refund:renew:resume:fail"));
+    assert_eq!(
+        scalar_i64(
+            &store,
+            "SELECT count(*) FROM refund_attempt WHERE idempotency_key='refund:renew:resume:legacy'"
+        )
+        .await,
+        0,
+        "legacy renew_resume audit rows are not pending resume refunds"
+    );
+    assert_eq!(event_count(&store, sub_id, "resume_failed").await, 1);
+
+    let refunder = Refunder::new(store.clone(), payment.clone(), clock.clone());
+    assert_eq!(refunder.drive().await.unwrap().sent, 1);
+    let (status, count) = refund_row(&store, sub_id).await;
+    assert_eq!(count, 1);
+    assert_eq!(status.as_deref(), Some("SENT"));
+    assert_eq!(
+        sub_state(&store, sub_id).await.as_deref(),
+        Some("SUSPENDED"),
+        "the detached renewal refund does not move the sub to REFUNDED"
+    );
+    assert_eq!(
+        reservation_state(&store, sub_id).await.as_deref(),
+        Some("CONSUMED"),
+        "the detached renewal refund does not release the reservation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn permanent_resume_failure_refunds_renewal_settled_while_hook_was_running() {
+    let buyer = Keys::generate();
+    let buyer_hex = buyer.public_key().to_hex();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let clock = Arc::new(TestClock::new(START));
+    let sub_id = "ord:resume:race-fail";
+    let previous_paid_through = 1_000;
+    let previous_floor = 1_300;
+    let previous_next_deadline = previous_floor + RETENTION;
+    let first_ext = "renew:resume:race:one";
+    let second_ext = "renew:resume:race:two";
+
+    seed_subscription(
+        &store,
+        sub_id,
+        "SUSPENDED",
+        &buyer_hex,
+        Some(previous_paid_through),
+        Some(previous_next_deadline),
+        Some("lnaddr@buyer"),
+    )
+    .await;
+    set_suspend_not_before(&store, sub_id, previous_floor).await;
+    seed_instance(&store, sub_id).await;
+    seed_reservation(&store, sub_id, "CONSUMED").await;
+    seed_invoice(
+        &store,
+        "inv-renew-resume-race-one",
+        sub_id,
+        first_ext,
+        "renewal",
+        "OPEN",
+        None,
+        None,
+    )
+    .await;
+    seed_invoice(
+        &store,
+        "inv-renew-resume-race-two",
+        sub_id,
+        second_ext,
+        "renewal",
+        "OPEN",
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        capture(
+            &store,
+            Settlement {
+                invoice_id: "inv-renew-resume-race-one".to_string(),
+                external_id: first_ext.to_string(),
+                amount_sat: 100,
+                settled_at: 1_500,
+            },
+            clock.now(),
+        )
+        .await
+        .unwrap(),
+        Capture::Resumed
+    );
+
+    let (recipe, started, release) = blocking_failing_resume_recipe("resume-race-fail");
+    let driver = ResumeDriver::new(store.clone(), clock.clone(), recipe);
+    let sub_for_drive = sub_id.to_string();
+    let drive = tokio::spawn(async move { driver.drive(&sub_for_drive).await });
+
+    wait_for_path(&started, "resume hook started").await;
+    assert_eq!(
+        capture(
+            &store,
+            Settlement {
+                invoice_id: "inv-renew-resume-race-two".to_string(),
+                external_id: second_ext.to_string(),
+                amount_sat: 200,
+                settled_at: 1_600,
+            },
+            clock.now(),
+        )
+        .await
+        .unwrap(),
+        Capture::Resumed,
+        "a renewal settled while the hook is in flight must join the pending resume batch"
+    );
+    std::fs::write(&release, b"go").unwrap();
+
+    assert_eq!(
+        drive.await.unwrap().unwrap(),
+        ResumeOutcome::SuspendedRefundPending
+    );
+    assert_eq!(
+        sub_times(&store, sub_id).await,
+        (
+            Some(previous_paid_through),
+            Some(previous_paid_through - RENEW_LEAD),
+            Some(previous_next_deadline),
+            Some(previous_floor)
+        )
+    );
+
+    let refunds: Vec<(String, Option<i64>)> = store
+        .read({
+            let sub_id = sub_id.to_string();
+            move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT idempotency_key, amount_sat
+                       FROM refund_attempt
+                      WHERE subscription_id=?1
+                      ORDER BY idempotency_key",
+                )?;
+                let refunds = stmt
+                    .query_map(params![sub_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(refunds)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        refunds,
+        vec![
+            (format!("refund:{first_ext}"), Some(100)),
+            (format!("refund:{second_ext}"), Some(200)),
+        ],
+        "failure rereads renew_resume rows inside the CAS txn, including in-flight settlements"
+    );
+    assert_eq!(
+        sub_state(&store, sub_id).await.as_deref(),
+        Some("SUSPENDED")
+    );
+    assert_eq!(instance_count(&store, sub_id).await, 1);
+    assert_eq!(
+        reservation_state(&store, sub_id).await.as_deref(),
+        Some("CONSUMED")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn permanent_resume_failure_refunds_stacked_resuming_renewals() {
+    let buyer = Keys::generate();
+    let buyer_hex = buyer.public_key().to_hex();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let payment = Arc::new(MockPayment::new());
+    let clock = Arc::new(TestClock::new(START));
+    let sub_id = "ord:resume:stacked-fail";
+    let previous_paid_through = 1_000;
+    let previous_floor = 1_300;
+    let previous_next_deadline = previous_floor + RETENTION;
+    let first_ext = "renew:resume:stacked:one";
+    let second_ext = "renew:resume:stacked:two";
+
+    seed_subscription(
+        &store,
+        sub_id,
+        "SUSPENDED",
+        &buyer_hex,
+        Some(previous_paid_through),
+        Some(previous_next_deadline),
+        Some("lnaddr@buyer"),
+    )
+    .await;
+    set_suspend_not_before(&store, sub_id, previous_floor).await;
+    seed_instance(&store, sub_id).await;
+    seed_reservation(&store, sub_id, "CONSUMED").await;
+    seed_invoice(
+        &store,
+        "inv-renew-resume-stacked-one",
+        sub_id,
+        first_ext,
+        "renewal",
+        "OPEN",
+        None,
+        None,
+    )
+    .await;
+    seed_invoice(
+        &store,
+        "inv-renew-resume-stacked-two",
+        sub_id,
+        second_ext,
+        "renewal",
+        "OPEN",
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        capture(
+            &store,
+            Settlement {
+                invoice_id: "inv-renew-resume-stacked-one".to_string(),
+                external_id: first_ext.to_string(),
+                amount_sat: 100,
+                settled_at: 1_500,
+            },
+            clock.now(),
+        )
+        .await
+        .unwrap(),
+        Capture::Resumed
+    );
+    assert_eq!(sub_state(&store, sub_id).await.as_deref(), Some("RESUMING"));
+    assert_eq!(
+        capture(
+            &store,
+            Settlement {
+                invoice_id: "inv-renew-resume-stacked-two".to_string(),
+                external_id: second_ext.to_string(),
+                amount_sat: 100,
+                settled_at: 1_600,
+            },
+            clock.now(),
+        )
+        .await
+        .unwrap(),
+        Capture::Resumed,
+        "a second paid renewal during RESUMING stacks instead of refunding"
+    );
+    assert_eq!(sub_state(&store, sub_id).await.as_deref(), Some("RESUMING"));
+    assert_eq!(event_count(&store, sub_id, "renew_resume").await, 2);
+
+    let driver = ResumeDriver::new(store.clone(), clock.clone(), failing_resume_recipe());
+    assert_eq!(
+        driver.drive(sub_id).await.unwrap(),
+        ResumeOutcome::SuspendedRefundPending
+    );
+
+    assert_eq!(
+        sub_times(&store, sub_id).await,
+        (
+            Some(previous_paid_through),
+            Some(previous_paid_through - RENEW_LEAD),
+            Some(previous_next_deadline),
+            Some(previous_floor)
+        ),
+        "failure restores the baseline from before the first pending resume renewal"
+    );
+    let refunds: Vec<(String, String, Option<i64>, String)> = store
+        .read({
+            let sub_id = sub_id.to_string();
+            move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT id, status, amount_sat, idempotency_key
+                       FROM refund_attempt
+                      WHERE subscription_id=?1
+                      ORDER BY idempotency_key",
+                )?;
+                let refunds = stmt
+                    .query_map(params![sub_id], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(refunds)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        refunds,
+        vec![
+            (
+                format!("ref-{first_ext}"),
+                "PENDING".to_string(),
+                Some(100),
+                format!("refund:{first_ext}")
+            ),
+            (
+                format!("ref-{second_ext}"),
+                "PENDING".to_string(),
+                Some(100),
+                format!("refund:{second_ext}")
+            ),
+        ],
+        "each paid renewal in the pending resume window gets one detached refund"
+    );
+    assert_eq!(instance_count(&store, sub_id).await, 1);
+    assert_eq!(
+        reservation_state(&store, sub_id).await.as_deref(),
+        Some("CONSUMED")
+    );
+
+    let refunder = Refunder::new(store.clone(), payment.clone(), clock.clone());
+    assert_eq!(refunder.drive().await.unwrap().sent, 2);
+    assert_eq!(
+        sub_state(&store, sub_id).await.as_deref(),
+        Some("SUSPENDED"),
+        "stacked renewal refunds still do not move the sub to REFUNDED"
+    );
+    assert_eq!(
+        reservation_state(&store, sub_id).await.as_deref(),
+        Some("CONSUMED"),
+        "stacked renewal refunds still do not release the reservation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boot_recovery_redrives_resuming_to_active() {
+    let relay = mock_relay().await;
+    let url = relay.url().await.to_string();
+    let op = Keys::generate();
+    let buyer = Keys::generate();
+    let buyer_hex = buyer.public_key().to_hex();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let payment = Arc::new(MockPayment::new());
+    payment.set_now(START);
+    let clock = Arc::new(TestClock::new(START));
+    let sub_id = "ord:resume:boot";
+    let renewal_ext = "renew:resume:boot";
+
+    seed_subscription(
+        &store,
+        sub_id,
+        "SUSPENDED",
+        &buyer_hex,
+        Some(1_000),
+        Some(1_000 + RETENTION),
+        Some("lnaddr@buyer"),
+    )
+    .await;
+    seed_instance(&store, sub_id).await;
+    seed_reservation(&store, sub_id, "CONSUMED").await;
+    seed_invoice(
+        &store,
+        "inv-renew-resume-boot",
+        sub_id,
+        renewal_ext,
+        "renewal",
+        "OPEN",
+        None,
+        None,
+    )
+    .await;
+    let settlement = Settlement {
+        invoice_id: "inv-renew-resume-boot".to_string(),
+        external_id: renewal_ext.to_string(),
+        amount_sat: 100,
+        settled_at: START,
+    };
+    assert_eq!(
+        capture(&store, settlement, clock.now()).await.unwrap(),
+        Capture::Resumed
+    );
+    assert_eq!(sub_state(&store, sub_id).await.as_deref(), Some("RESUMING"));
+
+    let (recipe, marker) = resume_marker_recipe("resume-boot");
+    let _sup = start_supervisor(
+        &op,
+        &url,
+        store.clone(),
+        payment.clone(),
+        clock.clone(),
+        recipe,
+    )
+    .await;
+
+    wait_until(
+        &store,
+        "boot resume -> ACTIVE",
+        |s: &Option<String>| s.as_deref() == Some("ACTIVE"),
+        {
+            let id = sub_id.to_string();
+            move |c| sub_state_blocking(c, &id)
+        },
+    )
+    .await;
+    assert!(marker.exists(), "boot recovery ran the resume hook");
+    assert_eq!(event_count(&store, sub_id, "resume_active").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconcile_leaves_resuming_subscriptions_alone() {
+    let buyer_hex = Keys::generate().public_key().to_hex();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
+    let sub_id = "ord:resume:reconcile";
+    seed_subscription(
+        &store,
+        sub_id,
+        "RESUMING",
+        &buyer_hex,
+        Some(PAID_THROUGH),
+        Some(START),
+        Some("lnaddr@buyer"),
+    )
+    .await;
+    seed_instance(&store, sub_id).await;
+    seed_reservation(&store, sub_id, "CONSUMED").await;
+
+    let reconciler = Reconciler::new(store.clone(), payment, dummy_recipe());
+    let report = reconciler.reconcile_tick(START).await.unwrap();
+
+    assert_eq!(report.noops, 1);
+    assert_eq!(report.reminded, 0);
+    assert_eq!(report.suspended, 0);
+    assert_eq!(report.terminated, 0);
+    assert_eq!(sub_state(&store, sub_id).await.as_deref(), Some("RESUMING"));
+    assert_eq!(event_count(&store, sub_id, "reconcile_suspend").await, 0);
+    assert_eq!(event_count(&store, sub_id, "reconcile_terminate").await, 0);
+    assert_eq!(outbox_count(&store, sub_id, "billing.notice").await, 0);
+    assert_eq!(instance_count(&store, sub_id).await, 1);
+    assert_eq!(
+        reservation_state(&store, sub_id).await.as_deref(),
+        Some("CONSUMED")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn active_renewal_stays_active_and_never_runs_resume() {
+    let buyer_hex = Keys::generate().public_key().to_hex();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let clock = Arc::new(TestClock::new(START));
+    let sub_id = "ord:resume:active-renew";
+    let renewal_ext = "renew:resume:active-renew";
+    seed_subscription(
+        &store,
+        sub_id,
+        "ACTIVE",
+        &buyer_hex,
+        Some(PAID_THROUGH),
+        Some(SOFT_DATE),
+        Some("lnaddr@buyer"),
+    )
+    .await;
+    seed_instance(&store, sub_id).await;
+    seed_invoice(
+        &store,
+        "inv-renew-active-no-resume",
+        sub_id,
+        renewal_ext,
+        "renewal",
+        "OPEN",
+        None,
+        None,
+    )
+    .await;
+
+    let settlement = Settlement {
+        invoice_id: "inv-renew-active-no-resume".to_string(),
+        external_id: renewal_ext.to_string(),
+        amount_sat: 100,
+        settled_at: START,
+    };
+    assert_eq!(
+        capture(&store, settlement, clock.now()).await.unwrap(),
+        Capture::Renewed
+    );
+    assert_eq!(sub_state(&store, sub_id).await.as_deref(), Some("ACTIVE"));
+
+    let (recipe, marker) = resume_marker_recipe("active-renew-no-hook");
+    let driver = ResumeDriver::new(store.clone(), clock.clone(), recipe);
+    assert_eq!(driver.recover().await.unwrap(), 0);
+    assert!(
+        !marker.exists(),
+        "an already-ACTIVE renewal must not run the resume hook"
+    );
+    assert_eq!(event_count(&store, sub_id, "renew_extend").await, 1);
+    assert_eq!(event_count(&store, sub_id, "renew_resume").await, 0);
 }
 
 // ==============================================================================================
@@ -2208,6 +2947,55 @@ fn restart_marker_recipe() -> (Recipe, PathBuf) {
     let mut r = dummy_recipe();
     r.dir = dir;
     (r, marker)
+}
+
+/// A dummy-id recipe whose `resume` hook writes its stdin JSON to `marker`.
+fn resume_marker_recipe(name: &str) -> (Recipe, PathBuf) {
+    let dir = fresh_dir(&format!("lnrent-e2e-{name}"));
+    let marker = dir.join("resume-input.json");
+    write_hook(
+        &dir,
+        "resume",
+        &format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\ncat > '{}'\necho '{{\"ok\":true}}'\n",
+            marker.display()
+        ),
+    );
+    let mut r = dummy_recipe();
+    r.dir = dir;
+    (r, marker)
+}
+
+/// A dummy-id recipe whose `resume` hook always fails.
+fn failing_resume_recipe() -> Recipe {
+    let dir = fresh_dir("lnrent-e2e-failresume");
+    write_hook(
+        &dir,
+        "resume",
+        "#!/usr/bin/env bash\ncat >/dev/null\necho resume failed >&2\nexit 1\n",
+    );
+    let mut r = dummy_recipe();
+    r.dir = dir;
+    r
+}
+
+/// A dummy-id recipe whose `resume` hook blocks until `release` exists, then fails.
+fn blocking_failing_resume_recipe(name: &str) -> (Recipe, PathBuf, PathBuf) {
+    let dir = fresh_dir(&format!("lnrent-e2e-{name}"));
+    let started = dir.join("resume-started");
+    let release = dir.join("release");
+    write_hook(
+        &dir,
+        "resume",
+        &format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\ncat >/dev/null\necho run >> '{}'\nwhile [ ! -e '{}' ]; do sleep 0.01; done\necho resume failed >&2\nexit 1\n",
+            started.display(),
+            release.display()
+        ),
+    );
+    let mut r = dummy_recipe();
+    r.dir = dir;
+    (r, started, release)
 }
 
 /// A fresh, EMPTY temp dir (wiping any same-PID leftovers so a stale marker can't skew assertions).

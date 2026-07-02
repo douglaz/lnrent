@@ -21,6 +21,7 @@ pub mod reconcile;
 pub mod refund;
 pub mod refund_resolver;
 pub mod reservation;
+pub mod resume;
 pub mod runner;
 pub mod store;
 pub mod supervisor;

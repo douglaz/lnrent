@@ -26,7 +26,7 @@ pub enum Capture {
     Captured,
     /// OPEN renewal invoice on an ACTIVE sub -> `paid_through` extended.
     Renewed,
-    /// OPEN renewal invoice on a SUSPENDED sub -> resumed (ACTIVE) + extended.
+    /// OPEN renewal invoice on a SUSPENDED sub -> RESUMING + extended; the resume driver activates.
     Resumed,
     /// Settled-but-terminal / expired / unmatched -> exactly one `refund_attempt` (PENDING).
     RefundDue,
@@ -191,10 +191,13 @@ fn apply_paid(
             journal(tx, Some(sub_id), "capture_order", s, now)?;
             Ok(Capture::Captured)
         }
-        // Renewal on a live (or resumable) sub: extend, and resume if it had lapsed to SUSPENDED.
+        // Renewal on a live (or resumable) sub: extend, and resume if it had lapsed to SUSPENDED
+        // or is already waiting for the resume hook. A RESUMING renewal stays RESUMING, so the row
+        // does not read ACTIVE before the service is running, and the resume driver can refund the
+        // whole pending resume batch if the hook fails permanently.
         // paid_through = max(paid_through, settled_at) + period — early renewals stack, a late one
         // never lands in the past (§6.3).
-        (Some("renewal"), st @ ("ACTIVE" | "SUSPENDED")) => {
+        (Some("renewal"), st @ ("ACTIVE" | "SUSPENDED" | "RESUMING")) => {
             // Reconcile is periodic, so a sub can still read ACTIVE/SUSPENDED past its retention
             // end before the TERMINATED flip lands. A settlement that arrives at or after retention
             // end is too late: the Instance is destroyed (or due to be — reconcile fires `destroy`
@@ -224,25 +227,20 @@ fn apply_paid(
             // `renew_lead_s >= period_s` the renewed `paid_through` can land at/before a stale floor,
             // pinning suspension past the newly-paid `paid_through`. Setting it NULL here makes the
             // effective suspend boundary track the fresh `paid_through` unconditionally.
+            let resumed = st != "ACTIVE";
+            let new_state = if resumed { "RESUMING" } else { "ACTIVE" };
             tx.execute(
                 "UPDATE subscription
-                   SET state='ACTIVE', paid_through=?2, soft_date=?3, next_deadline=?3,
-                       suspend_not_before=NULL, updated_at=?4
+                   SET state=?2, paid_through=?3, soft_date=?4, next_deadline=?4,
+                       suspend_not_before=NULL, updated_at=?5
                  WHERE id=?1",
-                params![sub_id, new_paid_through, soft, now],
+                params![sub_id, new_state, new_paid_through, soft, now],
             )?;
-            let resumed = st == "SUSPENDED";
-            journal(
-                tx,
-                Some(sub_id),
-                if resumed {
-                    "renew_resume"
-                } else {
-                    "renew_extend"
-                },
-                s,
-                now,
-            )?;
+            if resumed {
+                journal_renew_resume(tx, sub_id, s, now, paid_through, suspend_not_before)?;
+            } else {
+                journal(tx, Some(sub_id), "renew_extend", s, now)?;
+            }
             Ok(if resumed {
                 Capture::Resumed
             } else {
@@ -286,17 +284,39 @@ fn refund_intent(
     s: &Settlement,
     now: i64,
 ) -> Result<bool> {
+    insert_refund_attempt_txn(
+        tx,
+        sub_id,
+        dest,
+        &s.external_id,
+        Some(s.amount_sat as i64),
+        now,
+    )
+}
+
+/// Insert a durable refund attempt keyed by `refund:<external_id>`.
+///
+/// This is crate-visible so non-capture code that is still downstream of a verified paid invoice
+/// can reuse the audited refund writer instead of adding another raw `refund_attempt` insertion site.
+pub(crate) fn insert_refund_attempt_txn(
+    tx: &Transaction,
+    sub_id: Option<&str>,
+    dest: Option<&str>,
+    external_id: &str,
+    amount_sat: Option<i64>,
+    now: i64,
+) -> Result<bool> {
     let n = tx.execute(
         "INSERT INTO refund_attempt
             (id, subscription_id, dest, amount_sat, idempotency_key, status, attempts, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, 'PENDING', 0, ?6, ?6)
          ON CONFLICT(idempotency_key) DO NOTHING",
         params![
-            format!("ref-{}", s.external_id),
+            format!("ref-{external_id}"),
             sub_id,
             dest,
-            s.amount_sat as i64,
-            format!("refund:{}", s.external_id),
+            amount_sat,
+            format!("refund:{external_id}"),
             now
         ],
     )?;
@@ -321,6 +341,31 @@ fn journal(
     tx.execute(
         "INSERT INTO event_log (subscription_id, kind, detail_json, at) VALUES (?1, ?2, ?3, ?4)",
         params![sub_id, kind, detail, now],
+    )?;
+    Ok(())
+}
+
+/// Journal the paid suspended-renewal with the pre-renewal timers the resume driver needs if the
+/// hook fails permanently and the row must return to SUSPENDED.
+fn journal_renew_resume(
+    tx: &Transaction,
+    sub_id: &str,
+    s: &Settlement,
+    now: i64,
+    previous_paid_through: Option<i64>,
+    previous_suspend_not_before: Option<i64>,
+) -> Result<()> {
+    let detail = serde_json::json!({
+        "external_id": s.external_id,
+        "amount_sat": s.amount_sat,
+        "settled_at": s.settled_at,
+        "previous_paid_through": previous_paid_through,
+        "previous_suspend_not_before": previous_suspend_not_before,
+    })
+    .to_string();
+    tx.execute(
+        "INSERT INTO event_log (subscription_id, kind, detail_json, at) VALUES (?1, 'renew_resume', ?2, ?3)",
+        params![sub_id, detail, now],
     )?;
     Ok(())
 }
@@ -653,7 +698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn renewal_resumes_a_suspended_sub() {
+    async fn renewal_moves_a_suspended_sub_to_resuming() {
         let s = mem_store();
         seed(
             &s,
@@ -675,9 +720,83 @@ mod tests {
         );
         assert_eq!(
             sub_state(&s, "o1").await,
-            "ACTIVE",
-            "a paid renewal resumes a suspended sub"
+            "RESUMING",
+            "a paid renewal waits for the resume hook before reading ACTIVE"
         );
+        let detail: serde_json::Value = s
+            .read(|c| {
+                let raw: String = c.query_row(
+                    "SELECT detail_json FROM event_log WHERE subscription_id='o1' AND kind='renew_resume'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok(serde_json::from_str(&raw)?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(detail["external_id"], "rext");
+        assert_eq!(detail["amount_sat"], 1000);
+        assert_eq!(detail["previous_paid_through"], 100);
+        assert_eq!(
+            detail["previous_suspend_not_before"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn renewal_while_resuming_stacks_and_stays_resuming() {
+        let s = mem_store();
+        seed(
+            &s,
+            "o1",
+            "RESUMING",
+            Some(1100),
+            100,
+            10,
+            2000,
+            None,
+            "renewal",
+            "OPEN",
+            "rext2",
+        )
+        .await;
+        assert_eq!(
+            capture(&s, settlement("rext2", 1050), 2).await.unwrap(),
+            Capture::Resumed,
+            "a renewal paid while resume is pending must not be routed to refund"
+        );
+        assert_eq!(
+            sub_state(&s, "o1").await,
+            "RESUMING",
+            "service still must not read ACTIVE before the resume hook succeeds"
+        );
+        let (paid_through, soft_date, next_deadline): (i64, i64, i64) = s
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT paid_through, soft_date, next_deadline FROM subscription WHERE id='o1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(paid_through, 1200, "max(1100,1050)+100");
+        assert_eq!(soft_date, 1190);
+        assert_eq!(next_deadline, 1190);
+        let detail: serde_json::Value = s
+            .read(|c| {
+                let raw: String = c.query_row(
+                    "SELECT detail_json FROM event_log WHERE subscription_id='o1' AND kind='renew_resume'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok(serde_json::from_str(&raw)?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(detail["external_id"], "rext2");
+        assert_eq!(detail["previous_paid_through"], 1100);
+        assert_eq!(refund_count(&s).await, 0);
     }
 
     // A renewal that lands AFTER retention (paid_through + retention_s) must refund, not resurrect
@@ -807,9 +926,9 @@ mod tests {
                 .await
                 .unwrap(),
             Capture::Resumed,
-            "a renewal inside the CREDITED retention window resumes (does not refund)"
+            "a renewal inside the CREDITED retention window starts resume (does not refund)"
         );
-        assert_eq!(sub_state(&resumes, "o1").await, "ACTIVE");
+        assert_eq!(sub_state(&resumes, "o1").await, "RESUMING");
         assert_eq!(inv_status(&resumes, "rext").await.0, "PAID");
         assert_eq!(refund_count(&resumes).await, 0);
 
