@@ -10,6 +10,8 @@ use tokio::sync::mpsc;
 
 use async_trait::async_trait;
 
+pub const DEV_SETTLE_UNSUPPORTED: &str = "dev settle is only supported on the mock payment backend";
+
 /// Where a workload runs. SPEC.md §8.1 (was `ProvisionBackend` in early drafts).
 pub trait ComputeBackend: Send + Sync {
     /// Create a container/VM; returns the Instance handle to record.
@@ -113,6 +115,11 @@ pub trait PaymentBackend: Send + Sync {
     /// Whether the backend can currently price and pay refunds.
     async fn refund_gateway_ready(&self) -> Result<bool> {
         Ok(true)
+    }
+    /// DEV-ONLY test/operator affordance: force-settle an inbound invoice by backend external id.
+    /// Real money backends must leave this unsupported.
+    async fn dev_settle(&self, _external_id: &str, _settled_at: i64) -> Result<()> {
+        Err(anyhow::anyhow!(DEV_SETTLE_UNSUPPORTED))
     }
     /// Stream of settled payments (push). `Settlement.external_id` carries the order id
     /// (SPEC §6.1). M1a wires this to the Fedimint client settlement stream.
@@ -275,23 +282,7 @@ impl MockPayment {
     /// straight to capture. Errors if no such invoice was created.
     pub fn settle(&self, external_id: &str, settled_at: i64) -> Result<Settlement> {
         let mut st = self.state.lock().unwrap();
-        let inv = st
-            .invoices
-            .get(external_id)
-            .ok_or_else(|| anyhow::anyhow!("mock: no invoice for external_id {external_id}"))?
-            .clone();
-        st.paid.insert(external_id.to_string());
-        st.settled_at.insert(external_id.to_string(), settled_at);
-        let s = Settlement {
-            invoice_id: inv.id,
-            external_id: external_id.to_string(),
-            amount_sat: inv.amount_sat,
-            settled_at,
-        };
-        if let Some(tx) = &st.settle_tx {
-            let _ = tx.try_send(s.clone());
-        }
-        Ok(s)
+        settle_mock_invoice(&mut st, external_id, settled_at)
     }
 
     /// Mark a previously-created invoice paid as a RECOVERY settlement: it was settled while the
@@ -307,6 +298,30 @@ impl MockPayment {
         st.paid.insert(external_id.to_string());
         Ok(())
     }
+}
+
+fn settle_mock_invoice(
+    st: &mut MockState,
+    external_id: &str,
+    settled_at: i64,
+) -> Result<Settlement> {
+    let inv = st
+        .invoices
+        .get(external_id)
+        .ok_or_else(|| anyhow::anyhow!("mock: no invoice for external_id {external_id}"))?
+        .clone();
+    st.paid.insert(external_id.to_string());
+    st.settled_at.insert(external_id.to_string(), settled_at);
+    let s = Settlement {
+        invoice_id: inv.id,
+        external_id: external_id.to_string(),
+        amount_sat: inv.amount_sat,
+        settled_at,
+    };
+    if let Some(tx) = &st.settle_tx {
+        let _ = tx.try_send(s.clone());
+    }
+    Ok(s)
 }
 
 #[async_trait]
@@ -384,6 +399,17 @@ impl PaymentBackend for MockPayment {
         } else {
             PayStatus::Unknown
         })
+    }
+    async fn dev_settle(&self, external_id: &str, settled_at: i64) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        let inv = st.invoices.get(external_id).ok_or_else(|| {
+            anyhow::anyhow!("mock: no OPEN invoice for external_id {external_id}")
+        })?;
+        if st.paid.contains(external_id) || st.now >= inv.expires_at {
+            bail!("mock: no OPEN invoice for external_id {external_id}");
+        }
+        settle_mock_invoice(&mut st, external_id, settled_at)?;
+        Ok(())
     }
     async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
         let (tx, rx) = mpsc::channel(64);

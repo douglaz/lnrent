@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
+use async_trait::async_trait;
 use nostr_relay_builder::MockRelay;
 use nostr_sdk::prelude::*;
 use rusqlite::OptionalExtension;
@@ -28,11 +30,11 @@ use lnrent_wire::{
     gift_unwrap, gift_wrap, listing_coordinate, parse_listing, Msg, OrderRequest, ProvisionReady,
     LISTING_KIND,
 };
-use lnrentd::backends::MockPayment;
+use lnrentd::backends::{FedimintPayment, MockPayment, PaymentBackend, DEV_SETTLE_UNSUPPORTED};
 use lnrentd::capture::{capture, Capture};
 use lnrentd::clock::{Clock, TestClock};
 use lnrentd::ipc::{self, Reply};
-use lnrentd::nostr_engine::{NostrEngine, OrderHandler};
+use lnrentd::nostr_engine::{NostrEngine, OrderHandler, Outbound};
 use lnrentd::order_intake::OrderIntake;
 use lnrentd::recipe::Recipe;
 use lnrentd::refund_resolver::PassThroughResolver;
@@ -88,6 +90,41 @@ async fn buyer_client(url: &str, keys: Keys) -> Client {
     client.connect().await;
     client.wait_for_connection(DEADLINE).await;
     client
+}
+
+struct NoopOutbound;
+
+#[async_trait]
+impl Outbound for NoopOutbound {
+    async fn reply(&self, _recipient: &PublicKey, _msg: &Msg) -> Result<EventId> {
+        Ok(EventId::all_zeros())
+    }
+}
+
+struct EnvGuard {
+    key: &'static str,
+    old: Option<String>,
+}
+
+impl EnvGuard {
+    fn unset(key: &'static str) -> Self {
+        let old = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, old }
+    }
+
+    fn set(&self, value: &str) {
+        std::env::set_var(self.key, value);
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.old {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }
 
 /// Connect a fresh operator engine to `url`.
@@ -206,6 +243,21 @@ async fn provision_outbox(store: &Store, sub_id: &str) -> (i64, Option<String>) 
                 )
                 .optional()?;
             Ok((n, st))
+        })
+        .await
+        .unwrap()
+}
+
+async fn invoice_status(store: &Store, external_id: &str) -> Option<String> {
+    let id = external_id.to_string();
+    store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT status FROM invoice WHERE external_id=?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .optional()?)
         })
         .await
         .unwrap()
@@ -411,6 +463,10 @@ async fn full_handshake_drives_settlement_through_to_provision_ready() {
         1,
         "exactly one instance"
     );
+    wait_until("provision.ready SENT", || async {
+        provision_outbox(&store, &sub_id).await.1.as_deref() == Some("SENT")
+    })
+    .await;
     let (n, state) = provision_outbox(&store, &sub_id).await;
     assert_eq!(n, 1, "exactly one provision.ready outbox row");
     assert_eq!(
@@ -420,6 +476,127 @@ async fn full_handshake_drives_settlement_through_to_provision_ready() {
     );
 
     running.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dev_settle_ipc_is_env_gated_and_provisions_mock_invoice() {
+    let env = EnvGuard::unset("LNRENT_DEV");
+    let relay = mock_relay().await;
+    let url = relay.url().await.to_string();
+    let op_keys = Keys::generate();
+    let buyer_keys = Keys::generate();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let payment = Arc::new(MockPayment::new());
+    payment.set_now(START);
+    let clock = Arc::new(TestClock::new(START));
+
+    let (running, sock) = start_supervisor(
+        &op_keys,
+        &url,
+        store.clone(),
+        payment.clone(),
+        clock.clone(),
+    )
+    .await;
+    assert!(wait_for_ipc_ok(&sock).await.ok);
+
+    let coord = listing_coordinate(&op_keys.public_key().to_hex(), "dummy");
+    let intake = OrderIntake::new(
+        store.clone(),
+        payment.clone(),
+        clock.clone(),
+        dummy_recipe(),
+        Budget {
+            cpu: 4,
+            mem_mb: 4096,
+            disk_gb: 100,
+            ports: 16,
+        },
+    );
+    let order = Msg::OrderRequest(OrderRequest {
+        id: "dev-1".into(),
+        listing_id: coord,
+        params: serde_json::json!({}),
+        refund_dest: Some("refunds@example.com".to_string()),
+    });
+    intake
+        .handle(buyer_keys.public_key(), order, &NoopOutbound)
+        .await
+        .expect("order intake commits an open invoice");
+
+    let buyer_hex = buyer_keys.public_key().to_hex();
+    let sub_id = format!("ord:{buyer_hex}:dev-1");
+    let external_id = format!("order:{buyer_hex}:dev-1");
+    assert_eq!(
+        invoice_status(&store, &external_id).await.as_deref(),
+        Some("OPEN")
+    );
+
+    let disabled = ipc::call(
+        &sock,
+        ipc::Request::DevSettle {
+            subscription_id: sub_id.clone(),
+        },
+    )
+    .await
+    .expect("dev settle disabled reply");
+    assert!(!disabled.ok);
+    assert_eq!(
+        disabled.error.as_ref().map(|e| e.code.as_str()),
+        Some("dev_disabled")
+    );
+    assert_eq!(
+        invoice_status(&store, &external_id).await.as_deref(),
+        Some("OPEN"),
+        "the disabled command must not settle anything"
+    );
+
+    env.set("1");
+    let settled = ipc::call(
+        &sock,
+        ipc::Request::DevSettle {
+            subscription_id: sub_id.clone(),
+        },
+    )
+    .await
+    .expect("dev settle enabled reply");
+    assert!(settled.ok, "dev settle failed: {:?}", settled.error);
+    let data = settled.data.expect("dev settle returns data");
+    assert_eq!(data["subscription_id"], serde_json::json!(&sub_id));
+    assert_eq!(data["external_id"], serde_json::json!(&external_id));
+    assert_eq!(data["settled_at"], serde_json::json!(START));
+
+    wait_until("dev settle provisions subscription", || async {
+        sub_state(&store, &sub_id).await.as_deref() == Some("ACTIVE")
+    })
+    .await;
+    assert_eq!(
+        invoice_status(&store, &external_id).await.as_deref(),
+        Some("PAID")
+    );
+    assert_eq!(
+        instance_count(&store, &sub_id).await,
+        1,
+        "dev-settled order provisions exactly once"
+    );
+    wait_until("dev settle sends provision.ready", || async {
+        provision_outbox(&store, &sub_id).await.1.as_deref() == Some("SENT")
+    })
+    .await;
+    let (n, state) = provision_outbox(&store, &sub_id).await;
+    assert_eq!(n, 1, "exactly one provision.ready outbox row");
+    assert_eq!(state.as_deref(), Some("SENT"));
+
+    running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn dev_settle_default_is_unsupported_for_non_mock_backend() {
+    let err = FedimintPayment
+        .dev_settle("external", START)
+        .await
+        .expect_err("non-mock backend must not support dev settle");
+    assert_eq!(err.to_string(), DEV_SETTLE_UNSUPPORTED);
 }
 
 // ==============================================================================================

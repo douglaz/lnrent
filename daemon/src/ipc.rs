@@ -4,7 +4,7 @@
 //! This is the OPERATOR's agent surface: every reply is structured JSON (so an operator agent
 //! drives it), and it is never network-reachable (a UDS with owner-only perms, no HTTP/MCP).
 
-use crate::backends::PaymentBackend;
+use crate::backends::{PaymentBackend, DEV_SETTLE_UNSUPPORTED};
 use crate::clock::Clock;
 use crate::recipe::Recipe;
 use crate::store::Store;
@@ -29,6 +29,7 @@ pub enum Request {
     Sub { id: String },
     AdminSuspend { id: String },
     AdminResume { id: String },
+    DevSettle { subscription_id: String },
 }
 
 /// A structured error a caller (human or agent) can branch on (mirrors §5.1 error shape).
@@ -252,6 +253,71 @@ pub async fn dispatch(
                 clock.now(),
             )
             .await
+        }
+        Request::DevSettle { subscription_id } => {
+            dev_settle_subscription(store, payment, clock, subscription_id).await
+        }
+    }
+}
+
+async fn dev_settle_subscription(
+    store: &Store,
+    payment: &Arc<dyn PaymentBackend>,
+    clock: &Arc<dyn Clock>,
+    subscription_id: String,
+) -> Reply {
+    if std::env::var("LNRENT_DEV").ok().as_deref() != Some("1") {
+        return Reply::err(
+            "dev_disabled",
+            "dev settle requires LNRENT_DEV=1 and is only for the mock payment backend",
+        );
+    }
+
+    let id = subscription_id.clone();
+    let external_id = match store
+        .read(move |c| {
+            match c.query_row(
+                "SELECT external_id
+                   FROM invoice
+                  WHERE subscription_id=?1 AND status='OPEN'
+                  ORDER BY issued_at DESC, id DESC
+                  LIMIT 1",
+                rusqlite::params![id],
+                |r| r.get::<_, String>(0),
+            ) {
+                Ok(external_id) => Ok(Some(external_id)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
+    {
+        Ok(Some(external_id)) => external_id,
+        Ok(None) => {
+            return Reply::err(
+                "not_found",
+                format!("no OPEN invoice for subscription `{subscription_id}`"),
+            )
+        }
+        Err(e) => return Reply::err("internal", e.to_string()),
+    };
+
+    let settled_at = clock.now();
+    match payment.dev_settle(&external_id, settled_at).await {
+        Ok(()) => Reply::ok(json!({
+            "subscription_id": subscription_id,
+            "external_id": external_id,
+            "settled_at": settled_at,
+        })),
+        Err(e) => {
+            let message = e.to_string();
+            if message == DEV_SETTLE_UNSUPPORTED {
+                Reply::err("unsupported", message)
+            } else if message.contains("no OPEN invoice") {
+                Reply::err("not_found", message)
+            } else {
+                Reply::err("internal", message)
+            }
         }
     }
 }

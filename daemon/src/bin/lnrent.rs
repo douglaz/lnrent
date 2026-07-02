@@ -39,6 +39,17 @@ enum Cmd {
     Suspend { id: String },
     /// Admin: force-resume a suspended subscription.
     Resume { id: String },
+    /// Dev-only commands. Require LNRENT_DEV=1 and mock payment backend support.
+    Dev {
+        #[command(subcommand)]
+        cmd: DevCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DevCmd {
+    /// Settle the open MockPayment invoice for a subscription.
+    Settle { subscription_id: String },
 }
 
 /// Exit-code taxonomy (agent-grade, ADR-0014): 0 ok; 2 not_found; 3 bad_request/invalid_state;
@@ -46,7 +57,7 @@ enum Cmd {
 fn exit_for(err_code: &str) -> ExitCode {
     match err_code {
         "not_found" => ExitCode::from(2),
-        "bad_request" | "invalid_state" => ExitCode::from(3),
+        "bad_request" | "invalid_state" | "dev_disabled" | "unsupported" => ExitCode::from(3),
         "internal" => ExitCode::from(5),
         _ => ExitCode::from(1),
     }
@@ -69,6 +80,9 @@ async fn main() -> ExitCode {
         Cmd::Sub { id } => (Request::Sub { id }, HumanRender::Generic),
         Cmd::Suspend { id } => (Request::AdminSuspend { id }, HumanRender::Generic),
         Cmd::Resume { id } => (Request::AdminResume { id }, HumanRender::Generic),
+        Cmd::Dev {
+            cmd: DevCmd::Settle { subscription_id },
+        } => (Request::DevSettle { subscription_id }, HumanRender::Generic),
     };
     let sock = format!("{}/lnrent.sock", cli.data_dir);
 
