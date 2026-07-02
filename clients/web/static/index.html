@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>lnrent buyer</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="mast">
+        <div>
+          <h1>lnrent buyer</h1>
+          <p>Static marketplace access over one Nostr relay.</p>
+        </div>
+        <div class="capabilities" aria-label="Browser capabilities">
+          <span id="cap-nostr" class="pill">NIP-07: checking</span>
+          <span id="cap-webln" class="pill">WebLN: checking</span>
+        </div>
+      </header>
+
+      <section class="panel">
+        <form id="config-form" class="config-grid">
+          <label>
+            Relay URL
+            <input id="relay-url" name="relay_url" required placeholder="wss://relay.example" autocomplete="url" />
+          </label>
+          <label>
+            Operator npub
+            <input id="operator-npub" name="operator_npub" required placeholder="npub1..." autocomplete="off" />
+          </label>
+          <label>
+            Signer mode
+            <select id="signer-mode" name="signer_mode">
+              <option value="auto">Auto</option>
+              <option value="nip07">NIP-07</option>
+              <option value="embedded">Embedded</option>
+            </select>
+          </label>
+          <button type="submit">Connect</button>
+        </form>
+        <div id="status" class="status" role="status" aria-live="polite"></div>
+        <div id="error" class="error" role="alert" aria-live="assertive" hidden></div>
+        <div id="signer-panel" class="signer-panel" hidden></div>
+      </section>
+
+      <section id="listings-section" class="panel" hidden>
+        <div class="section-head">
+          <div>
+            <h2>Listings</h2>
+            <p id="listing-count"></p>
+          </div>
+          <button id="refresh-listings" type="button">Refresh</button>
+        </div>
+        <div id="listings" class="listing-grid"></div>
+      </section>
+
+      <section id="order-section" class="panel" hidden>
+        <div class="section-head">
+          <div>
+            <h2>Order</h2>
+            <p id="order-title"></p>
+          </div>
+          <button id="clear-order" type="button">Change listing</button>
+        </div>
+        <form id="order-form" class="form-stack">
+          <div id="param-fields" class="form-stack"></div>
+          <label>
+            Refund destination
+            <input id="refund-dest" required placeholder="name@example.com or https://..." autocomplete="off" />
+            <span class="hint">LN address or HTTPS LNURL only. Raw BOLT11/BOLT12 is rejected.</span>
+          </label>
+          <button type="submit">Create order</button>
+        </form>
+      </section>
+
+      <section id="invoice-section" class="panel" hidden>
+        <div class="section-head">
+          <div>
+            <h2>Invoice</h2>
+            <p id="invoice-summary"></p>
+          </div>
+          <span id="invoice-mode" class="pill"></span>
+        </div>
+        <dl id="invoice-meta" class="meta-list"></dl>
+        <div id="invoice-actions" class="invoice-actions"></div>
+        <div id="qr-box" class="qr-box" hidden></div>
+      </section>
+
+      <section id="credentials-section" class="panel" hidden>
+        <div class="section-head">
+          <div>
+            <h2>Credentials</h2>
+            <p id="credential-subscription"></p>
+          </div>
+        </div>
+        <dl id="credential-fields" class="meta-list"></dl>
+        <pre id="credential-json" class="json-box"></pre>
+      </section>
+
+      <section id="ops-section" class="panel" hidden>
+        <div class="section-head">
+          <div>
+            <h2>Ops</h2>
+            <p id="ops-subscription"></p>
+          </div>
+          <button id="refresh-ops" type="button">Refresh ops</button>
+        </div>
+        <div id="ops-list" class="ops-list"></div>
+      </section>
+    </main>
+
+    <script type="module">
+      import init, { WebBuyer, bolt11_qr_svg } from "./pkg/lnrent_buyer_web.js";
+
+      await import("./app.js");
+      await init();
+      window.LnRentBuyerWeb.start({ WebBuyer, bolt11_qr_svg });
+    </script>
+  </body>
+</html>

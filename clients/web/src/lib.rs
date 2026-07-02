@@ -11,6 +11,7 @@ use lnrent_buyer_core::{
     lnrent_wire::{OperationDecl, ParsedListing},
     BuyerError,
 };
+use qrcode::{render::svg, QrCode};
 use serde::Serialize;
 use serde_json::{json, Value};
 use wasm_bindgen::prelude::*;
@@ -26,6 +27,27 @@ pub use signer::Nip07Signer;
 
 #[cfg(target_arch = "wasm32")]
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+pub fn bolt11_qr_svg(bolt11: &str) -> String {
+    render_bolt11_qr_svg(bolt11)
+}
+
+fn render_bolt11_qr_svg(bolt11: &str) -> String {
+    let Ok(code) = QrCode::new(bolt11.as_bytes()) else {
+        return String::new();
+    };
+    let rendered = code
+        .render::<svg::Color<'_>>()
+        .min_dimensions(256, 256)
+        .dark_color(svg::Color("#111111"))
+        .light_color(svg::Color("#ffffff"))
+        .build();
+    rendered
+        .find("<svg")
+        .map(|idx| rendered[idx..].to_owned())
+        .unwrap_or(rendered)
+}
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct WebBuyer {
@@ -554,5 +576,14 @@ mod tests {
             Ok(SignerMode::Embedded)
         ));
         assert!(SignerMode::parse("hardware").is_err());
+    }
+
+    #[test]
+    fn bolt11_qr_svg_is_non_empty_svg() {
+        let svg = render_bolt11_qr_svg("lnbc1p5qqqexamplebolt11invoice");
+
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains("</svg>"));
+        assert!(svg.contains("path"));
     }
 }
