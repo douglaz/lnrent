@@ -325,10 +325,14 @@
       state.invoice = invoice;
       state.subscriptionId = invoice.order_id || invoice.subscription_id || "";
       renderInvoice();
-      setStatus("Invoice ready.");
-      if (state.capabilities.webln) {
-        await payWithWebLn();
-      }
+      // Invoice hand-off is EXPLICIT — the SPA never auto-triggers a payment (a pre-authorized WebLN
+      // wallet could otherwise pay without the buyer choosing to). The user clicks "Pay with WebLN"
+      // (rendered by renderInvoice) or copies/scans the invoice to pay from their own wallet.
+      setStatus(
+        state.capabilities.webln
+          ? 'Invoice ready — click "Pay with WebLN", or copy/scan it to pay from another wallet.'
+          : "Invoice ready — copy or scan the invoice to pay from your wallet.",
+      );
     } catch (error) {
       showError(error);
       setStatus("Order failed.");
@@ -430,6 +434,9 @@
     if (!state.invoice || !state.invoice.bolt11) {
       return;
     }
+    if (state.paying) {
+      return; // reentrancy guard: at most one in-flight WebLN sendPayment
+    }
     clearError();
     detectCapabilities();
     renderCapabilities();
@@ -439,6 +446,7 @@
       return;
     }
 
+    state.paying = true;
     setStatus("Opening WebLN wallet...");
     try {
       await window.webln.enable();
@@ -449,6 +457,8 @@
       showMessageError("wallet", error && error.message ? error.message : "WebLN payment did not complete.");
       renderQrFallback();
       setStatus("Use copy or QR to pay with another wallet.");
+    } finally {
+      state.paying = false;
     }
   }
 

@@ -109,6 +109,12 @@ if (NO_WEBLN) {
   await waitFor(ws, `!document.getElementById('qr-box').hasAttribute('hidden') && (document.getElementById('qr-box').innerHTML||'').includes('<svg')`, 8000, 'QR fallback rendered');
   await evalJs(ws, `(() => { const b = [...document.querySelectorAll('#invoice-section button')].find(x => /paid|wait|credential/i.test(x.textContent)); if (b) b.click(); return !!b; })()`);
   console.log('no-WebLN fallback: QR rendered + clicked the wait-for-credentials action');
+} else {
+  // Regression for the auto-pay fix: the SPA must NOT call sendPayment before an EXPLICIT click.
+  const preClick = await evalJs(ws, `window.__paidBolt11 || ''`);
+  if (preClick) throw new Error('REGRESSION: SPA auto-paid via WebLN before an explicit user click');
+  await evalJs(ws, `(() => { const b = [...document.querySelectorAll('#invoice-section button')].find(x => /pay with webln/i.test(x.textContent)); if (b) b.click(); return !!b; })()`);
+  console.log('WebLN: no auto-pay before click (good); clicked "Pay with WebLN"');
 }
 
 // --- 5. settle out-of-band (the SPA/mock WebLN cannot) --------------------------------------------
