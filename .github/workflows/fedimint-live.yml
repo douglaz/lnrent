@@ -2,16 +2,18 @@ name: fedimint-live
 
 # The LIVE Fedimint e2e: build daemon/tests/fedimint_live.rs (which is #[ignore]d in
 # the per-push CI) and run it under a real regtest federation that devimint spins up
-# (fedimintd + gatewayd + bitcoind + lightning + esplora). This is the real ecash
-# money-path proof (receive + pay) on regtest — no mainnet, no DigitalOcean billing.
+# (fedimintd + gatewayd + bitcoind + lightning + esplora). Real ecash money-path proof
+# (receive + pay) on regtest — no mainnet, no DigitalOcean billing.
 #
-# It is a heavy job (a full federation + daemon stack, tens of minutes), so it runs
-# NIGHTLY and on manual dispatch rather than per-push. The /nix/store is cached
-# between runs so fedimint's devshell (esplora et al.) is not rebuilt every time.
+# ⚠️ NOT viable on a cold GitHub-hosted runner: fedimint's cachix does not serve external
+# flake evaluations of the v0.11.1 tag, so `nix build #devimint` compiles the entire
+# fedimint tree from source (~2h) and times out. This workflow is therefore MANUAL-ONLY
+# (workflow_dispatch) and is intended for a SELF-HOSTED runner with a warm /nix/store +
+# fedimint build. For local runs use `scripts/live-fed-e2e.sh` (this box already has a
+# built v0.11.1 worktree). Kept here so the CI path is ready once a self-hosted runner
+# exists — do not add a `schedule:` trigger until then (it would burn ~2h per night).
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 6 * * *' # nightly 06:00 UTC
 
 concurrency:
   group: fedimint-live
