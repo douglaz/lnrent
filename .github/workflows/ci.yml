@@ -10,12 +10,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Job 1 — the full workspace gate: clippy + every non-ignored test (incl. the
-  # mocked end-to-end money path in daemon/tests/e2e_money_path.rs) with the real
-  # Fedimint tree compiled in (default feature), plus the mock-only build. Runs
-  # inside the Nix devshell so rustc + the bundled RocksDB/C++ toolchain match local.
-  # ---------------------------------------------------------------------------
+  # The per-push gate: clippy + every non-ignored test (incl. the mocked end-to-end
+  # money path in daemon/tests/e2e_money_path.rs) with the real Fedimint tree compiled
+  # in (default feature), plus the mock-only build. Runs inside the Nix devshell so
+  # rustc + the bundled RocksDB/C++ toolchain match local. The live regtest-federation
+  # e2e is a separate, heavier workflow (.github/workflows/fedimint-live.yml).
   lint-test:
     name: lint + test (nix devshell)
     runs-on: ubuntu-latest
@@ -48,59 +47,3 @@ jobs:
 
       - name: build mock-only (no fedimint/rocksdb tree)
         run: nix develop . --command cargo build -p lnrentd --no-default-features
-
-  # ---------------------------------------------------------------------------
-  # Job 2 — the LIVE Fedimint e2e: build daemon/tests/fedimint_live.rs (which is
-  # #[ignore]d in job 1) and run it under a real regtest federation that devimint
-  # spins up (fedimintd + gatewayd + bitcoind + lightning). devimint's `--exec`
-  # injects FM_INVITE_CODE + a fedimint-cli alias onto PATH. This is the real ecash
-  # money-path proof (receive + pay), on regtest — no mainnet, no DO billing.
-  # ---------------------------------------------------------------------------
-  fedimint-live:
-    name: live fedimint e2e (devimint regtest federation)
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
-          df -h / | tail -1
-
-      - uses: DeterminateSystems/nix-installer-action@main
-        with:
-          # Trust fedimint's binary cache so `nix develop github:fedimint/fedimint`
-          # pulls prebuilt devimint + daemons instead of compiling fedimint from source.
-          extra-conf: |
-            extra-substituters = https://fedimint.cachix.org
-            extra-trusted-public-keys = fedimint.cachix.org-1:FpJJjy1iPVlvyv4OMiN5y9+/arFLPcnZhZVVCHCDYTs=
-            accept-flake-config = true
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ". -> target"
-          cache-on-failure: true
-
-      # Build the (ignored) live test binary in OUR devshell — running it via the
-      # prebuilt binary avoids a nested nix-shell PATH clash with fedimint's devshell.
-      - name: build the fedimint_live test binary
-        id: build
-        run: |
-          nix develop . --command cargo test -p lnrentd --features fedimint \
-            --test fedimint_live --no-run
-          TESTBIN=$(ls -t target/debug/deps/fedimint_live-* | grep -vE '\.d$' | head -1)
-          test -x "$TESTBIN"
-          echo "testbin=$TESTBIN" >> "$GITHUB_OUTPUT"
-          echo "built: $TESTBIN"
-
-      # devimint's dev-fed brings up a fresh regtest federation and runs the test
-      # binary with the federation env injected. Pinned to the same v0.11.1 the
-      # daemon links, so the wire/consensus versions match.
-      - name: run the live e2e under a devimint dev-fed
-        env:
-          TESTBIN: ${{ steps.build.outputs.testbin }}
-        run: |
-          nix develop 'github:fedimint/fedimint?ref=v0.11.1' --accept-flake-config --command \
-            devimint dev-fed --exec "$TESTBIN" --ignored --nocapture --test-threads=1

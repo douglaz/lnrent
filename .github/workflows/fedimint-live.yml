@@ -1,0 +1,92 @@
+name: fedimint-live
+
+# The LIVE Fedimint e2e: build daemon/tests/fedimint_live.rs (which is #[ignore]d in
+# the per-push CI) and run it under a real regtest federation that devimint spins up
+# (fedimintd + gatewayd + bitcoind + lightning + esplora). This is the real ecash
+# money-path proof (receive + pay) on regtest — no mainnet, no DigitalOcean billing.
+#
+# It is a heavy job (a full federation + daemon stack, tens of minutes), so it runs
+# NIGHTLY and on manual dispatch rather than per-push. The /nix/store is cached
+# between runs so fedimint's devshell (esplora et al.) is not rebuilt every time.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * *' # nightly 06:00 UTC
+
+concurrency:
+  group: fedimint-live
+  cancel-in-progress: true
+
+jobs:
+  live:
+    name: live fedimint e2e (devimint regtest federation)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h / | tail -1
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          # Trust fedimint's binary cache so the prebuilt daemons + devshell inputs are
+          # substituted rather than compiled from source.
+          extra-conf: |
+            extra-substituters = https://fedimint.cachix.org
+            extra-trusted-public-keys = fedimint.cachix.org-1:FpJJjy1iPVlvyv4OMiN5y9+/arFLPcnZhZVVCHCDYTs=
+            accept-flake-config = true
+
+      # Persist /nix/store across nightly runs (fedimint's devshell + daemons are large
+      # and partly build from source). GitHub-Actions-cache backed, so no external token.
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-fedimint-live-${{ runner.os }}-${{ hashFiles('.github/workflows/fedimint-live.yml', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-fedimint-live-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+
+      # Build the (ignored) live test binary in OUR devshell — running the prebuilt
+      # binary avoids a nested nix-shell PATH clash with fedimint's devshell.
+      - name: build the fedimint_live test binary
+        id: build
+        run: |
+          nix develop . --command cargo test -p lnrentd --features fedimint \
+            --test fedimint_live --no-run
+          TESTBIN=$(ls -t target/debug/deps/fedimint_live-* | grep -vE '\.d$' | head -1)
+          test -x "$TESTBIN"
+          echo "testbin=$(readlink -f "$TESTBIN")" >> "$GITHUB_OUTPUT"
+          echo "built: $(readlink -f "$TESTBIN")"
+
+      # devimint + the fedimint daemons are `packages.*` (built via crane), NOT part of
+      # the default devshell — so pull them PREBUILT from fedimint's cachix, then run
+      # devimint INSIDE the default devshell (which provides the external daemons:
+      # bitcoind, cln, lnd, esplora, electrs). devimint's dev-fed brings up a fresh
+      # regtest federation and `--exec` injects FM_INVITE_CODE + fedimint-cli onto PATH.
+      - name: run the live e2e under a devimint dev-fed
+        env:
+          TESTBIN: ${{ steps.build.outputs.testbin }}
+          FEDI: github:fedimint/fedimint?ref=v0.11.1
+        run: |
+          set -euo pipefail
+          echo "== fetching prebuilt fedimint daemons =="
+          BINS=$(nix build --no-link --print-out-paths --accept-flake-config \
+            "$FEDI#devimint" "$FEDI#fedimint-pkgs" "$FEDI#gateway-pkgs")
+          echo "$BINS"
+          nix develop "$FEDI" --accept-flake-config --command bash -euo pipefail -c '
+            for b in '"$BINS"'; do PATH="$b/bin:$PATH"; done
+            export PATH
+            echo "== tooling on PATH =="
+            for t in devimint fedimintd gatewayd fedimint-cli gateway-cli bitcoind lightningd lnd esplora electrs; do
+              printf "  %-14s %s\n" "$t" "$(command -v "$t" 2>/dev/null || echo MISSING)"
+            done
+            echo "== dev-fed =="
+            devimint dev-fed --exec "'"$TESTBIN"'" --ignored --nocapture --test-threads=1
+          '
