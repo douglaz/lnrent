@@ -1,4 +1,5 @@
 mod clock;
+mod relay;
 
 use lnrent_buyer_core::lnrent_wire::PublicKey;
 use serde::Serialize;
@@ -6,6 +7,7 @@ use serde_json::{json, Value};
 use wasm_bindgen::prelude::*;
 
 pub use clock::BrowserClock;
+pub use relay::BrowserRelay;
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct WebBuyer {
@@ -108,7 +110,11 @@ struct WebBuyerConfig {
 }
 
 impl WebBuyerConfig {
-    fn parse(relay_url: String, operator_npub: String, signer_mode: String) -> Result<Self, String> {
+    fn parse(
+        relay_url: String,
+        operator_npub: String,
+        signer_mode: String,
+    ) -> Result<Self, String> {
         let relay_url = parse_relay_url(&relay_url)?;
         let operator_npub = operator_npub.trim().to_owned();
         let operator = parse_operator_npub(&operator_npub)?;

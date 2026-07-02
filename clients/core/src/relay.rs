@@ -6,7 +6,6 @@
 //! these as traits is what lets the same flows run on a wasm32 web target with a NIP-07 signer and a
 //! browser WebSocket — no native-only type leaks into core.
 
-use async_trait::async_trait;
 use lnrent_wire::{Event, PublicKey};
 use std::time::Duration;
 
@@ -16,11 +15,24 @@ use std::time::Duration;
 #[error("{0}")]
 pub struct RelayError(pub String);
 
+#[cfg(not(target_arch = "wasm32"))]
+pub trait RelayBounds: Send + Sync {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> RelayBounds for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait RelayBounds {}
+
+#[cfg(target_arch = "wasm32")]
+impl<T> RelayBounds for T {}
+
 /// The relay seam: publish a signed event, fetch the operator's listings, and open a live
 /// subscription to the buyer's gift-wrapped replies. The host owns the relay connection and the
 /// concrete filters; core only drives this trait.
-#[async_trait]
-pub trait Relay: Send + Sync {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+pub trait Relay: RelayBounds {
     /// Publish an already-signed event (a gift wrap or, in principle, any event) to the relay(s).
     async fn publish(&self, event: &Event) -> Result<(), RelayError>;
 
@@ -46,8 +58,19 @@ pub trait Relay: Send + Sync {
 /// A live stream of gift-wrap events from [`Relay::subscribe_giftwraps`]. `next` returns the next
 /// event, or `Ok(None)` once the subscription's deadline elapses (or it closes) — so core's
 /// correlation loop terminates with a timeout instead of hanging.
-#[async_trait]
+// `Send` is a DIRECT supertrait on native (not via a marker trait) so it is reflected onto the
+// `Box<dyn GiftWrapStream>` trait object `subscribe_giftwraps` returns — the buyer flow holds that box
+// across `.next().await`, so it must stay `Send` to run on a multi-threaded executor. On wasm32 the
+// stream owns non-`Send` JS handles (a `WebSocket`), so the trait is `?Send` and single-threaded.
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait::async_trait]
 pub trait GiftWrapStream: Send {
+    async fn next(&mut self) -> Result<Option<Event>, RelayError>;
+}
+
+#[cfg(target_arch = "wasm32")]
+#[async_trait::async_trait(?Send)]
+pub trait GiftWrapStream {
     async fn next(&mut self) -> Result<Option<Event>, RelayError>;
 }
 
