@@ -51,7 +51,10 @@ CHROME_BIN="${CHROME:-$(command -v google-chrome || command -v google-chrome-sta
 echo "   chrome: $CHROME_BIN"
 "$CHROME_BIN" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --use-gl=swiftshader \
   --remote-debugging-port="$DBG" about:blank >/dev/null 2>&1 & CHR=$!
-sleep 4
+# Wait for chrome's CDP endpoint to be READY — a fixed sleep races a cold chrome start on CI
+# (ECONNREFUSED on :$DBG). Poll /json/version until it answers.
+for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$DBG/json/version" >/dev/null 2>&1 && break; sleep 0.5; done
+curl -sf "http://127.0.0.1:$DBG/json/version" >/dev/null 2>&1 || { echo "chrome CDP ($DBG) never came up"; exit 1; }
 
 say "drive the SPA (CDP)"
 LNRENT_BIN="$ROOT/target/debug/lnrent" LNRENT_DATA_DIR="$WORK/data" \
