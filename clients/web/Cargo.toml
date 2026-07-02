@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 lnrent-buyer-core = { path = "../core" }
+nostr = { version = "0.44", features = ["nip44", "nip59"] }
 wasm-bindgen = "=0.2.121"
 wasm-bindgen-futures = "=0.4.71"
 serde = { version = "1", features = ["derive"] }

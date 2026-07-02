@@ -47,3 +47,11 @@ jobs:
 
       - name: build mock-only (no fedimint/rocksdb tree)
         run: nix develop . --command cargo build -p lnrentd --no-default-features
+
+      # The web buyer (clients/web) is wasm-primary — most of it is #[cfg(target_arch = "wasm32")]
+      # (the NIP-07 bridge, the browser Relay, the wired flows), which the host clippy/test above do
+      # NOT compile. Gate the wasm32 target explicitly so a wasm-only regression can't pass green.
+      - name: clippy + build the web buyer for wasm32
+        run: |
+          nix develop . --command cargo clippy -p lnrent-buyer-web --target wasm32-unknown-unknown
+          nix develop . --command cargo build  -p lnrent-buyer-web --target wasm32-unknown-unknown
