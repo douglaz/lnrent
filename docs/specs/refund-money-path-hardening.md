@@ -1,6 +1,6 @@
 # Spec: refund fee-deduction, liability-gated readiness, and refund provenance
 
-Status: **Proposed** — money-path hardening for the Fedimint payment backend wired in lnrent-o6p.
+Status: **Implemented** (master: INV-1/INV-3 `b7a5421`, INV-2 `c07fe11`, final-gate edge fixes `bcf6922`) — money-path hardening for the Fedimint payment backend wired in lnrent-o6p.
 Scope: `daemon/src/{backends.rs, fedimint_backend.rs, refund.rs, capture.rs, provision.rs, supervisor.rs, store.rs}`.
 Audience: the rb-lite implementer. This spec is the contract; tests below are mandatory ship gates.
 

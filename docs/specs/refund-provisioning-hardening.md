@@ -1,6 +1,6 @@
 # Spec: refund + provisioning hardening (codex full-review follow-up)
 
-**Status:** draft for codex-review-loop → rb-lite
+**Status:** **Implemented** (all on master) — F1 `8e411eb`, F3+F6 `5288ded`, F2 `206a98f`, F4 `6bfe0fe`, F5 `de10217`
 **Source:** full-project `codex exec` review 2026-07-01 (`/tmp/codex-review-lnrent-full-20260701T163906Z/final-review.md`),
 each finding independently verified against the code before writing this spec.
 

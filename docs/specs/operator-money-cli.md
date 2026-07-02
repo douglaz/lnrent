@@ -1,6 +1,6 @@
 # Spec: operator money view (`lnrent money`)
 
-Status: **Proposed** — gives the operator a read-only view of the daemon's ecash money position.
+Status: **Implemented** (master `5dd2d28`; test `daemon/tests/operator_money_cli.rs`) — a read-only view of the daemon's ecash money position.
 Scope: `daemon/src/{ipc.rs, supervisor.rs, bin/lnrent.rs}` (thread the payment backend into IPC + one
 new command). Reuses the INV-2 readiness report; adds NO new money logic.
 Audience: the rb-lite implementer. This spec is the contract; the tests below are mandatory ship gates.

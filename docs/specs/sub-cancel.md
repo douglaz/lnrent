@@ -1,6 +1,6 @@
 # Spec: buyer-initiated subscription cancellation (`sub.cancel`)
 
-Status: **Proposed** — closes the one genuine buyer-lifecycle gap (`sub.cancel` is currently a no-op).
+Status: **Implemented** (master `2f45dc5`) — closes the one genuine buyer-lifecycle gap (`sub.cancel` was a no-op).
 Scope: `daemon/src/{order_intake.rs, store.rs}` + a CLI comment/behaviour touch in `clients/cli/src/main.rs`.
 Audience: the rb-lite implementer. This spec is the contract; the tests below are mandatory ship gates.
 
