@@ -18,8 +18,8 @@ say() { echo "== $*"; }
 say "build wasm bundle -> static/pkg"
 wasm-pack build --target web --out-dir static/pkg clients/web >/dev/null 2>&1 || { echo "wasm-pack failed"; exit 1; }
 
-say "build daemon + operator CLI + local relay"
-cargo build -q -p lnrentd --bin lnrentd --bin lnrent 2>/dev/null
+say "build daemon + operator CLI + local relay (mock-only — no fedimint/rocksdb tree needed)"
+cargo build -q --no-default-features -p lnrentd --bin lnrentd --bin lnrent 2>/dev/null
 cargo build -q -p lnrent-buyer-cli --example localrelay 2>/dev/null
 
 # M1a serves a SINGLE recipe; isolate `dummy` (no params, host backend, instant echo-creds) so the
@@ -46,7 +46,10 @@ say "serve static/ (with pkg)"
 python3 -m http.server "$PORT" --directory clients/web/static >/dev/null 2>&1 & SRV=$!
 
 say "start headless chrome"
-google-chrome --headless=new --no-sandbox --disable-gpu --use-gl=swiftshader \
+CHROME_BIN="${CHROME:-$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser)}"
+[ -n "$CHROME_BIN" ] || { echo "no chrome/chromium found (set \$CHROME)"; exit 1; }
+echo "   chrome: $CHROME_BIN"
+"$CHROME_BIN" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --use-gl=swiftshader \
   --remote-debugging-port="$DBG" about:blank >/dev/null 2>&1 & CHR=$!
 sleep 4
 

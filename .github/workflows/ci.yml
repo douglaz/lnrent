@@ -55,3 +55,39 @@ jobs:
         run: |
           nix develop . --command cargo clippy -p lnrent-buyer-web --target wasm32-unknown-unknown
           nix develop . --command cargo build  -p lnrent-buyer-web --target wasm32-unknown-unknown
+
+  # The web buyer's FUNCTIONAL acceptance gate: build the wasm bundle, spawn a mock lnrentd + local
+  # relay + a static server + headless Chrome, and drive the SPA through the full loop (settling the
+  # mock invoice out-of-band via `lnrent dev settle`). ubuntu-latest ships google-chrome-stable + node
+  # + python3, all reachable inside `nix develop` (which keeps the runner PATH). The daemon is built
+  # mock-only (no fedimint/rocksdb tree), so this stays light.
+  web-e2e:
+    name: web buyer headless e2e (Chrome)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h / | tail -1
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+
+      - name: tooling check (chrome + node + python on the runner)
+        run: |
+          (command -v google-chrome-stable || command -v google-chrome || command -v chromium) || { echo "no chrome on runner"; exit 1; }
+          node --version && python3 --version
+
+      - name: web buyer e2e — WebLN path
+        run: nix develop . --command bash -c 'bash clients/web/e2e/run.sh'
+
+      - name: web buyer e2e — no-NIP-07/no-WebLN fallback (QR/copy)
+        run: nix develop . --command bash -c 'NO_WEBLN=1 bash clients/web/e2e/run.sh'
