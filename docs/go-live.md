@@ -6,9 +6,17 @@ renting real VMs." Every step below is the OPERATOR's own action with the OPERAT
 is compiled in by default, but without `payment_backend=fedimint` AND a `[fedimint]` config nothing moves
 (and a `--no-default-features` build drops the backend entirely).
 
-The code is go-live-ready (real Fedimint backend wired, refund path hardened, provisioning + the buyer
-and operator CLIs proven live end to end on a real federation). What remains is yours: pick a mainnet
-federation, back up a seed, fund a DigitalOcean account, set a real price, and flip it on.
+The code is go-live-ready for an **attended, operator-watched launch** (real Fedimint backend wired,
+refund path hardened, provisioning + the buyer and operator CLIs proven live end to end on a real
+federation). Be clear-eyed about one thing: **starting the daemon (step 4) publishes your public
+`30402` listing, and that IS public exposure** — any Nostr keypair can send you orders from that
+moment, already during the preflight checks (step 5 merely formalizes it). Until the GATE-0 abuse-resistance items in
+`docs/specs/production-readiness.md` land (per-buyer reservation caps, inbound rate-limiting), a
+stranger can hold your capacity at zero cost, so an attended launch accepts that documented risk
+knowingly: keep the price real but small, capacity low, and watch the logs. GATE-1 (alerting,
+teardown dead-letter, payout) gates leaving it to run unattended. What remains for the attended
+launch is yours: pick a mainnet federation, back up a seed, fund a DigitalOcean account, set a real
+price, and flip it on.
 
 ## 0. The one irreversible fact — your mnemonic IS your ecash
 
@@ -67,13 +75,16 @@ LNRENT_DATA_DIR=/srv/lnrent/data LNRENT_RECIPES_DIR=/srv/lnrent/recipes \
 ```
 
 Confirm ALL of these before customers can order:
-- Daemon log shows, in order: `fedimint payment backend joined; real ecash money path active` · the
-  operator npub · `operator recipe loaded` · `published … listing` · `ipc serving`. No `NOT fully ready`.
+- Daemon log shows, in order: the operator npub (`operator identity ready`) ·
+  `fedimint payment backend joined; real ecash money path active` · `operator recipe loaded` ·
+  `published … listing` · `ipc serving`. No `refund readiness warning:` / `refund readiness ALARM:`
+  lines (the daemon's actual not-ready markers).
 - `LNRENT_DATA_DIR=/srv/lnrent/data ./target/release/lnrent money` → `Gateway: ok` and `READY`.
 - DO token is valid: `curl -fsS -H "Authorization: Bearer $DO_TOKEN" https://api.digitalocean.com/v2/account`.
 - ONE real end-to-end order at a SMALL price first: a buyer discovers the listing → orders → pays →
-  gets a droplet → SSHes in → cancels. This is exactly the flow validated on the test federation
-  (`scratchpad/live-product-proof.sh` shows the shape). Do it before real customers.
+  gets a droplet → SSHes in → cancels. Drive it manually with the buyer CLI (`lnrent-buyer`) against
+  your live listing — no script covers the full product flow (`scripts/live-fed-e2e.sh` proves only
+  the ecash money path against a throwaway regtest federation). Do it before real customers.
 
 ## 5. Go live
 
@@ -104,4 +115,7 @@ Share the listing coordinate / operator npub.
 
 - Start with SMALL prices + a staging dogfood on a TEST federation FIRST — already validated this session
   on a real (non-mainnet-value) federation: real buyer → real ecash → real DO VM → SSH → cancel.
-- Keep it opt-in until you're ready: a default build (mock backend) moves no real money.
+- Keep it opt-in until you're ready: the default BUILD includes the fedimint backend
+  (`default = ["fedimint"]`), but it moves no money until you bootstrap with
+  `payment_backend=fedimint` + a `[fedimint]` config (the runtime default is `mock`).
+  `--no-default-features` drops the real backend from the binary entirely.

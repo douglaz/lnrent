@@ -32,7 +32,7 @@ Built and tested:
 - **Operator** — `lnrent status/recipes/subs/sub`, and `lnrent money` (ecash balance, gateway, refund
   liability coverage).
 
-Not yet: a browser/GUI buyer, more compute providers (Hetzner, bring-your-own-host), and the mainnet
+Not yet: more compute providers (Hetzner, bring-your-own-host) and the mainnet
 go-live (real money is opt-in at runtime and gated on the operator finalizing their setup). See
 [SPEC.md](./SPEC.md).
 
@@ -70,7 +70,7 @@ LNRENT_MNEMONIC="…" LNRENT_DATA_DIR=./data LNRENT_RECIPES_DIR=./recipes LNRENT
 
 ```sh
 LNRENT_DATA_DIR=./data nix develop . --command cargo run -p lnrentd --bin lnrent -- money
-#   subcommands: status · recipes · subs · sub <id> · money   (add --json for machine output)
+#   subcommands: status · recipes · subs · sub <id> · money · suspend <id> · resume <id>   (add --json for machine output)
 ```
 
 **Buyer CLI** (talks to the operator over a relay; the buyer pays the returned invoice from their own
@@ -91,6 +91,7 @@ $B order wait <order_id>              # -> access credentials (host/port/user)
 - `daemon/` — `lnrentd` (control plane) + `lnrent` (operator CLI)
 - `wire/` — the Nostr wire codec: DM message types, NIP-99 listings, NIP-17 gift-wrap
 - `clients/core` — `lnrent-buyer-core` (buyer library); `clients/cli` — `lnrent-buyer` (native buyer)
+- `clients/web` — the static WASM buyer SPA (NIP-07/WebLN with copy+QR fallback; e2e in `clients/web/e2e`)
 - `recipes/` — service recipes: `do-vps` (DigitalOcean VPS), `wireguard` (stub), `dummy` (tests)
 
 ## Docs

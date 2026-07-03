@@ -1,6 +1,6 @@
 # Spec: web (WASM) buyer — browser marketplace access (lnrent-7fp.18)
 
-**Status:** draft for codex-review-loop → rb-lite
+**Status:** **Implemented** (master `2ae0e1a`…`68dc79c`, WebLN explicit-click P1 fix `96cdd9f`, CI e2e `f1d2e2d`; clients/web/). Two landed amendments to the text below: (1) WebLN is invoked ONLY on an explicit user click, never auto-triggered after `create_order` (codex P1, `96cdd9f`); (2) the e2e's out-of-band settle landed as the dev-gated `lnrent dev settle` IPC command (refused unless `LNRENT_DEV=1` + mock backend, ipc.rs) rather than a host-side `MockPayment` handle, and the e2e runs as a per-push CI job (clients/web/e2e/run.sh), not box-local.
 **Bead:** lnrent-7fp.18 (P1; blockers .13 CLI buyer + .15 ship gate are CLOSED). Grill-converged bead;
 this spec turns it into an implementable plan grounded in the current code.
 

@@ -21,6 +21,11 @@ provisioning still fails.
 - `order.request` collects a refund destination up front (BOLT12 offer preferred,
   Lightning address fallback); the daemon pushes refunds via phoenixd
   `payoffer`/`paylnaddress`.
+  *Revision (2026-07, post-ADR-0012 + SPEC §6.4 F3/F6):* the landed contract is stricter —
+  `refund_dest` is REQUIRED and must be a **Lightning address or HTTPS LNURL** (re-resolvable
+  at refund time); raw BOLT11 is rejected and BOLT12 is unsupported. Refunds resolve via
+  LNURL and pay through the Fedimint `PaymentBackend` (phoenixd was never built). The
+  capture-then-refund decision itself is unchanged.
 - Subscriptions gain `PROVISIONING`, `REFUND_DUE`, and `REFUNDED` states.
 - Pre-flight (capacity and param checks before the invoice) is the main defense; the
   refund path is exceptional.

@@ -100,8 +100,8 @@ _Avoid_: cart, checkout, request, job
 **Subscription**:
 The durable paid relationship between a Buyer and a Listing. Prepaid to a Paid-through
 date and renewed before it. Carries the lifecycle state (pending, provisioning, active,
-suspended, terminated, plus expired, cancelled, refund-due, refunded; SPEC §6.3). One
-Subscription owns one Instance (v1).
+resuming, suspended, terminated, plus expired, cancelled, refund-due, refunded; SPEC §6.3).
+One Subscription owns one Instance (v1).
 _Avoid_: plan, contract, lease, membership; the removed `due`/`grace` states
 
 **Instance**:

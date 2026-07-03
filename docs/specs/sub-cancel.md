@@ -29,6 +29,9 @@ A `sub.cancel` from the subscription's owner MUST:
   no-op:
   - `CANCELLED`/`TERMINATED`/`EXPIRED`/`REFUNDED` — already terminal; drop.
   - `REFUND_DUE` — a refund is already owed; cancellation must not interfere; drop.
+  - `RESUMING` (added by lnrent-18v, post-dates this doc) — driver-owned in-flight paid state; drop
+    with WARN (the resume driver resolves it to ACTIVE or SUSPENDED; cancel again after). The
+    no-reply-DM UX gap in this window is tracked under z4u / production-readiness PR-9.
   - `PENDING`/`PROVISIONING` — OUT OF SCOPE for this cut (see §6): a `PENDING` order expires on its own
     and a `PROVISIONING` sub is mid-hook (racy); drop with a WARN.
 - **CANCEL-3 (terminate at the end of the already-paid window; compute the deadline INSIDE the txn).**

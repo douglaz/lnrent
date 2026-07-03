@@ -22,7 +22,7 @@ Decision:
   settled subscription (the operator counter-signs, or a payment proof) so only genuine
   customers count. The full anti-Sybil design is deferred but the binding hook is reserved.
 - **Structurally lower the stakes** regardless: short, cheap first periods (a trial); the
-  up-front BOLT12-offer refund (ADR-0003); and lead with non-sensitive Tier-0 services so
+  up-front refund destination (ADR-0003; LN-address/LNURL per SPEC §6.4); and lead with non-sensitive Tier-0 services so
   the trust ask is smaller.
 
 We chose buyer-signed attestations over bonds/staking/slashing or escrow because
