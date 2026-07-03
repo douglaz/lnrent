@@ -36,7 +36,9 @@ use crate::backends::{PayStatus, PaymentBackend, PaymentStatus, Settlement};
 use crate::capture::{capture, Capture};
 use crate::clock::Clock;
 use crate::ipc;
-use crate::nostr_engine::{listing_from_recipe, NostrEngine, OpHandler, OrderHandler, Outbound};
+use crate::nostr_engine::{
+    listing_from_recipe, InboundDrainResult, NostrEngine, OpHandler, OrderHandler, Outbound,
+};
 use crate::op_dispatch::OpDispatch;
 use crate::order_intake::OrderIntake;
 use crate::provision::{DeliveryResendOrderHandler, OutboxSender, Provisioner};
@@ -472,29 +474,19 @@ impl Supervisor {
         }
 
         // -- Nostr inbound loop (decode/dedupe/route order + op DMs) --
-        {
+        let inbound_task = {
             let engine = self.engine.clone();
             let order = self.order_handler.clone();
             let op = self.op_handler.clone();
-            tasks.push(tokio::spawn(supervise(
+            tokio::spawn(supervise_inbound(
                 "nostr-inbound",
                 shutdown_rx.clone(),
                 RESTART_BACKOFF,
-                move |sd| {
-                    let (engine, order, op) = (engine.clone(), order.clone(), op.clone());
-                    // run_inbound cannot observe the shutdown signal itself, so race it against the
-                    // signal here: on shutdown the select drops the inbound future and returns Ok,
-                    // letting the loop wind down gracefully instead of relying on a hard abort.
-                    async move {
-                        let mut sd = sd;
-                        tokio::select! {
-                            r = engine.run_inbound(order, op) => r,
-                            _ = wait_for_shutdown(&mut sd) => Ok(()),
-                        }
-                    }
-                },
-            )));
-        }
+                engine,
+                order,
+                op,
+            ))
+        };
 
         // -- Settlement -> capture loop --
         {
@@ -616,6 +608,7 @@ impl Supervisor {
 
         Ok(RunningSupervisor {
             shutdown_tx,
+            inbound_task: Some(inbound_task),
             tasks,
             engine: self.engine,
             store: self.store,
@@ -628,7 +621,6 @@ impl Supervisor {
 #[derive(Default)]
 struct InboundDrain {
     active: AtomicUsize,
-    idle: Notify,
 }
 
 impl InboundDrain {
@@ -639,13 +631,8 @@ impl InboundDrain {
         }
     }
 
-    async fn wait_idle(&self) {
-        loop {
-            if self.active.load(Ordering::SeqCst) == 0 {
-                return;
-            }
-            self.idle.notified().await;
-        }
+    fn active_count(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
     }
 }
 
@@ -655,9 +642,7 @@ struct InboundGuard {
 
 impl Drop for InboundGuard {
     fn drop(&mut self) {
-        if self.drain.active.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.drain.idle.notify_waiters();
-        }
+        self.drain.active.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -705,6 +690,7 @@ impl OpHandler for DrainingOpHandler {
 /// [`shutdown`]: RunningSupervisor::shutdown
 pub struct RunningSupervisor {
     shutdown_tx: watch::Sender<bool>,
+    inbound_task: Option<JoinHandle<()>>,
     tasks: Vec<JoinHandle<()>>,
     engine: NostrEngine,
     store: Store,
@@ -714,13 +700,27 @@ pub struct RunningSupervisor {
 
 impl RunningSupervisor {
     /// Graceful shutdown: stop accepting new work, let in-flight transactions commit (the store actor
-    /// drains its queue), flush the outbox once, then stop every loop. Bounded by [`SHUTDOWN_GRACE`].
+    /// drains its queue), flush the outbox once, then stop every loop. The wind-down is bounded by
+    /// ~2×[`SHUTDOWN_GRACE`] — the inbound loop drains its accepted per-wrap tasks (step 1b) before the
+    /// remaining loops are awaited (step 2), each with its own `SHUTDOWN_GRACE` window — plus the final
+    /// outbox flush.
     pub async fn shutdown(mut self) -> Result<()> {
         tracing::info!("supervisor: graceful shutdown starting");
-        // 1. Signal every loop. Each supervise() wrapper aborts its in-flight child, so the inbound
-        //    loop (which can't observe shutdown itself) stops too.
+        // 1. Signal every loop. The inbound supervisor special-cases run_inbound: it asks the engine
+        //    to stop accepting and drains accepted per-wrap tasks before returning.
         let _ = self.shutdown_tx.send(true);
-        // 2. Wait for the loops to wind down (take the handles out so Drop is a no-op afterward).
+
+        if let Some(inbound) = self.inbound_task.take() {
+            let abort = inbound.abort_handle();
+            if tokio::time::timeout(SHUTDOWN_GRACE, inbound).await.is_err() {
+                tracing::warn!(
+                    "supervisor: inbound drain did not stop within the grace window; aborting wrapper"
+                );
+                abort.abort();
+            }
+        }
+
+        // 2. Wait for the remaining loops to wind down (take the handles out so Drop is a no-op afterward).
         let tasks = std::mem::take(&mut self.tasks);
         let aborts: Vec<AbortHandle> = tasks.iter().map(|t| t.abort_handle()).collect();
         let join = async move {
@@ -734,15 +734,12 @@ impl RunningSupervisor {
                 a.abort();
             }
         }
-        // 3. run_inbound spawns per-wrap handler tasks internally. We cannot own those join handles
-        //    from here, but the injected order/op handlers are wrapped with an active-call tracker;
-        //    wait for those commits/replies before the final outbox flush.
-        if tokio::time::timeout(SHUTDOWN_DRAIN, self.inbound_drain.wait_idle())
-            .await
-            .is_err()
-        {
+        // 3. InboundDrain is diagnostic-only; the engine-owned TaskTracker above is authoritative.
+        let active = self.inbound_drain.active_count();
+        if active > 0 {
             tracing::warn!(
-                "supervisor: inbound handlers did not drain within the grace window; flushing anyway"
+                active,
+                "supervisor: diagnostic inbound handler counter still active after engine drain"
             );
         }
         // 4. Final outbox flush so a just-committed provision.ready / billing.refund DM goes out.
@@ -763,6 +760,9 @@ impl Drop for RunningSupervisor {
         // supervise() wrapper drops its AbortOnDrop guard, which aborts the wrapper's in-flight child
         // — so no loop (not even the engine inbound loop) survives the drop.
         let _ = self.shutdown_tx.send(true);
+        if let Some(t) = &self.inbound_task {
+            t.abort();
+        }
         for t in &self.tasks {
             t.abort();
         }
@@ -777,6 +777,113 @@ struct AbortOnDrop(AbortHandle);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// Nostr inbound supervision is separate from [`supervise`] because graceful shutdown must not drop
+/// `run_inbound` before the engine has stopped accepting and drained accepted per-wrap work.
+async fn supervise_inbound(
+    name: &'static str,
+    mut shutdown: watch::Receiver<bool>,
+    backoff: Backoff,
+    engine: NostrEngine,
+    order: Arc<dyn OrderHandler>,
+    op: Arc<dyn OpHandler>,
+) {
+    let mut delay = backoff.base;
+    loop {
+        if *shutdown.borrow() {
+            // A prior run_inbound may have exited (relay drop -> restart backoff) leaving accepted
+            // per-wrap handlers still committing; drain them before returning so the final outbox flush
+            // includes their replies rather than detaching them. No-op on the first iteration.
+            drain_stopped_inbound(name, &engine).await;
+            return;
+        }
+        let started = tokio::time::Instant::now();
+        let run_engine = engine.clone();
+        let run_order = order.clone();
+        let run_op = op.clone();
+        let mut child =
+            tokio::spawn(async move { run_engine.run_inbound(run_order, run_op).await });
+        // If this inbound supervisor wrapper is aborted or dropped, abort run_inbound too. Dropping
+        // the JoinHandle alone would detach the child and leave the receive loop alive.
+        let guard = AbortOnDrop(child.abort_handle());
+
+        let outcome = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => {
+                drain_running_inbound(name, &engine, &mut child).await;
+                return;
+            }
+            out = &mut child => out,
+        };
+        drop(guard);
+
+        if *shutdown.borrow() {
+            drain_stopped_inbound(name, &engine).await;
+            return;
+        }
+
+        match outcome {
+            Ok(Ok(())) => tracing::warn!(
+                task = name,
+                "supervised loop exited cleanly (unexpected for a long-lived loop); restarting"
+            ),
+            Ok(Err(e)) => tracing::error!(
+                task = name,
+                error = %format!("{e:#}"),
+                "supervised loop returned an error; restarting"
+            ),
+            Err(join) if join.is_panic() => tracing::error!(
+                task = name,
+                "supervised loop PANICKED; restarting (process and sibling loops stay up)"
+            ),
+            Err(join) => {
+                tracing::warn!(task = name, error = %join, "supervised loop cancelled; stopping");
+                return;
+            }
+        }
+
+        if started.elapsed() >= backoff.max {
+            delay = backoff.base;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = wait_for_shutdown(&mut shutdown) => {
+                drain_stopped_inbound(name, &engine).await;
+                return;
+            }
+        }
+        delay = delay.saturating_mul(2).min(backoff.max);
+    }
+}
+
+async fn drain_running_inbound(
+    name: &'static str,
+    engine: &NostrEngine,
+    child: &mut JoinHandle<Result<()>>,
+) {
+    match engine.drain(SHUTDOWN_DRAIN, child).await {
+        InboundDrainResult::Drained => {
+            tracing::info!(task = name, "inbound loop drained for shutdown");
+        }
+        InboundDrainResult::TimedOut => {
+            tracing::warn!(task = name, "inbound loop drain timed out during shutdown");
+        }
+    }
+}
+
+async fn drain_stopped_inbound(name: &'static str, engine: &NostrEngine) {
+    match engine.drain_after_inbound_stopped(SHUTDOWN_DRAIN).await {
+        InboundDrainResult::Drained => {
+            tracing::info!(task = name, "stopped inbound loop drained for shutdown");
+        }
+        InboundDrainResult::TimedOut => {
+            tracing::warn!(
+                task = name,
+                "stopped inbound loop drain timed out during shutdown"
+            );
+        }
     }
 }
 
@@ -1591,6 +1698,8 @@ mod tests {
     use super::*;
     use crate::backends::Invoice;
     use crate::store::migrate;
+    use nostr_relay_builder::MockRelay;
+    use nostr_sdk::Keys;
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::mpsc;
@@ -1728,6 +1837,78 @@ mod tests {
         refund_readiness_report(store, payment).await.unwrap()
     }
 
+    async fn mock_relay() -> MockRelay {
+        let mut last_err = None;
+        for _ in 0..10 {
+            match MockRelay::run().await {
+                Ok(relay) => return relay,
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        panic!("local relay failed after retries: {}", last_err.unwrap());
+    }
+
+    struct SlowOutboxOrderHandler {
+        store: Store,
+        clock: Arc<dyn Clock>,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl OrderHandler for SlowOutboxOrderHandler {
+        async fn handle(&self, sender: PublicKey, _msg: Msg, _out: &dyn Outbound) -> Result<()> {
+            self.started.notify_waiters();
+            self.release.notified().await;
+
+            let payload = Msg::ProvisionReady(lnrent_wire::ProvisionReady {
+                subscription_id: "sub-drain".into(),
+                payload: serde_json::json!({ "credential": "after-drain" }),
+            });
+            let recipient = sender.to_hex();
+            let payload_json = serde_json::to_string(&payload)?;
+            let now = self.clock.now();
+            self.store
+                .transaction(move |tx| {
+                    tx.execute(
+                        "INSERT INTO outbox
+                            (id, recipient, subscription_id, msg_type, payload_json, state, attempts, created_at)
+                         VALUES ('outbox-drain', ?1, 'sub-drain', 'provision.ready', ?2, 'PENDING', 0, ?3)",
+                        rusqlite::params![recipient, payload_json, now],
+                    )?;
+                    Ok(())
+                })
+                .await
+        }
+    }
+
+    struct TestNoopOpHandler;
+
+    #[async_trait]
+    impl OpHandler for TestNoopOpHandler {
+        async fn handle(&self, _sender: PublicKey, _msg: Msg, _out: &dyn Outbound) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn outbox_state(store: &Store, id: &str) -> Option<String> {
+        let id = id.to_string();
+        store
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT state FROM outbox WHERE id=?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .optional()?)
+            })
+            .await
+            .unwrap()
+    }
+
     async fn seed_subscription(store: &Store, id: &str, state: &str) {
         let (id, state) = (id.to_string(), state.to_string());
         store
@@ -1820,6 +2001,86 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_inbound_handler_before_final_outbox_flush() {
+        let relay = mock_relay().await;
+        let url = relay.url().await.to_string();
+        let op_keys = Keys::generate();
+        let buyer_keys = Keys::generate();
+        let store = Store::open_spawn(":memory:").expect("open in-memory store");
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let engine =
+            NostrEngine::connect(op_keys.clone(), std::slice::from_ref(&url), store.clone())
+                .await
+                .expect("operator engine connects");
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let order_handler: Arc<dyn OrderHandler> = Arc::new(SlowOutboxOrderHandler {
+            store: store.clone(),
+            clock: clock.clone(),
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        });
+        let op_handler: Arc<dyn OpHandler> = Arc::new(TestNoopOpHandler);
+        let inbound_drain = Arc::new(InboundDrain::default());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let inbound_task = tokio::spawn(supervise_inbound(
+            "nostr-inbound-test",
+            shutdown_rx,
+            RESTART_BACKOFF,
+            engine.clone(),
+            Arc::clone(&order_handler),
+            Arc::clone(&op_handler),
+        ));
+        let running = RunningSupervisor {
+            shutdown_tx,
+            inbound_task: Some(inbound_task),
+            tasks: Vec::new(),
+            engine: engine.clone(),
+            store: store.clone(),
+            clock: clock.clone(),
+            inbound_drain,
+        };
+
+        let order = Msg::OrderRequest(lnrent_wire::OrderRequest {
+            id: "shutdown-drain".into(),
+            listing_id: format!("30402:{}:dummy", op_keys.public_key().to_hex()),
+            params: serde_json::json!({}),
+            refund_dest: None,
+        });
+        let wrap = lnrent_wire::gift_wrap(&buyer_keys, &op_keys.public_key(), &order)
+            .await
+            .expect("buyer gift-wraps order.request");
+        engine
+            .queue_inbound_event_for_test(wrap, Arc::clone(&order_handler), Arc::clone(&op_handler))
+            .await
+            .expect("queue accepted inbound wrap");
+        tokio::time::timeout(Duration::from_secs(10), started.notified())
+            .await
+            .expect("slow handler started before shutdown");
+
+        let shutdown = tokio::spawn(running.shutdown());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown waits for the accepted inbound handler"
+        );
+
+        release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .expect("shutdown returned")
+            .expect("shutdown task joined")
+            .expect("shutdown succeeded");
+
+        assert_eq!(
+            outbox_state(&store, "outbox-drain").await.as_deref(),
+            Some("SENT"),
+            "final shutdown outbox flush sends the DM enqueued by the drained handler"
+        );
     }
 
     #[tokio::test]

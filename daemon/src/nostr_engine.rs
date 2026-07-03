@@ -26,6 +26,7 @@
 //! handler traits. The integration tests drive it over an in-process `nostr-relay-builder` relay.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,6 +35,10 @@ use async_trait::async_trait;
 use nostr_sdk::prelude::*;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Semaphore;
+use tokio::task::{AbortHandle, JoinHandle};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use lnrent_wire::{
     build_listing, gift_unwrap, gift_wrap, Listing, Msg, OperationDecl, ParamDecl, Unwrapped,
@@ -172,6 +177,18 @@ pub struct NostrEngine {
     /// Short-circuits recently re-fetched non-routable wraps when a reconnect/lag backfill sees the
     /// relay's retained set again. Bounded + ephemeral, so it never durably suppresses a wrap.
     negative_cache: Arc<Mutex<NegativeCache>>,
+    /// Engine-owned ownership/drain state for inbound tasks accepted by the live subscription and
+    /// retained-set helpers.
+    inbound_tasks: Arc<InboundTaskState>,
+}
+
+/// Result of a bounded inbound shutdown drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundDrainResult {
+    /// The inbound loop stopped accepting and all accepted per-wrap tasks finished.
+    Drained,
+    /// The deadline expired; straggler inbound work was aborted so process exit cannot hang.
+    TimedOut,
 }
 
 impl NostrEngine {
@@ -200,6 +217,7 @@ impl NostrEngine {
             in_flight: Arc::new(Mutex::new(HashSet::new())),
             inbound_sem: Arc::new(Semaphore::new(MAX_INBOUND_CONCURRENCY)),
             negative_cache: Arc::new(Mutex::new(NegativeCache::default())),
+            inbound_tasks: Arc::new(InboundTaskState::new()),
         })
     }
 
@@ -244,6 +262,9 @@ impl NostrEngine {
         order: Arc<dyn OrderHandler>,
         op: Arc<dyn OpHandler>,
     ) -> Result<()> {
+        if self.inbound_tasks.is_stopping() {
+            return Ok(());
+        }
         let mut notifications = self.client.notifications();
         let closed_resubscriptions: ClosedResubscriptions = Arc::new(Mutex::new(HashMap::new()));
         // Retry the initial subscribe: a transient relay hiccup right after `connect` must not
@@ -252,6 +273,9 @@ impl NostrEngine {
         // resubscribe below is only logged because by then the loop is already running and the next
         // lag (or relay reconnect) re-triggers it.
         self.subscribe_inbound_with_retry().await?;
+        if self.inbound_tasks.is_stopping() {
+            return Ok(());
+        }
         // A live subscription replay can be clamped by the relay's default limit because the
         // long-lived REQ intentionally carries no limit, so run the explicit paged retained-set
         // fetch on startup too. SPAWN it rather than await it: the paged backfill can walk up to
@@ -264,7 +288,7 @@ impl NostrEngine {
             let engine = self.clone();
             let order = Arc::clone(&order);
             let op = Arc::clone(&op);
-            tokio::spawn(async move {
+            self.spawn_inbound_aux(async move {
                 if let Err(e) = engine.fetch_inbound_backlog(order, op).await {
                     tracing::error!(
                         error = %e,
@@ -274,7 +298,12 @@ impl NostrEngine {
             });
         }
         loop {
-            match notifications.recv().await {
+            let notification = tokio::select! {
+                biased;
+                _ = self.inbound_tasks.stop.cancelled() => break,
+                notification = notifications.recv() => notification,
+            };
+            match notification {
                 Ok(RelayPoolNotification::Message { relay_url, message }) => match message {
                     // The raw relay EVENT for our REQ — the source we route off (fires for every
                     // relay copy, including saved duplicates, unlike `Event` below). The guard drops
@@ -321,10 +350,17 @@ impl NostrEngine {
                             let closed_resubscriptions = Arc::clone(&closed_resubscriptions);
                             let order = Arc::clone(&order);
                             let op = Arc::clone(&op);
-                            tokio::spawn(async move {
+                            self.spawn_inbound_aux(async move {
                                 let mut backoff = backoff;
                                 loop {
-                                    tokio::time::sleep(backoff).await;
+                                    tokio::select! {
+                                        biased;
+                                        _ = engine.inbound_tasks.stop.cancelled() => break,
+                                        _ = tokio::time::sleep(backoff) => {}
+                                    }
+                                    if engine.inbound_tasks.is_stopping() {
+                                        break;
+                                    }
                                     let recovered = match engine
                                         .subscribe_inbound_to_with_retry(relay_url.clone())
                                         .await
@@ -416,9 +452,12 @@ impl NostrEngine {
                     let engine = self.clone();
                     let order = Arc::clone(&order);
                     let op = Arc::clone(&op);
-                    tokio::spawn(async move {
+                    self.spawn_inbound_aux(async move {
                         if let Err(e) = engine.fetch_inbound_backlog(order, op).await {
                             tracing::error!(error = %e, "failed to fetch inbound backlog after lag");
+                        }
+                        if engine.inbound_tasks.is_stopping() {
+                            return;
                         }
                         if let Err(e) = engine.subscribe_inbound_with_retry().await {
                             tracing::error!(error = %e, "failed to resubscribe after inbound lag");
@@ -428,6 +467,114 @@ impl NostrEngine {
             }
         }
         Ok(())
+    }
+
+    /// Stop the inbound receive loop, wait for its accepted event handoffs to be registered in the
+    /// engine-owned tracker, then drain accepted per-wrap work within `deadline`.
+    ///
+    /// The caller must pass the supervisor-owned `run_inbound` join handle. Awaiting that handle is the
+    /// proof that the live recv loop has stopped accepting and no accepted live wrap remains between
+    /// relay notification and tracker registration.
+    pub async fn drain(
+        &self,
+        deadline: Duration,
+        inbound: &mut JoinHandle<Result<()>>,
+    ) -> InboundDrainResult {
+        let deadline_at = Instant::now() + deadline;
+        self.start_inbound_drain_until(deadline_at).await;
+
+        match tokio::time::timeout_at(deadline_at, &mut *inbound).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => tracing::warn!(
+                error = %format!("{e:#}"),
+                "inbound loop returned an error during shutdown drain"
+            ),
+            Ok(Err(join)) if join.is_panic() => {
+                tracing::error!("inbound loop panicked during shutdown drain")
+            }
+            Ok(Err(join)) => tracing::warn!(
+                error = %join,
+                "inbound loop was cancelled during shutdown drain"
+            ),
+            Err(_) => {
+                inbound.abort();
+                // Wait for the aborted accept loop to actually stop BEFORE snapshotting the per-wrap
+                // handles: abort() is cooperative, so run_inbound can still finish a synchronous
+                // spawn_inbound_wrap (past the semaphore acquire) after the deadline. Joining it first
+                // guarantees that last-spawned handler is registered in the tracker and included in the
+                // abort snapshot below, not left detached past the final flush.
+                let _ = (&mut *inbound).await;
+                let handlers = self.inbound_tasks.abort_per_wrap();
+                self.inbound_tasks.close_per_wrap();
+                tracing::error!(
+                    handlers,
+                    "inbound drain timed out waiting for the accept loop; aborting accepted handlers"
+                );
+                return InboundDrainResult::TimedOut;
+            }
+        }
+
+        self.drain_per_wrap_until(deadline_at).await
+    }
+
+    /// Drain accepted per-wrap work after the inbound loop has already returned. This is used only
+    /// by the supervisor's shutdown race path where the child completed before the shutdown arm won.
+    pub(crate) async fn drain_after_inbound_stopped(
+        &self,
+        deadline: Duration,
+    ) -> InboundDrainResult {
+        let deadline_at = Instant::now() + deadline;
+        self.start_inbound_drain_until(deadline_at).await;
+        self.drain_per_wrap_until(deadline_at).await
+    }
+
+    async fn start_inbound_drain_until(&self, deadline_at: Instant) {
+        self.inbound_tasks.stop_accepting();
+
+        let aux = self.inbound_tasks.abort_aux();
+        if aux > 0 {
+            tracing::debug!(
+                tasks = aux,
+                "aborted auxiliary inbound backlog/resubscribe tasks"
+            );
+        }
+        self.inbound_tasks.close_aux();
+        if tokio::time::timeout_at(deadline_at, self.inbound_tasks.wait_aux())
+            .await
+            .is_err()
+        {
+            tracing::warn!("inbound auxiliary tasks did not stop within the drain deadline");
+        }
+    }
+
+    async fn drain_per_wrap_until(&self, deadline_at: Instant) -> InboundDrainResult {
+        self.inbound_tasks.close_per_wrap();
+        match tokio::time::timeout_at(deadline_at, self.inbound_tasks.wait_per_wrap()).await {
+            Ok(()) => InboundDrainResult::Drained,
+            Err(_) => {
+                let handlers = self.inbound_tasks.abort_per_wrap();
+                tracing::error!(
+                    handlers,
+                    "inbound drain deadline expired; aborting straggler handlers"
+                );
+                InboundDrainResult::TimedOut
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn inbound_aux_task_count_for_test(&self) -> usize {
+        self.inbound_tasks.aux_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn queue_inbound_event_for_test(
+        &self,
+        event: Event,
+        order: Arc<dyn OrderHandler>,
+        op: Arc<dyn OpHandler>,
+    ) -> Result<()> {
+        self.queue_inbound_event(event, order, op).await
     }
 
     /// Decode, dedupe, and route a single inbound gift wrap — the unit [`run_inbound`] runs per
@@ -606,7 +753,7 @@ impl NostrEngine {
             .await
             .context("inbound semaphore closed")?;
         let engine = self.clone();
-        tokio::spawn(async move {
+        self.spawn_inbound_wrap(async move {
             // Hold the permit for the task's lifetime so the slot frees only when this wrap is
             // fully processed.
             let _permit = permit;
@@ -621,11 +768,32 @@ impl NostrEngine {
         Ok(())
     }
 
+    fn spawn_inbound_wrap<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let handle = self.inbound_tasks.per_wrap.spawn(task);
+        self.inbound_tasks
+            .track_per_wrap_abort(handle.abort_handle());
+        drop(handle);
+    }
+
+    fn spawn_inbound_aux<F>(&self, task: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.inbound_tasks.spawn_aux(task)
+    }
+
     async fn fetch_inbound_backlog(
         &self,
         order: Arc<dyn OrderHandler>,
         op: Arc<dyn OpHandler>,
     ) -> Result<()> {
+        if self.inbound_tasks.is_stopping() {
+            return Ok(());
+        }
         let relays = self.client.relays().await;
         if relays.is_empty() {
             bail!("streaming retained inbound DMs: no relays configured");
@@ -633,11 +801,14 @@ impl NostrEngine {
 
         let mut tasks = Vec::with_capacity(relays.len());
         for (relay_url, relay) in relays {
+            if self.inbound_tasks.is_stopping() {
+                break;
+            }
             let engine = self.clone();
             let order = Arc::clone(&order);
             let op = Arc::clone(&op);
             let filter = self.inbound_filter();
-            tasks.push(tokio::spawn(async move {
+            tasks.push(self.spawn_inbound_aux(async move {
                 engine
                     .fetch_inbound_backlog_from_relay(relay_url, relay, filter, order, op)
                     .await
@@ -669,6 +840,9 @@ impl NostrEngine {
         order: Arc<dyn OrderHandler>,
         op: Arc<dyn OpHandler>,
     ) -> Result<usize> {
+        if self.inbound_tasks.is_stopping() {
+            return Ok(0);
+        }
         let mut relays = self.client.relays().await;
         let relay = relays.remove(&relay_url).with_context(|| {
             format!("streaming retained inbound DMs from {relay_url}: relay not configured")
@@ -715,18 +889,28 @@ impl NostrEngine {
         let mut observed_page_limit = 0usize;
         let mut count = 0usize;
         for page in 0..INBOUND_BACKFILL_MAX_PAGES {
+            if self.inbound_tasks.is_stopping() {
+                return Ok(count);
+            }
             let mut filter = base_filter.clone().limit(INBOUND_BACKFILL_PAGE_LIMIT);
             if let Some(until) = until {
                 filter = filter.until(until);
             }
-            let mut events = relay
-                .stream_events(filter, INBOUND_BACKFILL_TIMEOUT, ReqExitPolicy::ExitOnEOSE)
-                .await
-                .with_context(|| format!("streaming retained inbound DMs from {relay_url}"))?;
+            let mut events = tokio::select! {
+                biased;
+                _ = self.inbound_tasks.stop.cancelled() => return Ok(count),
+                events = relay.stream_events(filter, INBOUND_BACKFILL_TIMEOUT, ReqExitPolicy::ExitOnEOSE) => {
+                    events.with_context(|| format!("streaming retained inbound DMs from {relay_url}"))?
+                }
+            };
 
             let mut page_items = 0usize;
             let mut oldest: Option<Timestamp> = None;
-            while let Some(event) = events.next().await {
+            while let Some(event) = tokio::select! {
+                biased;
+                _ = self.inbound_tasks.stop.cancelled() => return Ok(count),
+                event = events.next() => event,
+            } {
                 page_items += 1;
                 match event {
                     Ok(event) => {
@@ -835,6 +1019,9 @@ impl NostrEngine {
         order: Arc<dyn OrderHandler>,
         op: Arc<dyn OpHandler>,
     ) -> Result<usize> {
+        if self.inbound_tasks.is_stopping() {
+            return Ok(0);
+        }
         // Use negentropy only as an ID reconciliation step. Letting the SDK perform the "down"
         // fetch internally makes the backfill depend on that helper's subscription bookkeeping; by
         // running it as a dry run and doing our own exact-id fetches below, the transport keeps the
@@ -851,12 +1038,15 @@ impl NostrEngine {
             .direction(SyncDirection::Down)
             .dry_run();
         let id_filter = filter.clone();
-        let reconciliation = relay
-            .sync_with_items(filter, local_items.to_vec(), &opts)
-            .await
-            .with_context(|| {
-                format!("negentropy reconciling retained inbound DMs from {relay_url}")
-            })?;
+        let reconciliation = tokio::select! {
+            biased;
+            _ = self.inbound_tasks.stop.cancelled() => return Ok(0),
+            reconciliation = relay.sync_with_items(filter, local_items.to_vec(), &opts) => {
+                reconciliation.with_context(|| {
+                    format!("negentropy reconciling retained inbound DMs from {relay_url}")
+                })?
+            }
+        };
 
         if reconciliation.remote.is_empty() {
             return Ok(0);
@@ -869,17 +1059,27 @@ impl NostrEngine {
         let mut count = 0usize;
         let ids: Vec<EventId> = reconciliation.remote.into_iter().collect();
         for chunk in ids.chunks(INBOUND_BACKFILL_ID_CHUNK_LIMIT) {
-            let mut events = relay
-                .stream_events(
+            if self.inbound_tasks.is_stopping() {
+                return Ok(count);
+            }
+            let mut events = tokio::select! {
+                biased;
+                _ = self.inbound_tasks.stop.cancelled() => return Ok(count),
+                events = relay.stream_events(
                     id_filter.clone().ids(chunk.iter().copied()),
                     INBOUND_BACKFILL_TIMEOUT,
                     ReqExitPolicy::ExitOnEOSE,
-                )
-                .await
-                .with_context(|| {
-                    format!("fetching exact retained inbound DM ids from {relay_url}")
-                })?;
-            while let Some(event) = events.next().await {
+                ) => {
+                    events.with_context(|| {
+                        format!("fetching exact retained inbound DM ids from {relay_url}")
+                    })?
+                }
+            };
+            while let Some(event) = tokio::select! {
+                biased;
+                _ = self.inbound_tasks.stop.cancelled() => return Ok(count),
+                event = events.next() => event,
+            } {
                 match event {
                     Ok(event) => {
                         if seen_ids.insert(event.id) {
@@ -1196,6 +1396,102 @@ impl Outbound for NostrEngine {
     }
 }
 
+struct InboundTaskState {
+    stop: CancellationToken,
+    per_wrap: TaskTracker,
+    aux: TaskTracker,
+    per_wrap_aborts: Mutex<Vec<AbortHandle>>,
+    aux_aborts: Mutex<Vec<AbortHandle>>,
+}
+
+impl InboundTaskState {
+    fn new() -> Self {
+        Self {
+            stop: CancellationToken::new(),
+            per_wrap: TaskTracker::new(),
+            aux: TaskTracker::new(),
+            per_wrap_aborts: Mutex::new(Vec::new()),
+            aux_aborts: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stop.is_cancelled()
+    }
+
+    fn stop_accepting(&self) {
+        self.stop.cancel();
+    }
+
+    fn close_per_wrap(&self) {
+        self.per_wrap.close();
+    }
+
+    async fn wait_per_wrap(&self) {
+        self.per_wrap.wait().await;
+    }
+
+    fn close_aux(&self) {
+        self.aux.close();
+    }
+
+    async fn wait_aux(&self) {
+        self.aux.wait().await;
+    }
+
+    fn track_per_wrap_abort(&self, abort: AbortHandle) {
+        track_abort(&self.per_wrap_aborts, abort);
+    }
+
+    fn spawn_aux<F>(&self, task: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let handle = self.aux.spawn(task);
+        track_abort(&self.aux_aborts, handle.abort_handle());
+        handle
+    }
+
+    fn abort_aux(&self) -> usize {
+        abort_tracked(&self.aux_aborts)
+    }
+
+    fn abort_per_wrap(&self) -> usize {
+        abort_tracked(&self.per_wrap_aborts)
+    }
+
+    #[cfg(test)]
+    fn aux_count(&self) -> usize {
+        live_abort_count(&self.aux_aborts)
+    }
+}
+
+fn track_abort(handles: &Mutex<Vec<AbortHandle>>, abort: AbortHandle) {
+    let mut handles = handles.lock().expect("inbound abort list mutex poisoned");
+    handles.retain(|handle| !handle.is_finished());
+    handles.push(abort);
+}
+
+fn abort_tracked(handles: &Mutex<Vec<AbortHandle>>) -> usize {
+    let mut handles = handles.lock().expect("inbound abort list mutex poisoned");
+    let live = handles
+        .iter()
+        .filter(|handle| !handle.is_finished())
+        .count();
+    for handle in handles.drain(..) {
+        handle.abort();
+    }
+    live
+}
+
+#[cfg(test)]
+fn live_abort_count(handles: &Mutex<Vec<AbortHandle>>) -> usize {
+    let mut handles = handles.lock().expect("inbound abort list mutex poisoned");
+    handles.retain(|handle| !handle.is_finished());
+    handles.len()
+}
+
 fn verify_inbound_wrap(wrap: &Event) -> Result<()> {
     if wrap.kind != Kind::GiftWrap {
         bail!("inbound event {} is not a gift wrap", wrap.id);
@@ -1477,6 +1773,54 @@ mod tests {
         }
     }
 
+    struct GateOrderHandler {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl OrderHandler for GateOrderHandler {
+        async fn handle(&self, _sender: PublicKey, _msg: Msg, _out: &dyn Outbound) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one(); // sticky: retains a permit so the test's notified() can't miss the start signal
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct NeverOrderHandler {
+        started: Arc<tokio::sync::Notify>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl OrderHandler for NeverOrderHandler {
+        async fn handle(&self, _sender: PublicKey, _msg: Msg, _out: &dyn Outbound) -> Result<()> {
+            let _drop = DropCounter(Arc::clone(&self.dropped));
+            self.started.notify_one(); // sticky: retains a permit so the test's notified() can't miss the start signal
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    fn order_request(id: &str, op_key: PublicKey) -> Msg {
+        Msg::OrderRequest(lnrent_wire::OrderRequest {
+            id: id.into(),
+            listing_id: format!("30402:{}:dummy-1", op_key.to_hex()),
+            params: serde_json::json!({}),
+            refund_dest: None,
+        })
+    }
+
     #[test]
     fn all_failed_relay_output_is_an_error() {
         let output = Output::<()>::default();
@@ -1599,6 +1943,293 @@ mod tests {
         assert!(
             !engine.is_negative_cached(wrap.id),
             "wrong-#p relay events are dropped before decrypt/negative-cache work"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_slow_inbound_handler_to_finish_and_mark_seen() {
+        let _relay_test = RELAY_TEST.lock().await;
+        let relay = mock_relay().await;
+        let url = relay.url().await.to_string();
+
+        let op_keys = Keys::generate();
+        let buyer_keys = Keys::generate();
+        let store = Store::open_spawn(":memory:").expect("open in-memory store");
+        let engine = NostrEngine::connect(op_keys.clone(), std::slice::from_ref(&url), store)
+            .await
+            .expect("operator engine connects");
+        let wrap = gift_wrap(
+            &buyer_keys,
+            &op_keys.public_key(),
+            &order_request("drain-slow", op_keys.public_key()),
+        )
+        .await
+        .expect("gift-wrap order.request");
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let order_handler: Arc<dyn OrderHandler> = Arc::new(GateOrderHandler {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            calls: Arc::clone(&calls),
+        });
+        let op_handler: Arc<dyn OpHandler> = Arc::new(NoopOpHandler);
+
+        engine
+            .queue_inbound_event(wrap.clone(), order_handler, op_handler)
+            .await
+            .expect("queue inbound wrap");
+        timeout(TEST_DEADLINE, started.notified())
+            .await
+            .expect("handler started before drain");
+
+        let drain_engine = engine.clone();
+        let drain = tokio::spawn(async move {
+            let mut inbound = tokio::spawn(async { Ok(()) });
+            drain_engine
+                .drain(Duration::from_secs(2), &mut inbound)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !drain.is_finished(),
+            "drain waits while the accepted handler is still running"
+        );
+
+        release.notify_waiters();
+        let result = timeout(TEST_DEADLINE, drain)
+            .await
+            .expect("drain returned")
+            .expect("drain task joined");
+        assert_eq!(result, InboundDrainResult::Drained);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            engine.is_seen(wrap.id).await.expect("seen check"),
+            "seen_message is written only after the handler returns and drain completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_deadline_aborts_stuck_inbound_handler_without_marking_seen() {
+        let _relay_test = RELAY_TEST.lock().await;
+        let relay = mock_relay().await;
+        let url = relay.url().await.to_string();
+
+        let op_keys = Keys::generate();
+        let buyer_keys = Keys::generate();
+        let store = Store::open_spawn(":memory:").expect("open in-memory store");
+        let engine = NostrEngine::connect(op_keys.clone(), std::slice::from_ref(&url), store)
+            .await
+            .expect("operator engine connects");
+        let wrap = gift_wrap(
+            &buyer_keys,
+            &op_keys.public_key(),
+            &order_request("drain-stuck", op_keys.public_key()),
+        )
+        .await
+        .expect("gift-wrap order.request");
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let order_handler: Arc<dyn OrderHandler> = Arc::new(NeverOrderHandler {
+            started: Arc::clone(&started),
+            dropped: Arc::clone(&dropped),
+        });
+        let op_handler: Arc<dyn OpHandler> = Arc::new(NoopOpHandler);
+
+        engine
+            .queue_inbound_event(wrap.clone(), order_handler, op_handler)
+            .await
+            .expect("queue inbound wrap");
+        timeout(TEST_DEADLINE, started.notified())
+            .await
+            .expect("handler started before drain");
+
+        let mut inbound = tokio::spawn(async { Ok(()) });
+        let result = timeout(
+            Duration::from_secs(1),
+            engine.drain(Duration::from_millis(50), &mut inbound),
+        )
+        .await
+        .expect("bounded drain returned");
+        assert_eq!(result, InboundDrainResult::TimedOut);
+
+        timeout(TEST_DEADLINE, async {
+            while dropped.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stuck handler task was aborted");
+        assert!(
+            !engine.is_seen(wrap.id).await.expect("seen check"),
+            "timed-out abort must not write seen_message before handler success"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_inbound_accepts_no_work_after_drain_starts() {
+        let _relay_test = RELAY_TEST.lock().await;
+        let relay = mock_relay().await;
+        let url = relay.url().await.to_string();
+
+        let op_keys = Keys::generate();
+        let store = Store::open_spawn(":memory:").expect("open in-memory store");
+        let engine = NostrEngine::connect(op_keys, std::slice::from_ref(&url), store)
+            .await
+            .expect("operator engine connects");
+        let mut inbound = tokio::spawn(async { Ok(()) });
+        assert_eq!(
+            engine.drain(Duration::from_millis(100), &mut inbound).await,
+            InboundDrainResult::Drained
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let order_handler: Arc<dyn OrderHandler> = Arc::new(CountingOrderHandler {
+            calls: Arc::clone(&calls),
+        });
+        let op_handler: Arc<dyn OpHandler> = Arc::new(NoopOpHandler);
+        timeout(
+            Duration::from_millis(200),
+            engine.run_inbound(order_handler, op_handler),
+        )
+        .await
+        .expect("run_inbound returns immediately after drain")
+        .expect("run_inbound exits cleanly after drain");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_aborts_auxiliary_inbound_tasks() {
+        let _relay_test = RELAY_TEST.lock().await;
+        let relay = mock_relay().await;
+        let url = relay.url().await.to_string();
+
+        let op_keys = Keys::generate();
+        let store = Store::open_spawn(":memory:").expect("open in-memory store");
+        let engine = NostrEngine::connect(op_keys, std::slice::from_ref(&url), store)
+            .await
+            .expect("operator engine connects");
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped_for_task = Arc::clone(&dropped);
+        let started_for_task = Arc::clone(&started);
+        let aux = engine.spawn_inbound_aux(async move {
+            let _drop = DropCounter(dropped_for_task);
+            started_for_task.notify_one(); // sticky: don't lose the start signal if the test isn't awaiting yet
+            std::future::pending::<()>().await;
+        });
+        timeout(TEST_DEADLINE, started.notified())
+            .await
+            .expect("aux task started");
+        assert_eq!(engine.inbound_aux_task_count_for_test(), 1);
+
+        let mut inbound = tokio::spawn(async { Ok(()) });
+        assert_eq!(
+            engine.drain(Duration::from_millis(100), &mut inbound).await,
+            InboundDrainResult::Drained
+        );
+        assert_eq!(engine.inbound_aux_task_count_for_test(), 0);
+        assert!(aux.await.expect_err("aux task is aborted").is_cancelled());
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn queue_inbound_event_backpressures_before_spawning_extra_task() {
+        let _relay_test = RELAY_TEST.lock().await;
+        let relay = mock_relay().await;
+        let url = relay.url().await.to_string();
+
+        let op_keys = Keys::generate();
+        let buyer_keys = Keys::generate();
+        let store = Store::open_spawn(":memory:").expect("open in-memory store");
+        let engine = NostrEngine::connect(op_keys.clone(), std::slice::from_ref(&url), store)
+            .await
+            .expect("operator engine connects");
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let order_handler: Arc<dyn OrderHandler> = Arc::new(GateOrderHandler {
+            started,
+            release: Arc::clone(&release),
+            calls: Arc::clone(&calls),
+        });
+        let op_handler: Arc<dyn OpHandler> = Arc::new(NoopOpHandler);
+
+        for i in 0..MAX_INBOUND_CONCURRENCY {
+            let wrap = gift_wrap(
+                &buyer_keys,
+                &op_keys.public_key(),
+                &order_request(&format!("backpressure-{i}"), op_keys.public_key()),
+            )
+            .await
+            .expect("gift-wrap order.request");
+            engine
+                .queue_inbound_event(wrap, Arc::clone(&order_handler), Arc::clone(&op_handler))
+                .await
+                .expect("queue inbound wrap");
+        }
+
+        timeout(TEST_DEADLINE, async {
+            while calls.load(Ordering::SeqCst) != MAX_INBOUND_CONCURRENCY {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("all concurrency slots are occupied");
+
+        let extra = gift_wrap(
+            &buyer_keys,
+            &op_keys.public_key(),
+            &order_request("backpressure-extra", op_keys.public_key()),
+        )
+        .await
+        .expect("gift-wrap extra order.request");
+        let queue = {
+            let engine = engine.clone();
+            let order_handler = Arc::clone(&order_handler);
+            let op_handler = Arc::clone(&op_handler);
+            tokio::spawn(async move {
+                engine
+                    .queue_inbound_event(extra, order_handler, op_handler)
+                    .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !queue.is_finished(),
+            "the extra wrap waits for a permit instead of spawning an unbounded pending task"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            MAX_INBOUND_CONCURRENCY,
+            "no extra handler starts until a concurrency slot frees"
+        );
+
+        release.notify_waiters();
+        timeout(TEST_DEADLINE, queue)
+            .await
+            .expect("extra queue call returned after a slot freed")
+            .expect("queue task joined")
+            .expect("extra wrap queued");
+        timeout(TEST_DEADLINE, async {
+            while calls.load(Ordering::SeqCst) != MAX_INBOUND_CONCURRENCY + 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("extra handler started after a slot freed");
+
+        release.notify_waiters();
+        assert_eq!(
+            engine
+                .drain_after_inbound_stopped(Duration::from_secs(2))
+                .await,
+            InboundDrainResult::Drained
         );
     }
 
