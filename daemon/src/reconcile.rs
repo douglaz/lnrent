@@ -16,7 +16,8 @@
 //! `daemon_state`; on restart [`Reconciler::apply_restart_downtime_credit`] reads the gap since that
 //! heartbeat and, for every ACTIVE sub whose `soft_date`/`paid_through` fell inside the outage, raises
 //! a NULLABLE `suspend_not_before` FLOOR so the buyer still gets their full `renew_lead` window of
-//! availability before suspension. `paid_through` is NEVER moved (it anchors prepaid money AND the
+//! availability before suspension, and a SUSPENDED sub still gets its remaining retention window before
+//! destroy. `paid_through` is NEVER moved (it anchors prepaid money AND the
 //! `renew:auto:<sub>:<paid_through>` invoice key); the floor self-expires once a later renewal pushes
 //! `paid_through` past it. The credit path NEVER mints invoices — a missed soft reminder fires via the
 //! existing soft-date transition on the boot catch-up tick. The ACTIVE suspend transition then gates
@@ -113,6 +114,16 @@ struct CreditCandidate {
     paid_through: Option<i64>,
     suspend_not_before: Option<i64>,
     next_deadline: Option<i64>,
+}
+
+/// A SUSPENDED subscription read while applying restart downtime credit (§6.5): its effective
+/// retention start and destroy cursor can be raised without touching paid_through.
+struct SuspendedCreditCandidate {
+    id: String,
+    paid_through: i64,
+    retention_s: i64,
+    suspend_not_before: Option<i64>,
+    next_deadline: i64,
 }
 
 /// Recorded instance facts passed to `suspend`/`destroy` hooks when the subscription has already
@@ -264,8 +275,10 @@ impl Reconciler {
     /// is none (first boot) just establish it and credit nothing. Otherwise, for every ACTIVE sub
     /// whose `soft_date` or `paid_through` fell inside the outage window `[last, now]`, raise a
     /// `suspend_not_before` FLOOR so the buyer still gets their full `renew_lead` window of operator
-    /// availability before suspension. `paid_through` is NEVER moved and NO invoice is ever minted here
-    /// — a missed soft reminder fires via the normal soft-date transition on the boot catch-up tick.
+    /// availability before suspension. It also raises that same floor for SUSPENDED subs whose retention
+    /// window was still open when the outage began, so their destroy cursor gives back the remaining
+    /// retention from restart. `paid_through` is NEVER moved and NO invoice is ever minted here — a
+    /// missed soft reminder fires via the normal soft-date transition on the boot catch-up tick.
     ///
     /// For each credited sub: `lead = max(renew_lead_s, 0)`; `soft = soft_date ?? paid_through - lead`;
     /// `pre_available = clamp(last - soft, 0, lead)` is how much lead the buyer already saw before the
@@ -273,8 +286,17 @@ impl Reconciler {
     /// `new_floor = max(suspend_not_before ?? paid_through, paid_through, target)` (so the floor never
     /// regresses and never precedes the prepaid window). The cursor moves to `new_floor` UNLESS the sub
     /// is still pre-reminder (`next_deadline < paid_through`), in which case it is LEFT so the missed
-    /// soft reminder still fires on restart. Each UPDATE preserves the reconcile CAS shape. Returns the
-    /// number of subs credited.
+    /// soft reminder still fires on restart.
+    ///
+    /// For a SUSPENDED sub (lnrent-d6n) the credit gives back lost RETENTION instead of `renew_lead`,
+    /// via the same floor. With `E_old = max(paid_through, suspend_not_before)` and destroy deadline
+    /// `B_old = E_old + retention_s`, credit ONLY when `B_old > last` (retention still open at the
+    /// outage start — otherwise it already lapsed and destroys normally, the anti-resurrection gate):
+    /// `remaining = clamp(B_old - last, 0, retention_s)` is the un-consumed retention; `target_B =
+    /// now + remaining` gives it back from restart; `new_B = max(target_B, B_old)` (monotonic) and the
+    /// floor rises to `new_B - retention_s`. A SUSPENDED credit ALWAYS moves the cursor
+    /// (`next_deadline = new_B`); the pre-reminder LEFT rule above is ACTIVE-only. Each UPDATE
+    /// preserves the reconcile CAS shape. Returns the number of subs credited.
     pub async fn apply_restart_downtime_credit(&self, now: i64) -> Result<usize> {
         self.store
             .transaction(move |tx| {
@@ -372,6 +394,55 @@ impl Reconciler {
                             SET suspend_not_before=?2, next_deadline=?3, updated_at=?4
                           WHERE id=?1 AND state='ACTIVE' AND next_deadline=?5",
                         params![c.id, new_floor, new_cursor, now, nd],
+                    )?;
+                    if n == 1 {
+                        journal(tx, &c.id, "downtime_credit", now)?;
+                        credited += 1;
+                    }
+                }
+
+                let suspended_candidates = {
+                    let mut stmt = tx.prepare(
+                        "SELECT id, paid_through, retention_s, suspend_not_before, next_deadline
+                           FROM subscription
+                          WHERE state='SUSPENDED'
+                            AND paid_through IS NOT NULL
+                            AND retention_s IS NOT NULL
+                            AND next_deadline IS NOT NULL
+                            AND MAX(paid_through, COALESCE(suspend_not_before, paid_through)) <= ?2
+                            AND MAX(paid_through, COALESCE(suspend_not_before, paid_through)) + retention_s > ?1",
+                    )?;
+                    let rows = stmt
+                        .query_map(params![last, now], |r| {
+                            Ok(SuspendedCreditCandidate {
+                                id: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                                paid_through: r.get(1)?,
+                                retention_s: r.get(2)?,
+                                suspend_not_before: r.get(3)?,
+                                next_deadline: r.get(4)?,
+                            })
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    rows
+                };
+
+                for c in suspended_candidates {
+                    let e_old = c
+                        .paid_through
+                        .max(c.suspend_not_before.unwrap_or(c.paid_through));
+                    let b_old = e_old + c.retention_s;
+                    let remaining = (b_old - last).clamp(0, c.retention_s);
+                    let target_b = now + remaining;
+                    let new_floor = e_old.max(c.paid_through).max(target_b - c.retention_s);
+                    let new_b = c.paid_through.max(new_floor) + c.retention_s;
+                    if new_b <= c.next_deadline {
+                        continue;
+                    }
+                    let n = tx.execute(
+                        "UPDATE subscription
+                            SET suspend_not_before=?2, next_deadline=?3, updated_at=?4
+                          WHERE id=?1 AND state='SUSPENDED' AND next_deadline=?5",
+                        params![c.id, new_floor, new_b, now, c.next_deadline],
                     )?;
                     if n == 1 {
                         journal(tx, &c.id, "downtime_credit", now)?;
@@ -1097,6 +1168,15 @@ mod tests {
 
     fn reconciler(store: Store, recipe: Recipe) -> Reconciler {
         Reconciler::new(store, Arc::new(crate::backends::MockPayment::new()), recipe)
+    }
+
+    fn settlement(external_id: &str, settled_at: i64) -> crate::backends::Settlement {
+        crate::backends::Settlement {
+            invoice_id: format!("inv-{external_id}"),
+            external_id: external_id.to_string(),
+            amount_sat: 100,
+            settled_at,
+        }
     }
 
     // ---- seed helpers -------------------------------------------------------
@@ -2210,5 +2290,243 @@ mod tests {
         );
         // The heartbeat still advances to the restart time (consumed exactly once).
         assert_eq!(heartbeat(&store).await, Some(900));
+    }
+
+    #[tokio::test]
+    async fn suspended_retention_overlap_extends_destroy_boundary_not_destroyed_on_boot() {
+        let store = mem_store();
+        // SUSPENDED in retention: E=paid_through=1000, B=1500. Outage [1200,1600] consumes 300s of
+        // retention, so the credited destroy boundary is restart + remaining = 1600+300 = 1900.
+        seed_sub(
+            &store,
+            "s1",
+            "SUSPENDED",
+            "buyer",
+            Some(1000),
+            500,
+            Some(1500),
+        )
+        .await;
+        set_heartbeat(&store, 1200).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        assert_eq!(r.apply_restart_downtime_credit(1600).await.unwrap(), 1);
+        assert_eq!(sub_suspend_not_before(&store, "s1").await, Some(1400));
+        assert_eq!(sub_next_deadline(&store, "s1").await, Some(1900));
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM subscription WHERE id='s1' AND paid_through=1000"
+            )
+            .await,
+            1,
+            "paid_through is never moved by SUSPENDED downtime credit"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
+            0,
+            "the credit path does not mint renewal invoices"
+        );
+
+        let rep = r.reconcile_tick(1600).await.unwrap();
+        assert_eq!(rep.terminated, 0, "boot catch-up does not destroy early");
+        assert_eq!(sub_state(&store, "s1").await, "SUSPENDED");
+    }
+
+    #[tokio::test]
+    async fn suspended_credit_skips_outage_before_retention_and_credits_partial_overlap() {
+        let store = mem_store();
+        // For s-before, outage [500,900] is wholly before E=1000 and must be a no-op.
+        seed_sub(
+            &store,
+            "s-before",
+            "SUSPENDED",
+            "buyer",
+            Some(1000),
+            500,
+            Some(1500),
+        )
+        .await;
+        // For s-partial, E=800, B=1300. The same outage overlaps retention only from 800..900, so
+        // B extends by exactly that 100s overlap to 1400.
+        seed_sub(
+            &store,
+            "s-partial",
+            "SUSPENDED",
+            "buyer",
+            Some(800),
+            500,
+            Some(1300),
+        )
+        .await;
+        set_heartbeat(&store, 500).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        assert_eq!(r.apply_restart_downtime_credit(900).await.unwrap(), 1);
+        assert_eq!(sub_suspend_not_before(&store, "s-before").await, None);
+        assert_eq!(sub_next_deadline(&store, "s-before").await, Some(1500));
+        assert_eq!(sub_suspend_not_before(&store, "s-partial").await, Some(900));
+        assert_eq!(sub_next_deadline(&store, "s-partial").await, Some(1400));
+    }
+
+    #[tokio::test]
+    async fn suspended_retention_already_ended_before_outage_is_not_credited_and_destroys() {
+        let store = mem_store();
+        // E=1000, B=1500. With last=1500, retention was already gone when the outage began, so the
+        // anti-resurrection gate skips credit and normal destroy catch-up terminates the sub.
+        seed_sub(
+            &store,
+            "s1",
+            "SUSPENDED",
+            "buyer",
+            Some(1000),
+            500,
+            Some(1500),
+        )
+        .await;
+        set_heartbeat(&store, 1500).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        assert_eq!(r.apply_restart_downtime_credit(1700).await.unwrap(), 0);
+        assert_eq!(sub_suspend_not_before(&store, "s1").await, None);
+        assert_eq!(sub_next_deadline(&store, "s1").await, Some(1500));
+
+        let rep = r.reconcile_tick(1700).await.unwrap();
+        assert_eq!(rep.terminated, 1);
+        assert_eq!(sub_state(&store, "s1").await, "TERMINATED");
+    }
+
+    #[tokio::test]
+    async fn suspended_credit_is_idempotent_and_monotonic_across_outages() {
+        let store = mem_store();
+        seed_sub(
+            &store,
+            "s1",
+            "SUSPENDED",
+            "buyer",
+            Some(1000),
+            500,
+            Some(1500),
+        )
+        .await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        set_heartbeat(&store, 1200).await;
+        assert_eq!(r.apply_restart_downtime_credit(1600).await.unwrap(), 1);
+        assert_eq!(sub_suspend_not_before(&store, "s1").await, Some(1400));
+        assert_eq!(sub_next_deadline(&store, "s1").await, Some(1900));
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM event_log WHERE subscription_id='s1' AND kind='downtime_credit'"
+            )
+            .await,
+            1
+        );
+
+        assert_eq!(
+            r.apply_restart_downtime_credit(1600).await.unwrap(),
+            0,
+            "same restart heartbeat is already consumed"
+        );
+        assert_eq!(sub_suspend_not_before(&store, "s1").await, Some(1400));
+        assert_eq!(sub_next_deadline(&store, "s1").await, Some(1900));
+
+        set_heartbeat(&store, 1650).await;
+        assert_eq!(r.apply_restart_downtime_credit(1700).await.unwrap(), 1);
+        assert_eq!(
+            sub_suspend_not_before(&store, "s1").await,
+            Some(1450),
+            "a later outage moves the floor forward, never backward"
+        );
+        assert_eq!(sub_next_deadline(&store, "s1").await, Some(1950));
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM event_log WHERE subscription_id='s1' AND kind='downtime_credit'"
+            )
+            .await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn paid_renewal_of_credited_suspended_sub_clears_floor() {
+        let store = mem_store();
+        seed_sub(
+            &store,
+            "s1",
+            "SUSPENDED",
+            "buyer",
+            Some(1000),
+            500,
+            Some(1500),
+        )
+        .await;
+        set_heartbeat(&store, 1200).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+        assert_eq!(r.apply_restart_downtime_credit(1600).await.unwrap(), 1);
+        assert_eq!(sub_suspend_not_before(&store, "s1").await, Some(1400));
+        assert_eq!(sub_next_deadline(&store, "s1").await, Some(1900));
+
+        seed_invoice(
+            &store,
+            "inv-renew-s1",
+            "s1",
+            "renew:auto:s1:1000",
+            "renewal",
+            "OPEN",
+            None,
+        )
+        .await;
+        assert_eq!(
+            crate::capture::capture(&store, settlement("renew:auto:s1:1000", 1700), 1700)
+                .await
+                .unwrap(),
+            crate::capture::Capture::Resumed
+        );
+
+        let (state, paid_through, floor): (String, i64, Option<i64>) = store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT state, paid_through, suspend_not_before FROM subscription WHERE id='s1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "RESUMING");
+        assert_eq!(paid_through, 1800);
+        assert_eq!(floor, None, "the paid renewal consumed the credit floor");
+    }
+
+    #[tokio::test]
+    async fn active_credit_regression_and_resuming_cancelled_not_credited() {
+        let store = mem_store();
+        seed_active_sub(&store, "active", "buyer", 100, 900, 1000, 500, 1000).await;
+        for (id, state) in [("resuming", "RESUMING"), ("cancelled", "CANCELLED")] {
+            seed_sub(&store, id, state, "buyer", Some(1000), 500, Some(1500)).await;
+        }
+        set_heartbeat(&store, 950).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        assert_eq!(r.apply_restart_downtime_credit(1100).await.unwrap(), 1);
+        assert_eq!(sub_suspend_not_before(&store, "active").await, Some(1150));
+        assert_eq!(sub_next_deadline(&store, "active").await, Some(1150));
+        for id in ["resuming", "cancelled"] {
+            assert_eq!(sub_suspend_not_before(&store, id).await, None);
+            assert_eq!(sub_next_deadline(&store, id).await, Some(1500));
+            assert_eq!(
+                count(
+                    &store,
+                    &format!(
+                        "SELECT count(*) FROM event_log WHERE subscription_id='{id}' AND kind='downtime_credit'"
+                    )
+                )
+                .await,
+                0
+            );
+        }
     }
 }
