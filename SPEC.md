@@ -1150,12 +1150,18 @@ CREATE TABLE reservation (            -- capacity held for a PENDING order (§9.
 CREATE TABLE daemon_state (          -- single row; heartbeat for downtime credit (§6.5)
   last_heartbeat INTEGER);
 
-CREATE TABLE refund_attempt (        -- durable refund ledger (ADR-0009, §6.6)
+CREATE TABLE refund_attempt (        -- durable refund ledger (ADR-0009, §6.6; resolver cols lnrent-ug8)
   id TEXT PRIMARY KEY, subscription_id TEXT, dest TEXT, amount_sat INTEGER,
-  idempotency_key TEXT NOT NULL UNIQUE,  -- `refund:<external_id>`; dedups the outbound pay AND the ledger row (§6.6)
+  idempotency_key TEXT NOT NULL UNIQUE,  -- GEN-BOUND pay+ledger key: gen 0 = bare `refund:<external_id>`
+                                     -- (legacy bolt11 pass-through), gen>=1 = `refund:<external_id>:g<gen>`;
+                                     -- dedups outbound pay AND the ledger row (§6.6, ug8/4gt)
   backend_payment_id TEXT,           -- from pay(), once known
   status TEXT NOT NULL,              -- PENDING (durable intent; retry pay(key) safely on restart) | SENT | FAILED
-  attempts INTEGER, created_at INTEGER, updated_at INTEGER);
+  attempts INTEGER,
+  resolved_bolt11 TEXT,              -- concrete bolt11 a LN-address/LNURL `dest` resolved to (cached; a retry re-pays the SAME invoice)
+  resolved_expiry INTEGER,           -- the resolved invoice's expiry; only a CURRENT-gen Failed+expired invoice is ever re-resolved
+  resolution_gen INTEGER NOT NULL DEFAULT 0,  -- 0 = bolt11 pass-through (no resolution); 1+ once resolved (binds each re-resolution to its own key)
+  created_at INTEGER, updated_at INTEGER);
 
 CREATE TABLE outbox (                -- pending operator->buyer NIP-17 DMs (ADR-0009)
   id TEXT PRIMARY KEY, recipient TEXT, subscription_id TEXT,
