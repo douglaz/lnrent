@@ -256,6 +256,18 @@ impl Reconciler {
         // (§6.5) measures the outage from the last time the daemon was known up.
         self.write_heartbeat(now).await?;
 
+        // Idempotency-cache GC runs AFTER the heartbeat and is BEST-EFFORT: a sweep DB error must not
+        // skip the liveness stamp or fail the reconcile tick (it is a housekeeping chore, not a
+        // correctness gate).
+        match self.store.prune_idempotency_caches(now).await {
+            Ok(pruned) => tracing::debug!(
+                op_invocation = pruned.op_invocation,
+                inbound_request = pruned.inbound_request,
+                "reconcile: idempotency cache sweep"
+            ),
+            Err(e) => tracing::warn!(error = %e, "reconcile: idempotency cache sweep failed (non-fatal)"),
+        }
+
         Ok(report)
     }
 

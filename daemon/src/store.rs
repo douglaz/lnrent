@@ -14,6 +14,26 @@ use tokio::sync::{mpsc, oneshot};
 const SETTLE_REFUND_KINDS_SQL: &str = "'settle_unmatched_refund', 'settle_terminal_refund',
                                          'settle_orphan_refund', 'settle_expired_refund'";
 
+/// How long durable business idempotency rows are retained. Deliberately LONGER than the transport
+/// dedupe window (`SEEN_MESSAGE_RETENTION_SECS`, 90d) so the cached response/result OUTLIVES the
+/// `seen_message` suppressor: a late duplicate order/op DM redelivered just past the dedupe window
+/// still hits the cached response instead of re-executing (a second reservation/invoice or a re-run
+/// management hook). The margin is the backstop the two-window design relies on.
+pub const IDEMPOTENCY_CACHE_RETENTION_SECS: i64 = 120 * 24 * 60 * 60;
+
+/// Rows removed by one durable idempotency cache sweep.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IdempotencyPruneReport {
+    pub op_invocation: usize,
+    pub inbound_request: usize,
+}
+
+impl IdempotencyPruneReport {
+    pub fn total(self) -> usize {
+        self.op_invocation + self.inbound_request
+    }
+}
+
 /// A value-received/not-delivered row for the supervisor's refund-readiness check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefundReadinessLiability {
@@ -262,16 +282,24 @@ ALTER TABLE refund_attempt ADD COLUMN resolved_expiry INTEGER;
 ALTER TABLE refund_attempt ADD COLUMN resolution_gen INTEGER NOT NULL DEFAULT 0;
 ";
 
+// lnrent-xjn: back the durable idempotency-cache TTL sweep (reconcile) with indexes so the periodic
+// prune does not full-scan these flood-prone tables (mirrors seen_message_seen_at_idx).
+const M5_IDEMPOTENCY_CACHE_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS op_invocation_finished_at_idx ON op_invocation(finished_at);
+CREATE INDEX IF NOT EXISTS inbound_request_created_at_idx ON inbound_request(created_at);
+";
+
 /// Ordered migrations (lnrent-7fp.3): index `i` upgrades the DB from schema version `i` to
 /// `i+1`. Version 1 is the §11 schema; version 2 adds `seen_message` (lnrent-7fp.5); version 3 adds
 /// `subscription.suspend_not_before` (lnrent-7fp.22); version 4 adds the `refund_attempt` resolver
-/// columns (lnrent-ug8). A future schema change appends a new entry of `ALTER`/`CREATE` statements;
-/// **never edit a shipped migration**.
+/// columns (lnrent-ug8); version 5 adds the idempotency-cache TTL-sweep indexes (lnrent-xjn). A future
+/// schema change appends a new entry of `ALTER`/`CREATE` statements; **never edit a shipped migration**.
 const MIGRATIONS: &[&str] = &[
     SCHEMA,
     M2_SEEN_MESSAGE,
     M3_SUSPEND_NOT_BEFORE,
     M4_REFUND_RESOLUTION,
+    M5_IDEMPOTENCY_CACHE_INDEXES,
 ];
 
 /// The target schema version this binary expects (= number of migrations).
@@ -444,6 +472,31 @@ impl Store {
     /// precedence: refund_attempt > paid-undelivered order > unreconciled settlement.
     pub async fn refund_readiness_liabilities(&self) -> Result<Vec<RefundReadinessLiability>> {
         self.read(load_refund_readiness_liabilities).await
+    }
+
+    /// Prune durable business idempotency caches past the retention window. The cutoff uses SQLite
+    /// wall time, capped by the daemon clock that stamps these rows, so synthetic-clock tests and a
+    /// lagging daemon clock do not over-prune. RUNNING op invocations are never removed: they are the
+    /// in-flight idempotency claim.
+    pub async fn prune_idempotency_caches(&self, now: i64) -> Result<IdempotencyPruneReport> {
+        self.transaction(move |tx| {
+            let op_invocation = tx.execute(
+                "DELETE FROM op_invocation
+                  WHERE state IN ('DONE', 'ERROR')
+                    AND finished_at < MIN(unixepoch(), ?1) - ?2",
+                rusqlite::params![now, IDEMPOTENCY_CACHE_RETENTION_SECS],
+            )?;
+            let inbound_request = tx.execute(
+                "DELETE FROM inbound_request
+                  WHERE created_at < MIN(unixepoch(), ?1) - ?2",
+                rusqlite::params![now, IDEMPOTENCY_CACHE_RETENTION_SECS],
+            )?;
+            Ok(IdempotencyPruneReport {
+                op_invocation,
+                inbound_request,
+            })
+        })
+        .await
     }
 
     async fn run<T, F>(&self, f: F) -> Result<T>
@@ -753,7 +806,11 @@ mod tests {
     fn migrate_recovers_partially_applied_refund_resolution() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
+            // A real v3 DB has all the v1 base tables; include the ones M5 (lnrent-xjn) indexes so the
+            // partial-M4 recovery still applies the full migration chain to current.
             "CREATE TABLE refund_attempt (id TEXT PRIMARY KEY, status TEXT, resolved_bolt11 TEXT);
+             CREATE TABLE op_invocation (sender_pubkey TEXT, request_id TEXT, state TEXT, finished_at INTEGER);
+             CREATE TABLE inbound_request (sender_pubkey TEXT, request_id TEXT, created_at INTEGER);
              PRAGMA user_version = 3;",
         )
         .unwrap();
@@ -781,6 +838,14 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         Store::spawn(conn)
+    }
+
+    async fn count(store: &Store, sql: &str) -> i64 {
+        let sql = sql.to_string();
+        store
+            .read(move |c| Ok(c.query_row(&sql, [], |r| r.get(0))?))
+            .await
+            .unwrap()
     }
 
     // A transaction commits on Ok and ROLLS BACK on Err (the atomicity the money path needs).
@@ -998,6 +1063,100 @@ mod tests {
                 "{table}: duplicate insert must not create a second row"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn prune_idempotency_caches_removes_only_old_terminal_rows() {
+        let s = mem_store();
+        let now = 2 * IDEMPOTENCY_CACHE_RETENTION_SECS;
+        s.transaction(move |tx| {
+            tx.execute(
+                "INSERT INTO op_invocation
+                    (sender_pubkey, request_id, subscription_id, op, state, result_json,
+                     error_json, created_at, finished_at)
+                 VALUES
+                    ('buyer', 'old-done', 's1', 'restart', 'DONE', '{}', NULL,
+                     ?1 - ?2 - 1, ?1 - ?2 - 1),
+                    ('buyer', 'old-error', 's1', 'restart', 'ERROR', NULL, '{}',
+                     ?1 - ?2 - 1, ?1 - ?2 - 1),
+                    ('buyer', 'old-running', 's1', 'restart', 'RUNNING', NULL, NULL,
+                     ?1 - ?2 - 1, ?1 - ?2 - 1),
+                    ('buyer', 'recent-done', 's1', 'restart', 'DONE', '{}', NULL,
+                     ?1, ?1 - ?2 + 1)",
+                rusqlite::params![now, IDEMPOTENCY_CACHE_RETENTION_SECS],
+            )?;
+            tx.execute(
+                "INSERT INTO inbound_request
+                    (sender_pubkey, request_id, kind, response_msg_type, response_json, created_at)
+                 VALUES
+                    ('buyer', 'old-order', 'order', 'order.invoice', '{}',
+                     ?1 - ?2 - 1),
+                    ('buyer', 'recent-order', 'order', 'order.invoice', '{}',
+                     ?1 - ?2 + 1)",
+                rusqlite::params![now, IDEMPOTENCY_CACHE_RETENTION_SECS],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let pruned = s.prune_idempotency_caches(now).await.unwrap();
+        assert_eq!(
+            pruned,
+            IdempotencyPruneReport {
+                op_invocation: 2,
+                inbound_request: 1,
+            }
+        );
+        assert_eq!(pruned.total(), 3);
+
+        assert_eq!(
+            count(&s, "SELECT count(*) FROM op_invocation").await,
+            2,
+            "only old terminal op_invocation rows are pruned"
+        );
+        assert_eq!(
+            count(
+                &s,
+                "SELECT count(*) FROM op_invocation WHERE request_id='old-running' AND state='RUNNING'",
+            )
+            .await,
+            1,
+            "RUNNING rows keep their in-flight idempotency claim"
+        );
+        assert_eq!(
+            count(
+                &s,
+                "SELECT count(*) FROM op_invocation WHERE request_id='recent-done'"
+            )
+            .await,
+            1,
+            "recent terminal op_invocation rows stay within retention"
+        );
+        assert_eq!(
+            count(
+                &s,
+                "SELECT count(*) FROM inbound_request WHERE request_id='recent-order'"
+            )
+            .await,
+            1,
+            "recent inbound_request rows stay within retention"
+        );
+        assert_eq!(
+            count(
+                &s,
+                "SELECT count(*) FROM inbound_request WHERE request_id='old-order'"
+            )
+            .await,
+            0,
+            "old inbound_request rows are pruned"
+        );
+
+        assert_eq!(
+            s.prune_idempotency_caches(now).await.unwrap(),
+            IdempotencyPruneReport::default(),
+            "re-running the sweep is idempotent"
+        );
     }
 
     // WAL is enabled on a real file DB (durability + a future RO read path; §11).
