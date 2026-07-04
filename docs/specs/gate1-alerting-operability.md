@@ -156,7 +156,9 @@ CREATE TABLE teardown_failure (
   `reserved_msat` — at-risk receipts + open refund liabilities — on top of this holdings bound.
   `expected_msat` answers "what should the wallet HOLD"; the sweep's surplus answers "what may
   the operator KEEP". Never authorize a payout from `expected_msat`):
-  `expected_msat = Σ gross of all captured receipts − Σ gross of refund_attempt rows that are SENT
+  `expected_msat = Σ gross of all captured receipts (BOTH INV-3 provenance classes: settled
+  invoice rows AND settle-refund event_log entries, de-duped by external payment id — the same
+  receipt base as the sweep spec) − Σ gross of refund_attempt rows that are SENT
   **or whose pay has durable started evidence in the local pay index** (the same started-evidence
   disambiguator INV-2/recovery already use) − Σ max_outlay_msat of SENT/PENDING sweep rows`.
   Started-but-not-yet-SENT refunds must be subtracted: once the backend op starts, the outgoing

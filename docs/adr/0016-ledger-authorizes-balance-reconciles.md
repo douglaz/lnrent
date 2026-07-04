@@ -27,7 +27,11 @@ floor warnings, not at backend startup.
 
 - **Sweep authorization** is a pure ledger computation:
   `surplus = Σ captured receipts − reserved (at-risk receipts + non-terminal refunds, at gross,
-  de-duped per external_id) − paid_out (SENT refunds at gross + sweep outlay caps)`.
+  de-duped per external_id) − paid_out (SENT refunds at gross + sweep outlay caps)`,
+  where "captured receipts" spans both provenance classes INV-3 recognizes (settled invoice rows
+  and unmatched/orphan settlement journal entries), **de-duped by external payment id** — a
+  settlement recorded in both classes counts once — so receipts and their refunds always net over
+  the same set.
   A receipt counts toward surplus only when no state-machine path can still route it to a refund;
   when in doubt it is reserved (fail closed).
 - **Refund readiness (INV-2)** compares its liability requirement against the ledger-derived

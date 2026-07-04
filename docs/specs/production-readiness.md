@@ -114,8 +114,10 @@ but stops *duplicate* work, not *flood* work (distinct `request_id`s bypass it e
   logs." The current posture assumes an operator tailing logs 24/7, which is not production-ready for
   real money.
 - **Fix (cheap, reuses what exists):** a minimal alert dispatcher with a configurable sink, fired on
-  the money-critical conditions (parked-FAILED refund, stuck-PENDING refund, balance-query ALARM,
-  orphaned-teardown from PR-6, zero-relay from PR-9). **Self-nostr-DM is the cheapest first sink** — the
+  the money-critical conditions (parked-FAILED refund, stuck-PENDING refund, orphaned-teardown from
+  PR-6, zero-relay from PR-9, ledger-holdings floor from PR-16 — the full AlertKind set is defined in
+  docs/specs/gate1-alerting-operability.md §A; per the ledger-authoritative revision there is NO
+  balance-query alert, that class is retired). **Self-nostr-DM is the cheapest first sink** — the
   engine and operator keys already exist, so the daemon can NIP-17 DM the operator's own pubkey with no
   new infra. Leave webhook/Prometheus as optional additional sinks. Keep it a thin dispatcher, not a
   monitoring framework.
@@ -133,6 +135,11 @@ but stops *duplicate* work, not *flood* work (distinct `request_id`s bypass it e
   attempts, last error), retry with backoff on the maintenance loop, surface via a new IPC query +
   `lnrent` subcommand, and fire a PR-5 alert. Do not block the `TERMINATED` transition on teardown (the
   reservation must still release), but record the orphan so it is never silently lost.
+  **Scope (per the focused spec, gate1-alerting-operability.md §B):** the dead-letter table covers
+  reconcile `fire_destroy` ONLY. The provision-failure destroy already has its own durable retry ledger
+  (`provision_cleanup_pending`/`_done` + `recover_failed_cleanups()`, provision.rs) — it gets
+  *surfaced* into the same teardowns view and alerted from its existing retry site, never a second
+  ledger (two retry loops over one destroy would drift out of sync).
 
 ### PR-7 (downgraded to HARDEN after verification) — make money-DB `synchronous` explicit
 - **Original claim VERIFIED FALSE:** the review initially flagged WAL-default-`NORMAL` data loss
@@ -225,13 +232,15 @@ Three operability blind spots that leave the operator able to *see* trouble but 
   perms (no `SO_PEERCRED`). Narrow (needs a loose umask + a pre-existing world-traversable data dir, which
   `config.rs` deliberately permits), but a local user could issue operator commands in the window. Set a
   tight umask before `bind` (or bind in a private subdir); optionally add an `SO_PEERCRED` check.
-- **PR-16 — Draining-wallet warning independent of liabilities.** `log_refund_readiness` early-returns at
-  zero liabilities (`supervisor.rs:1261`) and readiness is liability-gated, so a wallet draining toward
-  zero with nothing *currently* owed emits no warning. Add a balance-floor warning independent of
-  liabilities. **Cross-doc note:** this deliberately extends INV-2's "warn ONLY when an actual liability
-  exists" (docs/specs/refund-money-path-hardening.md); when PR-16 lands, add a carve-out to INV-2 there
-  (a balance-floor operator warning is not a refund-readiness warning) rather than leaving the two docs
-  pointing opposite ways.
+- **PR-16 — Draining-holdings warning independent of liabilities (ledger-derived).** `log_refund_readiness`
+  early-returns at zero liabilities (`supervisor.rs:1261`) and readiness is liability-gated, so books
+  draining toward zero with nothing *currently* owed warn nobody. Per the ledger-authoritative revision
+  (note above / ADR-0016), the floor is computed from **ledger-expected holdings** (`expected_msat`,
+  a pure local read — gate1-alerting-operability.md §D), NOT from `available_balance_msat` (no
+  automatic balance read exists anymore; wallet-vs-books drift is the explicit `lnrent reconcile`'s
+  job). **Cross-doc note:** this deliberately extends INV-2's "warn ONLY when an actual liability
+  exists" (docs/specs/refund-money-path-hardening.md); the carve-out is annotated there (a holdings-floor
+  operator warning is not a refund-readiness warning).
 - **PR-17 — Stale past-due `next_deadline` on terminal states.** `capture` order arm (PROVISIONING),
   `provision` (REFUND_DUE), and `refund` (REFUNDED) never clear/reset the reconcile cursor
   (`capture.rs:187-190`, `provision.rs:884-887`, `refund.rs:792-793`), unlike EXPIRED/TERMINATED which set

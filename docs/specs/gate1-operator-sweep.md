@@ -28,8 +28,14 @@ two-clock reconciliation problem with an unbounded race surface.
 So the sweep authorizes from a single ledger-derived quantity:
 
 ```
-receipts_msat = Σ gross of ALL captured receipts (every invoice the ledger has marked
-                PAID/settled — final, at-risk, and later-refunded alike)
+receipts_msat = Σ gross of ALL captured receipts, over BOTH provenance classes INV-3
+                recognizes (docs/specs/refund-money-path-hardening.md §3.3), de-duped by
+                external payment id:
+                • every invoice row the ledger marked PAID/settled — final, at-risk, and
+                  later-refunded alike, AND
+                • every settle-refund event_log settlement entry (`settle_unmatched_refund`
+                  / `settle_orphan_refund`, capture.rs) — real money received whose only
+                  ledger record is the journal entry + its detached refund_attempt
 reserved_msat = Σ gross, counted ONCE per external_id (the same de-dup rule INV-2 uses), of:
                 • captured receipts still AT RISK (their sub is PENDING/PROVISIONING/
                   RESUMING/REFUND_DUE — a state-machine refund path still exists), and
@@ -45,7 +51,11 @@ ALLOW iff surplus_msat >= outlay_msat(sweep)
 
 The base is ALL receipts, not just "final" ones — the arithmetic must net to the right value per
 receipt: a FINAL receipt contributes +gross (sweepable); an at-risk receipt +gross −gross = 0; a
-refunded receipt +gross −gross(SENT) = 0. (Starting the base at final-only and *also* subtracting
+refunded receipt +gross −gross(SENT) = 0. **Receipts, reserves, and paid-out MUST all draw from the
+same provenance set** — subtracting a refund whose receipt exists only as an event_log settlement
+entry, while the base counted only invoice rows, would understate surplus by that gross and strand
+the operator's netted-out funds (an orphan settlement nets to 0 like any refunded receipt, but only
+if both sides are counted). (Starting the base at final-only and *also* subtracting
 reserves/refunds would double-count every non-final receipt and systematically over-refuse —
 e.g. one ACTIVE 100k order + one PROVISIONING 100k order must leave 100k sweepable, not 0.) A
 receipt is FINAL (contributes its full gross with no offsetting reserve) exactly when no
