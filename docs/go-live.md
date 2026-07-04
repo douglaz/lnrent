@@ -63,6 +63,11 @@ LNRENT_RELAYS=wss://relay-a,wss://relay-b \
 Idempotent (re-reads the persisted seed on a re-run). Note the operator **npub** it prints — that is your
 listing author + DM peer. BACK UP the mnemonic now if you haven't (§0).
 
+**Never set `LNRENT_MNEMONIC` (or the `LNRENT_FEDIMINT_*` vars) on the RUN invocation or in the
+systemd unit/EnvironmentFile** — they are bootstrap-only. The run daemon reads the seed from the
+persisted 0600 `operator.seed`; putting the mnemonic in the run environment would hand it to every
+recipe hook the daemon spawns (until docs/specs/hook-env-hygiene.md lands and blocks that in code).
+
 ## 4. Preflight — verify readiness BEFORE you announce it
 
 Run the daemon (the config is now persisted; run only needs the data dir, the recipes dir, and `DO_TOKEN`

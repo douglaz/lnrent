@@ -84,6 +84,10 @@ expensive part: handlers, DB writes, invoice creation, signed replies).
 - The operator's own pubkey (self-DMs, PR-5 alerts later) is exempt.
 - Do NOT rate-limit by outer wrap identity (ephemeral keys make that free to rotate); only the seal
   sender counts.
+- **Flat by design (operator-ratified 2026-07-04):** paying/ACTIVE-sub senders share the same
+  bucket as strangers — an ownership tier would cost a hot-path DB lookup and let a 1-sat purchase
+  buy a bigger flood budget. Do not add owner tiers without dogfood evidence of real agent
+  friction; the knobs are the tuning surface.
 
 ### C. PR-3 — authorize the op.request reject path before the durable claim
 

@@ -41,16 +41,23 @@ One small `alerts` module owned by the supervisor:
 - `Alert { kind: AlertKind, subject: String, detail: String }` with a closed `AlertKind` enum:
   `RefundParked`, `RefundStuck`, `TeardownFailed`, `RelayBlackout`, `HoldingsLow`. No free-form
   kinds. (No `BalanceQueryFailed`: with §E there is no automatic balance query left to fail.)
-- **Sink = a NIP-17 DM to the operator's own npub via the existing outbox.** This reuses the
-  durable drain/retry/FAILED machinery and needs zero new infra; the operator reads alerts in any
-  Nostr DM client. **Wire format (required):** `OutboxSender::drain_once` deserializes every
-  outbox `payload_json` as `lnrent_wire::Msg` and drops non-`Msg` rows to FAILED (verified,
-  provision.rs). An `msg_type='alert'` row is therefore NOT enough — add a real wire variant
-  `Msg::OperatorAlert { kind, subject, detail }` to `wire/src/` (operator→operator DM; it is only
-  ever sent to self, so no buyer-facing decode path changes) and set `payload_json` to that. The
-  alert is a normal gift-wrapped DM to the operator pubkey. Config: `alerts_enabled` (default
-  **true** when the payment backend is fedimint, false for mock), and that is the ONLY config — no
-  webhook/email/metrics sinks in this cut (they can be added behind the same dispatch seam later).
+- **Sink = a NIP-17 DM via the existing outbox, to a configurable recipient.** This reuses the
+  durable drain/retry/FAILED machinery and needs zero new infra. **Recipient (operator decision,
+  2026-07-04 grill):** new optional config `alert_npub` — the operator's PERSONAL Nostr identity,
+  distinct from the daemon's operator key — so alerts arrive in the DM client the operator already
+  uses, with the key they already carry; the daemon's hot key never has to leave the box just to
+  read notifications (reading a self-DM would require importing the seed-derived operator key into
+  a phone client, against ADR-0010's plane-separation spirit). Unset ⇒ fall back to self-DM
+  (alerts still land durably in the outbox); go-live.md's checklist gains "set `alert_npub`".
+  **Wire format (required):** `OutboxSender::drain_once` deserializes every outbox `payload_json`
+  as `lnrent_wire::Msg` and drops non-`Msg` rows to FAILED (verified, provision.rs). An
+  `msg_type='alert'` row is therefore NOT enough — add a real wire variant
+  `Msg::OperatorAlert { kind, subject, detail }` to `wire/src/` (an operator→operator-chosen-peer
+  DM; buyers never receive or decode it, so no buyer-facing decode path changes) and set
+  `payload_json` to that. The alert is a normal gift-wrapped DM to the configured recipient.
+  Config: `alerts_enabled` (default **true** when the payment backend is fedimint, false for mock)
+  + `alert_npub` — and that is ALL the config; no webhook/email/metrics sinks in this cut (they
+  can be added behind the same dispatch seam later).
 - **Edge-triggered with a per-(kind,subject) cooldown**, not level-triggered: the dispatcher keeps
   an in-memory last-sent map and re-sends the same (kind,subject) at most once per
   `ALERT_COOLDOWN_S = 6h`. Restart resets the map (worst case: one duplicate alert per condition

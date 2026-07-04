@@ -391,6 +391,15 @@ defends a real attack ("buried money-DM", table-fill) — **do not cut it as par
 
 ## Suggested sequencing (for the follow-on focused specs / beads)
 
+> **Operator decision (2026-07-04):** go-live is gated on **GATE-0 (PR-1..4) + PR-5 alerting +
+> PR-12 hook-env hygiene** landing, plus the existing lnrent-7qc refund staging dogfood. The
+> attended-dogfood carve-out in the legend remains valid policy but will NOT be exercised before
+> those land. Critical path: GATE-0 → PR-5 → PR-12 → 7qc dogfood → go-live; everything else (rest
+> of GATE-1, cleanup, HARDEN) may land during or after the attended phase. (PR-12 gates by
+> operator choice: the documented runbook never exposes the seed to hooks — bootstrap is one-shot
+> and hookless, run reads the seed from disk — but the operator wants the misuse path closed in
+> code, not just in prose, before real money.)
+
 1. **GATE-0 first (PR-1, PR-2, PR-3, PR-4):** the abuse cluster is what blocks unattended/scaled
    public exposure (attended dogfood excepted, per the legend) and PR-1's fix is nearly free (sender
    already in `order_id`). One focused spec.

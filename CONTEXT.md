@@ -126,6 +126,32 @@ window) from which the Operator nudges the Buyer to renew, so renewing early avo
 interruption. Not a hard transition.
 _Avoid_: grace, reminder date.
 
+**Receipt**:
+A payment the Operator's books have recorded as received for a specific Order or
+renewal. A receipt is *at risk* while any path could still owe it back to the Buyer,
+and *final* once the service outcome makes it irrevocably the Operator's.
+_Avoid_: deposit, balance entry, payment (ambiguous with the Buyer-side act).
+
+**Surplus**:
+The portion of the Operator's received money that is provably theirs to keep: final
+receipts minus everything still owed or at risk. Computed from the books alone — never
+from the wallet balance (ADR-0016).
+_Avoid_: profit (accounting term), balance, available funds.
+
+**Sweep**:
+The Operator withdrawing Surplus out of the daemon's wallet to their own wallet. The
+only Operator-initiated outbound payment; refused whenever the owed amount cannot be
+bounded.
+_Avoid_: withdrawal, payout (ambiguous with refunds), cash out.
+
+**Reconcile (operator act)**:
+The explicit, on-demand comparison of the wallet against the books, reporting whether
+they agree. The single sanctioned reading of the wallet balance; it informs a human and
+never authorizes anything. Distinct from the *reconcile loop* (the timer-driven
+subscription state machine walker, SPEC §6.5) — same word, different thing; say
+"reconcile command" vs "reconcile loop" when ambiguous.
+_Avoid_: audit, balance check.
+
 ### VM security
 
 **Security tier**:
