@@ -15,6 +15,14 @@ marketplace server, no central payment custodian. "Marketplace" means the decent
 fabric, not a service lnrent runs: relays are public or operator-run, and any KMS /
 registry referenced by the VM guidelines is operator-run, never a central party.
 
+**Who this is for.** lnrent is not built for its authors' own hosting. The point is an
+**ecosystem of independent service providers**: many unrelated operators, each running their own
+daemon on their own boxes, meeting buyers in the same open Nostr marketplace. The "operator"
+throughout this spec is therefore a third party who has never read this codebase — which makes
+operator-facing surface (safe defaults, preflight, alerts, payout, runbooks) product, not internal
+tooling, and makes abuse-resistance a duty owed to operators who cannot patch around gaps
+themselves.
+
 Renting is one capability, not the whole product. A managed service is either:
 
 - **self-use** — the operator runs it for themselves; no Listing, no billing; or
@@ -51,6 +59,8 @@ hardcoded. Adding a service means dropping in a new recipe.
   after retention.
 - New services are added as self-contained recipes without touching daemon code.
 - The whole thing runs on NixOS (declarative) and Debian (imperative).
+- The end state is an **ecosystem of providers**, not one deployment: any number of
+  independent operators can pick this up, onboard cold, and run it unattended.
 
 ### Non-goals (v1)
 - No central marketplace website or hosted directory. Discovery is Nostr-native.

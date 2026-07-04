@@ -15,6 +15,15 @@ minimal design sketch, and is the source the follow-on focused specs + beads are
 **not** an instruction to implement now, and it deliberately **cuts** speculative mechanism (see
 §CUT) — overengineering is the top project risk.
 
+**"A real operator" is meant literally.** The project's goal is an ecosystem of independent
+third-party service providers (SPEC §1), so the operator this roadmap serves is a stranger who has
+never read this code. That framing is why the gates sit where they do: GATE-0 abuse-resistance
+protects operators who cannot patch around a griefing gap themselves, and the GATE-1 operability
+surface (alerts, sweep, teardown dead-letter, actuators — plus preflight/doctor and go-live.md) is
+the product those operators onboard through, not internal tooling. "Single-box operator" scope
+discipline (§non-goals) is unchanged: the ecosystem is many independent single boxes, not multi-box
+HA.
+
 ## Headline (what the review actually found)
 
 **The money-correctness core is strong and must not be cut.** All three money-path/refund audits

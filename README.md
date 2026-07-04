@@ -5,6 +5,10 @@ anyone can discover it, order it, pay a Lightning/Fedimint invoice, and get a pr
 no central server, no accounts, no AI in the serving path. Services are **recipes** (a manifest + a few
 lifecycle hooks), so the catalogue is open-ended; the first real one provisions DigitalOcean VPSs.
 
+The goal is an **ecosystem of independent service providers** — many unrelated operators, each
+running their own daemon, selling into the same open Nostr marketplace — not a single hosted
+deployment run by this project.
+
 - **Control plane:** `lnrentd` (Rust) — orders, payments, subscriptions, provisioning, refunds, Nostr.
 - **Operator CLI:** `lnrent` — talks to a running daemon over a local IPC socket (status, subs, money).
 - **Buyer CLI:** `lnrent-buyer` — agent-grade; discovers listings and places orders over Nostr.
