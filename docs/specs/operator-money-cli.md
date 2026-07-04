@@ -1,6 +1,11 @@
 # Spec: operator money view (`lnrent money`)
 
 Status: **Implemented** (master `5dd2d28`; test `daemon/tests/operator_money_cli.rs`) — a read-only view of the daemon's ecash money position.
+*Pending revision (2026-07-04, ledger-authoritative — docs/specs/gate1-alerting-operability.md §E):
+the `balance_msat` field and the `BalanceQueryFailed` warning variant below are superseded — plain
+`lnrent money` becomes ledger-only (`expected_msat` + earned/reserved/paid-out), and the federation
+balance is read solely by the explicit `lnrent reconcile` command. This doc records the landed v1
+contract; the §E spec is the forward contract.*
 Scope: `daemon/src/{ipc.rs, supervisor.rs, bin/lnrent.rs}` (thread the payment backend into IPC + one
 new command). Reuses the INV-2 readiness report; adds NO new money logic.
 Audience: the rb-lite implementer. This spec is the contract; the tests below are mandatory ship gates.

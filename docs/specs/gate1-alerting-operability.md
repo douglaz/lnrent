@@ -1,10 +1,20 @@
-# Spec: GATE-1 alerting + operability (PR-5/PR-6/PR-9/PR-16)
+# Spec: GATE-1 alerting + operability (PR-5/PR-6/PR-9/PR-16 + the INV-2 ledger revision)
 
 **Status:** draft for codex-review-loop → rb-lite
 **Source:** docs/specs/production-readiness.md GATE-1 (verified findings, 2026-07-03). Everything
 here is *around* the money core, not in it: surface conditions the daemon already detects, persist
 one failure class it currently swallows, and give the operator actuators. Thin dispatcher — NOT a
 monitoring framework.
+
+**Revised 2026-07-04 — ledger-authoritative:** no code path reads the federation balance implicitly
+anymore. The ledger (sqlite transaction history) is the sole authority for every money decision and
+every automatic warning; `available_balance_msat` survives ONLY inside the explicit operator
+`reconcile` command (§F), which compares wallet vs books and *reports* — never acts. This revises
+the LANDED INV-2 readiness path (§E) and redefines PR-16 (§D). Rationale: the balance is an
+eventually-consistent aggregate of the same history the ledger records, on a different clock —
+reading it in automatic paths creates reconciliation races and a whole failure class
+(`BalanceQueryFailed` handling) that exists only because of the read. Same principle as
+docs/specs/gate1-operator-sweep.md.
 
 ## Problem (verified)
 
@@ -29,8 +39,8 @@ monitoring framework.
 One small `alerts` module owned by the supervisor:
 
 - `Alert { kind: AlertKind, subject: String, detail: String }` with a closed `AlertKind` enum:
-  `RefundParked`, `RefundStuck`, `BalanceQueryFailed`, `TeardownFailed`, `RelayBlackout`,
-  `BalanceLow`. No free-form kinds.
+  `RefundParked`, `RefundStuck`, `TeardownFailed`, `RelayBlackout`, `HoldingsLow`. No free-form
+  kinds. (No `BalanceQueryFailed`: with §E there is no automatic balance query left to fail.)
 - **Sink = a NIP-17 DM to the operator's own npub via the existing outbox.** This reuses the
   durable drain/retry/FAILED machinery and needs zero new infra; the operator reads alerts in any
   Nostr DM client. **Wire format (required):** `OutboxSender::drain_once` deserializes every
@@ -45,10 +55,11 @@ One small `alerts` module owned by the supervisor:
   an in-memory last-sent map and re-sends the same (kind,subject) at most once per
   `ALERT_COOLDOWN_S = 6h`. Restart resets the map (worst case: one duplicate alert per condition
   per restart — acceptable, do not persist).
-- Wire-in points (all conditions the code already detects): refund parked-FAILED (refund.rs:864),
-  refund stuck-PENDING (see retune in §C), balance-query ALARM (supervisor.rs:1272), teardown
-  dead-letter insert (§B), relay blackout (§C), balance floor (§D). Each call site keeps its
-  existing log line; the alert is additive.
+- Wire-in points (all conditions the code already detects or this spec adds): refund parked-FAILED
+  (refund.rs:864), refund stuck-PENDING (see retune in §C), teardown dead-letter insert (§B), relay
+  blackout (§C), ledger holdings floor (§D). Each call site keeps its existing log line; the alert
+  is additive. (The old balance-query ALARM call site at supervisor.rs:1272 is REMOVED by §E, not
+  wired.)
 - If the relay pool is down, alert DMs queue in the outbox like any DM — self-limiting, and the
   `RelayBlackout` alert is precisely the one that cannot be delivered; that is what the §C status
   query is for. Document this honestly in the module doc.
@@ -137,22 +148,83 @@ CREATE TABLE teardown_failure (
   non-terminal refund whose `created_at` is older than the threshold alerts, regardless of which
   loop last touched it.
 
-### D. PR-16 — balance floor warning (liability-independent)
+### D. PR-16 — ledger-holdings floor warning (liability-independent, no network)
 
-- Config `min_balance_warn_msat` (default **0** = disabled; the operator opts in with a floor that
-  matches their float). On each maintenance tick, if the backend reports
-  `available_balance_msat = Some(b)` and `b < floor` → `BalanceLow` alert (cooldown-bounded).
-- **INV-2 carve-out:** this is an operator-float warning, NOT a refund-readiness warning — it does
-  not touch `refund_readiness_report`, `lnrent money`'s `ready` verdict, or the liability math.
-  Annotate INV-2 in docs/specs/refund-money-path-hardening.md accordingly (the roadmap's PR-16
+- Define **ledger-expected holdings** (pure LOCAL reads — sqlite ledger + the local `fedimint_pay`
+  index; no federation call — reused verbatim by §E's readiness compare and §F's reconcile;
+  **NOT the sweep's authorization quantity**: the sweep's `surplus_msat` additionally subtracts
+  `reserved_msat` — at-risk receipts + open refund liabilities — on top of this holdings bound.
+  `expected_msat` answers "what should the wallet HOLD"; the sweep's surplus answers "what may
+  the operator KEEP". Never authorize a payout from `expected_msat`):
+  `expected_msat = Σ gross of all captured receipts − Σ gross of refund_attempt rows that are SENT
+  **or whose pay has durable started evidence in the local pay index** (the same started-evidence
+  disambiguator INV-2/recovery already use) − Σ max_outlay_msat of SENT/PENDING sweep rows`.
+  Started-but-not-yet-SENT refunds must be subtracted: once the backend op starts, the outgoing
+  contract locks those funds out of the spendable wallet, so a bound that still counts them would
+  sit ABOVE the real spendable balance and §F would report false DRIFT (and readiness would
+  over-count coverage — consistently, `required_msat` already treats started pays as committed/0).
+  Because refunds/sweeps are subtracted at their gross/cap while real outlays are ≤ that (INV-1),
+  this is a conservative LOWER BOUND on the spendable wallet.
+- Config `min_holdings_warn_msat` (default **0** = disabled; the operator opts in with a floor that
+  matches their float). On each maintenance tick, if `expected_msat < floor` → `HoldingsLow` alert
+  (cooldown-bounded). No backend call — this warns about the operator's *books* draining (a real
+  low-float condition is visible in the books; wallet-vs-books drift is §F's job).
+- **Independence note:** this is an operator-float warning, NOT a refund-readiness warning — it is
+  computed regardless of whether any liability exists (the readiness report stays liability-gated,
+  §E). Annotate docs/specs/refund-money-path-hardening.md accordingly (the roadmap's PR-16
   cross-doc note already reserves this).
+
+### E. INV-2 revision — refund readiness goes ledger-derived (LANDED-CODE change)
+
+The landed readiness path (docs/specs/refund-money-path-hardening.md §3.2, implemented in
+supervisor.rs `log_refund_readiness`/`refund_readiness_report` + `lnrent money`) reads
+`available_balance_msat()` on every boot/maintenance tick and grew a `BalanceQueryFailed` ALARM
+class for when that network read fails. Revise it to the ledger:
+
+- The readiness compare becomes `expected_msat (§D) >= required_msat` — a pure sqlite read. The
+  liability-gating, the `required_msat` outlay pricing, `GatewayUnavailable`, `Unpriceable`,
+  `ParkedManual`, and the READY/NOT-READY verdict all stay exactly as they are; ONLY the
+  balance-side operand changes from a federation query to the ledger lower bound.
+- `BalanceQueryFailed` (warning variant + ALARM log + its call sites, supervisor.rs:1223/1272) is
+  RETIRED — there is no automatic balance query left to fail. Remove the variant; the 5-variant
+  taxonomy in docs/specs/operator-money-cli.md becomes 4.
+- `lnrent money` reports the ledger figures (`expected_msat`, earned/reserved/paid-out per the
+  sweep spec's breakdown once that lands) instead of `balance_msat`; plain `lnrent money` makes NO
+  network calls except the existing gateway probe and §C's federation liveness probe (both are
+  liveness/pricing checks, not balance reads).
+- Rationale (same as the sweep spec): if the wallet truly holds less than the books say, the refund
+  pay itself fails cleanly and parks/alerts — the pay is the fail-safe; the pre-read added only a
+  false sense of coverage plus a failure class. Wallet-vs-books drift detection moves to §F.
+- Annotate docs/specs/refund-money-path-hardening.md INV-2 and docs/specs/operator-money-cli.md
+  with one-line pointers to this revision (do not rewrite their landed history).
+
+### F. Explicit reconcile — the ONLY place the balance is read
+
+- CLI `lnrent reconcile [--json]` (IPC `Request::Reconcile`): operator-invoked, on demand, never on
+  a timer. It queries `available_balance_msat()` ONCE, computes `expected_msat` (§D) from the
+  ledger, and REPORTS: `{ wallet_msat, expected_msat, verdict }` where verdict is `OK`
+  (`wallet >= expected` — the normal case; fee savings make the wallet run above the lower bound)
+  or `DRIFT` (`wallet < expected` — the wallet holds less than the books' lower bound: a
+  fedimint-level loss, a missed sweep/refund accounting, or a ledger bug — investigate).
+- Report-only, always: reconcile never mutates state, never gates a payment, never auto-refuses
+  anything. A DRIFT verdict is for a human. A failed balance query here is just the command
+  erroring — operator retries; no alert class, no daemon state.
+- This is the single sanctioned `available_balance_msat` call site in the daemon after §E lands.
+  **That includes the backend's own startup probe:** `FedimintPayment::join_or_open()` currently
+  calls `log_readiness()`, which queries `available_balance_msat()` on every Fedimint start
+  (fedimint_backend.rs:371,381) — an implicit automatic balance read with its own
+  could-not-query failure branch. Remove the balance half of that startup log (keep the
+  gateway-reachability half — that is a liveness probe, not a balance read); the operator gets
+  wallet-vs-books on demand via `reconcile`.
 
 ## Non-goals
 
 No webhook/email/Prometheus sinks; no HTTP server; no persistence for alert cooldowns; no refund
 cancel/abandon verb; no gateway failover (PR-13), doctor/preflight (PR-14), or structured-JSON
 logging (PR-19); no changes to refund money math, capture, or reconcile transitions beyond the
-dead-letter insert and the alert calls.
+dead-letter insert and the alert calls. **No implicit balance read anywhere** — §F's
+operator-invoked reconcile is the sole `available_balance_msat` call site; no automatic path
+(readiness, floor, alerts, sweep) may query the federation balance.
 
 ## Acceptance
 
@@ -171,12 +243,26 @@ dead-letter insert and the alert calls.
 - All-relays-down > threshold → RelayBlackout alert queued + `lnrent status`/`Relays` show
   disconnected; reconnect clears the condition (next onset re-alerts).
 - A stuck refund alerts at 6h (was 7d), including the pay-in-flight-forever shape.
-- Balance below the configured floor alerts; floor=0 never alerts; the `ready` verdict and INV-2
-  behavior are unchanged (existing money-CLI tests stay green).
+- Ledger-expected holdings below the configured floor alerts (`HoldingsLow`); floor=0 never
+  alerts; no backend call is made by the floor check (assert via a backend stub that panics on
+  `available_balance_msat`); a started-but-PENDING refund reduces `expected_msat` by its gross
+  (assert with a row that has started-evidence in the local pay index).
+- The Fedimint startup `log_readiness` no longer queries the balance (its gateway half remains);
+  grep-level acceptance: after §E+§F land, `available_balance_msat` has exactly one non-test call
+  site (the reconcile handler).
+- INV-2 revision: readiness READY/NOT-READY verdicts reproduce the existing test matrix with the
+  balance operand replaced by `expected_msat` (liability-gating, Unpriceable, GatewayUnavailable,
+  ParkedManual unchanged); `BalanceQueryFailed` no longer exists; plain `lnrent money` makes no
+  balance query (same panic-stub assertion); existing money-CLI tests updated accordingly.
+- `lnrent reconcile` reports OK when the (mock, balance-stubbed) wallet ≥ expected and DRIFT when
+  below; it mutates nothing (ledger byte-identical before/after); it is the only test allowed to
+  see the balance stub called.
 
 ## Suggested implementation order
 
-1. Alert dispatcher + outbox sink + wire the two existing refund/balance conditions (PR-5 core).
-2. Teardown dead-letter table + retry + query/CLI + alert (PR-6).
-3. Refunds list/retry + relay status + federation probe + stuck retune (PR-9).
-4. Balance floor + INV-2 annotation (PR-16, smallest).
+1. Alert dispatcher + outbox sink + wire the two existing refund conditions (PR-5 core).
+2. §E INV-2 ledger revision (touches landed code; do it early so later steps build on
+   `expected_msat`) + the doc annotations.
+3. Teardown dead-letter table + retry + query/CLI + alert (PR-6).
+4. Refunds list/retry + relay status + federation probe + stuck retune (PR-9).
+5. §D holdings floor + §F reconcile command (small, both reuse `expected_msat`).

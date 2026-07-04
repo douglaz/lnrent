@@ -145,6 +145,17 @@ but stops *duplicate* work, not *flood* work (distinct `request_id`s bypass it e
   asserting `PRAGMA synchronous` == 2, so a future switch to a system/distro sqlite (where a
   NORMAL-in-WAL override is common) cannot silently lower money-write durability.
 
+> **Revision note (2026-07-04, ledger-authoritative):** PR-8, PR-16, and the landed INV-2 readiness
+> path were re-based on one principle — **the ledger (transaction history) authorizes and warns; the
+> federation balance is never read implicitly.** The balance is an eventually-consistent aggregate of
+> the same history on another clock; authorizing payouts or warnings off it created an unbounded
+> race surface (the sweep spec's first draft accreted catch-up/ordering/reserve patches before the
+> root cause was named). Now: the sweep authorizes from ledger surplus; readiness compares
+> ledger-expected holdings; the holdings floor is a ledger read; and the ONLY
+> `available_balance_msat` call site is the explicit, report-only `lnrent reconcile` command.
+> `BalanceQueryFailed` is retired. See docs/specs/gate1-operator-sweep.md +
+> docs/specs/gate1-alerting-operability.md §E/§F.
+
 ### PR-8 (GATE-1) — Operator payout / sweep path for accumulated ecash
 - **Evidence:** the CLI is read-only + admin (`Status/Recipes/Money/Subs/Sub/Suspend/Resume/Dev`,
   `bin/lnrent.rs:27-47`); the only outbound path is `pay`/`pay_refund_capped`, reachable only from the

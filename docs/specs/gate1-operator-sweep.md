@@ -1,9 +1,13 @@
-# Spec: GATE-1 operator sweep / payout (PR-8)
+# Spec: GATE-1 operator sweep / payout (PR-8) — ledger-authoritative
 
 **Status:** draft for codex-review-loop → rb-lite
 **Source:** docs/specs/production-readiness.md PR-8 (verified, 2026-07-03). Money-moving — kept as
-its own tight spec. This is the ONLY new outbound-payment path besides refunds; everything below
-exists to make it impossible for a sweep to eat funds owed to buyers or to double-pay.
+its own tight spec. **Revised 2026-07-04:** authorization is computed from the LEDGER ONLY; the
+federation balance is never read in this path. (The earlier draft authorized off
+`available_balance_msat` and accreted per-race patches — catch-up-first, balance-before-reserve
+ordering, open-invoice reserves, quiescence checks — all papering over one mistake: the balance is
+an eventually-consistent aggregate on a different clock than the ledger. Transactions are the
+truth; the balance is at most a reconciliation artifact. See §Design principle.)
 
 ## Problem (verified)
 
@@ -13,180 +17,161 @@ specific received amounts. The workaround — a second fedimint client against t
 RocksDB — risks corrupting the money DB (ADR-0015). Funds are recoverable from seed+invite but not
 withdrawable in operation.
 
-## Design
+## Design principle — the ledger authorizes; the balance never does
 
-One IPC command driving one idempotent backend pay, gated by the existing liability math.
+The daemon's sqlite ledger records every money event it has committed to: captured receipts
+(invoices marked PAID/settled by capture), refund intents/outcomes (`refund_attempt`), and — with
+this spec — sweep intents/outcomes (`sweep_attempt`). The Fedimint balance is a derived cache of
+the same history on the federation's clock; reading it to authorize a payout reintroduces a
+two-clock reconciliation problem with an unbounded race surface.
 
-### Command surface
+So the sweep authorizes from a single ledger-derived quantity:
+
+```
+receipts_msat = Σ gross of ALL captured receipts (every invoice the ledger has marked
+                PAID/settled — final, at-risk, and later-refunded alike)
+reserved_msat = Σ gross, counted ONCE per external_id (the same de-dup rule INV-2 uses), of:
+                • captured receipts still AT RISK (their sub is PENDING/PROVISIONING/
+                  RESUMING/REFUND_DUE — a state-machine refund path still exists), and
+                • every non-terminal refund_attempt (PENDING or otherwise unresolved,
+                  INCLUDING unpriceable ones — gross always bounds the INV-1-capped outlay)
+paid_out_msat = Σ gross of refund_attempt rows SENT (gross ≥ actual outlay, by INV-1)
+              + Σ max_outlay_msat of sweep_attempt rows SENT or PENDING
+
+surplus_msat  = receipts_msat − reserved_msat − paid_out_msat
+
+ALLOW iff surplus_msat >= outlay_msat(sweep)
+```
+
+The base is ALL receipts, not just "final" ones — the arithmetic must net to the right value per
+receipt: a FINAL receipt contributes +gross (sweepable); an at-risk receipt +gross −gross = 0; a
+refunded receipt +gross −gross(SENT) = 0. (Starting the base at final-only and *also* subtracting
+reserves/refunds would double-count every non-final receipt and systematically over-refuse —
+e.g. one ACTIVE 100k order + one PROVISIONING 100k order must leave 100k sweepable, not 0.) A
+receipt is FINAL (contributes its full gross with no offsetting reserve) exactly when no
+state-machine path can still route it to a refund:
+
+- an order receipt is final once its subscription reached `ACTIVE` (service delivered; cancel does
+  not refund prepaid time). A renewal receipt is final once applied to an `ACTIVE` sub, or once a
+  `RESUMING` resume succeeded. Anything ambiguous — the implementer cannot prove no refund path
+  remains — is reserved, at gross. **Fail closed: when in doubt, a receipt is reserved, never
+  sweepable.**
+- `outlay_msat(sweep) = refund_required_outlay_msat(amount_sat, Some(amount_sat))` — a gateway
+  QUOTE for the payment about to be made. This is a pricing call for execution, not a balance
+  read; if it fails, refuse (`sweep_unpriceable`).
+- Fees make the accounting conservative by construction: refunds are subtracted at gross though
+  their real outlay ≤ gross (INV-1), sweeps at their capped max outlay — so `surplus_msat`
+  UNDER-estimates real holdings and can never over-authorize.
+
+**Why the races are gone, not patched:** an uncaptured settlement is not a captured receipt, so it
+contributes nothing to `earned` — it cannot be swept, no matter when it lands (the money sits in
+the wallet, invisible to authorization, until capture books it *and* its at-risk reservation in
+the same act). An open unpaid invoice is not a receipt at all — no reserve needed. A late terminal
+settlement is captured atomically WITH its detached `refund_attempt` (capture writes both in one
+txn, §6.4/§6.6), so receipt and liability appear together — no window. There is no balance
+snapshot, so there is no read-ordering hazard. The earlier draft's catch-up-first, still-payable
+reserves, quiescence refusal, and balance-before-reserve rules are all deleted, not relocated.
+
+**If the wallet somehow holds less than the ledger-authorized surplus** (a fedimint-level loss or
+a ledger bug), the sweep's `pay` simply fails to assemble notes and errors cleanly — before
+anything moves. The pay itself is the fail-safe; no pre-read needed. Detecting such book-vs-wallet
+drift is a *reconciliation* concern, owned by the explicit operator command in
+docs/specs/gate1-alerting-operability.md §E — never by this authorization path.
+
+## Command surface
 
 - IPC `Request::Sweep { bolt11: String }` (LNRENT operator socket only, like every admin verb).
 - CLI `lnrent sweep <bolt11> [--json]`. The CLI first performs a dry-run quote
-  (`Request::SweepQuote { bolt11 }` → amount, fee outlay, balance, required liability reserve,
-  verdict) and prints it; executing requires the explicit flag `--yes` (mirrors the lnd-payments
-  pattern: quote by default, pay only on `--yes`).
+  (`Request::SweepQuote { bolt11 }` → amount, quoted outlay, earned/reserved/paid-out/surplus
+  breakdown, verdict) and prints it; executing requires the explicit flag `--yes` (mirrors the
+  lnd-payments pattern: quote by default, pay only on `--yes`).
 - The bolt11 MUST carry an amount (zero-amount invoices rejected: `sweep_invalid`). The amount is
-  the invoice's, not a CLI argument — no amount/dest mismatch class. The operator mints the invoice
-  in their own wallet.
+  the invoice's, not a CLI argument — no amount/dest mismatch class. The operator mints the
+  invoice in their own wallet.
+- Run the gate + the ledger write in the same serialized store/maintenance context the Refunder
+  uses, so the surplus computation cannot interleave with a capture or refund commit. (This is
+  ordinary single-writer discipline, ADR-0001 — not a race patch: all inputs are now in one
+  database under one writer.)
 
-### Safety gate (the whole point) — FAIL CLOSED
-
-The gate reconciles an external, asynchronously-moving federation balance against the local
-liability ledger. Rather than enumerate every read-interleaving, the gate obeys ONE dominant
-principle: **if total owed funds cannot be bounded to a concrete msat amount right now, REFUSE the
-sweep.** A refused sweep is a minor operator inconvenience; a sweep that guesses low is a drain of
-buyer funds. Concretely, the reserve counts owed funds at GROSS and never omits an unbounded one:
-
-- **Unpriceable refund liabilities are reserved at gross, never dropped.** The INV-2 readiness sum
-  omits an unpriceable PENDING refund from `required_msat` (it increments `unpriceable_count`); the
-  sweep must NOT reuse that omission. If any liability is unpriceable at gate time, either reserve
-  its full gross OR refuse the sweep outright with `sweep_unpriceable_liability` — do not let a
-  transient quote failure become sweepable headroom.
-- **Any invoice whose funds could still be owed is reserved at gross**, covering the
-  late-terminal-settlement window: an invoice can be locally EXPIRED/terminal while a late
-  settlement is still capturable (SPEC §6.3 — a late settlement on a terminal sub becomes a
-  detached refund). So reserve the gross of every invoice row that is NOT provably resolved —
-  i.e. every invoice that is neither (a) delivered as ACTIVE service nor (b) already represented by
-  a counted refund liability. In practice: all OPEN rows (as above) PLUS any terminal invoice
-  inside the late-settlement window that has no `refund_attempt` yet.
-- **Quiescence check:** if catch-up or the settlement stream shows any unreconciled settlement in
-  flight at gate time, refuse (`sweep_reconciling`) and let the operator retry once the daemon has
-  caught up. This closes the residual "settled at the backend, not yet a local row" window without
-  chasing its exact timing.
-
-The numeric gate below is evaluated only after the above fail-closed checks pass.
-
-**Reserve every still-payable invoice, not just captured liabilities.** The backend balance can
-include an order invoice the daemon RECEIVED but has not yet CAPTURED (settlement/catch-up lag), and
-— because the backend keeps receiving external payments asynchronously — a fresh payment can also
-land *between* any catch-up scan and the pay. A one-shot catch-up cannot close that race. So the
-reserve must be conservative about POTENTIAL liabilities, not just realized ones:
-
-1. Run the supervisor's settlement catch-up first (scan OPEN invoices, `lookup`, capture-if-Paid) so
-   already-received orders become visible liabilities.
-2. Then include in `reserve_msat` the **gross of every OPEN (non-terminal, un-captured)
-   order/renewal invoice in the store — with NO expiry filter.** An invoice row is OPEN only until
-   capture settles, refunds, or expires it; while it is OPEN, capture can still accept a settlement
-   whose `settled_at < expires_at` and owe/provision against it. Reserving ALL open rows (not just
-   "unexpired" ones) is the simplest rule that closes the entire class of expiry-window races: a
-   sweep can never withdraw funds an open invoice might still be captured against, regardless of
-   the exact moment balance vs reserve are read. It is intentionally conservative (an open invoice
-   that ultimately expires unpaid briefly holds sweepable headroom) — the correct bias for an
-   operator payout.
-
-Run the catch-up and the reserve read in the same serialized maintenance context. **The read order
-is a hard requirement: snapshot `balance_msat = available_balance_msat()` FIRST (call it T0), then
-read `reserve_msat` (liabilities + all OPEN rows) at T1 ≥ T0.** With this order the two rules
-compose into the full guarantee: any external payment reflected in the T0 balance was paid before
-T0, so its invoice row was OPEN (or captured) before T0 and is therefore still counted by the
-reserve read at T1. A NEW invoice created after T0 cannot inflate the T0 balance, so it can't make
-`ALLOW` pass on funds it will owe. Reserve-before-balance is NOT permitted (a new invoice could
-commit after the reserve snapshot and be paid before the balance snapshot, escaping the reserve).
-
-Computed inside the daemon at execution time, atomically with the pay decision (same serialized
-maintenance/store context as the Refunder so liability state cannot race):
-
-```
-outlay_msat   = payment.refund_required_outlay_msat(amount_sat, Some(amount_sat))   // payout + fee, real gateway quote
-reserve_msat  = gross of ALL outstanding refund liabilities INCLUDING unpriceable + parked/manual
-                  (fail-closed: unpriceable counted at gross, never omitted)
-                + gross_msat of EVERY OPEN (non-terminal, un-captured) order/renewal invoice
-                + gross_msat of every terminal invoice still inside the late-settlement window
-                  with no refund_attempt yet
-                // and only after the unpriceable / quiescence fail-closed checks above pass
-balance_msat  = payment.available_balance_msat()  (None or query error → REFUSE, sweep_unavailable)
-ALLOW iff balance_msat >= outlay_msat + reserve_msat
-```
-
-- Refusal is a structured error naming the shortfall — never a partial sweep. No "force" override:
-  if the operator wants to drain past the liability reserve, that is manual seed-level action, not
-  a daemon verb.
-- Parked/manual refunds count at GROSS in the reserve (they are owed until resolved).
-
-### Idempotency + ledger
+## Idempotency + ledger
 
 - Pay key: `sweep:<payment_hash>` (the bolt11 payment hash — unique per invoice, deterministic on
-  retry of the same invoice). **Send with an outlay cap, not bare `pay`:** the gateway fee can move
-  between the quote and the send, and bare `PaymentBackend::pay` has no outlay ceiling — a fee rise
-  could push the real outlay past the quoted `outlay_msat` and eat into the refund reserve. Reuse
-  the capped-send guarantee: extend the backend with `pay_capped(bolt11, amount_sat,
-  max_outlay_msat, key)` (or generalize the existing `pay_refund_capped`'s cap check to take an
-  explicit `max_outlay_msat` instead of a gross-sat) and pass the just-quoted `outlay_msat`. A
-  NEW operation refuses to start if the real `amount*1000 + fee > max_outlay_msat`; existing
-  SUCCEEDED/PENDING ops for the key re-await exactly like `pay`. This keeps INV-1's *refund* gross
-  semantics separate while giving the sweep its own explicit outlay ceiling. The backend key dedup +
-  fedimint payment-hash dedup make a re-submitted invoice safe (re-awaits, never double-pays).
+  retry of the same invoice). **Send with an outlay cap:** extend the backend with
+  `pay_capped(bolt11, amount_sat, max_outlay_msat, key)` (or generalize the existing
+  `pay_refund_capped`'s check to take an explicit `max_outlay_msat`), passing the just-quoted
+  `outlay_msat`. A NEW operation refuses to start if the real `amount*1000 + fee >
+  max_outlay_msat` (a fee rise between quote and send must refuse, not overspend); existing
+  SUCCEEDED/PENDING ops for the key re-await exactly like `pay`. The backend key dedup + fedimint
+  payment-hash dedup make a re-submitted invoice safe (re-awaits, never double-pays).
 - Durable intent BEFORE pay, mirroring the refund ledger pattern (§6.6): new table `sweep_attempt`
   (id = `sweep:<payment_hash>`, bolt11, amount_sat, max_outlay_msat, status PENDING|SENT|FAILED,
-  attempts, created_at, sent_at, last_error). **Recovery must distinguish a started backend payment
-  from an unstarted intent, and re-gate the latter** — a crash can leave a PENDING sweep whose pay
-  never started while restart catch-up discovers new refund liabilities; blindly re-driving by key
-  could spend funds now reserved for refunds. On boot/maintenance, for each PENDING sweep:
+  attempts, created_at, sent_at, last_error). A PENDING/SENT sweep row subtracts its
+  `max_outlay_msat` from the surplus (see gate) the moment it exists — so even mid-flight, the
+  committed outlay is already accounted.
+- **Crash recovery re-gates unstarted intents.** On boot/maintenance, for each PENDING sweep:
   `payment_started_by_key(key)` (the same disambiguator the refund path uses) →
-  - **started** (durable evidence of a backend op): re-await by key exactly like a refund
-    (`payment_status_by_key` fast-skip on Succeeded) — the funds are already committed, finishing
-    is correct and cannot double-pay;
-  - **not started**: RE-RUN the full balance/reserve gate against current liabilities before the
-    capped send. If the gate now fails, leave the row PENDING (or mark it FAILED with a clear
-    "superseded by refund liability" reason) and alert — never send.
-  Do NOT reuse the `refund_attempt` table — sweeps must never enter refund liability/readiness
-  math, and INV-3 provenance would (correctly) reject them.
+  - **started** (durable evidence of a backend op): re-await by key (`payment_status_by_key`
+    fast-skip on Succeeded) — funds are already committed; finishing is correct and cannot
+    double-pay;
+  - **not started**: RE-RUN the surplus gate against the current ledger before the capped send
+    (new liabilities may have been captured since the intent was written) — **excluding the row
+    being recovered from its own `paid_out_msat`** (its cap is already subtracted the moment the
+    PENDING row exists; gating it against itself would demand the funds twice and falsely
+    supersede a sweep that fit exactly). Other PENDING/SENT sweeps still count. If the gate now
+    fails, mark the row FAILED with reason `superseded_by_liability` and alert — never send.
 - One in-flight sweep at a time (`WHERE status='PENDING'` count must be 0 to accept a new one):
-  keeps the gate math simple and honest. `sweep_busy` error otherwise.
+  keeps the surplus math trivially serializable. `sweep_busy` error otherwise.
 - Expired bolt11 at execution → FAILED with the backend error; the operator re-issues and re-runs.
+- Do NOT reuse the `refund_attempt` table — sweeps must never enter refund liability/readiness
+  math, and INV-3 provenance would (correctly) reject them.
 
-### Observability
+## Observability
 
-- `lnrent money` gains `last_sweep` (status, amount, when) — one row lookup, no new probe.
-- Sweep attempts appear in the event_log journal (`kind='sweep'`) like other money transitions.
-- A FAILED sweep fires the PR-5 alert path if present (kind `SweepFailed` — add to the enum in the
-  alerting spec's build if both land; otherwise a WARN log suffices; do not create a dependency
-  between the two specs).
+- `lnrent money` gains `last_sweep` (status, amount, when) and the surplus breakdown (earned /
+  reserved / paid-out / surplus) — all ledger reads, no network.
+- Sweep attempts appear in the `event_log` journal (`kind='sweep'`) like other money transitions.
+- A FAILED sweep fires the PR-5 alert path if present (kind `SweepFailed`); otherwise a WARN log
+  suffices; do not create a dependency between the two specs.
 
 ## Non-goals
 
-No scheduled/automatic sweeps; no sweep-to-LN-address/LNURL (bolt11 only — the operator controls
-their own wallet; the resolver stays refund-only); no partial/split sweeps; no fee-limit knob
-(the gateway quote is the fee; refusal math already accounts for it); no on-chain/ecash-note
-export; no change to refund paths or INV-1/2/3.
+No balance read anywhere in this path (authorization, pre-checks, or acceptance); no scheduled/
+automatic sweeps; no sweep-to-LN-address/LNURL (bolt11 only — the operator controls their own
+wallet; the resolver stays refund-only); no partial/split sweeps; no fee-limit knob (the quote is
+the fee; the cap enforces it); no on-chain/ecash-note export; no change to refund paths or
+INV-1/INV-3; no book-vs-wallet drift detection here (that is the explicit reconcile command,
+alerting spec §E).
 
 ## Acceptance
 
-- Quote → pay happy path on a funded regtest backend: `sweep` with `--yes` pays the operator
-  invoice, ledger goes PENDING→SENT, `lnrent money` shows it, balance drops by outlay.
-- Liability gate: with an outstanding refund liability of R and balance < outlay + R, the sweep is
-  refused with the shortfall; paying down the liability (refund completes) then allows it.
-  Parked/manual liabilities gate at gross.
-- Fail-closed: an unpriceable PENDING refund refuses the sweep (`sweep_unpriceable_liability`) or is
-  reserved at gross (never omitted); an in-flight unreconciled settlement refuses (`sweep_reconciling`)
-  until catch-up completes; a terminal invoice inside the late-settlement window with no
-  `refund_attempt` is reserved at gross. In every ambiguous case the sweep refuses rather than
-  guessing low.
+- Happy path: with only FINAL receipts in the ledger, quote → `--yes` pays the operator invoice,
+  ledger goes PENDING→SENT, `lnrent money` shows it. On a funded regtest backend the fedimint_live
+  suite gains a sweep test alongside the existing pay test.
+- Surplus gate (pure ledger unit tests, no backend needed): at-risk receipts
+  (PENDING/PROVISIONING/RESUMING/REFUND_DUE) reserve at gross; non-terminal refunds — including an
+  unpriceable one — reserve at gross with per-external_id de-dup; SENT refunds and PENDING/SENT
+  sweeps subtract; a receipt becomes sweepable exactly when its sub reaches ACTIVE (and a
+  suspended-renewal receipt when RESUMING→ACTIVE lands).
+- An uncaptured settlement is inert: settle an invoice at the (mock) backend WITHOUT running
+  capture → surplus unchanged, sweep of those funds refused; after capture the receipt appears as
+  at-risk, and only at ACTIVE does it become sweepable.
+- Fee-rise safety: quote at fee F, raise the gateway fee before send → the capped send refuses;
+  nothing paid; row FAILED with the cap error.
 - Idempotency/crash: kill between ledger-PENDING and pay-confirm → restart re-drives by key, funds
-  sent exactly once (mirror the refund crash tests); re-submitting the same bolt11 after success
-  returns the cached success, no second payment.
-- Zero-amount bolt11, expired bolt11, balance-query failure, and a second concurrent sweep are all
-  structured refusals; nothing is written to `refund_attempt`; refund readiness (`lnrent money`
-  ready/warning) is byte-identical before/after a sweep with no liabilities.
-- Mock backend: `MockPayment` uses the trait-default `available_balance_msat() -> None`, so a
-  sweep against the plain mock is refused `sweep_unavailable` — assert that. To exercise the happy
-  path/gate math on the mock, the test injects a mock with a configured balance (add a
-  `MockPayment::set_balance`/override in the test support, mirroring `set_now`); `pay` then succeeds
-  normally (sweep is not dev-gated). The real balance-backed path is exercised in the fedimint_live
-  suite (a sweep test alongside the existing pay test).
-
-## Implementation note (money-safety surface)
-
-The sweep gate reconciles an async external balance against the local ledger — an inherently
-concurrent surface. This spec pins the money-safety INVARIANT (fail closed: never sweep unless total
-owed funds are bounded and covered; balance snapshot before reserve read; reserve every unresolved
-row at gross) rather than a single canonical interleaving. The implementer owns choosing the
-concrete serialization (e.g. gate + pay under the maintenance lock, quiescence check before quote)
-and MUST cover the fail-closed cases with tests. If the chosen mechanism cannot cheaply prove the
-invariant, prefer refusing more sweeps over risking one drain.
+  sent exactly once (mirror the refund crash tests); the not-started branch re-gates and refuses
+  (`superseded_by_liability`) when a new liability consumed the surplus; re-submitting the same
+  bolt11 after success returns the cached success, no second payment.
+- Zero-amount bolt11, expired bolt11, quote failure (`sweep_unpriceable`), and a second concurrent
+  sweep (`sweep_busy`) are structured refusals; nothing is written to `refund_attempt`; a sweep
+  never enters the refund LIABILITY set (`required_msat` unchanged) — but it DOES reduce
+  ledger-expected holdings (`expected_msat` subtracts SENT/PENDING sweep caps, per the alerting
+  spec §D), so readiness correctly reflects that a committed payout shrinks coverage.
+- Works identically on `MockPayment` (no balance concept needed — the gate never asks for one).
 
 ## Suggested implementation order
 
-1. `sweep_attempt` table + gate math incl. the fail-closed reserve (pure store/unit-testable).
-2. IPC SweepQuote/Sweep + CLI with `--yes`.
-3. Recovery drive + crash tests; the fail-closed cases (unpriceable, reconciling, late-settlement);
-   fedimint_live sweep test.
+1. `sweep_attempt` table + the ledger surplus computation (pure store/unit-testable — this is most
+   of the spec).
+2. `pay_capped` (or the generalized cap) on the backend trait + Fedimint impl.
+3. IPC SweepQuote/Sweep + CLI with `--yes`.
+4. Recovery drive + crash tests; fedimint_live sweep test.

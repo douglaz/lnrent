@@ -43,6 +43,12 @@ Three money-path defects exist now that the daemon can move real ecash (o6p, com
   what we owe") MUST be emitted only when an actual **liability** exists that the operator cannot cover.
   A *liability* is value received but not yet delivered or refunded. With **no liabilities, there are no
   readiness warnings**, regardless of balance.
+  *Revision (2026-07-04, ledger-authoritative — docs/specs/gate1-alerting-operability.md §E):* the
+  "cannot cover" operand changes from a live `available_balance_msat()` federation query to the
+  ledger-derived expected-holdings lower bound; `BalanceQueryFailed` is retired (no automatic balance
+  read remains — the only balance call site is the explicit operator `reconcile` command). The
+  liability-gating rule above is UNCHANGED; a separate liability-independent ledger-holdings floor
+  warning (PR-16) exists alongside it and is not a readiness warning.
 
 - **INV-3 — refund provenance.** A refund MUST NOT be executed unless it corresponds to a payment
   actually received for that order. Refunding before/without a received payment is forbidden and is a
