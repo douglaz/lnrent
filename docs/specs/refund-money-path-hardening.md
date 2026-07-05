@@ -1,6 +1,6 @@
 # Spec: refund fee-deduction, liability-gated readiness, and refund provenance
 
-Status: **Implemented** (master: INV-1/INV-3 `b7a5421`, INV-2 `c07fe11`, final-gate edge fixes `bcf6922`) — money-path hardening for the Fedimint payment backend wired in lnrent-o6p.
+Status: **Implemented** (master: INV-1/INV-3 `b7a5421`, INV-2 `c07fe11`, final-gate edge fixes `bcf6922`, balance-query alarm + fee-change re-resolve `f35ee77`) — money-path hardening for the Fedimint payment backend wired in lnrent-o6p.
 Scope: `daemon/src/{backends.rs, fedimint_backend.rs, refund.rs, capture.rs, provision.rs, supervisor.rs, store.rs}`.
 Audience: the rb-lite implementer. This spec is the contract; tests below are mandatory ship gates.
 
@@ -43,6 +43,12 @@ Three money-path defects exist now that the daemon can move real ecash (o6p, com
   what we owe") MUST be emitted only when an actual **liability** exists that the operator cannot cover.
   A *liability* is value received but not yet delivered or refunded. With **no liabilities, there are no
   readiness warnings**, regardless of balance.
+  *Revision (2026-07-04, ledger-authoritative — docs/specs/gate1-alerting-operability.md §E):* the
+  "cannot cover" operand changes from a live `available_balance_msat()` federation query to the
+  ledger-derived expected-holdings lower bound; `BalanceQueryFailed` is retired (no automatic balance
+  read remains — the only balance call site is the explicit operator `reconcile` command). The
+  liability-gating rule above is UNCHANGED; a separate liability-independent ledger-holdings floor
+  warning (PR-16) exists alongside it and is not a readiness warning.
 
 - **INV-3 — refund provenance.** A refund MUST NOT be executed unless it corresponds to a payment
   actually received for that order. Refunding before/without a received payment is forbidden and is a
@@ -59,7 +65,15 @@ consequence — there is no received ecash, therefore no refund row, therefore n
 **Fee model.** The selected gateway advertises `RoutingFees { base_msat: u32, proportional_millionths:
 u32 }` (`LightningGateway.fees`, reachable via `LightningClientModule::get_gateway(self.gateway,
 false) -> Result<Option<LightningGateway>>`). For an outgoing payment of `x_msat` the gateway charges
-`fee(x) = base_msat + floor(x_msat * ppm / 1_000_000)`. Fedimint's gateway contract makes this
+**exactly what Fedimint's `RoutingFees::to_amount` computes**:
+`fee(x) = base_msat + (ppm > 0 ? x_msat / (1_000_000 / ppm) : 0)`, with INTEGER (truncating) division
+on BOTH steps, and the schedule is **unpayable** (`None`; treat as "no positive payout fits") when
+`ppm > 1_000_000` (the truncated divisor is 0). Do NOT use the algebraically tempting
+`base_msat + floor(x_msat * ppm / 1_000_000)`: when `ppm` does not divide `1_000_000` the truncated
+divisor makes the REAL fee strictly larger, so the naive form under-quotes the cap and lets a refund
+spend more than the gross received — an INV-1 drain (found as a codex P1; regression test
+`nondividing_ppm_uses_actual_fee_not_naive_product`, impl `gateway_fee_msat`,
+daemon/src/fedimint_backend.rs:1272-1293). Fedimint's gateway contract makes this
 advertised schedule the operator's fee exposure; route-specific over/under-performance is the gateway's
 risk, not something the buyer can amplify by choosing a hard destination.
 
@@ -71,7 +85,10 @@ received amount:
 ```
 R_msat      = gross_sat * 1000
 pay_msat(n) = n * 1000
-fee_msat(n) = if n == 0 { 0 } else { base_msat + floor(pay_msat(n) * ppm / 1_000_000) }
+fee_msat(n) = if n == 0 { 0 }
+              else if ppm == 0 { base_msat }
+              else if 1_000_000 / ppm == 0 { UNPAYABLE (None) }   // ppm > 1_000_000
+              else { base_msat + pay_msat(n) / (1_000_000 / ppm) } // integer div BOTH steps (RoutingFees::to_amount)
 valid(n)    = pay_msat(n) + fee_msat(n) <= R_msat   // valid(0) is ALWAYS true: n==0 is NO payment,
                                                     // hence zero payout and zero fee
 net_sat     = max n in [0, gross_sat] such that valid(n)   // always well-defined; net_sat == 0 == dust
@@ -322,10 +339,25 @@ async fn available_balance_msat(&self) -> Result<Option<u64>> { Ok(None) }
 
 /// Whether the backend can currently price/pay refunds. Default true for mock/internal backends.
 async fn refund_gateway_ready(&self) -> Result<bool> { Ok(true) }
+
+/// Exact backend outlay in MSATS (payout + fee) needed NOW to start an automated refund of a
+/// `gross_sat` liability. `pay_sat=Some(_)` prices a fixed/persisted resolved invoice; `None` asks
+/// the backend to price a fresh net cap. Pricing failure is `Err` (counted as `Unpriceable` by
+/// readiness), never a silent default. Landed in `c07fe11` (daemon/src/backends.rs:74-84); the
+/// default (no-fee backends) prices `pay_sat.unwrap_or(refund_net_sat(gross_sat))` as u128 msats.
+async fn refund_required_outlay_msat(&self, gross_sat: u64, pay_sat: Option<u64>) -> Result<u128>;
 ```
 
-`FedimintPayment` overrides `available_balance_msat` (`get_balance_for_btc().msats`) and
-`refund_gateway_ready` using the same configured gateway lookup used by refund quoting/paying.
+`FedimintPayment` overrides `available_balance_msat` (`get_balance_for_btc().msats`),
+`refund_gateway_ready`, and `refund_required_outlay_msat` using the same configured gateway lookup
+used by refund quoting/paying.
+
+**Landed warning taxonomy note (`f35ee77`, post-dates the pseudocode above):** the readiness report
+grew two variants beyond the three arms sketched in the Supervisor block — `BalanceQueryFailed`
+(a balance query error is a loud ALARM, never treated as "no balance concept") and `Unpriceable`
+(a liability whose required outlay cannot be priced right now). The authoritative 5-variant set is
+documented in docs/specs/operator-money-cli.md and implemented at daemon/src/supervisor.rs:1230-1248;
+this section's pseudocode is the earlier sketch.
 
 ### 3.3 INV-3 — refund provenance
 

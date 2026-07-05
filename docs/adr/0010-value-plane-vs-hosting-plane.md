@@ -1,6 +1,6 @@
 # 0010 — Separate the value plane from the hosting plane
 
-The operator's funds (the phoenixd / Fedimint receiving wallet) and the BIP39 seed +
+The operator's funds (the Fedimint receiving wallet; phoenixd later, ADR-0012) and the BIP39 seed +
 master key are the operator's most valuable assets. Untrusted tenant VMs run on hosting
 boxes. Co-locating them means a tenant VM escape — or any box compromise — drains the
 operator's Lightning funds and steals the seed (which is the brand identity and derives
@@ -10,7 +10,7 @@ from the tenants.
 Rule: once a box hosts untrusted tenant VMs, the operator's funds and seed do NOT live on
 it. lnrent splits into two planes:
 
-- **Value / identity / marketplace plane (the control node):** holds the phoenixd/Fedimint
+- **Value / identity / marketplace plane (the control node):** holds the Fedimint
   wallet + the hot **marketplace operational key**, and the marketplace control — the Nostr
   engine (publish listings, handle order DMs), the subscription store + billing/reconcile. The
   **BIP39 seed + master key stay cold/offline** (used only to issue/update the manifest), not

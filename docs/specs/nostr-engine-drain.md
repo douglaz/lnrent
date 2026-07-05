@@ -1,6 +1,6 @@
 # Spec: NostrEngine graceful shutdown drain (lnrent-k82)
 
-**Status:** draft for codex-review-loop → rb-lite
+**Status:** **Implemented** (master `02917b5`; nostr_engine.rs `InboundTaskState`/`drain`, supervisor.rs inbound-special-cased shutdown). Landed slightly stronger than specified: aux backlog/resubscribe tasks are aborted *and awaited* within the drain deadline, and the timed-out path awaits the aborted accept loop before snapshotting per-wrap handles.
 **Bead:** lnrent-k82 (P2, money-path). Confirmed by reading `daemon/src/supervisor.rs` + `daemon/src/nostr_engine.rs`.
 
 ## Problem (verified)

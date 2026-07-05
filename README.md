@@ -5,6 +5,10 @@ anyone can discover it, order it, pay a Lightning/Fedimint invoice, and get a pr
 no central server, no accounts, no AI in the serving path. Services are **recipes** (a manifest + a few
 lifecycle hooks), so the catalogue is open-ended; the first real one provisions DigitalOcean VPSs.
 
+The goal is an **ecosystem of independent service providers** — many unrelated operators, each
+running their own daemon, selling into the same open Nostr marketplace — not a single hosted
+deployment run by this project.
+
 - **Control plane:** `lnrentd` (Rust) — orders, payments, subscriptions, provisioning, refunds, Nostr.
 - **Operator CLI:** `lnrent` — talks to a running daemon over a local IPC socket (status, subs, money).
 - **Buyer CLI:** `lnrent-buyer` — agent-grade; discovers listings and places orders over Nostr.
@@ -32,7 +36,7 @@ Built and tested:
 - **Operator** — `lnrent status/recipes/subs/sub`, and `lnrent money` (ecash balance, gateway, refund
   liability coverage).
 
-Not yet: a browser/GUI buyer, more compute providers (Hetzner, bring-your-own-host), and the mainnet
+Not yet: more compute providers (Hetzner, bring-your-own-host) and the mainnet
 go-live (real money is opt-in at runtime and gated on the operator finalizing their setup). See
 [SPEC.md](./SPEC.md).
 
@@ -70,7 +74,7 @@ LNRENT_MNEMONIC="…" LNRENT_DATA_DIR=./data LNRENT_RECIPES_DIR=./recipes LNRENT
 
 ```sh
 LNRENT_DATA_DIR=./data nix develop . --command cargo run -p lnrentd --bin lnrent -- money
-#   subcommands: status · recipes · subs · sub <id> · money   (add --json for machine output)
+#   subcommands: status · recipes · subs · sub <id> · money · suspend <id> · resume <id>   (add --json for machine output)
 ```
 
 **Buyer CLI** (talks to the operator over a relay; the buyer pays the returned invoice from their own
@@ -91,6 +95,7 @@ $B order wait <order_id>              # -> access credentials (host/port/user)
 - `daemon/` — `lnrentd` (control plane) + `lnrent` (operator CLI)
 - `wire/` — the Nostr wire codec: DM message types, NIP-99 listings, NIP-17 gift-wrap
 - `clients/core` — `lnrent-buyer-core` (buyer library); `clients/cli` — `lnrent-buyer` (native buyer)
+- `clients/web` — the static WASM buyer SPA (NIP-07/WebLN with copy+QR fallback; e2e in `clients/web/e2e`)
 - `recipes/` — service recipes: `do-vps` (DigitalOcean VPS), `wireguard` (stub), `dummy` (tests)
 
 ## Docs

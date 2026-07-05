@@ -1,6 +1,6 @@
 # Spec: downtime credit for SUSPENDED subscriptions (lnrent-d6n)
 
-**Status:** draft for codex-review-loop → rb-lite
+**Status:** **Implemented** (master `17e3f6a`; `reconcile.rs::apply_restart_downtime_credit` SUSPENDED branch, reconcile.rs:416-463)
 **Bead:** lnrent-d6n (P2; confirmed by the 2026-07-02 codex review). Extends the 7fp.22 downtime credit.
 
 ## Problem (verified)

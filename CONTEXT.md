@@ -12,7 +12,9 @@ the domain language. It is a glossary, not a spec; see SPEC.md for design.
 **Operator**:
 The person who owns one or more Boxes, installs Recipes, publishes Listings, and
 receives payment. One Operator has a single brand (Master identity); each Box uses a
-derived Operational key (see Identity), all from one Operator seed.
+derived Operational key (see Identity), all from one Operator seed. An Operator is a
+third party, not this project's authors: lnrent exists to create an ecosystem of many
+independent Operators, so anything Operator-facing is product surface.
 _Avoid_: seller, host, provider, vendor
 
 **Buyer**:
@@ -100,8 +102,8 @@ _Avoid_: cart, checkout, request, job
 **Subscription**:
 The durable paid relationship between a Buyer and a Listing. Prepaid to a Paid-through
 date and renewed before it. Carries the lifecycle state (pending, provisioning, active,
-suspended, terminated, plus expired, cancelled, refund-due, refunded; SPEC §6.3). One
-Subscription owns one Instance (v1).
+resuming, suspended, terminated, plus expired, cancelled, refund-due, refunded; SPEC §6.3).
+One Subscription owns one Instance (v1).
 _Avoid_: plan, contract, lease, membership; the removed `due`/`grace` states
 
 **Instance**:

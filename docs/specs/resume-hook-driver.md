@@ -1,6 +1,6 @@
 # Spec: run the recipe `resume` hook on a paid suspended-renewal (lnrent-18v)
 
-**Status:** draft for codex-review-loop → rb-lite
+**Status:** **Implemented** (master `86815fc`; daemon/src/resume.rs, capture.rs RESUMING arm, supervisor boot order). Landed with one deliberate extension beyond this doc: a renewal settling *while* the sub is already `RESUMING` is captured in-place (stays `RESUMING`, stacks another `renew_resume` baseline — capture.rs:200); on permanent resume failure the driver restores from the FIRST baseline and inserts one refund row *per pending renewal* (resume.rs:288-332, journaled `resume_failed`) — not the single-renewal shape below.
 **Bead:** lnrent-18v (P1; the resume-hook strand split from g5p, was blocked on `.21` daemon wiring — now
 unblocked). Confirmed by the 2026-07-02 codex review (a real paid-but-no-service money bug).
 

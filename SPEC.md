@@ -15,6 +15,14 @@ marketplace server, no central payment custodian. "Marketplace" means the decent
 fabric, not a service lnrent runs: relays are public or operator-run, and any KMS /
 registry referenced by the VM guidelines is operator-run, never a central party.
 
+**Who this is for.** lnrent is not built for its authors' own hosting. The point is an
+**ecosystem of independent service providers**: many unrelated operators, each running their own
+daemon on their own boxes, meeting buyers in the same open Nostr marketplace. The "operator"
+throughout this spec is therefore a third party who has never read this codebase — which makes
+operator-facing surface (safe defaults, preflight, alerts, payout, runbooks) product, not internal
+tooling, and makes abuse-resistance a duty owed to operators who cannot patch around gaps
+themselves.
+
 Renting is one capability, not the whole product. A managed service is either:
 
 - **self-use** — the operator runs it for themselves; no Listing, no billing; or
@@ -51,6 +59,8 @@ hardcoded. Adding a service means dropping in a new recipe.
   after retention.
 - New services are added as self-contained recipes without touching daemon code.
 - The whole thing runs on NixOS (declarative) and Debian (imperative).
+- The end state is an **ecosystem of providers**, not one deployment: any number of
+  independent operators can pick this up, onboard cold, and run it unattended.
 
 ### Non-goals (v1)
 - No central marketplace website or hosted directory. Discovery is Nostr-native.
@@ -345,7 +355,7 @@ NIP-17 private DM between the buyer and operator pubkeys:
 |--|--|--|
 | `order.request`   | buyer -> operator | `id` (unique request id), `listing_id`, validated `params`, `refund_dest` (REQUIRED, re-resolvable Lightning address / HTTPS LNURL; raw bolt11 and BOLT12 rejected for new orders) |
 | `order.invoice`   | operator -> buyer | `request_id` (= the `order.request` `id`), `order_id`, `bolt11`, `amount_sat`, `period`, `expires_at` |
-| `order.error`     | operator -> buyer | `request_id`, `order_id` (optional — absent for a pre-order validation failure), `error` `{ code, message, retryable }` with `code` in `capacity_full` / `params_invalid` / `price_changed` / `unavailable` / `rejected` — same nested `error` shape as `op.result`, so a buyer agent branches uniformly |
+| `order.error`     | operator -> buyer | `request_id`, `order_id` (optional — absent for a pre-order validation failure; currently ALWAYS absent: the order + invoice commit atomically, so no post-commit `order.error` path exists), `error` `{ code, message, retryable }` with `code` in `capacity_full` / `params_invalid` / `price_changed` / `unavailable` / `rejected` — same nested `error` shape as `op.result`, so a buyer agent branches uniformly |
 | `provision.ready` | operator -> buyer | `subscription_id`, `payload` (the credentials) |
 | `delivery.resend.request` | buyer -> operator | `subscription_id` — re-send the latest `provision.ready` (dropped-DM resync; replaces the old overload of `renew.request` for this) |
 | `billing.invoice` | operator -> buyer | `subscription_id`, `request_id` (when answering a `renew.request`), `bolt11`, `amount_sat`, `due_at`, `expires_at` |
@@ -482,19 +492,29 @@ trait PaymentBackend {
 }
 ```
 
+The sketch above is the original 6-method core. The landed trait (daemon/src/backends.rs) adds
+the money-hardening surface — most importantly **`pay_refund_capped`** (the INV-1 fee-capped
+refund pay; refunds MUST use it, never bare `pay`), plus `lookup_settlement`,
+`refund_net_sat` / `refund_required_outlay_msat`, `payment_started_by_key`,
+`available_balance_msat`, and `refund_gateway_ready`.
+docs/specs/refund-money-path-hardening.md §3 is the source of truth for those.
+
 `PaymentStatus` (`Open` / `Paid` / `Expired`) describes an inbound **invoice**; an **outbound**
 refund uses the distinct `PayStatus` (`Unknown` / `Pending` / `Succeeded` / `Failed`) — they
 are not the same enum. Because `pay` is **idempotent on `idempotency_key`**, the daemon can
-safely **retry `pay(key)`** after a crash at ANY point (the backend dedups, so a retry never
-double-refunds); `payment_status_by_key` is only an optimization to skip a redundant call when
+safely **retry the payment by `key`** after a crash at ANY point (the backend dedups, so a retry
+never double-refunds) — for refunds that retry goes through **`pay_refund_capped`**, which
+re-awaits an existing operation for the key exactly like `pay`, so the retry-by-key semantics are
+identical through the capped path; `payment_status_by_key` is only an optimization to skip a redundant call when
 the prior attempt already `Succeeded`. This requires a backend that dedups `pay` on the key —
 natively or via a durable key->payment map — which the v1 Fedimint backend must provide; a
 backend offering neither cannot do safe automatic refunds and falls back to operator
 reconciliation.
 
 `pay` is **idempotent on `idempotency_key`**: calling it twice with the same key never sends
-twice. The daemon persists the `refund_attempt` (with its key) as `PENDING` *before* calling
-`pay`; on restart it simply **retries `pay(key)`** for any non-terminal refund — safe whether
+twice, and `pay_refund_capped` re-awaits an existing operation for the key exactly the same way.
+The daemon persists the `refund_attempt` (with its key) as `PENDING` *before* paying; on restart
+it simply **retries the capped pay for the key** of any non-terminal refund — safe whether
 the crash was before or after a prior call, because the key dedups (§6.6). `payment_status_by_key`
 only skips a redundant `pay` once a prior attempt `Succeeded`. Backends that cannot natively
 dedup an outbound payment must persist a key->payment map; a backend that can do neither cannot
@@ -537,8 +557,13 @@ A subscription is **prepaid to a hard expiry date** (`paid_through`):
 
 ### 6.3 Subscription state machine
 
-States: `PENDING`, `PROVISIONING`, `ACTIVE`, `SUSPENDED`, `TERMINATED`, `EXPIRED`,
+States: `PENDING`, `PROVISIONING`, `ACTIVE`, `RESUMING`, `SUSPENDED`, `TERMINATED`, `EXPIRED`,
 `CANCELLED`, `REFUND_DUE`, `REFUNDED`.
+
+`RESUMING` is the paid, in-flight resume state (the renewal analogue of `PROVISIONING`): a late
+renewal of a `SUSPENDED` sub is captured into `RESUMING`, not straight to `ACTIVE`, so the row is
+never read as running until the recipe `resume` hook has actually powered the service back on
+(docs/specs/resume-hook-driver.md, bead lnrent-18v).
 
 Timers per Listing (operator-tunable): `period` (how much a payment extends
 `paid_through`, e.g. 30d), `renew_lead` (how far before expiry renewal is recommended
@@ -582,15 +607,29 @@ re-based to `settled_at`):
   / destroy) governs. Renewal-invoice expiry is not a subscription transition.
 - **ACTIVE -> SUSPENDED** — `paid_through` reached unpaid; run `suspend` (service
   interrupted, data kept).
-- **SUSPENDED -> ACTIVE** — late renewal within retention; run `resume`; apply the
-  `paid_through` formula above.
+- **SUSPENDED -> RESUMING -> ACTIVE** — a late renewal settles within retention. Capture applies
+  the `paid_through` formula and moves the sub to **RESUMING** (paid, captured, but the service is
+  not yet powered back on); the resume driver then runs the recipe `resume` hook and
+  CAS-transitions **RESUMING -> ACTIVE** on success. `RESUMING` is driver-owned: reconcile never
+  treats it as ACTIVE/SUSPENDED, and buyer `cancel`/`renew` are refused while in it.
+- **RESUMING -> SUSPENDED** — the `resume` hook failed permanently (after bounded retries). Each
+  captured-but-unresumed renewal (more can settle and stack while `RESUMING`) is auto-refunded via
+  exactly one detached `refund_attempt` per renewal, the pre-renewal suspended timers are restored
+  from the first baseline, and the instance/reservation are left intact — the sub is never left
+  wedged in `RESUMING` (docs/specs/resume-hook-driver.md).
 - **SUSPENDED -> TERMINATED** — retention ended; run `destroy` (purge data).
 
-**Buyer-initiated:**
-- **ACTIVE/SUSPENDED -> CANCELLED** — buyer cancels; run `suspend`. Remaining prepaid time is
-  not refunded.
-- **CANCELLED -> TERMINATED** — after the post-cancel retention `destroy` completes (resources
-  purged), the subscription is `TERMINATED`. `CANCELLED` is the wind-down intent; `TERMINATED`
+**Buyer-initiated** (docs/specs/sub-cancel.md, implemented `2f45dc5`):
+- **ACTIVE/SUSPENDED -> CANCELLED** — buyer cancels. Cancel is NOT a lapse-suspend: no
+  `suspend` hook runs and the service is not interrupted. An ACTIVE sub keeps running for the
+  full prepaid window and is destroyed at `paid_through` — there is no post-cancel
+  retention/grace (that grace exists to let a *lapsed* payer recover; an explicit canceller
+  needs none, and granting one would be free extra service). A SUSPENDED sub keeps its
+  existing retention deadline unchanged. The termination deadline is computed from the
+  CURRENT row inside the cancel transaction. Remaining prepaid time is used, not refunded.
+  A cancel in any other state (including the driver-owned `RESUMING`) is an idempotent no-op.
+- **CANCELLED -> TERMINATED** — the `destroy` hook runs at that deadline (resources
+  purged) and the subscription is `TERMINATED`. `CANCELLED` is the wind-down intent; `TERMINATED`
   is the single finalized terminal state both the cancel path and the expiry path converge to.
 
 **Late / terminal settlement (never resurrect, never keep):**
@@ -656,15 +695,16 @@ Because all dates are absolute wall-clock timestamps, the loop is **downtime-saf
 transition missed while the Box was off fires on restart. But suspension is **credited
 for operator downtime** (ADR-0005): the daemon persists a heartbeat, and on restart it
 records a per-subscription `suspend_not_before` floor for any ACTIVE sub whose renewal
-window overlapped its downtime window — WITHOUT moving `paid_through` (the prepaid-money +
+window overlapped its downtime window — and extends the retention cursor of any
+already-SUSPENDED sub whose retention overlapped the outage (docs/specs/
+downtime-credit-suspended.md) — WITHOUT moving `paid_through` (the prepaid-money +
 `renew:auto` invoice anchor), so renewal math and the duplicate-invoice guard are untouched.
 The credited "resumable until" boundary `B = max(paid_through, suspend_not_before) +
 retention_s` is honored uniformly by the suspend/destroy transitions, capture's renewal
 refund gate, the buyer's `renew.request`, and the restart settlement catch-up, so a buyer is
 never suspended (nor destroyed, nor refused renewal) for the operator's outage; the missed
 reminder fires on the restart tick. The buyer can also request a renewal invoice on demand
-(`renew.request`); reminders are otherwise best-effort. (Crediting an already-SUSPENDED sub's
-retention is tracked separately.)
+(`renew.request`); reminders are otherwise best-effort.
 
 ### 6.6 Durable handshake and crash recovery (M1a)
 
@@ -712,10 +752,13 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
 - **Delivery outbox:** `provision.ready` is written to an `outbox` row in the same
   transaction as `-> ACTIVE`; a sender drains it and retries until sent, so a crash after
   ACTIVE but before the DM cannot strand a paid buyer (also the dropped-DM resync answer).
+  A structurally-undeliverable payload is quarantined **`FAILED`** (terminal, never
+  overwrites `SENT`) instead of retrying forever.
 - **Refund ledger:** a `refund_attempt` row (dest, amount, a durable `idempotency_key`,
   status `PENDING` / `SENT` / `FAILED`, attempts) is persisted **`PENDING` (durable intent)
-  BEFORE** calling `pay(dest, amount, key)`. Because `pay` is idempotent on `key`, recovery is
-  simply to **retry `pay(key)`** for any non-terminal refund on restart — a crash *before* or
+  BEFORE** calling the capped refund pay (`pay_refund_capped(bolt11, amount, gross, key)` —
+  §6.1/INV-1; never bare `pay`). Because the pay is idempotent on `key`, recovery is
+  simply to **retry the capped pay for the key** of any non-terminal refund on restart — a crash *before* or
   *after* the call is equally safe: the key dedups (no double-refund) and no crash point can
   strand the intent (the durable `PENDING` row is always there to retry). `payment_status_by_key`
   lets restart skip a redundant `pay` when the prior one already `Succeeded`. After N failed
@@ -729,8 +772,8 @@ Crash-recovery (step -> durable record in one txn -> restart action):
 | order placed | sub PENDING + invoice OPEN (external_id) | expired-invoice PENDING -> EXPIRED |
 | settlement | invoice PAID + sub PROVISIONING | replay no-ops (status guard) |
 | provision ok | sub ACTIVE + outbox row | unsent outbox -> resend |
-| provision fail | best-effort `destroy` + sub REFUND_DUE + refund_attempt PENDING | retry `pay(key)` — idempotent, safe before or after a prior call |
-| late settle on terminal sub | detached refund_attempt PENDING | retry `pay(key)` (order not resurrected) |
+| provision fail | best-effort `destroy` + sub REFUND_DUE + refund_attempt PENDING | retry the capped pay by `key` (`pay_refund_capped`, §6.1) — idempotent, safe before or after a prior call |
+| late settle on terminal sub | detached refund_attempt PENDING | retry the capped pay by `key` (order not resurrected) |
 
 Lifecycle hooks (provision / suspend / resume / destroy) **must be idempotent** (§7.2): each
 transition is guarded by a durable record (the `event_log` entry + a state/deadline guard), so
@@ -882,9 +925,12 @@ The manager core drives a Box through trait-bounded subsystems. Recipes declare 
 subsystems they use; the manager wires them. The same subsystems serve self-use and
 rented Instances; only the rental layer differs.
 
-v1 implements **Compute** (`host` + `incus`) and **Network** (WireGuard, firewall,
-port allocation) fully. **Storage** and **Observability** ship as trait stubs and
-fill in at M7.
+In the shipped daemon, provisioning is 100% **recipe-hook-driven** (§7): the recipe's
+`provisioning.backend` string selects hook behavior, and no subsystem trait is dispatched
+at runtime. The trait sketches below are the intended LATER seam — today
+`Compute`/`Network`/`Storage`/`Observability` exist only as dead M0 stubs slated for
+removal (production-readiness CUT-1) until a second real implementation forces the
+abstraction.
 
 ### 8.1 Compute (`ComputeBackend`)
 
@@ -1058,8 +1104,10 @@ order race, capacity is **reserved at order time**, not at payment:
 - Invoice expires unpaid -> reservation released. Paid -> reservation stays **HELD**
   through `PROVISIONING` and becomes **CONSUMED** only when the Instance reaches `ACTIVE`,
   so a concurrent order cannot reuse the slot mid-provision.
-- SUSPENDED keeps the reservation (disk + ports held through retention); TERMINATED and
-  REFUND_DUE release it.
+- SUSPENDED keeps the reservation (disk + ports held through retention). TERMINATED and
+  REFUNDED release it; REFUND_DUE deliberately **keeps the hold** for the refund executor —
+  it is released only in the same transaction as `REFUND_DUE -> REFUNDED`, so a parked-FAILED
+  refund holds its capacity until resolved (surfaced via `lnrent money`).
 
 `available = host budget - (active Instances + live reservations)`.
 
@@ -1115,7 +1163,7 @@ CREATE TABLE recipe (                -- mirror of on-disk recipes for fast looku
 CREATE TABLE subscription (
   id TEXT PRIMARY KEY,
   recipe_id TEXT, listing_id TEXT, instance_id TEXT, buyer_pubkey TEXT,
-  state TEXT,                        -- see §6.3 (PENDING|PROVISIONING|ACTIVE|SUSPENDED|TERMINATED|EXPIRED|CANCELLED|REFUND_DUE|REFUNDED)
+  state TEXT,                        -- see §6.3 (PENDING|PROVISIONING|ACTIVE|RESUMING|SUSPENDED|TERMINATED|EXPIRED|CANCELLED|REFUND_DUE|REFUNDED)
   params_json TEXT,                  -- validated buyer params
   refund_dest TEXT,                  -- re-resolvable Lightning address/LNURL, REQUIRED for new orders (raw bolt11/BOLT12 rejected at intake); NULL only on legacy rows, for refunds (§6.4)
   -- backend handles live on `instance` (instance_id), not duplicated here
@@ -1156,7 +1204,7 @@ CREATE TABLE refund_attempt (        -- durable refund ledger (ADR-0009, §6.6; 
                                      -- (legacy bolt11 pass-through), gen>=1 = `refund:<external_id>:g<gen>`;
                                      -- dedups outbound pay AND the ledger row (§6.6, ug8/4gt)
   backend_payment_id TEXT,           -- from pay(), once known
-  status TEXT NOT NULL,              -- PENDING (durable intent; retry pay(key) safely on restart) | SENT | FAILED
+  status TEXT NOT NULL,              -- PENDING (durable intent; retry the capped pay by key on restart, §6.1) | SENT | FAILED
   attempts INTEGER,
   resolved_bolt11 TEXT,              -- concrete bolt11 a LN-address/LNURL `dest` resolved to (cached; a retry re-pays the SAME invoice)
   resolved_expiry INTEGER,           -- the resolved invoice's expiry; only a CURRENT-gen Failed+expired invoice is ever re-resolved
@@ -1166,8 +1214,13 @@ CREATE TABLE refund_attempt (        -- durable refund ledger (ADR-0009, §6.6; 
 CREATE TABLE outbox (                -- pending operator->buyer NIP-17 DMs (ADR-0009)
   id TEXT PRIMARY KEY, recipient TEXT, subscription_id TEXT,
   msg_type TEXT, payload_json TEXT,
-  state TEXT,                        -- PENDING|SENT
+  state TEXT,                        -- PENDING|SENT|FAILED (structurally-undeliverable, quarantined)
   attempts INTEGER, created_at INTEGER, sent_at INTEGER);
+
+CREATE TABLE seen_message (          -- transport dedup of inbound gift wraps (§5.1)
+  event_id TEXT PRIMARY KEY,         -- kind-1059 OUTER event id (stable per delivered DM)
+  sender TEXT, msg_type TEXT,        -- audit
+  seen_at INTEGER NOT NULL);         -- 90d retention; best-effort (written only AFTER handler success)
 
 CREATE TABLE op_invocation (         -- durable buyer management ops (§7.4, ADR-0013)
   sender_pubkey TEXT NOT NULL, request_id TEXT NOT NULL,   -- the op.request `id`

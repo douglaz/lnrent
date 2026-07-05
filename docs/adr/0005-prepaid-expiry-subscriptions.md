@@ -45,4 +45,5 @@ tick. Every consumer of the "resumable until" boundary honors the credited
 restart settlement catch-up. So a buyer is never suspended — nor destroyed, nor refused a
 renewal — for the operator's outage. The floor never moves a deadline *earlier*, self-expires
 once a renewal pushes `paid_through` past it, and is cleared on renewal. (Crediting an
-*already-SUSPENDED* sub's retention/destroy is tracked separately, lnrent-d6n.)
+*already-SUSPENDED* sub's retention/destroy landed too — lnrent-d6n,
+docs/specs/downtime-credit-suspended.md.)
