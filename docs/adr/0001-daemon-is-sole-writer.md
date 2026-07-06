@@ -21,6 +21,7 @@ there are no write races between skills and the daemon.
 
 - The daemon must expose a local CLI/IPC surface, which operators need anyway.
 - Recipe files on disk are the single thing skills write directly; the daemon
-  reloads them on demand.
+  loads them at startup (restart to pick up an edit — there is no reload IPC yet;
+  on-demand reload is a later affordance).
 - Every state change is deterministic, logged daemon code, which makes both the
   audit trail and the AI-free boundary real.

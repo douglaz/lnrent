@@ -67,6 +67,10 @@ never over-authorize.
 
 ## Consequences
 
+*(Target state — lands with docs/specs/gate1-operator-sweep.md + gate1-alerting-operability.md.
+As of 2026-07-05 the startup probe, the readiness path, and `lnrent money` still read the
+balance, and no sweep/reconcile command exists.)*
+
 - `available_balance_msat()` keeps exactly one non-test call site (the reconcile handler); the
   Fedimint startup `log_readiness` balance probe is removed (its gateway-liveness half stays —
   liveness and pricing probes are execution concerns, not balance reads, and remain allowed).

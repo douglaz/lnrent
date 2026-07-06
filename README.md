@@ -64,9 +64,14 @@ For **real Fedimint payments + real VMs** (the default build), configure the fed
 token and select the fedimint backend at runtime:
 
 ```sh
+# One-time bootstrap: persists the seed (0600) + federation config into the data dir.
 LNRENT_PAYMENT_BACKEND=fedimint LNRENT_FEDIMINT_INVITE=fed1… LNRENT_FEDIMINT_GATEWAY=<gateway_pubkey> \
-LNRENT_COMPUTE_BACKEND=cloud-do DO_TOKEN=<digitalocean_token> \
-LNRENT_MNEMONIC="…" LNRENT_DATA_DIR=./data LNRENT_RECIPES_DIR=./recipes LNRENT_RELAYS=wss://relay.example \
+LNRENT_MNEMONIC="…" LNRENT_DATA_DIR=./data LNRENT_RELAYS=wss://relay.example \
+  nix develop . --command cargo run -p lnrentd --bin lnrentd -- bootstrap
+
+# Run: the daemon reads the persisted seed/config. NEVER put the mnemonic (or LNRENT_FEDIMINT_*)
+# in the run environment — every recipe hook inherits it (docs/go-live.md §3).
+DO_TOKEN=<digitalocean_token> LNRENT_DATA_DIR=./data LNRENT_RECIPES_DIR=./recipes \
   nix develop . --command cargo run -p lnrentd --bin lnrentd
 ```
 
@@ -84,7 +89,8 @@ wallet — the CLI never holds funds):
 B="nix develop . --command cargo run -p lnrent-buyer-cli -- --relay wss://relay.example --operator <npub> --key-file buyer.nsec"
 $B identity new                       # create a buyer key
 $B listings                           # discover the operator's listings
-$B order create <30402:…:…> --params-json '{"ssh_pubkey":"ssh-ed25519 …"}'   # -> a bolt11 invoice
+$B order create <30402:…:…> --params-json '{"ssh_pubkey":"ssh-ed25519 …"}' \
+   --refund-dest you@lnaddress                # REQUIRED (LN address / LNURL) -> a bolt11 invoice
 #   ...pay the bolt11 from your wallet...
 $B order wait <order_id>              # -> access credentials (host/port/user)
 #   also: renew <sub> · cancel <sub> · ops <sub> <op> · delivery resend <sub>
@@ -101,5 +107,5 @@ $B order wait <order_id>              # -> access credentials (host/port/user)
 ## Docs
 
 - Spec: [SPEC.md](./SPEC.md) (draft v0.29) · glossary: [CONTEXT.md](./CONTEXT.md)
-- Decisions: [docs/adr/](./docs/adr/) (0001-0015) · change specs: [docs/specs/](./docs/specs/)
+- Decisions: [docs/adr/](./docs/adr/) (0001-0016) · change specs: [docs/specs/](./docs/specs/)
 - Security/deployment notes: [docs/security/](./docs/security/)

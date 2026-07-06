@@ -40,3 +40,8 @@ not have.
 - MVP order (guidelines §24): per-VM tap/firewall -> no metadata -> outbound-only agent
   -> Iroh control + management -> Tor fallback -> shared IPv4 publishing. M1 ships the
   private planes (Iroh + Tor); public publishing is the fast-follow.
+
+> **Revision (2026-07-05):** "M1" was later split M1a/M1b. M1a landed with the cloud-DO
+> recipe delivering plain public-IPv4 SSH (`{"host":<ipv4>,"port":22,"user":"root"}`) and
+> no Iroh/Tor in the tree; the private planes above land with M1b's self-hosted VM recipe
+> (SPEC roadmap). The decision itself is unchanged.

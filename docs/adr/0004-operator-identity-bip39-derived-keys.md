@@ -31,7 +31,7 @@ re-issuing the manifest.
   the NIP-06 Nostr paths), so one seed regenerates identity AND the ecash client. The ecash
   position is recoverable from the federation — but **the seed alone is not a full backup**:
   restore also needs the federation invite/config (which federation to rejoin), so onboard's
-  backup must include it. phoenixd (secondary) keeps its own channel-state seed, backed up
-  separately.
+  backup must include it. (A phoenixd secondary — M3, ADR-0012, never built in v1 — would
+  keep its own channel-state seed, backed up separately.)
 - v1 single-box operators may keep the seed on the box, accepting that a box
   compromise is then a seed compromise. Onboard forces an explicit backup.

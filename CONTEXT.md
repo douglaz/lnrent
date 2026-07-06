@@ -15,12 +15,15 @@ receives payment. One Operator has a single brand (Master identity); each Box us
 derived Operational key (see Identity), all from one Operator seed. An Operator is a
 third party, not this project's authors: lnrent exists to create an ecosystem of many
 independent Operators, so anything Operator-facing is product surface.
-_Avoid_: seller, host, provider, vendor
+_Avoid_: seller, host, vendor; "provider" only in the fixed framing phrase "ecosystem of
+independent service providers"
 
 **Buyer**:
 A Nostr identity that rents a service by paying its invoices. Has no account; the
 Buyer's Nostr pubkey is the only identifier.
-_Avoid_: customer, client, user, tenant
+_Avoid_: customer, client, user; "tenant" is reserved for the VM-isolation context (a
+Buyer's workload occupying an Instance — "tenant Instances", the §9 planes), never the
+marketplace actor
 
 ### Infrastructure
 
@@ -141,13 +144,15 @@ _Avoid_: profit (accounting term), balance, available funds.
 **Sweep**:
 The Operator withdrawing Surplus out of the daemon's wallet to their own wallet. The
 only Operator-initiated outbound payment; refused whenever the owed amount cannot be
-bounded.
+bounded. (Target — ADR-0016 / docs/specs/gate1-operator-sweep.md; no sweep command
+exists in M1a yet.)
 _Avoid_: withdrawal, payout (ambiguous with refunds), cash out.
 
 **Reconcile (operator act)**:
 The explicit, on-demand comparison of the wallet against the books, reporting whether
 they agree. The single sanctioned reading of the wallet balance; it informs a human and
-never authorizes anything. Distinct from the *reconcile loop* (the timer-driven
+never authorizes anything. (Target — in M1a `lnrent money` still reads the live balance
+and no reconcile command exists yet; ADR-0016 / gate1 specs land this.) Distinct from the *reconcile loop* (the timer-driven
 subscription state machine walker, SPEC §6.5) — same word, different thing; say
 "reconcile command" vs "reconcile loop" when ambiguous.
 _Avoid_: audit, balance check.

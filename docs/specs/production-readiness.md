@@ -138,8 +138,8 @@ but stops *duplicate* work, not *flood* work (distinct `request_id`s bypass it e
   A DO droplet that failed to delete keeps costing real money and is invisible: not in `lnrent money`,
   not in `subs`/`sub` (reads clean `TERMINATED`), only a WARN. (The do-vps hook is by-tag idempotent, so
   a *manual* re-run could clean it, but nothing surfaces that it's needed.) The same swallow applies to
-  the provision-fail `destroy` (§6.4) — and SPEC §6.3 line 564 *claims* that failure is "logged +
-  alerted," which is currently false (there is no alert sink; see PR-5 and DRIFT-2).
+  the provision-fail `destroy` (§6.4) — and SPEC §6.3 (the destroy-failure bullet) *claimed* that
+  failure is "logged + alerted"; DRIFT-2 (now fixed) rewords it until PR-5 lands.
 - **Fix:** persist teardown failures to a queryable dead-letter table (sub id, hook, provider handles,
   attempts, last error), retry with backoff on the maintenance loop, surface via a new IPC query +
   `lnrent` subcommand, and fire a PR-5 alert. Do not block the `TERMINATED` transition on teardown (the
@@ -179,7 +179,8 @@ but stops *duplicate* work, not *flood* work (distinct `request_id`s bypass it e
   has **no daemon-safe exit** — the only workaround is a second `fedimint-cli` against the daemon-owned
   RocksDB (ADR-0015), risking lock/corruption of the money DB. Funds aren't lost (recoverable from
   seed+invite), but there is no first-class withdrawal.
-- **Fix:** a `lnrent sweep <bolt11|amount>` IPC command that drives an operator-initiated `pay` outside
+- **Fix:** a `lnrent sweep <bolt11>` IPC command (the amount is the invoice's own — no amount
+  argument; surface per docs/specs/gate1-operator-sweep.md) that drives an operator-initiated `pay` outside
   the refund cap, serialized through the same store/backend actor so it can't race the Refunder or
   corrupt RocksDB. Borderline GATE-0-important: without it an operator literally cannot realize revenue.
 
@@ -193,7 +194,9 @@ Three operability blind spots that leave the operator able to *see* trouble but 
   down** — a week is far too slow for stranded money.
 - **Refund actuator (`abdd29`):** `lnrent money` shows a `parked_count` but there is no per-item list and
   no retry/cancel — the operator sees "3 parked" and cannot inspect destination/amount/attempts or act
-  (`ipc.rs:373-405`, no `Refunds` request). Add a `lnrent refunds` list + a retry/cancel actuator.
+  (`ipc.rs:373-405`, no `Refunds` request). Add a `lnrent refunds` list + a retry actuator (a
+  cancel/abandon verb is deliberately EXCLUDED — gate1-alerting-operability.md §C keeps abandoning
+  a refund liability a manual, deliberate act).
   Note this also gates capacity: REFUND_DUE deliberately holds its reservation until REFUNDED
   (§9.3), so a permanently-parked refund pins host capacity until the operator resolves it.
 - **Relay-pool status (`acd5`):** relay churn is logged but not queryable or alerted; if all relays drop,
@@ -318,10 +321,10 @@ defends a real attack ("buried money-DM", table-fill) — **do not cut it as par
 - **DRIFT-1 (FIXED this pass) — SPEC §6.3 omitted `RESUMING`.** The canonical state machine's state list
   and the `SUSPENDED -> ACTIVE` bullet never reflected bead lnrent-18v's `SUSPENDED -> RESUMING -> ACTIVE`
   path. Corrected in SPEC.md §6.3 (state list + resume/resume-fail transitions).
-- **DRIFT-2 — SPEC §6.3 line 564 claims a failed provision-time `destroy` is "logged + alerted."** There
-  is no alert sink (PR-5), and the reconcile teardown swallows failures silently (PR-6). Once PR-5/PR-6
-  land, this becomes true; until then the spec overstates. Reword to "logged (and alerted once PR-5
-  lands)," or gate the wording on PR-5.
+- **DRIFT-2 (FIXED 2026-07-05) — SPEC claimed operator "alerts" that don't exist.** The §6.3
+  destroy-failure bullet said "logged + alerted" with no alert sink built (PR-5), and the second
+  review pass found four more phantom-alert anchors (§6.3 stuck-refund, §6.4 refund-failure, §6.6
+  refund ledger, §7.2 hook failure). All five now read "logged (alert once PR-5 lands)".
 - **DRIFT-3 — `renew.request` / `op.request` ids are not charset/length-validated; `order.request` is.**
   `validate_buyer_request_id_tail` (`order_intake.rs:978`, `[A-Za-z0-9_-]`, len 1..=128) is applied only to
   the order path (`:99`). `renew.request.id` flows unvalidated into `external_id = renew:req:<sender>:<id>`
@@ -376,6 +379,88 @@ defends a real attack ("buried money-DM", table-fill) — **do not cut it as par
   Fedimint); ADR-0005 (d6n landed), ADR-0010/0011 (phoenixd/BOLT12 one-liners) touched up.
   README: "Not yet: a browser/GUI buyer" was false (clients/web landed; added to Layout), CLI list
   gained suspend/resume. CONTEXT.md glossary state list gained `resuming`.
+
+---
+
+## Second review pass (2026-07-05) — fresh-eyes full corpus + code
+
+Six independent fresh-eyes reviews (spec corpus, ADRs/security/runbook, SPEC/CONTEXT/README, and
+three code sweeps: money path, transport/daemon shell, clients/recipes) re-swept the tree after
+this roadmap landed, deliberately skipping everything already dispositioned above. Everything they
+found was either **fixed in the same pass** or queued below as a new PR item.
+
+**Fixed in the pass (code):** recipe-hook failure diagnostics moved to stderr (the runner captures
+ONLY stderr on a non-zero exit — every `err()`'s stdout JSON was being discarded, do-vps AND the
+wireguard stubs); do-vps `DO_TOKEN` moved off curl argv into a 0600 header file (argv is
+world-readable via `/proc/<pid>/cmdline`) plus curl connect/max-time bounds and a multi-line
+`ssh_pubkey` reject; do-vps `recipe.toml` tier corrected **2 → 0** (a stock DO droplet has no
+attestation; ADR-0007 forbids claiming above the real tier and the value is published into the
+signed listing); `order.error` no longer echoes raw backend/store error text to unauthenticated
+strangers (fixed generic message + local warn, mirroring op_dispatch); relay URLs are
+scheme-validated at bootstrap and the engine now skips (not fails on) an unusable stored relay URL;
+M6 adds the missing `event_log` indexes (the ≤5s maintenance scans were unbounded full scans
+serialized ahead of money writes); the fedimint receive index marks Canceled invoices out of the
+`watch()` respawn set (previously every restart re-subscribed every historical unpaid invoice);
+the web buyer's refund-dest validation now matches the daemon's gate (bech32 `lnurl1…` accepted,
+`@`-first so `lnbc…@`/`lno…@` addresses are no longer falsely rejected); the supervisor's private
+duplicates of `gen_key`/`parse_whole_sat` were deleted in favor of `pub(crate)` in refund.rs (the
+lnrent-4gt lockstep-edit hazard). **Fixed in the pass (docs):** DRIFT-2's reword executed across
+all five phantom-alert SPEC anchors; README's real-payments example split into bootstrap-then-run
+(it violated go-live §3's mnemonic-is-bootstrap-only rule) and its buyer golden path gained the
+required `--refund-dest`; SPEC §6.6 "no money-moving backend has shipped", §5.4 codec-pending, §10
+skills-as-present, §14 layout, §6.1 duplicated pay-idempotency paragraph, §6.3 RESUMING
+"refused"-vs-no-op; CONTEXT Sweep/Reconcile marked target-not-landed + tenant/provider avoid-list
+carve-outs; ADR-0001 reload claim, ADR-0002 DO_TOKEN exception, ADR-0004/0009 phoenixd-as-fact,
+ADR-0008 M1a/M1b revision note, ADR-0016 consequences marked target-state; go-live §2 now builds
+`lnrent-buyer-cli` (§4 preflight needs it), §1 tier honesty + `name` field, §5 announce-vs-order
+wording; gate-spec cross-refs (PR-8 bolt11-only, PR-9 no-cancel, §E→§F pointers, SweepFailed enum
+note, `max_live_holds_per_buyer` rename, both refund-park alert anchors).
+
+**Verified clean by the code sweeps** (beyond the first pass): capture.rs, refund_resolver.rs,
+reservation.rs, backup.rs (fee math, generation gates, oplog backfill, staged restore); the e2e
+suite is not vacuous against the test relay's 60/min rate limit and 500 filter clamp.
+
+### PR-21 (GATE-1) — suspend/destroy lifecycle hooks race a concurrently-captured renewal
+- **Evidence:** `fire_suspend` (`reconcile.rs:853-869`) runs the suspend hook OUTSIDE the CAS: if
+  the buyer's renewal settles during the hook's up-to-120s window, capture commits first (sub stays
+  ACTIVE, fresh deadline), the post-hook CAS matches 0 rows and no-ops — leaving the instance
+  powered off while the row reads ACTIVE, and the resume driver only drives RESUMING. The buyer
+  pays for a down service until the next suspend/renew cycle. `fire_destroy` (`reconcile.rs:899-911`)
+  has the same shape: a renewal captured mid-destroy-hook (inside the credited resumable window)
+  flips SUSPENDED→RESUMING while the droplet is being irreversibly deleted; money-safe (ends in a
+  refund) but a timely-paid service is destroyed and it surfaces only as a confusing refund.
+- **Fix sketch:** on a lost suspend-CAS, re-read the sub and best-effort run the `resume` hook as a
+  compensating action (mirror provision.rs's lost-CAS cleanup), logged loudly; on destroy, re-check
+  `renewal_settlement_pending` after the hook before the CAS and fire a PR-5 alert on a lost CAS to
+  RESUMING. Money-core adjacent: needs its own focused spec + acceptance tests before code.
+
+### PR-22 (GATE-1) — single-instance lock on the data dir
+- **Evidence:** `run_daemon` takes no lock and `ipc.rs` silently removes + rebinds an existing
+  socket, so a systemd restart racing a manually-started daemon yields two maintenance loops
+  driving the same PROVISIONING sub (duplicate concurrent drives are exactly the hazard
+  `supervisor.rs:1043-1046` documents) — two real droplets, one orphaned — and the second daemon
+  steals the first's IPC socket. Mock mode has no accidental RocksDB-lock protection at all.
+- **Fix:** an exclusive `flock` on `{data_dir}/lnrentd.lock` at startup; exit with a structured
+  "daemon already running" error.
+
+### PR-23 (HARDEN, feeds PR-6) — process-group kill for timed-out hooks
+- **Evidence:** `reap()` (`runner.rs:127-130`) SIGKILLs only the immediate hook process; a
+  timed-out do-vps provision's in-flight `curl` survives and can complete the droplet create AFTER
+  the daemon declared failure, ran the (empty-by-tag) cleanup, and refunded — an invisible billed
+  droplet that even PR-6's dead-letter never sees because no hook ever reported it.
+- **Fix:** `.process_group(0)` at spawn + kill the group in `reap()`.
+
+### PR-24 (HARDEN, extends PR-15) — IPC connection read deadline
+- **Evidence:** `handle_conn` has no read timeout; one idle connected client pins the graceful
+  IPC drain at shutdown until the 3s abort kills the whole task set — which can abort a concurrent
+  in-flight handler after its txn committed but before its reply was written.
+- **Fix:** wrap the request read in a short `tokio::time::timeout`; reply `bad_request`/close.
+
+### PR-25 (HARDEN) — buyer CLI `--json` contract on argv parse errors
+- **Evidence:** `Cli::parse()` renders clap failures as plaintext usage on stderr with exit 2 —
+  breaking the machine-readable contract and colliding with the taxonomy's exit 2 = not_found.
+- **Fix:** `try_parse` + render a `bad_request` JSON envelope (exit 3) when `--json` is present in
+  raw argv.
 
 ---
 

@@ -86,7 +86,7 @@ reserves, quiescence refusal, and balance-before-reserve rules are all deleted, 
 a ledger bug), the sweep's `pay` simply fails to assemble notes and errors cleanly — before
 anything moves. The pay itself is the fail-safe; no pre-read needed. Detecting such book-vs-wallet
 drift is a *reconciliation* concern, owned by the explicit operator command in
-docs/specs/gate1-alerting-operability.md §E — never by this authorization path.
+docs/specs/gate1-alerting-operability.md §F — never by this authorization path.
 
 ## Command surface
 
@@ -150,7 +150,7 @@ automatic sweeps; no sweep-to-LN-address/LNURL (bolt11 only — the operator con
 wallet; the resolver stays refund-only); no partial/split sweeps; no fee-limit knob (the quote is
 the fee; the cap enforces it); no on-chain/ecash-note export; no change to refund paths or
 INV-1/INV-3; no book-vs-wallet drift detection here (that is the explicit reconcile command,
-alerting spec §E).
+alerting spec §F).
 
 ## Acceptance
 
