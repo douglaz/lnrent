@@ -181,7 +181,9 @@ enum ProvenanceCheck {
 /// no money. The bare-key gen-0 convention is therefore fixed BEFORE the first real-money release, so
 /// a live `:g0` payment can never exist for a bare-key gen-0 pay to double up against. The fuller
 /// legacy-upgrade reasoning (incl. the LN-address caveat) lives at the `process()` legacy-safety block.
-fn gen_key(external_id: &str, gen: i64) -> String {
+/// `pub(crate)`: the supervisor's refund-readiness probe keys on the SAME generation-bound pay-key
+/// scheme; a private duplicate there once had to be changed in lockstep (lnrent-4gt) — one definition.
+pub(crate) fn gen_key(external_id: &str, gen: i64) -> String {
     if gen == 0 {
         format!("refund:{external_id}")
     } else {
@@ -1031,8 +1033,9 @@ impl Refunder {
 /// Parse a bolt11's amount as a WHOLE number of sats (spec §3.1). `Err` if the invoice is amountless
 /// or its amount is not a whole sat (sub-sat msats) — neither is payable by the sat-only backends.
 /// Used for the gen-0 pass-through (the buyer's fixed invoice) and to recover a persisted resolved
-/// invoice's pay amount on a re-await.
-fn parse_whole_sat(bolt11: &str) -> Result<u64, String> {
+/// invoice's pay amount on a re-await. `pub(crate)`: also the supervisor readiness probe's parser
+/// (was a private duplicate — one definition, see `gen_key`).
+pub(crate) fn parse_whole_sat(bolt11: &str) -> Result<u64, String> {
     let inv = Bolt11Invoice::from_str(bolt11).map_err(|e| format!("bolt11 parse error: {e}"))?;
     let msat = inv
         .amount_milli_satoshis()

@@ -937,6 +937,12 @@ async fn run_receive_task(
             }
             LnReceiveState::Canceled { reason } => {
                 tracing::warn!(op = %op_hex, ?reason, "fedimint: ln receive canceled");
+                // Flip the index row out of 'OPEN': rows left OPEN here accumulated forever, and
+                // every `watch()` (boot + each settlement-loop restart) re-spawned one receive
+                // task per historical unpaid invoice via `idx_list_open`.
+                if let Err(e) = idx_mark_canceled(&index, &op_hex) {
+                    tracing::warn!(op = %op_hex, error = %e, "fedimint: marking canceled receive in index failed");
+                }
                 return;
             }
             _ => {}
@@ -1187,6 +1193,20 @@ fn idx_mark_paid(index: &Mutex<Connection>, op_hex: &str, settled_at: Option<i64
     Ok(())
 }
 
+/// Terminal receive cancel (expiry): take the row out of the `idx_list_open` respawn set so
+/// `watch()` never re-subscribes a dead invoice again. Guarded on `status='OPEN'` so a late
+/// Canceled event can never demote a row a concurrent Claimed already marked PAID. `lookup`
+/// still derives Open/Expired from `expires_at` for any non-PAID status, so reads are unchanged.
+fn idx_mark_canceled(index: &Mutex<Connection>, op_hex: &str) -> Result<()> {
+    let conn = index.lock().unwrap();
+    conn.execute(
+        "UPDATE fedimint_invoice SET status = 'CANCELED'
+           WHERE operation_id = ?1 AND status = 'OPEN'",
+        params![op_hex],
+    )?;
+    Ok(())
+}
+
 // ---- the lnrent-owned outbound-pay index (refund idempotency, keyed by idempotency_key) ----------
 
 /// `(operation_id_hex, status, pay_kind)` for a refund key, if any.
@@ -1333,6 +1353,56 @@ fn net_payout_sat(base_msat: u64, ppm: u64, gross_sat: u64) -> u64 {
 
 fn fedimint_readiness_warns(_balance_msat: Option<u64>, gateway_ok: bool) -> bool {
     !gateway_ok
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::{idx_list_open, idx_mark_canceled, idx_mark_paid, INDEX_SCHEMA};
+    use rusqlite::{params, Connection};
+    use std::sync::Mutex;
+
+    fn index_with_row(op_hex: &str, status: &str) -> Mutex<Connection> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(INDEX_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO fedimint_invoice
+               (external_id, operation_id, invoice_id, bolt11, payment_hash, amount_sat,
+                expires_at, status)
+             VALUES (?1, ?2, ?3, 'lnbc1…', 'hash', 100, 4102444800, ?4)",
+            params![format!("ext-{op_hex}"), op_hex, format!("inv-{op_hex}"), status],
+        )
+        .unwrap();
+        Mutex::new(conn)
+    }
+
+    // A Canceled receive must leave the `watch()` respawn set: rows that stayed 'OPEN' were
+    // re-subscribed on every restart, one task per historical unpaid invoice, forever.
+    #[test]
+    fn canceled_receive_leaves_the_open_respawn_set() {
+        let index = index_with_row("op1", "OPEN");
+        assert_eq!(idx_list_open(&index).unwrap().len(), 1);
+        idx_mark_canceled(&index, "op1").unwrap();
+        assert!(idx_list_open(&index).unwrap().is_empty());
+    }
+
+    // The OPEN-only guard: a late Canceled event must never demote a row a concurrent Claimed
+    // already marked PAID (the settlement provenance would be lost).
+    #[test]
+    fn canceled_never_demotes_a_paid_row() {
+        let index = index_with_row("op2", "OPEN");
+        idx_mark_paid(&index, "op2", Some(1000)).unwrap();
+        idx_mark_canceled(&index, "op2").unwrap();
+        let status: String = index
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM fedimint_invoice WHERE operation_id = 'op2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "PAID");
+    }
 }
 
 #[cfg(test)]

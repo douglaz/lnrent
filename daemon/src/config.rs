@@ -578,6 +578,18 @@ fn resolve_config(raw: &RawConfig) -> Result<OperatorConfig, IpcError> {
         Some(r) if !r.is_empty() => normalize_relays(r),
         _ => DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
     };
+    // Relay URLs are stored verbatim and later fed to the engine's `add_relay`; a non-websocket
+    // scheme (an `https://` paste is the common typo) would otherwise pass bootstrap and then fail
+    // at every daemon start. Fail fast with a structured error instead — the ADR-0014 "invalid
+    // config -> error at bootstrap, never stored" contract the other validated fields honor.
+    if let Some(bad) = relays
+        .iter()
+        .find(|r| !(r.starts_with("ws://") || r.starts_with("wss://")))
+    {
+        return Err(config_err(format!(
+            "relay `{bad}` is not a websocket URL (expected wss://… or ws://…)"
+        )));
+    }
 
     // Blank `data_dir` / `compute_backend` also fall back to defaults rather than being stored
     // verbatim (a blank data dir would otherwise fail later at create_dir_all) (review P3).
@@ -2913,6 +2925,37 @@ mod tests {
                 ok
             );
         }
+    }
+
+    // A non-websocket relay URL (the common `https://` paste) must fail bootstrap with a
+    // structured error naming the bad URL — not be stored verbatim and then fail every daemon
+    // start at engine connect (ADR-0014: invalid config -> error at bootstrap, never stored).
+    #[test]
+    fn non_websocket_relay_url_is_rejected_at_resolve() {
+        let raw = RawConfig {
+            relays: Some(vec![
+                "https://relay.example".into(),
+                "wss://good.example".into(),
+            ]),
+            ..Default::default()
+        };
+        let err = match resolve_config(&raw) {
+            Ok(_) => panic!("expected the https:// relay URL to be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, "config_invalid");
+        assert!(
+            err.message.contains("https://relay.example"),
+            "error must name the offending URL: {}",
+            err.message
+        );
+
+        let raw = RawConfig {
+            relays: Some(vec!["wss://a.example".into(), "ws://local.test".into()]),
+            ..Default::default()
+        };
+        let cfg = resolve_config(&raw).expect("ws/wss relays resolve");
+        assert_eq!(cfg.relays.len(), 2);
     }
 
     // Review P3 (R2): relay elements are normalized like the other string fields. Blank entries are

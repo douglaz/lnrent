@@ -289,10 +289,21 @@ CREATE INDEX IF NOT EXISTS op_invocation_finished_at_idx ON op_invocation(finish
 CREATE INDEX IF NOT EXISTS inbound_request_created_at_idx ON inbound_request(created_at);
 ";
 
+// The maintenance pass scans event_log by kind (the refund-readiness settle/refund journal CTEs in
+// load_refund_readiness_liabilities) and by (subscription_id, kind) (the provision-cleanup recovery's
+// correlated NOT EXISTS) every few seconds on the sole-writer connection; event_log journals every
+// mutation and has no GC yet, so without indexes those are ever-growing full scans serialized ahead
+// of money writes.
+const M6_EVENT_LOG_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS event_log_kind_idx ON event_log(kind);
+CREATE INDEX IF NOT EXISTS event_log_sub_kind_idx ON event_log(subscription_id, kind);
+";
+
 /// Ordered migrations (lnrent-7fp.3): index `i` upgrades the DB from schema version `i` to
 /// `i+1`. Version 1 is the §11 schema; version 2 adds `seen_message` (lnrent-7fp.5); version 3 adds
 /// `subscription.suspend_not_before` (lnrent-7fp.22); version 4 adds the `refund_attempt` resolver
-/// columns (lnrent-ug8); version 5 adds the idempotency-cache TTL-sweep indexes (lnrent-xjn). A future
+/// columns (lnrent-ug8); version 5 adds the idempotency-cache TTL-sweep indexes (lnrent-xjn);
+/// version 6 adds the event_log scan indexes. A future
 /// schema change appends a new entry of `ALTER`/`CREATE` statements; **never edit a shipped migration**.
 const MIGRATIONS: &[&str] = &[
     SCHEMA,
@@ -300,6 +311,7 @@ const MIGRATIONS: &[&str] = &[
     M3_SUSPEND_NOT_BEFORE,
     M4_REFUND_RESOLUTION,
     M5_IDEMPOTENCY_CACHE_INDEXES,
+    M6_EVENT_LOG_INDEXES,
 ];
 
 /// The target schema version this binary expects (= number of migrations).
@@ -744,6 +756,24 @@ mod tests {
         assert_eq!(n, 16);
     }
 
+    // M6: the maintenance pass scans event_log every few seconds on the sole-writer connection;
+    // these indexes must exist on both fresh and migrated DBs or those scans grow without bound.
+    #[test]
+    fn event_log_scan_indexes_exist_after_migrate() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        for idx in ["event_log_kind_idx", "event_log_sub_kind_idx"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "missing index {idx}");
+        }
+    }
+
     #[test]
     fn migrate_is_idempotent_on_current_db() {
         let conn = Connection::open_in_memory().unwrap();
@@ -806,11 +836,14 @@ mod tests {
     fn migrate_recovers_partially_applied_refund_resolution() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            // A real v3 DB has all the v1 base tables; include the ones M5 (lnrent-xjn) indexes so the
-            // partial-M4 recovery still applies the full migration chain to current.
+            // A real v3 DB has all the v1 base tables; include the ones the later migrations index
+            // (M5 lnrent-xjn: op_invocation/inbound_request; M6: event_log) so the partial-M4
+            // recovery still applies the full migration chain to current.
             "CREATE TABLE refund_attempt (id TEXT PRIMARY KEY, status TEXT, resolved_bolt11 TEXT);
              CREATE TABLE op_invocation (sender_pubkey TEXT, request_id TEXT, state TEXT, finished_at INTEGER);
              CREATE TABLE inbound_request (sender_pubkey TEXT, request_id TEXT, created_at INTEGER);
+             CREATE TABLE event_log (id INTEGER PRIMARY KEY AUTOINCREMENT, subscription_id TEXT,
+                                     kind TEXT, detail_json TEXT, at INTEGER);
              PRAGMA user_version = 3;",
         )
         .unwrap();
