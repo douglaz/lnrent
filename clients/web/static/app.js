@@ -384,11 +384,15 @@
     if (!value) {
       return false;
     }
-    const lower = value.toLowerCase();
-    if (lower.startsWith("lnbc") || lower.startsWith("lntb") || lower.startsWith("lnbcrt") || lower.startsWith("lno")) {
-      return false;
+    // Mirror the daemon's intake gate (order_intake.rs detect_form): an '@' means Lightning
+    // address and wins over any prefix (a local-part may legitimately start with "lnbc"/"lno"),
+    // then HTTPS LNURL or bech32 LNURL. bolt11/bolt12 strings have none of these shapes, so
+    // they are rejected by construction — no prefix blacklist.
+    if (value.includes("@")) {
+      return true;
     }
-    return value.includes("@") || lower.startsWith("https://");
+    const lower = value.toLowerCase();
+    return lower.startsWith("https://") || lower.startsWith("lnurl1");
   }
 
   function renderInvoice() {

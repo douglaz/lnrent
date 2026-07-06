@@ -2,9 +2,15 @@
 # DO VPS `restart` management op (request-kind): reboot the droplet. SPEC §7.4, ADR-0013.
 # Input: JSON on stdin. Output: op.result.data JSON on stdout (buyer-facing).
 set -euo pipefail
-err() { echo "{\"error\":$(jq -Rn --arg m "$1" '$m')}"; exit 1; }
+err() { echo "{\"error\":$(jq -Rn --arg m "$1" '$m')}" >&2; exit 1; }
 : "${DO_TOKEN:?DO_TOKEN not set}"
-API="https://api.digitalocean.com/v2"; AUTH=(-H "Authorization: Bearer ${DO_TOKEN}")
+API="https://api.digitalocean.com/v2"
+# Token rides in a 0600 temp file (curl -H @file), never argv — argv is world-readable via
+# /proc/<pid>/cmdline for the life of every API call. Timeouts keep a stalled DO endpoint from
+# eating the whole 120s hook budget (the daemon retries on failure).
+HDR="$(mktemp)"; trap 'rm -f "$HDR"' EXIT
+printf 'Authorization: Bearer %s\n' "$DO_TOKEN" > "$HDR"
+AUTH=(-H @"$HDR" --connect-timeout 10 --max-time 30)
 input="$(cat)"
 sub_id="$(jq -r '.subscription.id // .instance.subscription_id // empty' <<<"$input")"
 id="$(jq -r '.handles.droplet_id // .instance.handles.droplet_id // empty' <<<"$input")"

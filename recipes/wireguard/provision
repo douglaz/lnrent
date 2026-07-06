@@ -4,5 +4,5 @@
 # Output: delivery payload JSON on stdout (the .conf for the buyer) + internal handles.
 # M0 stub. M1: allocate an IP, add the wg peer, return the client config.
 set -euo pipefail
-echo '{"error":"wireguard provision not implemented (M0 stub)"}'
+echo '{"error":"wireguard provision not implemented (M0 stub)"}' >&2
 exit 1
