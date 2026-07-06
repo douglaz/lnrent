@@ -39,15 +39,18 @@ There is no separate wallet key.
 - **Relays** — the Nostr relays you publish your listing + receive orders on.
 - **Recipe + price** — set `recipes/do-vps/recipe.toml` `[pricing] amount_sat` to a real price covering
   your DO cost + margin (the shipped `30000` sat / 30d is a default to review), and set a real `[service]`
-  title/summary.
+  name/summary. Leave `[provisioning] tier` honest: a stock DO droplet is Tier **0** — ADR-0007
+  forbids claiming above what the host actually guarantees, and `tier` is published into your
+  signed listing for buyer agents to branch on.
 
 ## 2. Build (with real payments)
 
 Real Fedimint payments are the **default build** — no feature flag needed (use `--no-default-features`
-only if you want a mock-only build):
+only if you want a mock-only build). `lnrent-buyer-cli` builds the `lnrent-buyer` binary the §4
+preflight end-to-end order uses:
 
 ```sh
-nix develop . --command cargo build --release -p lnrentd
+nix develop . --command cargo build --release -p lnrentd -p lnrent-buyer-cli
 ```
 
 ## 3. Bootstrap the operator identity + config (persists the seed 0600 into the data dir)
@@ -79,7 +82,8 @@ LNRENT_DATA_DIR=/srv/lnrent/data LNRENT_RECIPES_DIR=/srv/lnrent/recipes \
   ./target/release/lnrentd
 ```
 
-Confirm ALL of these before customers can order:
+Confirm ALL of these before you ANNOUNCE the listing (as §intro says, orders are already
+technically possible from the moment the daemon started):
 - Daemon log shows, in order: the operator npub (`operator identity ready`) ·
   `fedimint payment backend joined; real ecash money path active` · `operator recipe loaded` ·
   `published … listing` · `ipc serving`. No `refund readiness warning:` / `refund readiness ALARM:`

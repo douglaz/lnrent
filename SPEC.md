@@ -355,7 +355,7 @@ NIP-17 private DM between the buyer and operator pubkeys:
 |--|--|--|
 | `order.request`   | buyer -> operator | `id` (unique request id), `listing_id`, validated `params`, `refund_dest` (REQUIRED, re-resolvable Lightning address / HTTPS LNURL; raw bolt11 and BOLT12 rejected for new orders) |
 | `order.invoice`   | operator -> buyer | `request_id` (= the `order.request` `id`), `order_id`, `bolt11`, `amount_sat`, `period`, `expires_at` |
-| `order.error`     | operator -> buyer | `request_id`, `order_id` (optional — absent for a pre-order validation failure; currently ALWAYS absent: the order + invoice commit atomically, so no post-commit `order.error` path exists), `error` `{ code, message, retryable }` with `code` in `capacity_full` / `params_invalid` / `price_changed` / `unavailable` / `rejected` — same nested `error` shape as `op.result`, so a buyer agent branches uniformly |
+| `order.error`     | operator -> buyer | `request_id`, `order_id` (optional — absent for a pre-order validation failure; currently ALWAYS absent: the order + invoice commit atomically, so no post-commit `order.error` path exists), `error` `{ code, message, retryable }` with `code` in `capacity_full` / `params_invalid` / `price_changed` / `unavailable` / `refund_dest_invalid` (missing/bolt11/BOLT12/malformed `refund_dest`) / `rejected` (reserved; not currently emitted) — same nested `error` shape as `op.result`, so a buyer agent branches uniformly |
 | `provision.ready` | operator -> buyer | `subscription_id`, `payload` (the credentials) |
 | `delivery.resend.request` | buyer -> operator | `subscription_id` — re-send the latest `provision.ready` (dropped-DM resync; replaces the old overload of `renew.request` for this) |
 | `billing.invoice` | operator -> buyer | `subscription_id`, `request_id` (when answering a `renew.request`), `bolt11`, `amount_sat`, `due_at`, `expires_at` |
@@ -472,8 +472,8 @@ same `(kind, pubkey, d)`), and that is what `order.request.listing_id` reference
 coordinate is stable across price edits, the operator detects a **stale-price order** by
 comparing the order against the current Listing (price/version) and, on mismatch, replies
 `order.error { code: "price_changed" }` rather than honoring a stale price. The exact
-tag/content layout (and the schema `version`) is pinned in M1a when the wire codec
-(lnrent-7fp.19) lands, alongside the DM schema.
+tag/content layout (and the schema `version`) is pinned by the landed wire codec
+(`wire/src/listing.rs`, schema version 1), alongside the DM schema.
 
 ## 6. Payments and subscriptions
 
@@ -511,15 +511,9 @@ natively or via a durable key->payment map — which the v1 Fedimint backend mus
 backend offering neither cannot do safe automatic refunds and falls back to operator
 reconciliation.
 
-`pay` is **idempotent on `idempotency_key`**: calling it twice with the same key never sends
-twice, and `pay_refund_capped` re-awaits an existing operation for the key exactly the same way.
-The daemon persists the `refund_attempt` (with its key) as `PENDING` *before* paying; on restart
-it simply **retries the capped pay for the key** of any non-terminal refund — safe whether
-the crash was before or after a prior call, because the key dedups (§6.6). `payment_status_by_key`
-only skips a redundant `pay` once a prior attempt `Succeeded`. Backends that cannot natively
-dedup an outbound payment must persist a key->payment map; a backend that can do neither cannot
-do safe automatic refunds and leaves the attempt for operator reconciliation rather than risk a
-double-refund.
+The daemon persists each `refund_attempt` (with its key) as `PENDING` *before* paying; on restart
+it simply **retries the capped pay for the key** of any non-terminal refund — safe whether the
+crash was before or after a prior call, because the key dedups (§6.6).
 
 - **fedimint (default for low-value rentals, ADR-0012):** connect to an **existing
   federation** and route through an **existing gatewayd**; payments settle into **ecash**
@@ -586,13 +580,15 @@ e.g. 7d).
 - **PROVISIONING -> REFUND_DUE** — provision failed permanently after retries. Before
   entering `REFUND_DUE` the daemon runs a **best-effort `destroy`** to purge any
   partially-created resources (VM / network / volume), so a refunded order leaves nothing
-  behind; a destroy failure is logged + alerted but does not block the refund.
+  behind; a destroy failure is logged (alert once production-readiness PR-5 lands) and does not
+  block the refund.
 
 **Refund path** (§6.4):
 - **REFUND_DUE -> REFUNDED** — auto-refund to the buyer's `refund_dest` succeeded
   (terminal).
 - **REFUND_DUE (stuck)** — the refund payment itself failed (payer offline, no
-  liquidity); operator alerted, manual resolution. Funds never silently vanish.
+  liquidity); operator warned in the log (push alert once PR-5 lands), manual resolution. Funds
+  never silently vanish.
 
 **Renewal** (prepaid, renew before the date, §6.2). Every renewal settlement sets
 `paid_through = max(paid_through, settled_at) + period` — so early renewals **stack** (the
@@ -611,7 +607,8 @@ re-based to `settled_at`):
   the `paid_through` formula and moves the sub to **RESUMING** (paid, captured, but the service is
   not yet powered back on); the resume driver then runs the recipe `resume` hook and
   CAS-transitions **RESUMING -> ACTIVE** on success. `RESUMING` is driver-owned: reconcile never
-  treats it as ACTIVE/SUSPENDED, and buyer `cancel`/`renew` are refused while in it.
+  treats it as ACTIVE/SUSPENDED, and buyer `cancel`/`renew` are dropped without a reply while in
+it (an idempotent no-op — the missing reply DM is the open z4u P3 UX gap).
 - **RESUMING -> SUSPENDED** — the `resume` hook failed permanently (after bounded retries). Each
   captured-but-unresumed renewal (more can settle and stack while `RESUMING`) is auto-refunded via
   exactly one detached `refund_attempt` per renewal, the pre-renewal suspended timers are restored
@@ -673,7 +670,8 @@ provision succeeds (ADR-0003). Two consequences:
   pre-existing rows (deferred: BOLT12 needs onion-message offer-fetch the Fedimint gateway can't yet service).
   The resolver is backend-agnostic (it lives in the refund path, ahead of `pay()`, not in
   any backend) and is activated alongside the Fedimint backend (lnrent-o6p). If the refund
-  payment itself fails, the subscription stays `REFUND_DUE` and the operator is alerted.
+  payment itself fails, the subscription stays `REFUND_DUE` and the operator is warned in the
+  log (push alert once PR-5 lands).
 
 Operators who require true provision-then-capture atomicity can run an **LND payment
 backend** (native hold invoices) instead of phoenixd. That backend is a later option,
@@ -732,8 +730,9 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
   or completed legacy **bolt11** refund dedups against the new binary's gen-0 pay on the identical key
   — no upgrade double-pay (lnrent-4gt). (This dedup covers the bolt11 legacy path only: an LN-address
   `dest` resolves to a fresh bolt11 under `:g1`, which does **not** dedup against a bare-key payment —
-  safe because a real LN backend rejects a non-bolt11 `dest` and no money-moving backend has shipped
-  yet, but a future Fedimint implementer must not assume LN-address legacy upgrades are deduped.)
+  safe because a real LN backend rejects a non-bolt11 `dest` and no money-moving backend had shipped
+  while that legacy window existed; the since-shipped Fedimint backend does not — and must never —
+  assume LN-address legacy upgrades are deduped.)
   The resolver re-resolves an expired-AND-definitively-`Failed`
   invoice to a fresh bolt11 under the next generation; binding `pay`'s key to the generation keeps
   each generation's idempotency separate and stops a stale generation from re-paying (lnrent-ug8).
@@ -762,7 +761,8 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
   *after* the call is equally safe: the key dedups (no double-refund) and no crash point can
   strand the intent (the durable `PENDING` row is always there to retry). `payment_status_by_key`
   lets restart skip a redundant `pay` when the prior one already `Succeeded`. After N failed
-  attempts the sub stays `REFUND_DUE` and the operator is alerted; funds never vanish and never
+  attempts the sub stays `REFUND_DUE` and the operator is warned in the log (push alert once
+  PR-5 lands); funds never vanish and never
   double-pay.
 
 Crash-recovery (step -> durable record in one txn -> restart action):
@@ -854,7 +854,8 @@ hook = "status"             # bare name -> ops/status
 - Output: JSON on stdout. `provision` returns the **delivery payload** (the object
   DM'd to the buyer, e.g. a WireGuard config) plus internal handles the daemon
   records (container id, peer index) for later hooks.
-- Exit non-zero = failure; the daemon does not advance state and alerts the operator.
+- Exit non-zero = failure; the daemon does not advance state and logs the failure loudly
+  (push alert once PR-5 lands).
 - **Lifecycle hooks (provision/suspend/resume/destroy) MUST be idempotent (re-run safe).**
   The daemon guards each transition with a compare-and-swap on `(state, next_deadline)` (§6.5)
   but may re-run a hook after a crash, so a non-idempotent lifecycle hook is a recipe bug. (Management-op hooks are not assumed
@@ -1133,7 +1134,10 @@ sandboxed conversion).
 
 ## 10. Claude skills (author-time and operator-time)
 
-These never run in the serving path. They are how a human drives lnrent.
+These never run in the serving path. They are how a human will drive lnrent. **Target surface,
+not shipped:** none of these skills exist in M1a — today's operator surface is `lnrentd
+bootstrap`, the `lnrent` CLI, and the docs/go-live.md runbook (production-readiness PR-14
+tracks the `doctor` functionality).
 
 - **lnrent-onboard** — given an existing box reachable over **SSH with sudo**,
   connect, install `lnrentd` (Nix on NixOS, apt+systemd on Debian), pick payment
@@ -1340,16 +1344,18 @@ lnrent/
   README.md
   daemon/                 # Rust: lnrentd + lnrent CLI
     src/
+  wire/                   # Nostr wire codec crate (DM types, NIP-99 listings, gift-wrap)
+  scripts/                # live-federation e2e proof + dev scripts
   recipes/                # built-in recipes
-    wireguard/ vm/ hermes/ fedimint/
-  skills/                 # Claude skills (author/operator-time)
+    do-vps/ wireguard/ dummy/     (vm/ hermes/ fedimint/ are planned)
+  skills/                 # Claude skills (author/operator-time) — PLANNED, not in the tree yet
     lnrent-onboard/ lnrent-recipe/ lnrent-list/ lnrent-subs/ lnrent-doctor/
   clients/
     core/                 # Rust buyer-core lib (DM protocol, order flow, gift-wrap; native + wasm32)
     cli/                  # thin native CLI over buyer-core
     web/                  # static WASM SPA over buyer-core (NIP-07 + WebLN + browser WS)
-  nix/                    # flake + NixOS module
-  packaging/debian/       # systemd unit + install script
+  nix/                    # flake + NixOS module — PLANNED (today: devshell in flake.nix only)
+  packaging/debian/       # systemd unit + install script — PLANNED
   docs/                   # protocol notes, NIP mapping, ADRs
 ```
 

@@ -191,12 +191,15 @@ impl OrderIntake {
             Ok(inv) => inv,
             Err(e) => {
                 // No sub committed yet — release the HELD reservation, then a structured error.
+                // The detail stays in the local log: backend/gateway internals must not reach an
+                // unauthenticated stranger over the wire (mirror op_dispatch's redaction).
+                tracing::warn!(order = %order_id, error = %e, "create_invoice failed for order");
                 return self
                     .fail_order(
                         &sender,
                         &req.id,
                         Some(&order_id),
-                        unavailable(&format!("payment backend unavailable: {e}")),
+                        unavailable("payment backend unavailable"),
                         out,
                     )
                     .await;
@@ -251,12 +254,14 @@ impl OrderIntake {
         let winner = match committed {
             Ok(w) => w,
             Err(e) => {
+                // Same redaction as the create_invoice arm: sqlite/store internals stay in the log.
+                tracing::warn!(order = %order_id, error = %e, "order commit failed");
                 return self
                     .fail_order(
                         &sender,
                         &req.id,
                         Some(&order_id),
-                        unavailable(&format!("store write failed: {e}")),
+                        unavailable("temporary storage failure"),
                         out,
                     )
                     .await;

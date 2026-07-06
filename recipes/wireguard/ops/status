@@ -4,5 +4,5 @@
 # Output: op.result.data JSON on stdout.
 # M0 stub. M1a: report the peer's up/down + last-handshake from `wg show`.
 set -euo pipefail
-echo '{"error":"wireguard status op not implemented (M0 stub)"}'
+echo '{"error":"wireguard status op not implemented (M0 stub)"}' >&2
 exit 1

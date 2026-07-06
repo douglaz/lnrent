@@ -17,14 +17,12 @@
 //! outbox-drain) woken on an interval AND on settlement/reconcile nudges.
 
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lightning_invoice::Bolt11Invoice;
 use lnrent_wire::Msg;
 use nostr_sdk::PublicKey;
 use rusqlite::OptionalExtension;
@@ -44,7 +42,7 @@ use crate::order_intake::OrderIntake;
 use crate::provision::{DeliveryResendOrderHandler, OutboxSender, Provisioner};
 use crate::recipe::Recipe;
 use crate::reconcile::Reconciler;
-use crate::refund::Refunder;
+use crate::refund::{gen_key, parse_whole_sat, Refunder};
 use crate::refund_resolver::RefundResolver;
 use crate::reservation::Budget;
 use crate::resume::ResumeDriver;
@@ -1425,7 +1423,7 @@ async fn pending_refund_required_msat(
     payment: &Arc<dyn PaymentBackend>,
 ) -> Result<u128> {
     if let Some(bolt11) = refund.resolved_bolt11.as_deref() {
-        let key = refund_generation_key(&liability.external_id, refund.resolution_gen);
+        let key = gen_key(&liability.external_id, refund.resolution_gen);
         match payment.payment_status_by_key(&key).await? {
             PayStatus::Succeeded | PayStatus::Pending => return Ok(0),
             PayStatus::Unknown if payment.payment_started_by_key(&key).await? => return Ok(0),
@@ -1437,8 +1435,8 @@ async fn pending_refund_required_msat(
             .await;
     }
 
-    if let Some(pay_sat) = refund.dest.as_deref().and_then(parse_whole_sat) {
-        let key = refund_generation_key(&liability.external_id, 0);
+    if let Some(pay_sat) = refund.dest.as_deref().and_then(|d| parse_whole_sat(d).ok()) {
+        let key = gen_key(&liability.external_id, 0);
         match payment.payment_status_by_key(&key).await? {
             PayStatus::Succeeded | PayStatus::Pending => return Ok(0),
             PayStatus::Unknown if payment.payment_started_by_key(&key).await? => return Ok(0),
@@ -1452,20 +1450,6 @@ async fn pending_refund_required_msat(
     payment
         .refund_required_outlay_msat(liability.gross_sat, None)
         .await
-}
-
-fn refund_generation_key(external_id: &str, gen: i64) -> String {
-    if gen == 0 {
-        format!("refund:{external_id}")
-    } else {
-        format!("refund:{external_id}:g{gen}")
-    }
-}
-
-fn parse_whole_sat(bolt11: &str) -> Option<u64> {
-    let invoice = Bolt11Invoice::from_str(bolt11).ok()?;
-    let msat = invoice.amount_milli_satoshis()?;
-    (msat % 1000 == 0).then_some(msat / 1000)
 }
 
 /// Settlement catch-up: capture any settlement the live `watch()` stream missed. A settlement can be

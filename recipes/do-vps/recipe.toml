@@ -19,7 +19,7 @@ retention = "7d"
 [provisioning]
 backend = "cloud-do"
 isolation = "vm"
-tier = "2"
+tier = "0"
 resources = { cpu = 1, mem_mb = 1024, disk_gb = 25 }
 
 [os]

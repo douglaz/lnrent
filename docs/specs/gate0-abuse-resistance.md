@@ -32,7 +32,8 @@ concurrency cap, not a volume cap. Replay dedup is strong but only stops *duplic
 
 ### A. PR-1 — per-pubkey cap on outstanding unpaid HELD reservations
 
-In `reservation::reserve()`, before the budget check, count the sender's LIVE unpaid holds and
+In `reservation::reserve()`, before the budget check, count the sender's LIVE holds (unpaid AND
+paid in-flight — the counting rule below) and
 refuse above a cap:
 
 - The sender is already embedded in the order id (`ord:{sender_hex}:{request_id}`,
@@ -53,7 +54,9 @@ refuse above a cap:
   predicate, so they don't eat the cap.
 - Over the cap → the existing `capacity_full` order error (retryable), NOT a new error code — the
   buyer-visible contract is unchanged and leaks nothing about the cap.
-- The cap is operator-tunable via config (`max_unpaid_holds_per_buyer`, default **2**), plumbed the
+- The cap is operator-tunable via config (`max_live_holds_per_buyer`, default **2** — "live", not
+  "unpaid": per the counting rule a paid order's hold stays HELD through PROVISIONING and still
+  consumes the cap, and the knob name must not suggest otherwise to a tuning operator), plumbed the
   same way existing operator config reaches the reservation path. `0` disables ordering for
   everyone; do not special-case it — document that.
 - The cap counts only **HELD** rows (a paid order's hold stays HELD through PROVISIONING — that is

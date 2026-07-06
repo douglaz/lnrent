@@ -15,5 +15,7 @@ demands signing, review, and sandboxed execution we are not building yet.
 - A signed, curated recipe registry is a possible later direction, not a committed
   milestone. It is its own security project (signing, opt-in trust, sandboxed
   execution) and is explicitly out of v1.
-- Recipe execution still follows least privilege (secrets via stdin, not argv/env),
-  but recipes are not sandboxed from each other in v1.
+- Recipe execution still follows least privilege (secrets via stdin, not argv/env —
+  with one codified exception: a recipe's declared provider-token env vars, e.g. the
+  do-vps `DO_TOKEN`; production-readiness PR-12's allowlist keeps that explicit), but
+  recipes are not sandboxed from each other in v1.

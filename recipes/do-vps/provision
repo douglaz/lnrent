@@ -5,21 +5,26 @@
 # Output (stdout): {"payload":{"host":<ipv4>,"port":22,"user":"root"}, "handles":{"droplet_id":<id>}}.
 # Env (from the daemon's environment, inherited by the hook):
 #   DO_TOKEN   (REQUIRED) DigitalOcean API token.
-#   DO_REGION  (default nyc3) DO_SIZE (default s-1vcpu-1gb) DO_IMAGE (default ubuntu-24-04-x64).
+#   DO_REGION  (default nyc3) DO_SIZE (default s-1vcpu-1gb) DO_IMAGE (default debian-12-x64).
 #
 # IDEMPOTENT: the droplet is tagged `sub:<id>`; a re-run (daemon retry / boot recovery) finds the
 # existing droplet by tag and reuses it instead of creating a second one. Bounded poll (<120s hook
 # budget); if a slow boot exceeds it, the next attempt's find-by-tag continues polling the same droplet.
 set -euo pipefail
 
-err() { echo "{\"error\":$(jq -Rn --arg m "$1" '$m')}"; exit 1; }
+err() { echo "{\"error\":$(jq -Rn --arg m "$1" '$m')}" >&2; exit 1; }
 
 : "${DO_TOKEN:?DO_TOKEN not set — the operator must configure the DigitalOcean API token in the daemon env}"
 REGION="${DO_REGION:-nyc3}"
 SIZE="${DO_SIZE:-s-1vcpu-1gb}"
 IMAGE="${DO_IMAGE:-debian-12-x64}"
 API="https://api.digitalocean.com/v2"
-AUTH=(-H "Authorization: Bearer ${DO_TOKEN}" -H "Content-Type: application/json")
+# Token rides in a 0600 temp file (curl -H @file), never argv — argv is world-readable via
+# /proc/<pid>/cmdline for the life of every API call. Timeouts keep a stalled DO endpoint from
+# eating the whole 120s hook budget (the daemon retries on failure).
+HDR="$(mktemp)"; trap 'rm -f "$HDR"' EXIT
+printf 'Authorization: Bearer %s\n' "$DO_TOKEN" > "$HDR"
+AUTH=(-H @"$HDR" -H "Content-Type: application/json" --connect-timeout 10 --max-time 30)
 
 input="$(cat)"
 sub_id="$(jq -r '.subscription.id // .instance.subscription_id // empty' <<<"$input")"
@@ -27,7 +32,9 @@ ssh_pubkey="$(jq -r '.subscription.params.ssh_pubkey // .params.ssh_pubkey // em
 [ -n "$sub_id" ] || err "missing subscription.id in hook input"
 [ -n "$ssh_pubkey" ] || err "missing params.ssh_pubkey"
 # The pubkey is buyer-supplied and gets written into the VM's authorized_keys via cloud-init, so
-# validate its shape BEFORE it reaches user_data (injection guard).
+# validate its shape BEFORE it reaches user_data (injection guard). Reject multi-line values first:
+# grep matches per-line, so line 1 could pass while line 2 injects extra cloud-config YAML.
+case "$ssh_pubkey" in *$'\n'*) err "ssh_pubkey must be a single line" ;; esac
 grep -Eq '^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/]+={0,2}( .*)?$' <<<"$ssh_pubkey" \
   || err "ssh_pubkey is not a well-formed OpenSSH public key"
 

@@ -196,17 +196,27 @@ impl NostrEngine {
     /// M1a; the real key is derived by lnrent-7fp.16 and injected here). Adds every relay and opens
     /// the connections so the engine can immediately publish and subscribe. Waits up to
     /// [`CONNECT_TIMEOUT`] for the connections; a slow/dead relay does not fail the call (the
-    /// pool keeps retrying and queues until one attaches), but at least one relay must be supplied.
+    /// pool keeps retrying and queues until one attaches), and an unusable relay URL is skipped
+    /// with a warning — the call fails only when NO usable relay remains, so one bad URL in a
+    /// stored config cannot brick every start (bootstrap validates new configs; this guards
+    /// configs stored before that gate existed).
     pub async fn connect(keys: Keys, relays: &[String], store: Store) -> Result<Self> {
         if relays.is_empty() {
             return Err(anyhow!("nostr engine needs at least one relay"));
         }
         let client = Client::new(keys.clone());
+        let mut added = 0usize;
         for url in relays {
-            client
-                .add_relay(url.as_str())
-                .await
-                .with_context(|| format!("adding relay {url}"))?;
+            match client.add_relay(url.as_str()).await {
+                Ok(_) => added += 1,
+                Err(e) => tracing::warn!(relay = %url, error = %e, "skipping unusable relay URL"),
+            }
+        }
+        if added == 0 {
+            return Err(anyhow!(
+                "no usable relay URL among the {} configured",
+                relays.len()
+            ));
         }
         client.connect().await;
         client.wait_for_connection(CONNECT_TIMEOUT).await;

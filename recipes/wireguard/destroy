@@ -2,5 +2,5 @@
 # WireGuard destroy hook: purge the peer and free its IP. SPEC.md §7.2.
 # M0 stub. M1: remove the peer and release the allocation.
 set -euo pipefail
-echo '{"error":"wireguard destroy not implemented (M0 stub)"}'
+echo '{"error":"wireguard destroy not implemented (M0 stub)"}' >&2
 exit 1

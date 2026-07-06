@@ -18,7 +18,7 @@ docs/specs/gate1-operator-sweep.md.
 
 ## Problem (verified)
 
-- Every "alert" is a log line (`tracing::error!`/`warn!` — refund.rs:864/983,
+- Every "alert" is a log line (`tracing::error!`/`warn!` — refund.rs:864/939/983,
   supervisor.rs:1266-1310); go-live.md's operating posture is "watch the WARN/ERROR logs". No push
   transport exists.
 - A failed `destroy` hook is swallowed: `run_lifecycle_hook` (reconcile.rs:622-630) WARNs and
@@ -40,7 +40,8 @@ One small `alerts` module owned by the supervisor:
 
 - `Alert { kind: AlertKind, subject: String, detail: String }` with a closed `AlertKind` enum:
   `RefundParked`, `RefundStuck`, `TeardownFailed`, `RelayBlackout`, `HoldingsLow`. No free-form
-  kinds. (No `BalanceQueryFailed`: with §E there is no automatic balance query left to fail.)
+  kinds. (One sanctioned extension: docs/specs/gate1-operator-sweep.md adds `SweepFailed` to this
+  enum when it lands — the two specs land the enum together or the sweep spec appends.) (No `BalanceQueryFailed`: with §E there is no automatic balance query left to fail.)
 - **Sink = a NIP-17 DM via the existing outbox, to a configurable recipient.** This reuses the
   durable drain/retry/FAILED machinery and needs zero new infra. **Recipient (operator decision,
   2026-07-04 grill):** new optional config `alert_npub` — the operator's PERSONAL Nostr identity,
@@ -56,14 +57,16 @@ One small `alerts` module owned by the supervisor:
   DM; buyers never receive or decode it, so no buyer-facing decode path changes) and set
   `payload_json` to that. The alert is a normal gift-wrapped DM to the configured recipient.
   Config: `alerts_enabled` (default **true** when the payment backend is fedimint, false for mock)
-  + `alert_npub` — and that is ALL the config; no webhook/email/metrics sinks in this cut (they
+  + `alert_npub` — and that is ALL the dispatcher/sink config (§D's `min_holdings_warn_msat` is a
+  warning-condition knob, not a sink knob); no webhook/email/metrics sinks in this cut (they
   can be added behind the same dispatch seam later).
 - **Edge-triggered with a per-(kind,subject) cooldown**, not level-triggered: the dispatcher keeps
   an in-memory last-sent map and re-sends the same (kind,subject) at most once per
   `ALERT_COOLDOWN_S = 6h`. Restart resets the map (worst case: one duplicate alert per condition
   per restart — acceptable, do not persist).
 - Wire-in points (all conditions the code already detects or this spec adds): refund parked-FAILED
-  (refund.rs:864), refund stuck-PENDING (see retune in §C), teardown dead-letter insert (§B), relay
+  (refund.rs:864 AND :939 — BOTH parked-FAILED sites, manual-handling and
+  retries-exhausted), refund stuck-PENDING (see retune in §C), teardown dead-letter insert (§B), relay
   blackout (§C), ledger holdings floor (§D). Each call site keeps its existing log line; the alert
   is additive. (The old balance-query ALARM call site at supervisor.rs:1272 is REMOVED by §E, not
   wired.)
