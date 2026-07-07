@@ -36,9 +36,30 @@ Built and tested:
 - **Operator** — `lnrent status/recipes/subs/sub`, and `lnrent money` (ecash balance, gateway, refund
   liability coverage).
 
-Not yet: more compute providers (Hetzner, bring-your-own-host) and the mainnet
-go-live (real money is opt-in at runtime and gated on the operator finalizing their setup). See
-[SPEC.md](./SPEC.md).
+## What's next — the path to unattended, public mainnet
+
+M1a is a hardened single-box money core. Taking it to a platform a stranger can run **unattended
+against real money and expose to the public marketplace** is planned in
+[docs/specs/production-readiness.md](./docs/specs/production-readiness.md) — the plan of record,
+written from a full read-only audit and cut into a dependency-ordered task graph. The remaining work
+groups into go-live gates:
+
+- **GATE-0 — abuse resistance** (before scaled public exposure): per-pubkey reservation caps and
+  inbound rate-limiting, so an unauthenticated stranger with a free keypair can't strand host
+  capacity or amplify daemon cost at zero price.
+- **GATE-1 — operability & money-safety** (before unattended mainnet): a real alert channel (not a
+  log line), an operator `sweep`/payout path, a dead-letter for failed teardowns (a failed droplet
+  delete otherwise bills the operator invisibly), federation-liveness / refund / relay actuators, and
+  a ledger-authoritative money core where the wallet balance is read in exactly one place.
+- **HARDEN** (before scale): terminal-row GC, disk-full/corruption handling on the money path, hook
+  secret hygiene, gateway failover, a `preflight`/`doctor` command, and encrypted backups.
+
+The money-correctness core (idempotent capture, fee-capped crash-recoverable refunds, SSRF-hardened
+refund resolver) is deliberately **out of scope** for these gates — they add durability and
+observability *around* it. Real money stays opt-in at runtime and gated on the operator finalizing
+their setup; an **attended, small-capacity dogfood launch** is the sanctioned first step (see the
+[operator runbook](./docs/go-live.md)). Also not yet: more compute providers (Hetzner,
+bring-your-own-host).
 
 ## Build
 
@@ -106,6 +127,7 @@ $B order wait <order_id>              # -> access credentials (host/port/user)
 
 ## Docs
 
+- Roadmap to mainnet: [docs/specs/production-readiness.md](./docs/specs/production-readiness.md) · operator runbook: [docs/go-live.md](./docs/go-live.md)
 - Spec: [SPEC.md](./SPEC.md) (draft v0.29) · glossary: [CONTEXT.md](./CONTEXT.md)
 - Decisions: [docs/adr/](./docs/adr/) (0001-0016) · change specs: [docs/specs/](./docs/specs/)
 - Security/deployment notes: [docs/security/](./docs/security/)
