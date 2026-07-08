@@ -158,6 +158,7 @@ async fn start_supervisor(
         dummy_recipe(),
         sock.clone(),
         fast_intervals(),
+        u32::MAX,
     )
     .await
     .expect("build supervisor");
@@ -515,6 +516,7 @@ async fn dev_settle_ipc_is_env_gated_and_provisions_mock_invoice() {
             disk_gb: 100,
             ports: 16,
         },
+        u32::MAX,
     );
     let order = Msg::OrderRequest(OrderRequest {
         id: "dev-1".into(),
@@ -731,6 +733,7 @@ async fn crash_recovery_redrives_provisioning_without_duplication() {
                 disk_gb: 100,
                 ports: 16,
             },
+            u32::MAX,
         );
         let order = Msg::OrderRequest(OrderRequest {
             id: "rec-1".into(),

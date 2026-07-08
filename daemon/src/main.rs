@@ -235,6 +235,7 @@ async fn run_daemon() -> Result<()> {
         recipe,
         sock,
         Intervals::production(),
+        lnrentd::config::max_live_holds_per_buyer(),
     )
     .await?;
     // The mock backend's internal clock is kept synced to SystemClock; the real Fedimint backend uses

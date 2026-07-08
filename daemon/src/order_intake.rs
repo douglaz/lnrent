@@ -52,6 +52,8 @@ pub struct OrderIntake {
     recipe: Recipe,
     /// The host's rentable budget for the capacity reservation (§9.3).
     budget: Budget,
+    /// Per-pubkey anti-griefing cap: max concurrent LIVE HELD holds one buyer key may hold (PR-1).
+    max_live_holds_per_buyer: u32,
 }
 
 /// The fields the order path needs from the current `listing` row (§5.4): the published price +
@@ -72,6 +74,7 @@ impl OrderIntake {
         clock: Arc<dyn Clock>,
         recipe: Recipe,
         budget: Budget,
+        max_live_holds_per_buyer: u32,
     ) -> Self {
         Self {
             store,
@@ -79,6 +82,7 @@ impl OrderIntake {
             clock,
             recipe,
             budget,
+            max_live_holds_per_buyer,
         }
     }
 
@@ -163,6 +167,7 @@ impl OrderIntake {
             self.budget,
             expires_at,
             now,
+            self.max_live_holds_per_buyer,
         )
         .await?
         {
@@ -1163,7 +1168,7 @@ mod tests {
         recipe: Recipe,
         budget: Budget,
     ) -> OrderIntake {
-        OrderIntake::new(store, payment, Arc::new(clock), recipe, budget)
+        OrderIntake::new(store, payment, Arc::new(clock), recipe, budget, u32::MAX)
     }
 
     async fn seed_listing(store: &Store, id: &str, recipe_id: &str, amount_sat: i64) {
@@ -2688,5 +2693,70 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    // PR-1 integration: the per-pubkey cap surfaces through order intake as
+    // order.error{capacity_full} for the (cap+1)th order from one buyer key, while a different buyer
+    // key still orders. Drives the real OrderIntake -> reserve() plumbing end to end (the cap is
+    // threaded config -> OrderIntake -> reserve). The dummy recipe reserves zero resources, so the
+    // per-pubkey CAP, not the host budget, is the only limiter here.
+    #[tokio::test]
+    async fn per_buyer_hold_cap_surfaces_capacity_full_through_order_intake() {
+        let store = mem_store();
+        let payment = Arc::new(MockPayment::new());
+        let recipe = dummy_recipe();
+        let listing_id = "30402:op:dummy-1";
+        seed_listing(
+            &store,
+            listing_id,
+            "dummy",
+            recipe.pricing.amount_sat as i64,
+        )
+        .await;
+        // cap = 1 live hold per buyer key.
+        let handler = OrderIntake::new(
+            store.clone(),
+            payment,
+            Arc::new(TestClock::new(1000)),
+            recipe,
+            budget_with_room(),
+            1,
+        );
+
+        let buyer_a = Keys::generate().public_key();
+        // A's first order -> order.invoice (reserved).
+        let out1 = RecordingOutbound::default();
+        handler
+            .handle(buyer_a, order("a-1", listing_id, json!({})), &out1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(out1.only().1, Msg::OrderInvoice(_)),
+            "A's first order is invoiced"
+        );
+
+        // A's second DISTINCT order -> order.error{capacity_full} (A is at the cap of 1).
+        let out2 = RecordingOutbound::default();
+        handler
+            .handle(buyer_a, order("a-2", listing_id, json!({})), &out2)
+            .await
+            .unwrap();
+        assert_eq!(
+            expect_order_error(&out2).error.code,
+            "capacity_full",
+            "A's order over the per-buyer cap is refused capacity_full"
+        );
+
+        // A DIFFERENT buyer key still orders freely (per-pubkey, not global).
+        let buyer_b = Keys::generate().public_key();
+        let out3 = RecordingOutbound::default();
+        handler
+            .handle(buyer_b, order("b-1", listing_id, json!({})), &out3)
+            .await
+            .unwrap();
+        assert!(
+            matches!(out3.only().1, Msg::OrderInvoice(_)),
+            "a second buyer key is unaffected by A's cap"
+        );
     }
 }
