@@ -2,6 +2,8 @@
 name = "lnrent-buyer-cli"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
+authors.workspace = true
 description = "lnrent buyer CLI (agent-grade; --json, non-interactive, deterministic exit codes; never pays)"
 
 [[bin]]

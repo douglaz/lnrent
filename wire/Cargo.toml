@@ -2,6 +2,8 @@
 name = "lnrent-wire"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
+authors.workspace = true
 description = "lnrent on-wire protocol codec: NIP-17 DM messages, NIP-59 gift-wrap, and NIP-99 30402 listings (shared by the operator engine and buyer-core)"
 
 [dependencies]
