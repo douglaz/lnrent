@@ -30,7 +30,10 @@ use lnrent_wire::{
     gift_unwrap, gift_wrap, listing_coordinate, parse_listing, Msg, OrderRequest, ProvisionReady,
     LISTING_KIND,
 };
-use lnrentd::backends::{FedimintPayment, MockPayment, PaymentBackend, DEV_SETTLE_UNSUPPORTED};
+use lnrentd::backends::{
+    Invoice, MockPayment, PayStatus, PaymentBackend, PaymentStatus, Settlement,
+    DEV_SETTLE_UNSUPPORTED,
+};
 use lnrentd::capture::{capture, Capture};
 use lnrentd::clock::{Clock, TestClock};
 use lnrentd::ipc::{self, Reply};
@@ -590,9 +593,40 @@ async fn dev_settle_ipc_is_env_gated_and_provisions_mock_invoice() {
     running.shutdown().await.unwrap();
 }
 
+/// A non-mock `PaymentBackend` that overrides none of the defaulted methods, so `dev_settle`
+/// falls through to the trait default. Replaces the deleted `backends::FedimintPayment` M0 stub
+/// (CUT-2): this test only ever needed *a* non-mock backend, not the real Fedimint one, and
+/// `MockPayment` can't stand in (it overrides `dev_settle` to succeed).
+struct NonMockBackend;
+
+#[async_trait]
+impl PaymentBackend for NonMockBackend {
+    async fn create_invoice(&self, _: u64, _: &str, _: u32, _: &str) -> Result<Invoice> {
+        unimplemented!("NonMockBackend is a dev_settle-default fixture only")
+    }
+    async fn lookup(&self, _: &str) -> Result<PaymentStatus> {
+        unimplemented!()
+    }
+    async fn lookup_settlement(&self, _: &str) -> Result<(PaymentStatus, Option<i64>)> {
+        unimplemented!()
+    }
+    async fn pay(&self, _: &str, _: u64, _: &str) -> Result<String> {
+        unimplemented!()
+    }
+    async fn payment_status(&self, _: &str) -> Result<PayStatus> {
+        unimplemented!()
+    }
+    async fn payment_status_by_key(&self, _: &str) -> Result<PayStatus> {
+        unimplemented!()
+    }
+    async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
+        unimplemented!()
+    }
+}
+
 #[tokio::test]
 async fn dev_settle_default_is_unsupported_for_non_mock_backend() {
-    let err = FedimintPayment
+    let err = NonMockBackend
         .dev_settle("external", START)
         .await
         .expect_err("non-mock backend must not support dev settle");

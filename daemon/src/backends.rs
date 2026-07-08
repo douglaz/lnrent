@@ -1,9 +1,9 @@
-//! Subsystem backends. SPEC.md §8. v1 implements Compute (host) + Network
-//! (WireGuard) and Payment (Fedimint, ADR-0012); these are M0 stubs that compile and fail
-//! loudly until M1 fills them in.
+//! The `PaymentBackend` money seam (SPEC.md §6.1): its DTOs (`Invoice`, `PaymentStatus`,
+//! `PayStatus`, `Settlement`) plus the in-memory `MockPayment` fixture. The real Fedimint
+//! backend lives in `fedimint_backend.rs` (ADR-0012); provisioning is hook-driven (`runner.rs`
+//! + recipes), not a trait here.
 
 use anyhow::{bail, Result};
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use tokio::sync::mpsc;
@@ -11,24 +11,6 @@ use tokio::sync::mpsc;
 use async_trait::async_trait;
 
 pub const DEV_SETTLE_UNSUPPORTED: &str = "dev settle is only supported on the mock payment backend";
-
-/// Where a workload runs. SPEC.md §8.1 (was `ProvisionBackend` in early drafts).
-pub trait ComputeBackend: Send + Sync {
-    /// Create a container/VM; returns the Instance handle to record.
-    fn create(&self, spec: &Value) -> Result<Value>;
-    fn stop(&self, handle: &Value) -> Result<()>;
-    fn start(&self, handle: &Value) -> Result<()>;
-    fn destroy(&self, handle: &Value) -> Result<()>;
-    fn exec(&self, handle: &Value, cmd: &[String]) -> Result<String>;
-}
-
-/// Network management. SPEC.md §8.2.
-pub trait NetworkBackend: Send + Sync {
-    fn add_wireguard_peer(&self, spec: &Value) -> Result<Value>;
-    fn remove_wireguard_peer(&self, peer: &str) -> Result<()>;
-    fn open_port(&self, spec: &Value) -> Result<Value>;
-    fn close_port(&self, handle: &Value) -> Result<()>;
-}
 
 /// Receiving and refunding Lightning. SPEC.md §6.1. No hold invoices on the v1
 /// backends, so `pay` exists for capture-then-refund (ADR-0003).
@@ -166,80 +148,6 @@ pub struct Settlement {
     pub amount_sat: u64,
     pub settled_at: i64, // when the backend observed settlement (unix secs); capture sets
                          // paid_through = settled_at + period (§6.3), so it must come from here
-}
-
-/// `host` compute: runs directly on the Box, no isolation. SPEC.md §8.1.
-pub struct HostCompute;
-
-impl ComputeBackend for HostCompute {
-    fn create(&self, _spec: &Value) -> Result<Value> {
-        bail!("host.create not implemented (M0 stub)")
-    }
-    fn stop(&self, _handle: &Value) -> Result<()> {
-        bail!("host.stop not implemented (M0 stub)")
-    }
-    fn start(&self, _handle: &Value) -> Result<()> {
-        bail!("host.start not implemented (M0 stub)")
-    }
-    fn destroy(&self, _handle: &Value) -> Result<()> {
-        bail!("host.destroy not implemented (M0 stub)")
-    }
-    fn exec(&self, _handle: &Value, _cmd: &[String]) -> Result<String> {
-        bail!("host.exec not implemented (M0 stub)")
-    }
-}
-
-/// WireGuard network backend. SPEC.md §8.2.
-pub struct WireguardNetwork;
-
-impl NetworkBackend for WireguardNetwork {
-    fn add_wireguard_peer(&self, _spec: &Value) -> Result<Value> {
-        bail!("wireguard.add_peer not implemented (M0 stub)")
-    }
-    fn remove_wireguard_peer(&self, _peer: &str) -> Result<()> {
-        bail!("wireguard.remove_peer not implemented (M0 stub)")
-    }
-    fn open_port(&self, _spec: &Value) -> Result<Value> {
-        bail!("network.open_port not implemented (M0 stub)")
-    }
-    fn close_port(&self, _handle: &Value) -> Result<()> {
-        bail!("network.close_port not implemented (M0 stub)")
-    }
-}
-
-/// Fedimint payment backend (PRIMARY, ADR-0012): ecash via an existing federation +
-/// gateway. Cannot hold invoices (ADR-0003). phoenixd is a secondary backend (M3).
-pub struct FedimintPayment;
-
-#[async_trait]
-impl PaymentBackend for FedimintPayment {
-    async fn create_invoice(
-        &self,
-        _amount_sat: u64,
-        _memo: &str,
-        _expiry_s: u32,
-        _external_id: &str,
-    ) -> Result<Invoice> {
-        bail!("fedimint.create_invoice not implemented (M0 stub)")
-    }
-    async fn lookup(&self, _id: &str) -> Result<PaymentStatus> {
-        bail!("fedimint.lookup not implemented (M0 stub)")
-    }
-    async fn lookup_settlement(&self, _id: &str) -> Result<(PaymentStatus, Option<i64>)> {
-        bail!("fedimint.lookup_settlement not implemented (M0 stub)")
-    }
-    async fn pay(&self, _dest: &str, _amount_sat: u64, _idempotency_key: &str) -> Result<String> {
-        bail!("fedimint.pay not implemented (M0 stub)")
-    }
-    async fn payment_status(&self, _payment_id: &str) -> Result<PayStatus> {
-        bail!("fedimint.payment_status not implemented (M0 stub)")
-    }
-    async fn payment_status_by_key(&self, _idempotency_key: &str) -> Result<PayStatus> {
-        bail!("fedimint.payment_status_by_key not implemented (M0 stub)")
-    }
-    async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
-        bail!("fedimint.watch not implemented (M0 stub)")
-    }
 }
 
 /// Deterministic in-memory PaymentBackend — the M1a money-path FIXTURE (the operator chose a
@@ -416,19 +324,6 @@ impl PaymentBackend for MockPayment {
         self.state.lock().unwrap().settle_tx = Some(tx);
         Ok(rx)
     }
-}
-
-/// Storage subsystem. SPEC.md §8.3 (phased, M7) — trait stub.
-pub trait StorageBackend: Send + Sync {
-    fn create_volume(&self, spec: &Value) -> Result<Value>;
-    fn snapshot(&self, handle: &Value) -> Result<Value>;
-    fn destroy_volume(&self, handle: &Value) -> Result<()>;
-}
-
-/// Observability subsystem, read-only. SPEC.md §8.4 (phased, M7) — trait stub.
-pub trait Observability: Send + Sync {
-    fn status(&self, instance: &Value) -> Result<Value>;
-    fn logs(&self, instance: &Value, lines: u32) -> Result<String>;
 }
 
 #[cfg(test)]

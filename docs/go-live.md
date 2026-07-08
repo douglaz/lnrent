@@ -58,7 +58,7 @@ nix develop . --command cargo build --release -p lnrentd -p lnrent-buyer-cli
 ```sh
 LNRENT_DATA_DIR=/srv/lnrent/data LNRENT_PAYMENT_BACKEND=fedimint \
 LNRENT_FEDIMINT_INVITE=fed1… LNRENT_FEDIMINT_GATEWAY=<gateway_pubkey> \
-LNRENT_COMPUTE_BACKEND=cloud-do LNRENT_MNEMONIC="…your backed-up mnemonic…" \
+LNRENT_MNEMONIC="…your backed-up mnemonic…" \
 LNRENT_RELAYS=wss://relay-a,wss://relay-b \
   ./target/release/lnrentd bootstrap
 ```
