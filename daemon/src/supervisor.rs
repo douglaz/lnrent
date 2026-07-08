@@ -156,6 +156,7 @@ impl Supervisor {
         recipe: Recipe,
         sock_path: PathBuf,
         intervals: Intervals,
+        max_live_holds_per_buyer: u32,
     ) -> Result<Self> {
         let (budget, box_id) = load_budget_and_box(&store).await;
 
@@ -168,6 +169,7 @@ impl Supervisor {
             clock.clone(),
             recipe.clone(),
             budget,
+            max_live_holds_per_buyer,
         ));
         let order_handler: Arc<dyn OrderHandler> = Arc::new(DrainingOrderHandler::new(
             Arc::new(DeliveryResendOrderHandler::new(

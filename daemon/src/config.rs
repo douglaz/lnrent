@@ -268,6 +268,31 @@ const ENV_FEDIMINT_GATEWAY: &str = "LNRENT_FEDIMINT_GATEWAY";
 const ENV_MNEMONIC: &str = "LNRENT_MNEMONIC";
 /// Optional path to a config file, an alternative to the `--config` flag.
 const ENV_CONFIG: &str = "LNRENT_CONFIG";
+/// Per-pubkey anti-griefing cap: the max concurrent LIVE HELD order reservations one buyer key may
+/// hold (PR-1, GATE-0). A runtime knob read at daemon start, not part of the persisted operator
+/// identity — so it can be retuned by restart without a re-bootstrap.
+const ENV_MAX_LIVE_HOLDS_PER_BUYER: &str = "LNRENT_MAX_LIVE_HOLDS_PER_BUYER";
+
+/// Default for [`max_live_holds_per_buyer`]. Small and bounded: a legitimate buyer rarely needs more
+/// than one or two unpaid orders in flight, while a griefer wants many. `0` refuses ALL orders.
+pub const DEFAULT_MAX_LIVE_HOLDS_PER_BUYER: u32 = 2;
+
+/// The per-pubkey live-HELD cap for the order-reservation path, from `LNRENT_MAX_LIVE_HOLDS_PER_BUYER`
+/// (default [`DEFAULT_MAX_LIVE_HOLDS_PER_BUYER`]). A blank/absent value uses the default; a
+/// non-numeric value warns and falls back to the default (a dead knob must never wedge startup).
+pub fn max_live_holds_per_buyer() -> u32 {
+    match std::env::var(ENV_MAX_LIVE_HOLDS_PER_BUYER) {
+        Err(_) => DEFAULT_MAX_LIVE_HOLDS_PER_BUYER,
+        Ok(v) if v.trim().is_empty() => DEFAULT_MAX_LIVE_HOLDS_PER_BUYER,
+        Ok(v) => v.trim().parse::<u32>().unwrap_or_else(|_| {
+            tracing::warn!(
+                value = %v,
+                "invalid {ENV_MAX_LIVE_HOLDS_PER_BUYER}; using default {DEFAULT_MAX_LIVE_HOLDS_PER_BUYER}"
+            );
+            DEFAULT_MAX_LIVE_HOLDS_PER_BUYER
+        }),
+    }
+}
 
 impl RawConfig {
     /// Merge the four bootstrap sources into one [`RawConfig`] with the documented precedence

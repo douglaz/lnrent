@@ -164,6 +164,7 @@ async fn start_supervisor_with_sock(
         recipe,
         sock.clone(),
         fast_intervals(),
+        u32::MAX,
     )
     .await
     .expect("build supervisor");
@@ -217,6 +218,7 @@ async fn place_order(
         clock.clone(),
         recipe.clone(),
         big_budget(),
+        u32::MAX,
     );
     let order = Msg::OrderRequest(OrderRequest {
         id: req_id.into(),
@@ -252,6 +254,7 @@ async fn issue_renew(
         clock.clone(),
         recipe.clone(),
         big_budget(),
+        u32::MAX,
     );
     let renew = Msg::RenewRequest(RenewRequest {
         id: req_id.into(),
@@ -3143,6 +3146,7 @@ async fn do_vps_full_order_provisions_a_real_droplet() {
         clock.clone(),
         recipe.clone(),
         big_budget(),
+        u32::MAX,
     );
     let order = Msg::OrderRequest(OrderRequest {
         id: req_id.into(),
@@ -3291,6 +3295,7 @@ async fn do_vps_real_payment_provisions_a_real_vm() {
         recipe.clone(),
         temp_sock(),
         fast_intervals(),
+        u32::MAX,
     )
     .await
     .expect("build supervisor")
@@ -3308,6 +3313,7 @@ async fn do_vps_real_payment_provisions_a_real_vm() {
         clock.clone(),
         recipe.clone(),
         big_budget(),
+        u32::MAX,
     );
     let order = Msg::OrderRequest(OrderRequest {
         id: req_id.into(),

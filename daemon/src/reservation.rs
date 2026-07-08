@@ -68,6 +68,7 @@ pub fn validate_params(recipe: &Recipe, params: &Map<String, Value>) -> Result<(
 /// `order_id` with `reservation_id`, TTL `expires_at`. Returns `Reserved` or `CapacityFull`.
 /// The whole check-and-insert runs in ONE store transaction, and the store actor serializes
 /// transactions, so two concurrent orders for the last slot can never both succeed.
+#[allow(clippy::too_many_arguments)] // cohesive reserve inputs; a params struct would not clarify
 pub async fn reserve(
     store: &Store,
     reservation_id: &str,
@@ -76,6 +77,7 @@ pub async fn reserve(
     budget: Budget,
     expires_at: i64,
     now: i64,
+    max_live_holds_per_buyer: u32,
 ) -> Result<Reserve> {
     let (rid, oid) = (reservation_id.to_string(), order_id.to_string());
     let resources_json = serde_json::to_string(&req.resources)?;
@@ -101,6 +103,20 @@ pub async fn reserve(
                 // re-holding capacity.
                 Some("RELEASED") => bail!("reserve: order `{oid}` reservation is already RELEASED"),
                 _ => {} // None (new) or HELD (legit pre-commit retry) fall through.
+            }
+            // Per-pubkey anti-griefing cap (PR-1, GATE-0). The `#p` recipient tag is public and any
+            // free keypair can reach `order.request`, so an unbounded stranger could cycle unpaid
+            // holds to strand a small host at zero cost. Count THIS sender's live HELD holds (same
+            // live predicate `live_usage` uses — a paid/PROVISIONING hold still counts) EXCLUDING
+            // this order's own hold, and refuse above the cap with the ordinary `CapacityFull`
+            // business result (leaks nothing about the cap). Self-exclusion keeps an idempotent
+            // re-reserve of an already-held order from counting against itself. `max=0` refuses all
+            // orders (0 >= 0) by construction — not special-cased.
+            if let Some(like) = sender_like_pattern(&oid) {
+                let held = live_hold_count(tx, now, &like, &oid)?;
+                if held >= max_live_holds_per_buyer {
+                    return Ok(Reserve::CapacityFull);
+                }
             }
             // Capacity check EXCLUDES this order's own live hold, so a HELD retry on a full host
             // can't reject itself as CapacityFull (it already accounts for that capacity).
@@ -277,6 +293,54 @@ fn live_usage(
     )
 }
 
+/// The `LIKE` pattern matching every order id from the same sender: `ord:<sender_hex>:%`, i.e.
+/// everything through the second colon plus `%`. The order id is `ord:<sender_hex>:<tail>`
+/// (order_intake.rs), and `sender_hex` is lowercase pubkey hex — it contains no `LIKE` metacharacters
+/// (`%`/`_`), so the pattern needs no escaping. Returns `None` for an id that is not in the two-colon
+/// order form (then the per-pubkey cap is skipped for that reserve — fail-open is safe: the budget
+/// check still bounds capacity, and every real `order.request` id is in this form).
+fn sender_like_pattern(order_id: &str) -> Option<String> {
+    let mut colons = order_id.match_indices(':');
+    let _first = colons.next()?;
+    let (second, _) = colons.next()?;
+    Some(format!("{}%", &order_id[..=second]))
+}
+
+/// Count this sender's LIVE HELD reservations (the per-pubkey anti-griefing cap denominator, PR-1).
+/// Uses the SAME live-HELD predicate as [`live_usage`] — a HELD row counts while unexpired, or once
+/// its order invoice is PAID, or while its subscription is PROVISIONING — so a paid in-flight order
+/// still consumes the cap and a stale expired-never-paid row does not. CONSUMED rows (active
+/// Instances) are NOT counted: the cap bounds outstanding holds, not completed rentals. Excludes
+/// `exclude_order_id` so an idempotent re-reserve of an already-held order is not counted against
+/// itself.
+fn live_hold_count(
+    tx: &rusqlite::Transaction,
+    now: i64,
+    sender_like: &str,
+    exclude_order_id: &str,
+) -> rusqlite::Result<u32> {
+    tx.query_row(
+        "SELECT COUNT(*)
+         FROM reservation r
+         WHERE r.state='HELD'
+           AND (
+             r.expires_at > ?1
+             OR EXISTS (
+               SELECT 1 FROM invoice i
+               WHERE i.subscription_id = r.order_id AND i.kind='order' AND i.status='PAID'
+             )
+             OR EXISTS (
+               SELECT 1 FROM subscription s
+               WHERE s.id = r.order_id AND s.state='PROVISIONING'
+             )
+           )
+           AND r.order_id LIKE ?2
+           AND r.order_id <> ?3",
+        rusqlite::params![now, sender_like, exclude_order_id],
+        |r| r.get(0),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,14 +379,32 @@ mod tests {
         let s = mem_store();
         let (a, b) = (s.clone(), s.clone());
         let ta = tokio::spawn(async move {
-            reserve(&a, "res-a", "order-a", req_one(), budget_one(), 1_000, 0)
-                .await
-                .unwrap()
+            reserve(
+                &a,
+                "res-a",
+                "order-a",
+                req_one(),
+                budget_one(),
+                1_000,
+                0,
+                u32::MAX,
+            )
+            .await
+            .unwrap()
         });
         let tb = tokio::spawn(async move {
-            reserve(&b, "res-b", "order-b", req_one(), budget_one(), 1_000, 0)
-                .await
-                .unwrap()
+            reserve(
+                &b,
+                "res-b",
+                "order-b",
+                req_one(),
+                budget_one(),
+                1_000,
+                0,
+                u32::MAX,
+            )
+            .await
+            .unwrap()
         });
         let (ra, rb) = (ta.await.unwrap(), tb.await.unwrap());
         // exactly one Reserved, one CapacityFull
@@ -344,7 +426,7 @@ mod tests {
     async fn reserve_consume_release_lifecycle() {
         let s = mem_store();
         assert_eq!(
-            reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0)
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0, u32::MAX)
                 .await
                 .unwrap(),
             Reserve::Reserved
@@ -379,7 +461,7 @@ mod tests {
     #[tokio::test]
     async fn consume_requires_a_held_reservation() {
         let s = mem_store();
-        reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0)
+        reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0, u32::MAX)
             .await
             .unwrap();
         assert!(
@@ -399,7 +481,7 @@ mod tests {
     #[tokio::test]
     async fn consume_honors_a_paid_hold_past_its_ttl() {
         let s = mem_store();
-        reserve(&s, "r1", "o1", req_one(), budget_one(), 100, 0)
+        reserve(&s, "r1", "o1", req_one(), budget_one(), 100, 0, u32::MAX)
             .await
             .unwrap();
         // now=101 is past the TTL of 100, yet the (paid) hold is still consumed.
@@ -424,14 +506,14 @@ mod tests {
         let s = mem_store();
         // o1 takes the whole single-slot budget.
         assert_eq!(
-            reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0)
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0, u32::MAX)
                 .await
                 .unwrap(),
             Reserve::Reserved
         );
         // Re-reserving o1 (crash-retry) on the now-full host is still Reserved, not CapacityFull.
         assert_eq!(
-            reserve(&s, "r1", "o1", req_one(), budget_one(), 2_000, 10)
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 2_000, 10, u32::MAX)
                 .await
                 .unwrap(),
             Reserve::Reserved
@@ -468,12 +550,12 @@ mod tests {
             }
         };
         // CONSUMED: a re-reserve is idempotent success but stays CONSUMED (not downgraded).
-        reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0)
+        reserve(&s, "r1", "o1", req_one(), budget_one(), 1_000, 0, u32::MAX)
             .await
             .unwrap();
         consume(&s, "o1", 1).await.unwrap();
         assert_eq!(
-            reserve(&s, "r1", "o1", req_one(), budget_one(), 2_000, 2)
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 2_000, 2, u32::MAX)
                 .await
                 .unwrap(),
             Reserve::Reserved
@@ -486,7 +568,7 @@ mod tests {
         // RELEASED: a re-reserve is refused outright (renewals get a fresh order_id).
         release(&s, "o1", 3).await.unwrap();
         assert!(
-            reserve(&s, "r1", "o1", req_one(), budget_one(), 4_000, 4)
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 4_000, 4, u32::MAX)
                 .await
                 .is_err(),
             "re-reserving a RELEASED order is a caller bug, surfaced not resurrected"
@@ -504,21 +586,21 @@ mod tests {
         let s = mem_store();
         // r1 HELD with TTL=100.
         assert_eq!(
-            reserve(&s, "r1", "o1", req_one(), budget_one(), 100, 0)
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 100, 0, u32::MAX)
                 .await
                 .unwrap(),
             Reserve::Reserved
         );
         // At now=50 the slot is still taken.
         assert_eq!(
-            reserve(&s, "r2", "o2", req_one(), budget_one(), 200, 50)
+            reserve(&s, "r2", "o2", req_one(), budget_one(), 200, 50, u32::MAX)
                 .await
                 .unwrap(),
             Reserve::CapacityFull
         );
         // At now=150 (past r1's TTL) the slot is free again.
         assert_eq!(
-            reserve(&s, "r3", "o3", req_one(), budget_one(), 300, 150)
+            reserve(&s, "r3", "o3", req_one(), budget_one(), 300, 150, u32::MAX)
                 .await
                 .unwrap(),
             Reserve::Reserved
@@ -529,7 +611,7 @@ mod tests {
     async fn paid_held_reservation_counts_even_after_ttl() {
         let s = mem_store();
         assert_eq!(
-            reserve(&s, "r1", "o1", req_one(), budget_one(), 100, 0)
+            reserve(&s, "r1", "o1", req_one(), budget_one(), 100, 0, u32::MAX)
                 .await
                 .unwrap(),
             Reserve::Reserved
@@ -550,7 +632,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            reserve(&s, "r2", "o2", req_one(), budget_one(), 300, 150)
+            reserve(&s, "r2", "o2", req_one(), budget_one(), 300, 150, u32::MAX)
                 .await
                 .unwrap(),
             Reserve::CapacityFull,
@@ -576,6 +658,176 @@ mod tests {
         assert!(
             validate_params(&r, &wrong_type).is_err(),
             "wrong-type param rejected"
+        );
+    }
+
+    // ---- PR-1: per-pubkey live-HELD anti-griefing cap (GATE-0) -----------------------------------
+
+    /// A budget large enough that the per-pubkey cap, not the host budget, is the only limiter here.
+    fn budget_big() -> Budget {
+        Budget {
+            cpu: 1000,
+            mem_mb: 1_000_000,
+            disk_gb: 1_000_000,
+            ports: 1000,
+        }
+    }
+
+    /// Reserve using the daemon's sender-embedding order id form `ord:<sender>:<tail>`.
+    async fn reserve_order(
+        s: &Store,
+        sender: &str,
+        tail: &str,
+        expires_at: i64,
+        now: i64,
+        cap: u32,
+    ) -> Reserve {
+        reserve(
+            s,
+            &format!("res:{sender}:{tail}"),
+            &format!("ord:{sender}:{tail}"),
+            req_one(),
+            budget_big(),
+            expires_at,
+            now,
+            cap,
+        )
+        .await
+        .unwrap()
+    }
+
+    // The Nth live hold from one buyer key is refused; a different key is unaffected (per-pubkey).
+    #[tokio::test]
+    async fn per_buyer_cap_blocks_nth_hold_only() {
+        let s = mem_store();
+        let cap = 2;
+        assert_eq!(
+            reserve_order(&s, "aaa", "1", 10_000, 0, cap).await,
+            Reserve::Reserved
+        );
+        assert_eq!(
+            reserve_order(&s, "aaa", "2", 10_000, 0, cap).await,
+            Reserve::Reserved
+        );
+        // aaa is at the cap of 2 live holds -> a third DISTINCT order is refused.
+        assert_eq!(
+            reserve_order(&s, "aaa", "3", 10_000, 0, cap).await,
+            Reserve::CapacityFull
+        );
+        // A different buyer key reserves freely at the same time.
+        assert_eq!(
+            reserve_order(&s, "bbb", "1", 10_000, 0, cap).await,
+            Reserve::Reserved
+        );
+        assert_eq!(
+            reserve_order(&s, "bbb", "2", 10_000, 0, cap).await,
+            Reserve::Reserved
+        );
+    }
+
+    // max=0 refuses every order (0 >= 0 by construction), not special-cased.
+    #[tokio::test]
+    async fn per_buyer_cap_zero_refuses_all_orders() {
+        let s = mem_store();
+        assert_eq!(
+            reserve_order(&s, "aaa", "1", 10_000, 0, 0).await,
+            Reserve::CapacityFull
+        );
+    }
+
+    // An idempotent re-reserve of the SAME order id is NOT counted against itself (self-exclusion):
+    // a buyer at the cap can still complete/retry an order they already hold.
+    #[tokio::test]
+    async fn per_buyer_cap_excludes_self_on_re_reserve() {
+        let s = mem_store();
+        let cap = 1;
+        assert_eq!(
+            reserve_order(&s, "aaa", "1", 10_000, 0, cap).await,
+            Reserve::Reserved
+        );
+        // aaa is at the cap of 1, but re-reserving the SAME order continues it.
+        assert_eq!(
+            reserve_order(&s, "aaa", "1", 10_000, 0, cap).await,
+            Reserve::Reserved
+        );
+        // a DISTINCT new order from aaa is refused.
+        assert_eq!(
+            reserve_order(&s, "aaa", "2", 10_000, 0, cap).await,
+            Reserve::CapacityFull
+        );
+    }
+
+    // An expired-and-never-paid hold no longer counts toward the cap.
+    #[tokio::test]
+    async fn per_buyer_cap_expired_unpaid_hold_frees_slot() {
+        let s = mem_store();
+        let cap = 1;
+        assert_eq!(
+            reserve_order(&s, "aaa", "1", 100, 0, cap).await,
+            Reserve::Reserved
+        );
+        // at t=200 the first hold is expired-unpaid -> frees the cap slot -> a new order is allowed.
+        assert_eq!(
+            reserve_order(&s, "aaa", "2", 10_000, 200, cap).await,
+            Reserve::Reserved
+        );
+    }
+
+    // Counting-rule regression: a paid/PROVISIONING hold still counts toward the cap even PAST its
+    // reservation TTL — the cap must use the same live predicate, not `expires_at` alone.
+    #[tokio::test]
+    async fn per_buyer_cap_paid_or_provisioning_hold_still_counts() {
+        let s = mem_store();
+        let cap = 1;
+        assert_eq!(
+            reserve_order(&s, "aaa", "1", 100, 0, cap).await,
+            Reserve::Reserved
+        );
+        // mark ord:aaa:1 PAID + PROVISIONING (mirrors capture -> provisioning).
+        s.transaction(|tx| {
+            tx.execute(
+                "INSERT INTO subscription (id, state) VALUES ('ord:aaa:1', 'PROVISIONING')",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO invoice (id, subscription_id, external_id, kind, status)
+                 VALUES ('i1', 'ord:aaa:1', 'order:ord:aaa:1', 'order', 'PAID')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        // at t=200 the first hold is PAST its TTL but PAID/PROVISIONING -> still counts -> aaa at cap.
+        assert_eq!(
+            reserve_order(&s, "aaa", "2", 10_000, 200, cap).await,
+            Reserve::CapacityFull
+        );
+    }
+
+    // Preserved invariant (oversell guard): the hold TTL is not shortened — the persisted reservation
+    // `expires_at` equals the order-invoice `expires_at` passed in (see reserve()'s invariant note).
+    #[tokio::test]
+    async fn hold_ttl_equals_order_invoice_expiry() {
+        let s = mem_store();
+        let expires_at = 987_654;
+        assert_eq!(
+            reserve_order(&s, "aaa", "1", expires_at, 0, 2).await,
+            Reserve::Reserved
+        );
+        let got: i64 = s
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT expires_at FROM reservation WHERE order_id='ord:aaa:1'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            got, expires_at,
+            "hold TTL must equal the order-invoice expiry (no shortening -> no oversell)"
         );
     }
 }
