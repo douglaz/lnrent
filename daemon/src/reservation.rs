@@ -37,10 +37,30 @@ pub enum Reserve {
     CapacityFull,
 }
 
+/// Cap on an order's params object, serialized (gdu.4). Params are stored verbatim in the
+/// subscription row, so this bounds the durable footprint an unauthenticated stranger buys per
+/// order. 8 KiB is generous: the largest legitimate param today is an SSH public key (<1 KiB).
+pub const MAX_PARAMS_JSON_BYTES: usize = 8 * 1024;
+/// Cap on an order's top-level param count (gdu.4). Recipes declare a handful of params; 32
+/// bounds the key-iteration work and pairs with [`MAX_PARAMS_JSON_BYTES`].
+pub const MAX_PARAMS_TOP_LEVEL_KEYS: usize = 32;
+
 /// Validate an order's params against the recipe's `[[params]]` (§7.1): every `required`
 /// param must be present, and a `number`/`bool` param must have the right JSON type. Run at
-/// pre-flight, before any money moves.
+/// pre-flight, before any money moves. Size-bounded first (gdu.4): an oversized or key-heavy
+/// params object is rejected before any per-recipe work, and both rejects surface through the
+/// caller's existing `params_invalid` mapping.
 pub fn validate_params(recipe: &Recipe, params: &Map<String, Value>) -> Result<()> {
+    if params.len() > MAX_PARAMS_TOP_LEVEL_KEYS {
+        bail!(
+            "params has too many top-level keys ({}, max {MAX_PARAMS_TOP_LEVEL_KEYS})",
+            params.len()
+        );
+    }
+    let serialized_bytes = serde_json::to_string(params)?.len();
+    if serialized_bytes > MAX_PARAMS_JSON_BYTES {
+        bail!("params too large ({serialized_bytes} bytes serialized, max {MAX_PARAMS_JSON_BYTES})");
+    }
     for p in &recipe.params {
         match params.get(&p.key) {
             None => {
@@ -658,6 +678,56 @@ mod tests {
         assert!(
             validate_params(&r, &wrong_type).is_err(),
             "wrong-type param rejected"
+        );
+    }
+
+    // gdu.4 boundary: params serializing to exactly MAX_PARAMS_JSON_BYTES pass; one byte over is
+    // rejected. Padding math: a filler param of 'x's grows the serialized JSON 1 byte per char.
+    #[tokio::test]
+    async fn params_size_cap_is_boundary_exact() {
+        let dir = format!("{}/../recipes/wireguard", env!("CARGO_MANIFEST_DIR"));
+        let r = crate::recipe::Recipe::load(&dir).unwrap();
+
+        let sized = |target: usize| -> Map<String, Value> {
+            let base = json!({"pubkey": "abc", "filler": ""})
+                .as_object()
+                .unwrap()
+                .clone();
+            let base_len = serde_json::to_string(&base).unwrap().len();
+            let mut m = base;
+            m.insert("filler".into(), Value::String("x".repeat(target - base_len)));
+            assert_eq!(serde_json::to_string(&m).unwrap().len(), target);
+            m
+        };
+
+        validate_params(&r, &sized(MAX_PARAMS_JSON_BYTES))
+            .expect("params exactly at the byte cap accepted");
+        assert!(
+            validate_params(&r, &sized(MAX_PARAMS_JSON_BYTES + 1)).is_err(),
+            "one byte over the params cap rejected"
+        );
+    }
+
+    // gdu.4 boundary: exactly MAX_PARAMS_TOP_LEVEL_KEYS keys pass; one more is rejected.
+    #[tokio::test]
+    async fn params_key_cap_is_boundary_exact() {
+        let dir = format!("{}/../recipes/wireguard", env!("CARGO_MANIFEST_DIR"));
+        let r = crate::recipe::Recipe::load(&dir).unwrap();
+
+        let keyed = |n: usize| -> Map<String, Value> {
+            let mut m = json!({"pubkey": "abc"}).as_object().unwrap().clone();
+            for i in 0..n.saturating_sub(1) {
+                m.insert(format!("k{i}"), json!(1));
+            }
+            assert_eq!(m.len(), n);
+            m
+        };
+
+        validate_params(&r, &keyed(MAX_PARAMS_TOP_LEVEL_KEYS))
+            .expect("params exactly at the key cap accepted");
+        assert!(
+            validate_params(&r, &keyed(MAX_PARAMS_TOP_LEVEL_KEYS + 1)).is_err(),
+            "one key over the cap rejected"
         );
     }
 

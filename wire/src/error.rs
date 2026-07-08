@@ -16,6 +16,10 @@ pub enum Error {
     /// The gift wrap's inner rumor was not a NIP-17 private DM (kind 14), so its content is not
     /// an lnrent message.
     NotPrivateDm,
+    /// The gift wrap's rumor content exceeds [`crate::wrap::MAX_INBOUND_CONTENT_BYTES`], so it is
+    /// rejected before the JSON decode (gdu.4: bounds the decode work an unauthenticated sender
+    /// can force per wrap).
+    ContentTooLarge { len: usize, max: usize },
     /// The event handed to `parse_listing` was not a NIP-99 classified listing (kind 30402).
     NotListing,
     /// A Nostr event failed id/signature verification before being trusted.
@@ -43,6 +47,9 @@ impl fmt::Display for Error {
             Error::NotGiftWrap => f.write_str("event is not a NIP-59 gift wrap (kind 1059)"),
             Error::NotPrivateDm => {
                 f.write_str("gift wrap rumor is not a NIP-17 private DM (kind 14)")
+            }
+            Error::ContentTooLarge { len, max } => {
+                write!(f, "rumor content too large ({len} bytes, max {max})")
             }
             Error::NotListing => f.write_str("event is not a NIP-99 listing (kind 30402)"),
             Error::InvalidEvent(e) => write!(f, "nostr event verification failed: {e}"),
