@@ -216,14 +216,19 @@ async fn run_daemon() -> Result<()> {
     let recipe = load_operator_recipe(&recipes_dir)?;
     tracing::info!(recipe = %recipe.service.id, "operator recipe loaded (validated)");
 
-    // Connect the Nostr engine with the operator account-0 key + configured relays.
+    // Connect the Nostr engine with the operator account-0 key + configured relays, then apply the
+    // operator-tuned per-pubkey inbound rate-limit knobs (GATE-0 PR-2).
     let engine = NostrEngine::connect(
         operator.identity.keys().clone(),
         &operator.config.relays,
         store.clone(),
     )
     .await
-    .context("connecting the operator Nostr engine")?;
+    .context("connecting the operator Nostr engine")?
+    .with_inbound_rate_limit(
+        lnrentd::config::inbound_rate_capacity(),
+        lnrentd::config::inbound_rate_refill_per_min(),
+    );
 
     let sock = operator.config.data_dir.join("lnrent.sock");
     let mut supervisor = Supervisor::build(

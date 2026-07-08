@@ -273,6 +273,13 @@ const ENV_CONFIG: &str = "LNRENT_CONFIG";
 /// identity — so it can be retuned by restart without a re-bootstrap.
 const ENV_MAX_LIVE_HOLDS_PER_BUYER: &str = "LNRENT_MAX_LIVE_HOLDS_PER_BUYER";
 
+/// Per-pubkey inbound token bucket (PR-2, GATE-0): the bucket `capacity` (burst size) and its
+/// `refill_per_min` (sustained rate) applied per authenticated seal sender in the inbound path. Like
+/// [`ENV_MAX_LIVE_HOLDS_PER_BUYER`], these are runtime knobs read at daemon start — retunable by
+/// restart, not part of the persisted operator identity.
+const ENV_INBOUND_RATE_CAPACITY: &str = "LNRENT_INBOUND_RATE_CAPACITY";
+const ENV_INBOUND_RATE_REFILL_PER_MIN: &str = "LNRENT_INBOUND_RATE_REFILL_PER_MIN";
+
 /// Default for [`max_live_holds_per_buyer`]. Small and bounded: a legitimate buyer rarely needs more
 /// than one or two unpaid orders in flight, while a griefer wants many. `0` refuses ALL orders.
 pub const DEFAULT_MAX_LIVE_HOLDS_PER_BUYER: u32 = 2;
@@ -292,6 +299,45 @@ pub fn max_live_holds_per_buyer() -> u32 {
             DEFAULT_MAX_LIVE_HOLDS_PER_BUYER
         }),
     }
+}
+
+/// Default inbound-token-bucket `capacity` (PR-2, GATE-0): the burst of accepted wraps one seal
+/// sender may spend before refill gates them. Matches the engine's fallback in
+/// `NostrEngine::connect`; `main` overrides it via [`inbound_rate_capacity`]. Setting capacity to
+/// `0` refuses all non-operator inbound DMs; refill is inert unless capacity is at least `1`.
+pub const DEFAULT_INBOUND_RATE_CAPACITY: u32 = 10;
+
+/// Default inbound-token-bucket `refill_per_min` (PR-2, GATE-0): the sustained tokens/minute one
+/// seal sender's bucket regains. See [`inbound_rate_refill_per_min`].
+pub const DEFAULT_INBOUND_RATE_REFILL_PER_MIN: u32 = 6;
+
+/// Read a `u32` runtime knob from `name`, falling back to `default` when unset/blank and warning
+/// (never failing startup) on a non-numeric value — the same fail-open contract
+/// [`max_live_holds_per_buyer`] uses. Shared by the two inbound-rate knobs below.
+fn u32_env_or_default(name: &str, default: u32) -> u32 {
+    match std::env::var(name) {
+        Err(_) => default,
+        Ok(v) if v.trim().is_empty() => default,
+        Ok(v) => v.trim().parse::<u32>().unwrap_or_else(|_| {
+            tracing::warn!(value = %v, "invalid {name}; using default {default}");
+            default
+        }),
+    }
+}
+
+/// The per-pubkey inbound token-bucket capacity, from `LNRENT_INBOUND_RATE_CAPACITY` (default
+/// [`DEFAULT_INBOUND_RATE_CAPACITY`]). Read at daemon start and handed to the Nostr engine.
+pub fn inbound_rate_capacity() -> u32 {
+    u32_env_or_default(ENV_INBOUND_RATE_CAPACITY, DEFAULT_INBOUND_RATE_CAPACITY)
+}
+
+/// The per-pubkey inbound token-bucket refill rate (tokens/minute), from
+/// `LNRENT_INBOUND_RATE_REFILL_PER_MIN` (default [`DEFAULT_INBOUND_RATE_REFILL_PER_MIN`]).
+pub fn inbound_rate_refill_per_min() -> u32 {
+    u32_env_or_default(
+        ENV_INBOUND_RATE_REFILL_PER_MIN,
+        DEFAULT_INBOUND_RATE_REFILL_PER_MIN,
+    )
 }
 
 impl RawConfig {
