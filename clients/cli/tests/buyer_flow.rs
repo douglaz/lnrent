@@ -107,6 +107,7 @@ async fn start_supervisor(
         dummy_recipe(),
         sock.clone(),
         fast_intervals(),
+        u32::MAX,
     )
     .await
     .expect("build supervisor");
