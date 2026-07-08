@@ -1,3 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["daemon", "wire", "clients/core", "clients/cli", "clients/web"]
+
+[workspace.package]
+license = "AGPL-3.0-or-later"
+authors = ["douglaz"]

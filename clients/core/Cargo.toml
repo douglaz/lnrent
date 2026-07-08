@@ -2,6 +2,8 @@
 name = "lnrent-buyer-core"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
+authors.workspace = true
 description = "lnrent buyer-side protocol logic (target-agnostic; the CLI and the web client share it)"
 
 # TARGET-AGNOSTIC by construction (SPEC.md §4.7, ADR-0014, lnrent-7fp.13): pure protocol over the

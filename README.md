@@ -131,3 +131,12 @@ $B order wait <order_id>              # -> access credentials (host/port/user)
 - Spec: [SPEC.md](./SPEC.md) (draft v0.29) · glossary: [CONTEXT.md](./CONTEXT.md)
 - Decisions: [docs/adr/](./docs/adr/) (0001-0016) · change specs: [docs/specs/](./docs/specs/)
 - Security/deployment notes: [docs/security/](./docs/security/)
+
+## License
+
+Copyright (C) 2026 douglaz
+
+Licensed under the **GNU Affero General Public License v3.0 or later** (AGPL-3.0-or-later) — see
+[LICENSE](./LICENSE). Because `lnrentd` is network server software, the AGPL's §13 applies: if you run
+a modified version and let others interact with it over a network, you must offer them the modified
+source.
