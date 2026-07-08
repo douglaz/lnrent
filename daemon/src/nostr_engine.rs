@@ -177,6 +177,11 @@ pub struct NostrEngine {
     /// Short-circuits recently re-fetched non-routable wraps when a reconnect/lag backfill sees the
     /// relay's retained set again. Bounded + ephemeral, so it never durably suppresses a wrap.
     negative_cache: Arc<Mutex<NegativeCache>>,
+    /// Per-authenticated-seal-sender inbound token buckets (GATE-0 PR-2). Shared across clones so
+    /// every inbound task consults the same limiter; ephemeral (a restart resets it, which is
+    /// acceptable — see [`InboundRateLimiter`]). Bounds the *cumulative* cost one sender can impose
+    /// past the concurrency cap's *instantaneous* bound.
+    rate_limiter: Arc<Mutex<InboundRateLimiter>>,
     /// Engine-owned ownership/drain state for inbound tasks accepted by the live subscription and
     /// retained-set helpers.
     inbound_tasks: Arc<InboundTaskState>,
@@ -227,8 +232,27 @@ impl NostrEngine {
             in_flight: Arc::new(Mutex::new(HashSet::new())),
             inbound_sem: Arc::new(Semaphore::new(MAX_INBOUND_CONCURRENCY)),
             negative_cache: Arc::new(Mutex::new(NegativeCache::default())),
+            // Default the inbound rate limit; the daemon (`main`) overrides it with the operator's
+            // configured knobs via [`with_inbound_rate_limit`]. Tests keep these defaults.
+            rate_limiter: Arc::new(Mutex::new(InboundRateLimiter::new(
+                crate::config::DEFAULT_INBOUND_RATE_CAPACITY,
+                crate::config::DEFAULT_INBOUND_RATE_REFILL_PER_MIN,
+            ))),
             inbound_tasks: Arc::new(InboundTaskState::new()),
         })
+    }
+
+    /// Override the per-pubkey inbound token-bucket knobs (GATE-0 PR-2) with the operator-tuned
+    /// values from config (`inbound_rate_capacity` / `inbound_rate_refill_per_min`). The daemon
+    /// startup path (`main`) chains this off [`connect`]; tests and other callers keep the defaults.
+    /// Consumes and returns `self` so it composes with `connect(...).await?`.
+    pub fn with_inbound_rate_limit(self, capacity: u32, refill_per_min: u32) -> Self {
+        *self
+            .rate_limiter
+            .lock()
+            .expect("inbound rate-limiter mutex poisoned") =
+            InboundRateLimiter::new(capacity, refill_per_min);
+        self
     }
 
     /// The operator's public key (the listing signer + the `#p` recipient inbound DMs address).
@@ -591,9 +615,10 @@ impl NostrEngine {
     /// delivered event, exposed so the dedupe is testable deterministically and an alternate driver
     /// (e.g. a durable inbox) can feed events directly. Returns `true` if the DM was routed to a
     /// handler that committed, or `false` if it was a duplicate (concurrent or already-handled) or
-    /// an ignored operator→buyer response. The wrap's `created_at` is never trusted for timing — it
-    /// is randomized (§5.1); the dedupe key is the stable outer event id, and any expiry lives in
-    /// the payload (handled downstream by lnrent-7fp.17 / .20).
+    /// an ignored/dropped DM (including operator→buyer responses and inbound rate-limit drops). The
+    /// wrap's `created_at` is never trusted for timing — it is randomized (§5.1); the dedupe key is
+    /// the stable outer event id, and any expiry lives in the payload (handled downstream by
+    /// lnrent-7fp.17 / .20).
     ///
     /// Dedupe layering (SPEC.md §5.1): the durable `seen_message` row is written only AFTER the
     /// handler returns Ok, so the guarantee this transport provides is *at-least-once* delivery to
@@ -668,6 +693,40 @@ impl NostrEngine {
         // Captured before the handler consumes `msg`/`sender`, for the post-success seen-write.
         let msg_type = msg.type_str().to_string();
         let sender_hex = sender.to_hex();
+
+        // Per-pubkey inbound token bucket (GATE-0 PR-2, spec §B). The verify/decrypt above is
+        // unavoidable — the sender is only authenticated after the NIP-44 decrypt — but the
+        // expensive part (business handlers, DB writes, invoice creation, signed replies) is bounded
+        // here per authenticated seal `sender`. We rate-limit ONLY by that seal sender, never the
+        // ephemeral outer wrap key (rotating that is free). The operator's OWN pubkey (self-DMs /
+        // future self-alerts) is exempt. On an empty bucket: DROP the wrap WITHOUT a reply and
+        // WITHOUT writing `seen_message` (return `Ok(false)` before `mark_seen`), so relay
+        // redelivery/backfill can retry it later — polite backpressure, no permanent loss for a
+        // bursty-but-honest buyer. A rate-dropped wrap is a VALID message, so it is NOT routed to
+        // the bounded negative cache (`note_non_routable`) — that is only for undecodable / non-buyer
+        // garbage.
+        // Rate-limit ONLY the expensive BUYER-REQUEST path (handlers, DB writes, invoice creation,
+        // signed replies) — the cost the bucket exists to bound. Non-buyer wraps (spoofed
+        // operator-response types / garbage) are cheap: they merely get `note_non_routable`'d. They
+        // MUST stay classified and negative-cached regardless of the bucket — otherwise a
+        // >capacity non-buyer flood from one key would leave the excess uncached and re-decoded on
+        // every backfill, defeating the negative-cache bound (codex-review #8 P2).
+        let is_buyer_request = matches!(
+            &msg,
+            Msg::OrderRequest(_)
+                | Msg::RenewRequest(_)
+                | Msg::SubCancel(_)
+                | Msg::DeliveryResendRequest(_)
+                | Msg::OpRequest(_)
+        );
+        if is_buyer_request && sender != self.operator_pubkey() && !self.admit_inbound(sender) {
+            tracing::debug!(
+                sender = %sender,
+                event_id = %wrap.id,
+                "inbound rate limit exceeded; dropping wrap unseen"
+            );
+            return Ok(false);
+        }
 
         let routed = match &msg {
             Msg::OrderRequest(_)
@@ -1193,6 +1252,17 @@ impl NostrEngine {
             .insert(id);
     }
 
+    /// Consult `sender`'s inbound token bucket (GATE-0 PR-2): `true` admits the wrap, `false` when
+    /// the bucket is empty (the caller drops it unseen). Uses [`tokio::time::Instant::now`] so a
+    /// test with a paused clock can advance refill deterministically. The operator-pubkey exemption
+    /// lives at the call site, not here.
+    fn admit_inbound(&self, sender: PublicKey) -> bool {
+        self.rate_limiter
+            .lock()
+            .expect("inbound rate-limiter mutex poisoned")
+            .check(sender, Instant::now())
+    }
+
     /// Subscribe to inbound DMs, retrying transient failures up to [`INBOUND_SUBSCRIBE_ATTEMPTS`]
     /// times. Used for both the initial subscribe (whose ultimate failure propagates so a
     /// supervisor restarts the task) and the lag-recovery resubscribe (whose ultimate failure is
@@ -1396,6 +1466,175 @@ impl NegativeCache {
                 }
             }
         }
+    }
+}
+
+/// LRU bound on the per-pubkey inbound token buckets — how many distinct recently-seen seal senders
+/// keep rate state in memory. Matched to [`NEGATIVE_CACHE_CAPACITY`] (spec §B "cap ~4096 like the
+/// negative cache"): past this bound the least-recently-seen sender's bucket is evicted, so a
+/// distinct-key flood caps pinned memory rather than growing it unbounded.
+const INBOUND_RATE_LRU_CAPACITY: usize = NEGATIVE_CACHE_CAPACITY;
+
+/// One sender's token bucket (GATE-0 PR-2). `tokens` is fractional so refill is smooth between
+/// checks; one whole token is spent per accepted wrap.
+struct Bucket {
+    tokens: f64,
+    last_refill: Instant,
+    lru_prev: Option<PublicKey>,
+    lru_next: Option<PublicKey>,
+}
+
+/// In-memory, per-authenticated-seal-sender inbound token-bucket limiter (GATE-0 PR-2, spec §B).
+///
+/// The concurrency cap ([`MAX_INBOUND_CONCURRENCY`]) bounds *instantaneous* inbound work; this
+/// bounds the *cumulative* cost one sender can impose after the unavoidable verify/decrypt — the
+/// handlers, DB writes, invoice creation, and signed replies. Each sender gets `capacity` burst
+/// tokens refilled at `refill_per_min` per minute; one token is spent per accepted wrap, and an
+/// empty bucket drops the wrap (the caller does that, unseen, so relay redelivery can retry).
+///
+/// Deliberately in-memory only (a restart resets every bucket — acceptable, spec §B) and bounded by
+/// an LRU over the most-recently-seen senders ([`INBOUND_RATE_LRU_CAPACITY`]) so a flood of distinct
+/// keys cannot grow the map without bound. Rate-limiting distinct keys is NOT this limiter's job (a
+/// fresh key gets a fresh full bucket, and the reservation cap / concurrency cap / decrypt cost bound
+/// that flood) — this stops a *single* key from minting distinct-`request_id` work for free. The
+/// operator-pubkey exemption lives at the call site.
+struct InboundRateLimiter {
+    capacity: f64,
+    refill_per_sec: f64,
+    buckets: HashMap<PublicKey, Bucket>,
+    /// Least-recently-seen sender in the exact O(1) LRU chain.
+    lru_head: Option<PublicKey>,
+    /// Most-recently-seen sender in the exact O(1) LRU chain.
+    lru_tail: Option<PublicKey>,
+}
+
+impl InboundRateLimiter {
+    fn new(capacity: u32, refill_per_min: u32) -> Self {
+        Self {
+            capacity: f64::from(capacity),
+            refill_per_sec: f64::from(refill_per_min) / 60.0,
+            buckets: HashMap::new(),
+            lru_head: None,
+            lru_tail: None,
+        }
+    }
+
+    /// Try to admit one wrap from `sender` at `now`: refill the sender's bucket by the time elapsed
+    /// since its last check (capped at `capacity`), then spend one token if at least one is
+    /// available. Returns `true` when the wrap is admitted, `false` when the bucket is empty. Marks
+    /// `sender` most-recently-seen on every call — accepted or dropped — since either way the sender
+    /// was just seen.
+    fn check(&mut self, sender: PublicKey, now: Instant) -> bool {
+        if self.capacity < 1.0 {
+            return false;
+        }
+
+        // Copy the shared knobs out before taking the mutable bucket borrow below.
+        let capacity = self.capacity;
+        let refill_per_sec = self.refill_per_sec;
+        if !self.buckets.contains_key(&sender) {
+            self.insert_bucket(sender, capacity, now);
+        }
+        self.touch_lru(sender);
+
+        let bucket = self
+            .buckets
+            .get_mut(&sender)
+            .expect("bucket exists after insert/touch");
+        // `saturating_duration_since` clamps a non-monotonic/equal `now` to zero elapsed.
+        let elapsed = now
+            .saturating_duration_since(bucket.last_refill)
+            .as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * refill_per_sec).min(capacity);
+        bucket.last_refill = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move `sender` to the most-recently-seen end of the LRU, evicting the least-recently-seen
+    /// sender's bucket when a NEW sender pushes the set past [`INBOUND_RATE_LRU_CAPACITY`]. Recency
+    /// updates are exact O(1): each bucket stores its neighbors, so a distinct-key flood cannot
+    /// amplify into a bounded-but-linear scan while the limiter mutex is held.
+    fn touch_lru(&mut self, sender: PublicKey) {
+        if self.lru_tail == Some(sender) {
+            return;
+        }
+
+        self.unlink_lru(sender);
+        self.link_lru_tail(sender);
+    }
+
+    fn insert_bucket(&mut self, sender: PublicKey, tokens: f64, now: Instant) {
+        self.buckets.insert(
+            sender,
+            Bucket {
+                tokens,
+                last_refill: now,
+                lru_prev: None,
+                lru_next: None,
+            },
+        );
+        self.link_lru_tail(sender);
+        while self.buckets.len() > INBOUND_RATE_LRU_CAPACITY {
+            if let Some(evicted) = self.lru_head {
+                self.unlink_lru(evicted);
+                self.buckets.remove(&evicted);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn unlink_lru(&mut self, sender: PublicKey) {
+        let Some((prev, next)) = self
+            .buckets
+            .get(&sender)
+            .map(|bucket| (bucket.lru_prev, bucket.lru_next))
+        else {
+            return;
+        };
+
+        if let Some(prev) = prev {
+            if let Some(bucket) = self.buckets.get_mut(&prev) {
+                bucket.lru_next = next;
+            }
+        } else if self.lru_head == Some(sender) {
+            self.lru_head = next;
+        }
+
+        if let Some(next) = next {
+            if let Some(bucket) = self.buckets.get_mut(&next) {
+                bucket.lru_prev = prev;
+            }
+        } else if self.lru_tail == Some(sender) {
+            self.lru_tail = prev;
+        }
+
+        if let Some(bucket) = self.buckets.get_mut(&sender) {
+            bucket.lru_prev = None;
+            bucket.lru_next = None;
+        }
+    }
+
+    fn link_lru_tail(&mut self, sender: PublicKey) {
+        let old_tail = self.lru_tail;
+        if let Some(tail) = old_tail {
+            if let Some(bucket) = self.buckets.get_mut(&tail) {
+                bucket.lru_next = Some(sender);
+            }
+        } else {
+            self.lru_head = Some(sender);
+        }
+
+        if let Some(bucket) = self.buckets.get_mut(&sender) {
+            bucket.lru_prev = old_tail;
+            bucket.lru_next = None;
+        }
+        self.lru_tail = Some(sender);
     }
 }
 
@@ -2155,9 +2394,17 @@ mod tests {
         let op_keys = Keys::generate();
         let buyer_keys = Keys::generate();
         let store = Store::open_spawn(":memory:").expect("open in-memory store");
+        // This test isolates the CONCURRENCY cap: it bursts `MAX_INBOUND_CONCURRENCY + 1` wraps from
+        // ONE buyer key and expects every one to reach the handler. Raise the per-pubkey inbound rate
+        // bucket (GATE-0 PR-2) above that burst so the bucket never drops any of them — otherwise the
+        // default capacity would throttle the burst and mask the semaphore behaviour under test.
         let engine = NostrEngine::connect(op_keys.clone(), std::slice::from_ref(&url), store)
             .await
-            .expect("operator engine connects");
+            .expect("operator engine connects")
+            .with_inbound_rate_limit(
+                MAX_INBOUND_CONCURRENCY as u32 + 2,
+                MAX_INBOUND_CONCURRENCY as u32 + 2,
+            );
 
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
@@ -2765,5 +3012,324 @@ mod tests {
 
         handle.abort();
         let _ = handle.await;
+    }
+
+    // ===== GATE-0 PR-2: per-pubkey inbound token bucket (spec §B) ==============================
+    //
+    // These call `process_inbound` directly with crafted gift wraps so the DAEMON bucket — not the
+    // in-process test relay (which itself rate-limits at 60 notes/min) — is what admits/drops. That
+    // keeps the assertions about the bucket meaningful rather than vacuous.
+
+    /// Build a connected engine over a fresh mock relay with an explicit inbound rate limit. The
+    /// caller holds [`RELAY_TEST`] and drives `process_inbound` directly, so the relay only exists
+    /// because `connect` requires one. Returns the relay too — keep it alive for the test.
+    async fn rate_limited_engine(
+        op_keys: Keys,
+        capacity: u32,
+        refill_per_min: u32,
+    ) -> (NostrEngine, MockRelay) {
+        let relay = mock_relay().await;
+        let url = relay.url().await.to_string();
+        let store = Store::open_spawn(":memory:").expect("open in-memory store");
+        let engine = NostrEngine::connect(op_keys, std::slice::from_ref(&url), store)
+            .await
+            .expect("operator engine connects")
+            .with_inbound_rate_limit(capacity, refill_per_min);
+        (engine, relay)
+    }
+
+    /// A burst of `capacity + k` wraps from ONE sender: exactly `capacity` reach the handler and the
+    /// remaining `k` are dropped. Asserts the boundary explicitly (the capacity-th wrap is the last
+    /// admitted, the capacity+1-th is the first dropped) and that dropped wraps leave no
+    /// `seen_message` row and are not negative-cached (covers spec tests 1, 2, and 6).
+    #[tokio::test]
+    async fn inbound_rate_limit_admits_capacity_then_drops_the_rest() {
+        let _relay_test = RELAY_TEST.lock().await;
+        let op_keys = Keys::generate();
+        let buyer = Keys::generate();
+        // capacity 3, burst capacity + 2 = 5.
+        let (engine, _relay) = rate_limited_engine(op_keys.clone(), 3, 6).await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let order = CountingOrderHandler {
+            calls: Arc::clone(&calls),
+        };
+        let op = NoopOpHandler;
+
+        let mut results = Vec::new();
+        for i in 0..5 {
+            let wrap = gift_wrap(
+                &buyer,
+                &op_keys.public_key(),
+                &order_request(&format!("burst-{i}"), op_keys.public_key()),
+            )
+            .await
+            .expect("gift-wrap order.request");
+            let routed = engine
+                .process_inbound(&wrap, &order, &op)
+                .await
+                .expect("process_inbound must not error on a valid wrap");
+            results.push((wrap.id, routed));
+        }
+
+        let admitted: Vec<bool> = results.iter().map(|(_, routed)| *routed).collect();
+        assert_eq!(
+            admitted,
+            vec![true, true, true, false, false],
+            "capacity=3: the 3rd wrap is the last admitted, the 4th the first dropped"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "exactly capacity wraps reached the handler"
+        );
+
+        for (id, routed) in &results {
+            if !routed {
+                assert!(
+                    !engine.is_seen(*id).await.expect("seen check"),
+                    "a rate-dropped wrap must not be written to seen_message (redelivery can retry)"
+                );
+                assert!(
+                    !engine.is_negative_cached(*id),
+                    "a rate-dropped wrap is a valid message; it must not be negative-cached"
+                );
+            }
+        }
+    }
+
+    /// Refill over time admits a later wrap. Exercises the limiter directly with synthetic instants
+    /// so it is deterministic and independent of wall-clock/store timing (spec test 3).
+    #[tokio::test]
+    async fn inbound_rate_limiter_refills_over_time() {
+        let sender = Keys::generate().public_key();
+        // capacity 2, refill 6/min = 0.1 token/sec.
+        let mut limiter = InboundRateLimiter::new(2, 6);
+        let t0 = Instant::now();
+
+        assert!(limiter.check(sender, t0), "1st token available at t0");
+        assert!(limiter.check(sender, t0), "2nd token available at t0");
+        assert!(!limiter.check(sender, t0), "bucket empty at capacity=2");
+
+        // A 1s advance is only +0.1 token — not enough to admit again.
+        assert!(
+            !limiter.check(sender, t0 + Duration::from_secs(1)),
+            "0.1 refilled token < 1: still dropped"
+        );
+        // A full minute refills well past one token, so a later wrap is admitted.
+        assert!(
+            limiter.check(sender, t0 + Duration::from_secs(60)),
+            "refill over time admits a later wrap"
+        );
+    }
+
+    /// A second, different sender is unaffected by the first sender's exhausted bucket (spec test 4).
+    #[tokio::test]
+    async fn inbound_rate_limit_is_per_sender() {
+        let _relay_test = RELAY_TEST.lock().await;
+        let op_keys = Keys::generate();
+        let sender_a = Keys::generate();
+        let sender_b = Keys::generate();
+        let (engine, _relay) = rate_limited_engine(op_keys.clone(), 2, 6).await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let order = CountingOrderHandler {
+            calls: Arc::clone(&calls),
+        };
+        let op = NoopOpHandler;
+
+        // Sender A exhausts its capacity-2 bucket, then one more that drops.
+        for i in 0..3 {
+            let wrap = gift_wrap(
+                &sender_a,
+                &op_keys.public_key(),
+                &order_request(&format!("a-{i}"), op_keys.public_key()),
+            )
+            .await
+            .expect("gift-wrap A");
+            engine
+                .process_inbound(&wrap, &order, &op)
+                .await
+                .expect("process A");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "sender A is admitted exactly capacity"
+        );
+
+        // Sender B's first wrap is admitted despite A's exhausted bucket.
+        let wrap_b = gift_wrap(
+            &sender_b,
+            &op_keys.public_key(),
+            &order_request("b-0", op_keys.public_key()),
+        )
+        .await
+        .expect("gift-wrap B");
+        let routed = engine
+            .process_inbound(&wrap_b, &order, &op)
+            .await
+            .expect("process B");
+        assert!(
+            routed,
+            "a second, different sender is unaffected by the first's exhausted bucket"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "sender B's wrap reached the handler"
+        );
+    }
+
+    /// The operator's OWN pubkey (self-DMs) bypasses the bucket entirely (spec test 5).
+    #[tokio::test]
+    async fn operator_self_dms_bypass_inbound_rate_limit() {
+        let _relay_test = RELAY_TEST.lock().await;
+        let op_keys = Keys::generate();
+        // capacity 1: a non-operator sender would get exactly one admit, so > 1 admits proves bypass.
+        let (engine, _relay) = rate_limited_engine(op_keys.clone(), 1, 6).await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let order = CountingOrderHandler {
+            calls: Arc::clone(&calls),
+        };
+        let op = NoopOpHandler;
+
+        // The operator gift-wraps to itself; send capacity + 2 = 3 distinct self-DMs — all route.
+        for i in 0..3 {
+            let wrap = gift_wrap(
+                &op_keys,
+                &op_keys.public_key(),
+                &order_request(&format!("self-{i}"), op_keys.public_key()),
+            )
+            .await
+            .expect("gift-wrap self-DM");
+            let routed = engine
+                .process_inbound(&wrap, &order, &op)
+                .await
+                .expect("process self-DM");
+            assert!(
+                routed,
+                "operator self-DM #{i} must bypass the bucket and route"
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "every operator self-DM bypasses the bucket"
+        );
+    }
+
+    /// Redelivery-safety regression (spec test 6): a rate-dropped event id writes NO `seen_message`
+    /// row and is NOT added to the negative cache. Uses capacity 1 so the second wrap is dropped.
+    #[tokio::test]
+    async fn rate_dropped_wrap_is_not_seen_and_not_negative_cached() {
+        let _relay_test = RELAY_TEST.lock().await;
+        let op_keys = Keys::generate();
+        let buyer = Keys::generate();
+        let (engine, _relay) = rate_limited_engine(op_keys.clone(), 1, 6).await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let order = CountingOrderHandler {
+            calls: Arc::clone(&calls),
+        };
+        let op = NoopOpHandler;
+
+        // The first wrap consumes the single token, is handled, and is marked seen.
+        let first = gift_wrap(
+            &buyer,
+            &op_keys.public_key(),
+            &order_request("accepted", op_keys.public_key()),
+        )
+        .await
+        .expect("gift-wrap accepted");
+        assert!(engine
+            .process_inbound(&first, &order, &op)
+            .await
+            .expect("process accepted"));
+        assert!(
+            engine.is_seen(first.id).await.expect("seen check"),
+            "the accepted wrap is marked seen"
+        );
+
+        // The second wrap from the same sender is rate-dropped.
+        let dropped = gift_wrap(
+            &buyer,
+            &op_keys.public_key(),
+            &order_request("dropped", op_keys.public_key()),
+        )
+        .await
+        .expect("gift-wrap dropped");
+        assert!(
+            !engine
+                .process_inbound(&dropped, &order, &op)
+                .await
+                .expect("process dropped"),
+            "the over-capacity wrap is dropped"
+        );
+        assert!(
+            !engine.is_seen(dropped.id).await.expect("seen check"),
+            "REGRESSION: a rate-dropped event id must NOT be written to seen_message"
+        );
+        assert!(
+            !engine.is_negative_cached(dropped.id),
+            "a rate-dropped wrap must NOT enter the negative cache"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the first (in-capacity) wrap reached the handler"
+        );
+    }
+
+    /// codex-review #8 P2: a NON-buyer wrap (spoofed operator-response type) OVER the rate limit is
+    /// still classified and negative-cached. The bucket gates only the expensive buyer-request path,
+    /// so a >capacity non-buyer flood from one key can never leave the excess uncached and
+    /// re-decoded on every backfill (which would defeat the negative-cache bound).
+    #[tokio::test]
+    async fn over_limit_non_buyer_wraps_are_still_negative_cached() {
+        let _relay_test = RELAY_TEST.lock().await;
+        let op_keys = Keys::generate();
+        let peer = Keys::generate();
+        let (engine, _relay) = rate_limited_engine(op_keys.clone(), 1, 6).await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let order = CountingOrderHandler {
+            calls: Arc::clone(&calls),
+        };
+        let op = NoopOpHandler;
+
+        // Two non-buyer (operator->buyer) wraps from ONE key with capacity 1: neither consumes a
+        // token, BOTH are dropped as non-routable AND negative-cached, and none reach a handler.
+        for i in 0..2u32 {
+            let msg = Msg::BillingNotice(lnrent_wire::BillingNotice {
+                subscription_id: format!("sub-{i}"),
+                state: "ACTIVE".into(),
+                message: "spoofed operator response".into(),
+            });
+            let wrap = gift_wrap(&peer, &op_keys.public_key(), &msg)
+                .await
+                .expect("gift-wrap non-buyer");
+            assert!(
+                !engine
+                    .process_inbound(&wrap, &order, &op)
+                    .await
+                    .expect("process non-buyer"),
+                "a non-buyer wrap is dropped"
+            );
+            assert!(
+                engine.is_negative_cached(wrap.id),
+                "over-limit non-buyer wrap #{i} MUST be negative-cached (codex-review #8 P2)"
+            );
+            assert!(
+                !engine.is_seen(wrap.id).await.expect("seen check"),
+                "a non-buyer wrap writes no seen_message"
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no non-buyer wrap reaches a handler"
+        );
     }
 }
