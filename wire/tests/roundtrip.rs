@@ -925,3 +925,49 @@ fn op_status_round_trips() {
         assert_eq!(serde_json::from_str::<OpStatus>(&j).unwrap(), s);
     }
 }
+
+/// An `order.request` with a `filler` param of `n` 'x' bytes (1 byte each in JSON — no escapes).
+fn order_with_filler(n: usize) -> Msg {
+    Msg::OrderRequest(OrderRequest {
+        id: "sized-1".into(),
+        listing_id: "30402:abc:wg-1".into(),
+        params: json!({ "filler": "x".repeat(n) }),
+        refund_dest: None,
+    })
+}
+
+// gdu.4: a large-but-legitimate message near the top of the wrappable range round-trips — the
+// inbound content cap (MAX_INBOUND_CONTENT_BYTES) does not falsely reject anything the transport
+// can carry. The cap's exact boundary is unit-tested in wire/src/wrap.rs instead, because the
+// NIP-59 layering (NIP-44's 65,535-byte plaintext ceiling applied to the seal's base64-expanded
+// ciphertext) caps rumor content well BELOW our bound: `gift_wrap` cannot produce an at-cap
+// rumor, which this test pins as the second assertion (the transport itself already refuses
+// over-cap content, making the unwrap-side guard defense-in-depth).
+#[tokio::test]
+async fn large_wrappable_content_round_trips_and_transport_refuses_over_cap() {
+    let sender = Keys::generate();
+    let recipient = Keys::generate();
+
+    // 32 KiB of filler: comfortably above every real lnrent message, still under the transport
+    // ceiling — the wrap layer NIP-44-encrypts the SEAL event, whose content is the base64 (4/3×)
+    // ciphertext of the padded rumor, so rumor content tops out just under 40 KiB (measured:
+    // 40,572 bytes with this fixture), not 65,535.
+    let big = order_with_filler(32 * 1024);
+    let wrapped = gift_wrap(&sender, &recipient.public_key(), &big)
+        .await
+        .expect("gift_wrap a 32 KiB message");
+    let out = gift_unwrap(&recipient, &wrapped)
+        .await
+        .expect("a large legitimate message decodes — no false reject from the content cap");
+    assert_eq!(out.msg, big);
+
+    // Content past MAX_INBOUND_CONTENT_BYTES cannot even be produced: the NIP-44 encrypt step
+    // refuses the plaintext, so the unwrap-side cap is currently unreachable via gift_wrap.
+    let over = order_with_filler(MAX_INBOUND_CONTENT_BYTES + 1);
+    assert!(
+        gift_wrap(&sender, &recipient.public_key(), &over)
+            .await
+            .is_err(),
+        "the NIP-44 plaintext ceiling refuses over-cap content at wrap time"
+    );
+}

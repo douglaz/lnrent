@@ -656,6 +656,91 @@ async fn undecodable_wrap_is_decoded_once_then_negative_cached() {
     );
 }
 
+// gdu.4: an OVERSIZED wrap takes the exact undecodable-wrap disposition — surfaced as Err once,
+// then negative-cached (the Err -> Ok(false) transition), with NO `seen_message` row — while a
+// normal-size wrap still routes. NIP-44's 65,535-byte plaintext ceiling means a compliant wrap
+// can't carry over-cap DECRYPTABLE content (the unwrap-side MAX_INBOUND_CONTENT_BYTES guard is
+// defense-in-depth, boundary-tested in wire/src/wrap.rs); the constructible oversized attack is
+// a garbage outer envelope, driven into `process_inbound` directly — the relay is bypassed on
+// purpose, since a >64 KiB event can trip relay-side limits and make the test vacuous.
+#[tokio::test]
+async fn oversized_wrap_is_negative_cached_without_seen_row_and_normal_wrap_routes() {
+    let relay = mock_relay().await;
+    let url = relay.url().await.to_string();
+
+    let op_keys = Keys::generate();
+    let buyer_keys = Keys::generate();
+    let store = store().await;
+    let engine = NostrEngine::connect(op_keys.clone(), std::slice::from_ref(&url), store.clone())
+        .await
+        .expect("operator engine connects");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let order_handler = CountingOrderHandler {
+        calls: calls.clone(),
+        fail: false,
+    };
+    let op_handler = StubOpHandler {
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+
+    // A self-signed kind-1059 whose content is 128 KiB of junk: the envelope verifies (valid id +
+    // signature) but the NIP-44 decrypt fails, so it takes the undecodable-`Err` path.
+    let junk = "A".repeat(2 * lnrent_wire::MAX_INBOUND_CONTENT_BYTES);
+    let big_wrap = EventBuilder::new(Kind::GiftWrap, junk)
+        .sign_with_keys(&buyer_keys)
+        .expect("sign the oversized garbage wrap");
+    let big_id = big_wrap.id;
+
+    let first = engine
+        .process_inbound(&big_wrap, &order_handler, &op_handler)
+        .await;
+    assert!(first.is_err(), "the over-cap wrap is rejected on first sight");
+
+    let second = engine
+        .process_inbound(&big_wrap, &order_handler, &op_handler)
+        .await
+        .expect("the cached over-cap wrap short-circuits without re-decoding");
+    assert!(!second, "the redelivery is dropped from the negative cache");
+
+    // A normal-size wrap from the SAME sender still routes.
+    let normal = Msg::OrderRequest(OrderRequest {
+        id: "normal-after-cap-1".into(),
+        listing_id: "30402:op:dummy-1".into(),
+        params: serde_json::json!({}),
+        refund_dest: None,
+    });
+    let normal_wrap = gift_wrap(&buyer_keys, &op_keys.public_key(), &normal)
+        .await
+        .expect("gift-wrap the normal order");
+    let routed = engine
+        .process_inbound(&normal_wrap, &order_handler, &op_handler)
+        .await
+        .expect("a normal wrap routes after the over-cap drop");
+    assert!(routed);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "only the normal wrap reached the handler"
+    );
+
+    // Only the normal wrap is durably seen; the over-cap wrap wrote no row.
+    let (seen_total, seen_over) = store
+        .transaction(move |tx| {
+            let total: i64 = tx.query_row("SELECT count(*) FROM seen_message", [], |r| r.get(0))?;
+            let over: i64 = tx.query_row(
+                "SELECT count(*) FROM seen_message WHERE event_id = ?1",
+                rusqlite::params![big_id.to_hex()],
+                |r| r.get(0),
+            )?;
+            Ok((total, over))
+        })
+        .await
+        .expect("count seen rows");
+    assert_eq!(seen_over, 0, "the over-cap wrap wrote no seen_message row");
+    assert_eq!(seen_total, 1, "exactly the normal wrap is durably seen");
+}
+
 // P2 (review round 7): a malformed relay copy can carry the same event fields/id with a bogus
 // signature, because Nostr ids do not commit to `sig`. The engine must reject it before using the
 // id for in-flight or negative-cache suppression, so the valid copy from another relay still routes.

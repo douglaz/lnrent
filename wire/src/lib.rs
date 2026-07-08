@@ -23,7 +23,7 @@ pub use listing::{
     build_listing, listing_coordinate, parse_listing, Listing, OperationDecl, ParamDecl,
     ParsedListing, LISTING_KIND, MAX_OPERATIONS, MAX_PARAMS, SCHEMA_VERSION,
 };
-pub use wrap::{gift_unwrap, gift_wrap, Unwrapped};
+pub use wrap::{gift_unwrap, gift_wrap, Unwrapped, MAX_INBOUND_CONTENT_BYTES};
 
 // Re-export the rust-nostr types that appear in this crate's signatures, so a consumer can
 // drive the codec without depending on `nostr` directly.

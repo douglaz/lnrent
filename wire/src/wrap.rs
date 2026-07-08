@@ -38,6 +38,28 @@ pub struct Unwrapped {
     pub msg: Msg,
 }
 
+/// Upper bound on a gift-wrapped rumor's content before it is JSON-decoded (gdu.4). Enforced in
+/// [`gift_unwrap`] — the earliest point where the decrypted bytes exist — so the JSON decode work
+/// per wrap is bounded at the lnrent layer. 64 KiB matches the refund resolver's response-body
+/// cap and is generous for every legitimate lnrent message type. Compliant NIP-59 encryption
+/// cannot produce over-cap content today (NIP-44's 65,535-byte plaintext ceiling applies to the
+/// seal's base64-expanded ciphertext, capping rumor content just under 40 KiB) — this guard pins
+/// the bound HERE so a future transport/library change cannot silently lift it.
+pub const MAX_INBOUND_CONTENT_BYTES: usize = 64 * 1024;
+
+/// The [`MAX_INBOUND_CONTENT_BYTES`] guard, split out so the exact boundary is unit-testable:
+/// the transport's own ceiling sits below the cap, so an at-cap rumor can't be produced through
+/// [`gift_wrap`] to exercise this through the full round trip.
+fn ensure_content_within_bound(content: &str) -> Result<(), Error> {
+    if content.len() > MAX_INBOUND_CONTENT_BYTES {
+        return Err(Error::ContentTooLarge {
+            len: content.len(),
+            max: MAX_INBOUND_CONTENT_BYTES,
+        });
+    }
+    Ok(())
+}
+
 /// Decode a gift wrap addressed to `recipient_keys` back into its lnrent message (SPEC.md §5.1).
 /// Verifies the NIP-59 seal (so `sender` is authentic) and parses the rumor content as a [`Msg`].
 pub async fn gift_unwrap<S>(recipient: &S, wrap: &Event) -> Result<Unwrapped, Error>
@@ -65,9 +87,36 @@ where
     if gift.rumor.kind != Kind::PrivateDirectMessage {
         return Err(Error::NotPrivateDm);
     }
+    // Size-bound the content BEFORE the JSON decode (gdu.4). An over-cap wrap takes the same
+    // `Err` path as any undecodable wrap, so the engine disposes of it identically (bounded
+    // negative cache, no `seen_message` row).
+    ensure_content_within_bound(&gift.rumor.content)?;
     let msg: Msg = serde_json::from_str(&gift.rumor.content)?;
     Ok(Unwrapped {
         sender: gift.sender,
         msg,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // gdu.4 boundary, on the extracted guard: content of exactly MAX_INBOUND_CONTENT_BYTES
+    // passes; one byte over is ContentTooLarge. Tested here because NIP-44 v2's 65,535-byte
+    // plaintext ceiling means gift_wrap cannot produce an at-cap rumor for a round-trip test.
+    #[test]
+    fn content_bound_is_boundary_exact() {
+        let at_cap = "x".repeat(MAX_INBOUND_CONTENT_BYTES);
+        ensure_content_within_bound(&at_cap).expect("content exactly at the cap passes");
+
+        let over = "x".repeat(MAX_INBOUND_CONTENT_BYTES + 1);
+        match ensure_content_within_bound(&over) {
+            Err(Error::ContentTooLarge { len, max }) => {
+                assert_eq!(len, MAX_INBOUND_CONTENT_BYTES + 1);
+                assert_eq!(max, MAX_INBOUND_CONTENT_BYTES);
+            }
+            other => panic!("expected ContentTooLarge, got {other:?}"),
+        }
+    }
 }
