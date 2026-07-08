@@ -81,9 +81,9 @@ CREATE TABLE IF NOT EXISTS subscription (
   listing_id           TEXT,
   instance_id          TEXT,
   buyer_pubkey         TEXT,
-  state                TEXT,    -- SubState; SPEC.md §6.3
+  state                TEXT,    -- lifecycle state string; SPEC.md §6.3
   params_json          TEXT,
-  refund_dest          TEXT,    -- BOLT12 offer or Lightning address
+  refund_dest          TEXT,    -- LN address or HTTPS LNURL (§6.4 F3/F6; BOLT12/raw bolt11 rejected at intake)
   -- backend handles live on `instance` (instance_id), not duplicated here
   period_s             INTEGER, -- copied from the listing at order time
   renew_lead_s         INTEGER,

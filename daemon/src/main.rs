@@ -63,9 +63,6 @@ struct BootstrapArgs {
     /// Receive backend: `mock` (M1a default) or `fedimint`. Env: LNRENT_PAYMENT_BACKEND.
     #[arg(long)]
     payment_backend: Option<String>,
-    /// Compute backend (`host` default, `incus`, `libvirt`, `proxmox`, `cloud-*`). Env: LNRENT_COMPUTE_BACKEND.
-    #[arg(long)]
-    compute_backend: Option<String>,
     /// A Nostr relay URL; repeat for several. A supplied set overrides lower-precedence relays
     /// wholesale. Env: LNRENT_RELAYS (comma-separated).
     #[arg(long = "relay")]
@@ -366,7 +363,9 @@ async fn run_bootstrap(args: BootstrapArgs) -> ExitCode {
             Some(args.relays)
         },
         payment_backend: args.payment_backend,
-        compute_backend: args.compute_backend,
+        // CUT-3: no CLI knob for the dead `compute_backend`; env (LNRENT_COMPUTE_BACKEND) and file
+        // layers still parse for back-compat, but a supplied value is ignored with a warning.
+        compute_backend: None,
         fedimint_invite: args.fedimint_invite,
         fedimint_gateway: args.fedimint_gateway,
         mnemonic: args.mnemonic,

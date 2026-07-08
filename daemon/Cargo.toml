@@ -72,7 +72,7 @@ lightning-invoice = { version = "0.33", features = ["std"] }
 # Hex-compare the bolt11 description_hash against sha256(metadata) (sha2 is already a dep above).
 hex = "0.4"
 
-# --- Real Fedimint backend (lnrent-7fp.4), behind the `fedimint` feature (default OFF) -----------
+# --- Real Fedimint backend (lnrent-7fp.4), behind the `fedimint` feature (DEFAULT ON; build with --no-default-features for the mock-only path) ---
 # Pinned to UPSTREAM fedimint v0.11.1 (tag commit 42ac7c9a — identical on the local checkout and on
 # github.com/fedimint/fedimint). A public git source so the repo is reproducible off this box and CI
 # can build the fedimint money path. Daemon-only (a 2nd DB engine, RocksDB C++; glibc-dynamic,

@@ -591,26 +591,24 @@ fn resolve_config(raw: &RawConfig) -> Result<OperatorConfig, IpcError> {
         )));
     }
 
-    // Blank `data_dir` / `compute_backend` also fall back to defaults rather than being stored
-    // verbatim (a blank data dir would otherwise fail later at create_dir_all) (review P3).
+    // Blank `data_dir` falls back to a default rather than being stored verbatim (a blank data dir
+    // would otherwise fail later at create_dir_all) (review P3).
     let data_dir = PathBuf::from(
         non_empty(raw.data_dir.as_deref()).unwrap_or_else(|| DEFAULT_DATA_DIR.to_string()),
     );
-    let compute_backend = non_empty(raw.compute_backend.as_deref())
-        .unwrap_or_else(|| DEFAULT_COMPUTE_BACKEND.to_string());
-    // An EXPLICITLY supplied compute backend is validated against the canonical recipe allowlist
-    // (the SAME `host|incus|libvirt|proxmox|cloud-*` set recipe.rs enforces), so a typo like
-    // `hsot` fails with a deterministic `config_invalid` instead of being persisted into the
-    // operator row — matching the fail-fast `payment_backend` handling and the ADR-0014 "invalid
-    // config -> structured error, never stored" contract (review R2 P2). The `host` default is
-    // always valid; on a re-bootstrap an omitted backend inherits the (already-validated) stored
-    // value in `persist_operator_row`, so this only rejects a bad supplied value.
-    if !crate::recipe::is_known_compute_backend(&compute_backend) {
-        return Err(config_err(format!(
-            "unknown compute_backend `{compute_backend}` (expected `host`, `incus`, `libvirt`, \
-             `proxmox`, or `cloud-*`)"
-        )));
+    // CUT-3: `compute_backend` is a dead operator knob — runtime provisioning dispatch uses the
+    // recipe's `provisioning.backend` (validated live in recipe.rs), never this value. Keep the
+    // field PARSEABLE (the config is `deny_unknown_fields`, so a deployed file/stdin config that
+    // still carries `compute_backend` must not fail to start) but ignore any supplied value with a
+    // one-time warning; the persisted column is always the fixed default and never drives behavior.
+    if let Some(supplied) = non_empty(raw.compute_backend.as_deref()) {
+        tracing::warn!(
+            supplied = %supplied,
+            "ignoring `compute_backend` — it is unused; provisioning is recipe-driven \
+             (recipe.provisioning.backend)"
+        );
     }
+    let compute_backend = DEFAULT_COMPUTE_BACKEND.to_string();
 
     Ok(OperatorConfig {
         data_dir,
@@ -1637,8 +1635,10 @@ enum RowOutcome {
 /// - `payment_backend` routes real money and is FIXED at bootstrap: an EXPLICITLY supplied
 ///   different backend is rejected, while an omitted backend inherits the stored one so a restored
 ///   Fedimint operator can boot from the data dir without silently downgrading to `mock`.
-/// - `relays` / `compute_backend` are mutable, but only an EXPLICITLY supplied value updates them;
-///   an omitted field inherits the stored value instead of resetting it to a default (review P2).
+/// - `relays` is mutable, but only an EXPLICITLY supplied value updates it; an omitted field
+///   inherits the stored value instead of resetting it to a default (review P2). `compute_backend`
+///   is a reserved/unused column (CUT-3): new rows get the fixed default, re-bootstraps always
+///   inherit the stored value — no supplied value ever changes it.
 ///
 /// A pre-existing row with a DIFFERENT master identity is always a conflict (never overwritten).
 async fn persist_operator_row(
@@ -1656,7 +1656,6 @@ async fn persist_operator_row(
     let relays_supplied = relays_explicitly_supplied(raw);
     // A blank value counts as unset (consistent with `resolve_config`), so an omitted/blank field
     // inherits the stored row rather than overwriting it with a default.
-    let compute_supplied = non_empty(raw.compute_backend.as_deref()).is_some();
     let payment_supplied = non_empty(raw.payment_backend.as_deref()).is_some();
 
     let outcome = store
@@ -1742,11 +1741,9 @@ async fn persist_operator_row(
                             .map(|relays| normalize_relays(&relays))
                             .unwrap_or(resolved_relays)
                     };
-                    let compute = if compute_supplied {
-                        resolved_compute
-                    } else {
-                        stored_compute
-                    };
+                    // `compute_backend` is a reserved/unused column (CUT-3): never updated on a
+                    // re-bootstrap — always inherit the stored value.
+                    let compute = stored_compute;
                     let relays_json = json!(&relays).to_string();
                     tx.execute(
                         "UPDATE operator SET box_index=?, op_pubkey=?, payment_backend=?, \
@@ -2896,33 +2893,22 @@ mod tests {
         assert_eq!(cfg.payment_backend, PaymentMode::Mock);
     }
 
-    // Review P2 (R2): an explicitly supplied compute_backend is validated against the canonical
-    // recipe allowlist — a typo fails with a structured `config_invalid` (never stored), while the
-    // known fixed backends and any `cloud-*` provider resolve through. Mirrors `payment_backend`.
+    // CUT-3: `compute_backend` is a dead knob — runtime dispatch uses the recipe's
+    // `provisioning.backend`, never this. Any supplied value (even a typo) is ignored with a
+    // warning and resolves to the fixed default; it no longer errors and is never stored verbatim.
     #[test]
-    fn unknown_compute_backend_is_rejected_and_known_ones_resolve() {
-        let raw = RawConfig {
-            compute_backend: Some("hsot".into()), // typo for "host"
-            ..Default::default()
-        };
-        let err = match resolve_config(&raw) {
-            Ok(_) => panic!("expected an unknown compute_backend to be rejected"),
-            Err(e) => e,
-        };
-        assert_eq!(err.code, "config_invalid");
-        assert!(!err.retryable);
-        assert_ne!(exit_code(&err.code), 0);
-
-        for ok in ["host", "incus", "libvirt", "proxmox", "cloud-aws"] {
+    fn supplied_compute_backend_is_ignored_and_resolves_to_default() {
+        for supplied in ["hsot", "incus", "libvirt", "proxmox", "cloud-aws", ""] {
             let raw = RawConfig {
-                compute_backend: Some(ok.into()),
+                compute_backend: Some(supplied.into()),
                 ..Default::default()
             };
             assert_eq!(
                 resolve_config(&raw)
-                    .expect("known compute backend resolves")
+                    .expect("compute_backend never blocks resolution")
                     .compute_backend,
-                ok
+                DEFAULT_COMPUTE_BACKEND,
+                "supplied `{supplied}` must be ignored and resolve to the default",
             );
         }
     }
