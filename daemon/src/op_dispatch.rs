@@ -9,7 +9,8 @@
 //!   the `RUNNING` claim is taken BEFORE the hook and the terminal `DONE`/`ERROR` is committed
 //!   AFTER it, both outside the (async) hook, so a duplicate resends the cached `op.result` and
 //!   NEVER re-runs the hook;
-//! - authorization against the `subscription` row (owner + `ACTIVE`), op resolution via
+//! - authorization against the `subscription` row (owner + `ACTIVE`), folded into the claim txn and
+//!   run BEFORE the durable insert so the three auth rejects persist no row (gdu.3); op resolution via
 //!   [`Recipe::operation`] (the load-time [`Recipe::validate`] already enforces hook-name safety /
 //!   `ops/`-containment — not re-checked here), and op-param validation;
 //! - the hook itself via [`runner::run_hook`].
@@ -27,7 +28,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, Transaction};
 use serde_json::{json, Value};
 
 use lnrent_wire::{Msg, OpRequest, OpResult, PublicKey, WireError};
@@ -52,11 +53,14 @@ pub struct OpDispatch {
     recipe: Recipe,
 }
 
-/// The outcome of the durable idempotency claim (step 1): whether WE took the `RUNNING` row, or a
-/// prior attempt already left a terminal/in-flight state for this `(sender, request_id)`.
+/// The outcome of the lookup → auth → claim transaction (steps 1–3 in [`OpDispatch::claim`]):
+/// whether WE took the `RUNNING` row, a prior attempt already left a terminal/in-flight state for
+/// this `(sender, request_id)`, or the request failed authorization (row-free — nothing persisted).
+#[derive(Debug)]
 enum Claim {
-    /// We inserted the `RUNNING` row — proceed to run the op.
-    Claimed,
+    /// We inserted the `RUNNING` row — proceed to run the op. Carries the authorized subscription's
+    /// state (always `"ACTIVE"`), read in the SAME txn that claimed, for the hook input.
+    Claimed { subscription_state: String },
     /// A prior attempt committed `DONE` — resend its cached result `data` JSON, labeled with the
     /// STORED subscription_id/op (the authorized request's), not the duplicate's. No hook re-run.
     Done {
@@ -73,6 +77,12 @@ enum Claim {
     },
     /// A concurrent duplicate is mid-flight (`RUNNING`, not ours). Defer-and-retry: do NOT re-run.
     Running,
+    /// Auth reject (no row existed): unknown sub OR not the owner. Reply `unauthorized`, persist
+    /// NOTHING — an unauthenticated stranger leaves no durable artifact (gdu.3).
+    Unauthorized,
+    /// Auth reject (no row existed): the owner's sub is not `ACTIVE`. Reply `not_active`, persist
+    /// NOTHING (gdu.3).
+    NotActive,
 }
 
 impl OpDispatch {
@@ -84,17 +94,22 @@ impl OpDispatch {
         }
     }
 
-    /// The `op.request` flow (SPEC.md §5.1/§7.4, ADR-0013): durable claim → authorize → resolve →
-    /// validate → run the hook outside any txn → commit terminal state → reply. Every business
-    /// outcome (auth/unknown/invalid/hook failure) is a committed, cached `op.result` — never a
-    /// handler `Err`, which would re-run the hook on transport retry.
+    /// The `op.request` flow (SPEC.md §5.1/§7.4, ADR-0013, gdu.3): lookup → authorize → durable
+    /// claim (one txn) → resolve → validate → run the hook outside any txn → commit terminal state →
+    /// reply. Every AUTHORIZED business outcome (unknown/invalid/hook failure) is a committed, cached
+    /// `op.result` — never a handler `Err`, which would re-run the hook on transport retry. The three
+    /// AUTH rejects (unknown sub / not-owner / not-ACTIVE) reply the same error but persist NOTHING.
     async fn dispatch(&self, sender: PublicKey, req: OpRequest, out: &dyn Outbound) -> Result<()> {
         let now = self.clock.now();
         let sender_hex = sender.to_hex();
 
-        // 1. DURABLE IDEMPOTENCY FIRST, keyed (sender, request_id). Claim RUNNING before any hook.
-        match self.claim(&sender_hex, &req, now).await? {
-            Claim::Claimed => {}
+        // 1. LOOKUP → AUTHORIZE → CLAIM in ONE serialized txn (see `claim`). A cached
+        //    terminal/in-flight state wins BEFORE auth (cached-resend must survive a later sub state
+        //    change); the three auth rejects persist NOTHING; only an authorized request inserts the
+        //    RUNNING claim, atomically with the ACTIVE read (TOCTOU-safe). Claim carries the
+        //    authorized sub's state for the hook input.
+        let subscription_state = match self.claim(&sender_hex, &req, now).await? {
+            Claim::Claimed { subscription_state } => subscription_state,
             Claim::Done {
                 result_json,
                 subscription_id,
@@ -139,29 +154,29 @@ impl OpDispatch {
                     req.id
                 ));
             }
-        }
-
-        // From here the RUNNING claim is OURS. Every BUSINESS outcome below (auth/unknown/invalid/
-        // hook result) commits a terminal DONE/ERROR and replies. A store-layer error (a failed
-        // read or terminal commit) instead propagates `Err`, leaving the row RUNNING — never re-run
-        // inline; the next startup's `recover_interrupted_ops` flips it to the cached `interrupted`
-        // error, and the buyer's later retry resends that. So the hook still runs at most once.
-
-        // 2. AUTHORIZE (no hook yet). The reply is IDENTICAL for a nonexistent sub and someone
-        //    else's sub — no existence leak.
-        let Some((buyer, state)) = self.load_subscription(&req.subscription_id).await? else {
-            return self.fail(&sender, &req, unauthorized(), now, out).await;
+            // Row-free AUTH rejects (gdu.3, spec §C). The reply is IDENTICAL for a nonexistent sub
+            // and someone else's sub (both `unauthorized`) — no existence leak. The reply itself
+            // stays: silence would break a legitimate buyer with a stale sub id and leaks nothing
+            // more; PR-2's per-pubkey bucket bounds the reply amplification. Nothing is persisted.
+            Claim::Unauthorized => {
+                return self.reply_error(&sender, &req, unauthorized(), out).await;
+            }
+            Claim::NotActive => {
+                return self.reply_error(&sender, &req, not_active(), out).await;
+            }
         };
-        if buyer != sender_hex {
-            return self.fail(&sender, &req, unauthorized(), now, out).await;
-        }
-        if state != "ACTIVE" {
-            return self.fail(&sender, &req, not_active(), now, out).await;
-        }
 
-        // 3. RESOLVE the op. Unknown, or a non-`request` kind (interactive is out of scope here),
-        //    is `unknown_op`. Hook-name safety / `ops/`-containment was enforced at load by
-        //    Recipe::validate (lnrent-7fp.6) — not re-checked here.
+        // From here the RUNNING claim is OURS and the sender is AUTHORIZED. Every BUSINESS outcome
+        // below (unknown/invalid/hook result) commits a terminal DONE/ERROR and replies. A
+        // store-layer error (a failed read or terminal commit) instead propagates `Err`, leaving the
+        // row RUNNING — never re-run inline; the next startup's `recover_interrupted_ops` flips it to
+        // the cached `interrupted` error, and the buyer's later retry resends that. So the hook still
+        // runs at most once.
+
+        // 2. RESOLVE the op. Unknown, or a non-`request` kind (interactive is out of scope here), is
+        //    `unknown_op`. Past auth → STILL commits a terminal ERROR row (cached-resend), unchanged.
+        //    Hook-name safety / `ops/`-containment was enforced at load by Recipe::validate
+        //    (lnrent-7fp.6) — not re-checked here.
         let Some(op) = self.recipe.operation(&req.op) else {
             return self.fail(&sender, &req, unknown_op(), now, out).await;
         };
@@ -169,7 +184,8 @@ impl OpDispatch {
             return self.fail(&sender, &req, unknown_op(), now, out).await;
         }
 
-        // 4. VALIDATE params against the op schema (reject unknown/missing/mistyped).
+        // 3. VALIDATE params against the op schema (reject unknown/missing/mistyped). Past auth →
+        //    STILL commits a terminal ERROR row (cached-resend), unchanged.
         if let Err(e) = validate_op_params(op, &req.params) {
             return self
                 .fail(
@@ -182,7 +198,7 @@ impl OpDispatch {
                 .await;
         }
 
-        // 5. RUN the hook OUTSIDE any sqlite txn (run_hook is async). The stdin mirrors the
+        // 4. RUN the hook OUTSIDE any sqlite txn (run_hook is async). The stdin mirrors the
         //    lifecycle-hook I/O contract (provision/suspend/destroy): subscription + instance +
         //    params + host facts, so a real recipe op can target the provisioned service via
         //    `instance.handles`. The instance is `null` before provisioning (dummy ops ignore it).
@@ -192,7 +208,7 @@ impl OpDispatch {
             "subscription": {
                 "id": req.subscription_id.clone(),
                 "buyer_pubkey": sender_hex,
-                "state": state,
+                "state": subscription_state,
             },
             "instance": instance,
             "op": req.op.clone(),
@@ -244,9 +260,21 @@ impl OpDispatch {
         }
     }
 
-    /// Step 1: in ONE transaction, `INSERT ... ON CONFLICT DO NOTHING` to claim `RUNNING`, then
-    /// SELECT the row's state to classify the outcome. The store actor serializes transactions, so
-    /// the insert-affected-rows count authoritatively says whether WE claimed it.
+    /// Steps 1–3 (lookup → authorize → claim) in ONE serialized transaction, keyed
+    /// `(sender, request_id)`. The store actor serializes transactions, so reading any existing
+    /// invocation, reading the subscription for authorization, and (only if authorized) inserting
+    /// the `RUNNING` claim all commit atomically — no other transaction interleaves.
+    ///
+    /// Ordering is load-bearing (gdu.3, spec §C):
+    /// - A pre-existing row wins BEFORE auth: cached-resend must survive a later sub state change, so
+    ///   a previously-authorized op whose sub since left ACTIVE still resends its cached DONE/ERROR
+    ///   rather than a fresh reject.
+    /// - With no row, the three auth rejects (unknown sub / not-owner / not-ACTIVE) return WITHOUT
+    ///   inserting — an unauthenticated stranger persists nothing.
+    /// - Only an authorized request inserts the claim, atomically with the ACTIVE read. This is the
+    ///   TOCTOU guard: a sub cannot pass the ACTIVE check and then be suspended before the insert.
+    ///   The concurrent-duplicate race (two fresh authorized requests) is caught by the top lookup —
+    ///   or, defensively, by the `ON CONFLICT DO NOTHING` re-read — and the loser defers/resends.
     async fn claim(&self, sender_hex: &str, req: &OpRequest, now: i64) -> Result<Claim> {
         let (s, r, sub, op) = (
             sender_hex.to_string(),
@@ -256,6 +284,35 @@ impl OpDispatch {
         );
         self.store
             .transaction(move |tx| {
+                // 1. LOOKUP existing — a cached terminal/in-flight state wins before auth.
+                if let Some(claim) = lookup_existing(tx, &s, &r)? {
+                    return Ok(claim);
+                }
+                // 2. AUTHORIZE against the subscription row WITHOUT inserting — the three auth
+                //    rejects are row-free. The reply is IDENTICAL for a nonexistent sub and someone
+                //    else's sub (both `Unauthorized`) — no existence leak.
+                let sub_row: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT buyer_pubkey, state FROM subscription WHERE id=?1",
+                        params![sub],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((buyer, state)) = sub_row else {
+                    return Ok(Claim::Unauthorized);
+                };
+                if buyer != s {
+                    return Ok(Claim::Unauthorized);
+                }
+                if state != "ACTIVE" {
+                    return Ok(Claim::NotActive);
+                }
+                // 3. AUTHORIZED → insert the RUNNING claim, atomically with the auth read above.
                 let inserted = tx.execute(
                     "INSERT INTO op_invocation
                         (sender_pubkey, request_id, subscription_id, op, state, created_at)
@@ -264,66 +321,41 @@ impl OpDispatch {
                     params![s, r, sub, op, now],
                 )?;
                 if inserted > 0 {
-                    return Ok(Claim::Claimed);
+                    return Ok(Claim::Claimed {
+                        subscription_state: state,
+                    });
                 }
-                // Conflict: a row already exists for this key — read its terminal/in-flight state.
-                let (state, result_json, error_json, sub_db, op_db): (
-                    String,
-                    Option<String>,
-                    Option<String>,
-                    Option<String>,
-                    Option<String>,
-                ) = tx.query_row(
-                    "SELECT state, result_json, error_json, subscription_id, op FROM op_invocation
-                          WHERE sender_pubkey=?1 AND request_id=?2",
-                    params![s, r],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )?;
-                Ok(match state.as_str() {
-                    "DONE" => Claim::Done {
-                        result_json: result_json.unwrap_or_default(),
-                        subscription_id: sub_db.unwrap_or_default(),
-                        op: op_db.unwrap_or_default(),
-                    },
-                    "ERROR" => Claim::Errored {
-                        error_json: error_json.unwrap_or_default(),
-                        subscription_id: sub_db.unwrap_or_default(),
-                        op: op_db.unwrap_or_default(),
-                    },
-                    // RUNNING (or any unexpected non-terminal): not ours, do not re-run.
-                    _ => Claim::Running,
+                // A row appeared under the conflict guard (a concurrent authorized duplicate). The
+                // serialized store makes the top lookup catch this first; ON CONFLICT keeps it
+                // correct regardless. Re-read and classify exactly as the lookup does.
+                lookup_existing(tx, &s, &r)?.ok_or_else(|| {
+                    anyhow!("op_invocation conflict for ({s}, {r}) vanished on re-read")
                 })
             })
             .await
     }
 
-    /// Authorize fields for `sub_id`: `(buyer_pubkey_hex, state)` if the subscription exists, else
-    /// `None`. A read (no txn) — the claim already committed RUNNING.
-    async fn load_subscription(&self, sub_id: &str) -> Result<Option<(String, String)>> {
-        let id = sub_id.to_string();
-        self.store
-            .read(move |c| {
-                Ok(c.query_row(
-                    "SELECT buyer_pubkey, state FROM subscription WHERE id=?1",
-                    params![id],
-                    |row| {
-                        Ok((
-                            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                            row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                        ))
-                    },
-                )
-                .optional()?)
-            })
-            .await
+    /// Reply an `op.result` error WITHOUT committing a row — the row-free auth-reject path
+    /// (gdu.3, spec §C). Distinct from [`Self::fail`], which ALSO commits a terminal ERROR row for
+    /// the post-auth `unknown_op` / `invalid_params` / hook failures that need cached-resend.
+    async fn reply_error(
+        &self,
+        sender: &PublicKey,
+        req: &OpRequest,
+        error: WireError,
+        out: &dyn Outbound,
+    ) -> Result<()> {
+        out.reply(
+            sender,
+            &Msg::OpResult(OpResult::err(
+                req.id.clone(),
+                req.subscription_id.clone(),
+                req.op.clone(),
+                error,
+            )),
+        )
+        .await?;
+        Ok(())
     }
 
     /// The provisioned instance for `sub_id` as the hook's `instance` context (id, box_id, kind, the
@@ -394,17 +426,7 @@ impl OpDispatch {
         let error_json = serde_json::to_string(&error)?;
         self.commit_terminal(sender, &req.id, "ERROR", None, Some(error_json), now)
             .await?;
-        out.reply(
-            sender,
-            &Msg::OpResult(OpResult::err(
-                req.id.clone(),
-                req.subscription_id.clone(),
-                req.op.clone(),
-                error,
-            )),
-        )
-        .await?;
-        Ok(())
+        self.reply_error(sender, req, error, out).await
     }
 
     /// The terminal commit (SPEC.md §7.4): flip OUR `RUNNING` row to `DONE`/`ERROR` with the cached
@@ -467,6 +489,45 @@ impl OpHandler for OpDispatch {
         };
         self.dispatch(sender, req, out).await
     }
+}
+
+/// Read any existing `op_invocation` for `(sender_hex, request_id)` and classify it into the
+/// resend/defer [`Claim`] variants — `Done`/`Errored`, else `Running` for a live (`RUNNING`, not
+/// ours) or any unexpected non-terminal state. `None` = no row yet (proceed to auth + claim).
+/// Shared by [`OpDispatch::claim`]'s top-of-txn lookup and its post-`INSERT` conflict re-read.
+fn lookup_existing(tx: &Transaction, sender_hex: &str, request_id: &str) -> Result<Option<Claim>> {
+    let row = tx
+        .query_row(
+            "SELECT state, result_json, error_json, subscription_id, op FROM op_invocation
+                  WHERE sender_pubkey=?1 AND request_id=?2",
+            params![sender_hex, request_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(row.map(|(state, result_json, error_json, sub_db, op_db)| {
+        match state.as_str() {
+            "DONE" => Claim::Done {
+                result_json: result_json.unwrap_or_default(),
+                subscription_id: sub_db.unwrap_or_default(),
+                op: op_db.unwrap_or_default(),
+            },
+            "ERROR" => Claim::Errored {
+                error_json: error_json.unwrap_or_default(),
+                subscription_id: sub_db.unwrap_or_default(),
+                op: op_db.unwrap_or_default(),
+            },
+            // RUNNING (or any unexpected non-terminal): not ours, do not re-run.
+            _ => Claim::Running,
+        }
+    }))
 }
 
 /// Validate `params` against the op's declared schema (§7.1), mirroring
@@ -591,14 +652,18 @@ mod tests {
     #[test]
     fn is_timeout_matches_only_the_runner_timeout_phrase() {
         // The runner's timeout error carries the specific phrase " timed out after ".
-        assert!(super::is_timeout(&anyhow!("operation hook timed out after 120s")));
+        assert!(super::is_timeout(&anyhow!(
+            "operation hook timed out after 120s"
+        )));
         // A nonzero-exit failure whose captured stderr merely contains "timed out after" must NOT
         // be misclassified as a (retryable) timeout — the " failed (exit " guard catches it.
         assert!(!super::is_timeout(&anyhow!(
             "operation hook failed (exit 3): upstream timed out after 5s"
         )));
         // A plain nonzero-exit failure.
-        assert!(!super::is_timeout(&anyhow!("operation hook failed (exit 1)")));
+        assert!(!super::is_timeout(&anyhow!(
+            "operation hook failed (exit 1)"
+        )));
     }
 
     fn mem_store() -> Store {
@@ -888,23 +953,9 @@ mod tests {
         // No existence leak: the error payload is identical whether the sub is foreign or absent.
         assert_eq!(foreign.error, missing.error);
 
-        // No hook ran: both committed ERROR, no DONE.
-        assert_eq!(
-            count(
-                &store,
-                "SELECT count(*) FROM op_invocation WHERE state='DONE'"
-            )
-            .await,
-            0
-        );
-        assert_eq!(
-            count(
-                &store,
-                "SELECT count(*) FROM op_invocation WHERE state='ERROR'"
-            )
-            .await,
-            2
-        );
+        // gdu.3: the auth rejects are ROW-FREE — neither request persisted an op_invocation row
+        // (no hook ran, and nothing terminal was committed). A stranger leaves no durable artifact.
+        assert_eq!(count(&store, "SELECT count(*) FROM op_invocation").await, 0);
     }
 
     // Test 5: an undeclared op name replies op.result.err "unknown_op" with no hook.
@@ -1021,6 +1072,244 @@ mod tests {
             )
             .await,
             1
+        );
+    }
+
+    // gdu.3 Test: each of the three AUTH rejects (unknown sub / non-owner / non-ACTIVE) replies the
+    // same reject as before AND writes NO op_invocation row — an unauthenticated stranger's
+    // op.request leaves no durable artifact (row-free auth gate, before the claim).
+    #[tokio::test]
+    async fn auth_rejects_are_row_free() {
+        let store = mem_store();
+        let owner = Keys::generate();
+        seed_sub(&store, "sub-1", &owner.public_key().to_hex(), "ACTIVE").await;
+        seed_sub(
+            &store,
+            "sub-susp",
+            &owner.public_key().to_hex(),
+            "SUSPENDED",
+        )
+        .await;
+        let handler = dispatcher(store.clone(), TestClock::new(1000), dummy_recipe());
+        let stranger = Keys::generate();
+
+        // (a) unknown sub → unauthorized.
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                stranger.public_key(),
+                op_req("a", "ghost", "status", json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            expect_op_result(&out).error.as_ref().unwrap().code,
+            "unauthorized"
+        );
+
+        // (b) existing sub, sender is not the owner → unauthorized.
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                stranger.public_key(),
+                op_req("b", "sub-1", "status", json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            expect_op_result(&out).error.as_ref().unwrap().code,
+            "unauthorized"
+        );
+
+        // (c) owner's own sub, but not ACTIVE → not_active.
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                owner.public_key(),
+                op_req("c", "sub-susp", "status", json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            expect_op_result(&out).error.as_ref().unwrap().code,
+            "not_active"
+        );
+
+        // None of the three persisted an op_invocation row.
+        assert_eq!(count(&store, "SELECT count(*) FROM op_invocation").await, 0);
+    }
+
+    // gdu.3 Test: PAST-AUTH rejects still commit a terminal ERROR row (cached-resend, unchanged).
+    // An authorized sender whose op is unknown (`unknown_op`) or whose params are invalid
+    // (`invalid_params`) is past the row-free auth gate, so each persists an ERROR op_invocation.
+    #[tokio::test]
+    async fn authorized_unknown_op_and_invalid_params_still_commit_error_row() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        seed_sub(&store, "sub-1", &buyer.public_key().to_hex(), "ACTIVE").await;
+        let handler = dispatcher(store.clone(), TestClock::new(1000), dummy_recipe());
+
+        // Authorized, unknown op name → unknown_op.
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                op_req("u", "sub-1", "frobnicate", json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            expect_op_result(&out).error.as_ref().unwrap().code,
+            "unknown_op"
+        );
+
+        // Authorized, unknown param on a real op (closed schema) → invalid_params.
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                op_req("i", "sub-1", "status", json!({"nope": 1})),
+                &out,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            expect_op_result(&out).error.as_ref().unwrap().code,
+            "invalid_params"
+        );
+
+        // Both past-auth rejects persisted a terminal ERROR row (cached for a duplicate resend).
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM op_invocation WHERE state='ERROR'"
+            )
+            .await,
+            2
+        );
+    }
+
+    // gdu.3 Test: cached-resend survives a sub state change. An authorized op runs to DONE; the sub
+    // is THEN suspended; a retry of the SAME (sender, request_id) resends the cached DONE result —
+    // NOT a fresh not_active reject (the lookup wins BEFORE the auth gate).
+    #[tokio::test]
+    async fn cached_done_resends_after_sub_suspended() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        seed_sub(&store, "sub-1", &buyer.public_key().to_hex(), "ACTIVE").await;
+        let handler = dispatcher(store.clone(), TestClock::new(1000), dummy_recipe());
+
+        // First call: authorized `status` → DONE + cached result.
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                op_req("op-1", "sub-1", "status", json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+        let first = expect_op_result(&out);
+        assert_eq!(first.status, OpStatus::Ok);
+
+        // Suspend the sub AFTER the op completed.
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "UPDATE subscription SET state='SUSPENDED' WHERE id='sub-1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Retry the SAME op id: the cached DONE is resent (status Ok, same data), not not_active.
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                op_req("op-1", "sub-1", "status", json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+        let retry = expect_op_result(&out);
+        assert_eq!(
+            retry.status,
+            OpStatus::Ok,
+            "cached DONE must resend despite the sub leaving ACTIVE"
+        );
+        assert_eq!(retry.data, first.data);
+
+        // Still exactly one op_invocation row, DONE — no fresh reject row was written.
+        assert_eq!(count(&store, "SELECT count(*) FROM op_invocation").await, 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM op_invocation WHERE state='DONE'"
+            )
+            .await,
+            1
+        );
+    }
+
+    // gdu.3 Test: auth+claim TOCTOU contract. `claim()` folds the ACTIVE read and the RUNNING insert
+    // into ONE serialized txn, so authorization gates the durable claim atomically. Asserted
+    // directly: an ACTIVE sub yields `Claimed` AND a persisted RUNNING row; a non-ACTIVE sub yields
+    // `NotActive` AND NO row. Under the OLD order (claim-then-auth) the non-ACTIVE case would leave a
+    // RUNNING row — it must not, so a sub that leaves ACTIVE before the insert never gets a hooked run.
+    #[tokio::test]
+    async fn claim_folds_auth_into_the_insert_txn() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let sender_hex = buyer.public_key().to_hex();
+        seed_sub(&store, "sub-active", &sender_hex, "ACTIVE").await;
+        seed_sub(&store, "sub-susp", &sender_hex, "SUSPENDED").await;
+        let handler = dispatcher(store.clone(), TestClock::new(1000), dummy_recipe());
+
+        // ACTIVE → Claimed AND a RUNNING row persisted (the claim committed inside the same txn).
+        let req_a = OpRequest {
+            id: "op-a".into(),
+            subscription_id: "sub-active".into(),
+            op: "status".into(),
+            params: json!({}),
+        };
+        match handler.claim(&sender_hex, &req_a, 1000).await.unwrap() {
+            Claim::Claimed { subscription_state } => assert_eq!(subscription_state, "ACTIVE"),
+            other => panic!("expected Claimed, got {other:?}"),
+        }
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM op_invocation WHERE state='RUNNING'"
+            )
+            .await,
+            1
+        );
+
+        // SUSPENDED → NotActive AND NO row — auth gated the insert within the one txn.
+        let req_s = OpRequest {
+            id: "op-s".into(),
+            subscription_id: "sub-susp".into(),
+            op: "status".into(),
+            params: json!({}),
+        };
+        assert!(matches!(
+            handler.claim(&sender_hex, &req_s, 1000).await.unwrap(),
+            Claim::NotActive
+        ));
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM op_invocation WHERE request_id='op-s'"
+            )
+            .await,
+            0
         );
     }
 }
