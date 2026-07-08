@@ -103,6 +103,16 @@ impl OpDispatch {
         let now = self.clock.now();
         let sender_hex = sender.to_hex();
 
+        // 0. Structural id gate (mi9.2/DRIFT-3, gate0-abuse-resistance §D): the same 1..=128 /
+        //    [A-Za-z0-9_-] bound the order path enforces, BEFORE the durable claim — a malformed
+        //    buyer-chosen id never persists an op_invocation row. A DISTINCT pre-lookup code (NOT
+        //    the post-auth `invalid_params`): nothing was looked up, let alone authorized.
+        if crate::order_intake::validate_buyer_request_id_tail(&req.id).is_err() {
+            return self
+                .reply_error(&sender, &req, invalid_request_id(), out)
+                .await;
+        }
+
         // 1. LOOKUP → AUTHORIZE → CLAIM in ONE serialized txn (see `claim`). A cached
         //    terminal/in-flight state wins BEFORE auth (cached-resend must survive a later sub state
         //    change); the three auth rejects persist NOTHING; only an authorized request inserts the
@@ -601,6 +611,13 @@ fn not_active() -> WireError {
         retryable: false,
     }
 }
+fn invalid_request_id() -> WireError {
+    WireError {
+        code: "invalid_request_id".into(),
+        message: "request id must be 1..=128 chars using only [A-Za-z0-9_-]".into(),
+        retryable: false,
+    }
+}
 fn unknown_op() -> WireError {
     WireError {
         code: "unknown_op".into(),
@@ -956,6 +973,49 @@ mod tests {
         // gdu.3: the auth rejects are ROW-FREE — neither request persisted an op_invocation row
         // (no hook ran, and nothing terminal was committed). A stranger leaves no durable artifact.
         assert_eq!(count(&store, "SELECT count(*) FROM op_invocation").await, 0);
+    }
+
+    // mi9.2/DRIFT-3: a malformed buyer-chosen id is rejected BEFORE the durable claim with the
+    // DISTINCT pre-lookup `invalid_request_id` code — row-free, like the auth rejects — while a
+    // valid id still dispatches normally.
+    #[tokio::test]
+    async fn malformed_request_id_is_rejected_row_free_before_the_claim() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        seed_sub(&store, "sub-1", &buyer.public_key().to_hex(), "ACTIVE").await;
+        let handler = dispatcher(store.clone(), TestClock::new(1000), dummy_recipe());
+
+        // Empty, over-long, and out-of-alphabet ids — even from the AUTHORIZED owner of an ACTIVE
+        // sub, so the reject provably fires before lookup/auth, not because of them.
+        let long = "a".repeat(129);
+        for bad in ["", long.as_str(), "sp ace", "semi;colon"] {
+            let out = RecordingOutbound::default();
+            handler
+                .handle(
+                    buyer.public_key(),
+                    op_req(bad, "sub-1", "status", json!({})),
+                    &out,
+                )
+                .await
+                .unwrap();
+            let res = expect_op_result(&out);
+            assert_eq!(res.status, OpStatus::Error);
+            assert_eq!(res.error.as_ref().unwrap().code, "invalid_request_id");
+        }
+        assert_eq!(count(&store, "SELECT count(*) FROM op_invocation").await, 0);
+
+        // A valid id on the same sub still claims + runs the hook (the gate does not over-drop).
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                op_req("ok-1", "sub-1", "status", json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+        assert_eq!(expect_op_result(&out).status, OpStatus::Ok);
+        assert_eq!(count(&store, "SELECT count(*) FROM op_invocation").await, 1);
     }
 
     // Test 5: an undeclared op name replies op.result.err "unknown_op" with no hook.

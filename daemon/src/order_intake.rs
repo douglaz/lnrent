@@ -304,6 +304,15 @@ impl OrderIntake {
             out.reply(&sender, &cached).await?;
             return Ok(());
         }
+        // Structural id gate (mi9.2/DRIFT-3, gate0-abuse-resistance §D): the same 1..=128 /
+        // [A-Za-z0-9_-] tail bound the order path enforces, BEFORE the id reaches the renew
+        // external id or the inbound_request row. Malformed → drop + log with NO reply: wire has
+        // no renew error variant (a renew is only ever answered by `billing.invoice`), matching
+        // renew's other rejects above/below.
+        if validate_buyer_request_id_tail(&req.id).is_err() {
+            tracing::warn!(sub = %req.subscription_id, "renew.request with a malformed request id — dropped");
+            return Ok(());
+        }
         let now = self.clock.now();
         // Authorize + gate state: only the OWNING buyer may renew, and only a renewable
         // (ACTIVE/SUSPENDED) subscription. Otherwise drop silently — an outsider must not be able
@@ -985,7 +994,7 @@ fn enqueue_outbox(
 
 // The five `order.error` codes (§5.1) — the only ones this handler emits. `retryable` follows the
 // nature of the failure: a bad request is permanent, capacity / backend / store trouble is not.
-fn validate_buyer_request_id_tail(id: &str) -> std::result::Result<(), WireError> {
+pub(crate) fn validate_buyer_request_id_tail(id: &str) -> std::result::Result<(), WireError> {
     let valid_tail = !id.is_empty()
         && id.len() <= 128
         && id
@@ -1787,6 +1796,72 @@ mod tests {
         assert_eq!(
             count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
             0
+        );
+    }
+
+    // mi9.2/DRIFT-3: a malformed renew request id is dropped with NO reply (wire has no renew
+    // error variant) before any invoice or inbound_request row exists — the same 1..=128 /
+    // [A-Za-z0-9_-] bound the order path enforces — while a valid id still renews.
+    #[tokio::test]
+    async fn renew_request_with_malformed_id_is_dropped_before_any_row() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        seed_active_sub(&store, "sub-1", &buyer.public_key().to_hex(), 5000).await;
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1000),
+            dummy_recipe(),
+            budget_with_room(),
+        );
+
+        // Empty, over-long, and out-of-alphabet ids — from the OWNER of an ACTIVE sub, so the
+        // drop provably comes from the id gate, not the owner/state gates.
+        let long = "a".repeat(129);
+        for bad in ["", long.as_str(), "sp ace", "semi;colon"] {
+            let out = RecordingOutbound::default();
+            handler
+                .handle(
+                    buyer.public_key(),
+                    Msg::RenewRequest(RenewRequest {
+                        id: bad.into(),
+                        subscription_id: "sub-1".into(),
+                    }),
+                    &out,
+                )
+                .await
+                .unwrap();
+            assert!(
+                out.messages().is_empty(),
+                "a malformed renew id is dropped without a reply"
+            );
+        }
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
+            0
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM inbound_request").await,
+            0
+        );
+
+        // A valid id still renews (the gate does not over-drop).
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                Msg::RenewRequest(RenewRequest {
+                    id: "ok-1".into(),
+                    subscription_id: "sub-1".into(),
+                }),
+                &out,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.messages().len(), 1, "a valid renew id gets an invoice");
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
+            1
         );
     }
 

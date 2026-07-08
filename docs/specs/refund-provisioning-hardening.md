@@ -150,6 +150,12 @@ the tag lookup.
    to `listing_id` (a Nostr coordinate) or to the full generated subscription id. Applying the same
    helper to `RenewRequest.id` / `OpRequest.id` is acceptable if it is a tiny reuse, but it is not
    required to close the DO tag leak.
+   > **DRIFT-3 (production-readiness.md) — landed.** The "acceptable if tiny reuse" option was
+   > exercised: the SAME `validate_buyer_request_id_tail` (length/charset only) now also gates
+   > `RenewRequest.id` (drop + log, no reply) and `OpRequest.id` (pre-claim
+   > `op.result invalid_request_id` reject). This is the bounded id-tail check applied for
+   > cross-path consistency — NOT the blanket subscription-id shape validator point 2 refuses,
+   > which remains refused.
 2. Do **not** add a blanket subscription-id shape validator for `RenewRequest`, `SubCancel`,
    `DeliveryResendRequest`, or `OpRequest` as part of F4. Once new order ids have a safe tail and all
    DO tag lookups are URL-encoded, malformed subscription references can continue through the
