@@ -476,6 +476,29 @@ suite is not vacuous against the test relay's 60/min rate limit and 500 filter c
 
 ## Suggested sequencing (for the follow-on focused specs / beads)
 
+> **Status (2026-07-08).** GATE-0 is 3/4 landed on master: PR-1 hold cap (#6), PR-2 inbound
+> rate limit (#8), PR-3 auth-before-claim (#10); the mi9.1 cleanup (CUT-1..4, DRIFT-2/4) also
+> landed (#5). The critical path below is now **encoded in the bead graph** — `br ready` surfaces
+> it, and `lnrent-7qc` (the final go-live gate) is dependency-blocked on exactly the three gates
+> still open:
+>
+> 1. **lnrent-gdu.4** (PR-4: cap unpaid invoice load + params/message size) and **lnrent-mi9.2**
+>    (DRIFT-3: request-id validator on renew/op paths) — the two beads that close the GATE-0 epic.
+> 2. **lnrent-urw.1** (PR-5: real alert sink) — also unblocks urw.2/urw.4/urw.7.
+> 3. **lnrent-y4m.7** (PR-12: hook-env hygiene).
+> 4. **lnrent-7qc** (fedimint refund staging dogfood) becomes ready when 1–3 close → attended
+>    go-live per docs/go-live.md.
+>
+> Steps 1–3 are parallel workstreams, not a hard sequence — per the operator decision below, the
+> rest of GATE-1 may also proceed in parallel. Deliberately, only 7qc is dependency-blocked (the
+> convergence point); GATE-1 child beads stay individually ready, and the epic-level
+> GATE-0→GATE-1 edge only orders epic *closure*, not the work.
+>
+> After the path: the rest of GATE-1 in ready-queue order (urw.9 flock, urw.5 refund actuator,
+> urw.8 suspend/renewal race), with **urw.10** (ledger-authoritative money core) as the
+> centerpiece that unblocks urw.3 (sweep) and urw.7 (draining-holdings). The GATE-1 epic is also
+> graph-ordered after GATE-0. HARDEN (y4m) batches by theme after the gates.
+
 > **Operator decision (2026-07-04):** go-live is gated on **GATE-0 (PR-1..4) + PR-5 alerting +
 > PR-12 hook-env hygiene** landing, plus the existing lnrent-7qc refund staging dogfood. The
 > attended-dogfood carve-out in the legend remains valid policy but will NOT be exercised before
