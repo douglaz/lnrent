@@ -36,6 +36,37 @@ use std::sync::Arc;
 /// per this window, then re-fires after it.
 pub const ALERT_COOLDOWN_S: i64 = 6 * 3600;
 
+/// Cap on the alert `detail` before it is serialized into the outbox payload. `detail` can embed
+/// buyer/endpoint-derived text (e.g. a structural refund-resolution error from a hostile LNURL
+/// endpoint), so an unbounded detail would let the operator.alert row exceed the NIP-59 gift-wrap
+/// transport ceiling — the wrap fails, the drain treats it as transient, and the row wedges PENDING
+/// forever, undelivered (codex xhigh). Capping here (the single serialization point) bounds EVERY
+/// alert kind and keeps the wrapped DM far under [`lnrent_wire::MAX_INBOUND_CONTENT_BYTES`].
+const MAX_ALERT_DETAIL_CHARS: usize = 1024;
+/// Cap on the alert `subject` (the outbox-id tail / cooldown key); bounded for the same reason.
+const MAX_ALERT_SUBJECT_CHARS: usize = 256;
+
+/// Truncate `s` to at most `max` chars (on a char boundary), appending `…` when it was cut.
+fn cap_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// The serialized `operator.alert` payload with `subject`/`detail` capped so the wrapped DM can
+/// never exceed the transport ceiling. Serializing three owned strings is infallible.
+fn alert_payload(kind: AlertKind, subject: &str, detail: &str) -> String {
+    serde_json::to_string(&Msg::OperatorAlert(OperatorAlert {
+        kind: kind.wire_str().to_string(),
+        subject: cap_chars(subject, MAX_ALERT_SUBJECT_CHARS),
+        detail: cap_chars(detail, MAX_ALERT_DETAIL_CHARS),
+    }))
+    .expect("serialize operator alert (three owned strings) is infallible")
+}
+
 /// The CLOSED set of alertable conditions (production-readiness.md PR-5 §A). Extended ONLY by the
 /// owning beads listed in the module doc — do not add free-form kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -160,18 +191,14 @@ impl AlertDispatcher {
             }
         }
 
-        let payload = serde_json::to_string(&Msg::OperatorAlert(OperatorAlert {
-            kind: alert.kind.wire_str().to_string(),
-            subject: alert.subject.clone(),
-            detail: alert.detail.clone(),
-        }))?;
+        let payload = alert_payload(alert.kind, &alert.subject, &alert.detail);
         // Distinct id per fire (cooldown already bounds the rate), so a legitimate re-fire past the
         // window is never swallowed by ON CONFLICT; the conflict guard only absorbs a same-second
-        // boundary race.
+        // boundary race. Cap the subject in the id too (a huge subject would bloat the id row).
         let outbox_id = format!(
             "outbox:alert:{}:{}:{now}",
             alert.kind.wire_str(),
-            alert.subject
+            cap_chars(&alert.subject, MAX_ALERT_SUBJECT_CHARS)
         );
         let recipient = self.recipient_hex.clone();
         self.store
@@ -209,14 +236,13 @@ impl AlertDispatcher {
         if !self.is_enabled() {
             return None;
         }
-        let payload = serde_json::to_string(&Msg::OperatorAlert(OperatorAlert {
-            kind: kind.wire_str().to_string(),
-            subject: subject.to_string(),
-            detail: detail.to_string(),
-        }))
-        .expect("serialize operator alert (three owned strings) is infallible");
+        let payload = alert_payload(kind, subject, detail);
         Some(AlertRow {
-            id: format!("outbox:alert:{}:{subject}", kind.wire_str()),
+            id: format!(
+                "outbox:alert:{}:{}",
+                kind.wire_str(),
+                cap_chars(subject, MAX_ALERT_SUBJECT_CHARS)
+            ),
             recipient: self.recipient_hex.clone(),
             payload,
         })
@@ -334,5 +360,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(alert_rows(&store).await, 3, "re-fires past the cooldown");
+    }
+
+    // codex xhigh: a detail carrying hostile-endpoint text (a structural refund-resolution error
+    // relayed from a buyer-controlled LNURL endpoint) must be capped, so the operator.alert row can
+    // always be gift-wrapped — an over-cap payload would fail the wrap, be treated as transient, and
+    // wedge the row PENDING forever, undelivered. Both enqueue paths cap identically.
+    #[tokio::test]
+    async fn oversized_detail_is_capped_below_the_transport_ceiling() {
+        let store = mem_store();
+        let clock = Arc::new(TestClock::new(1000));
+        let d = AlertDispatcher::new(store.clone(), clock, "npub".into());
+
+        // 200 KiB — well past the ~40 KiB NIP-59 rumor-content ceiling.
+        let huge = "x".repeat(200 * 1024);
+        d.dispatch(Alert::new(AlertKind::RefundParked, "r1", huge.clone()))
+            .await
+            .unwrap();
+        let (_recipient, alert) = only_alert(&store).await;
+        assert!(
+            alert.detail.chars().count() <= MAX_ALERT_DETAIL_CHARS + 1,
+            "detail capped to the bound (+1 for the ellipsis)"
+        );
+        assert!(alert.detail.ends_with('…'), "truncation is marked");
+        let async_payload = serde_json::to_string(&Msg::OperatorAlert(alert)).unwrap();
+
+        // The terminal (in-txn) path caps identically.
+        let row = d
+            .terminal_alert_row(AlertKind::RefundParked, "r2", &huge)
+            .expect("enabled dispatcher builds a row");
+
+        // Both payloads sit far under the inbound content bound, so the wrapped DM is deliverable.
+        let ceiling = lnrent_wire::MAX_INBOUND_CONTENT_BYTES;
+        assert!(async_payload.len() < ceiling / 8, "async payload well under the ceiling");
+        assert!(row.payload.len() < ceiling / 8, "terminal payload well under the ceiling");
     }
 }

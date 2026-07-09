@@ -15,3 +15,6 @@
 .beads/*.db-wal
 .beads/*.db-shm
 .rb-lite/
+
+# gstack skill temp output (codex review captures, etc.)
+.gstack/
