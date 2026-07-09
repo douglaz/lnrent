@@ -170,6 +170,35 @@ fn scrub_secret_env() {
     }
 }
 
+/// Take an exclusive advisory `flock` on `{data_dir}/lnrentd.lock` (lnrent-urw.9): the single-
+/// instance guard. Returns the held file handle — keep it alive for the daemon's lifetime; dropping
+/// it (or the process dying) releases the lock. Fails loudly with a "daemon already running" error
+/// when another daemon holds it, rather than silently rebinding the IPC socket + double-driving.
+fn acquire_data_dir_lock(data_dir: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let path = data_dir.join("lnrentd.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false) // the lock file's CONTENT is irrelevant; never clobber it
+        .open(&path)
+        .with_context(|| format!("opening single-instance lock {}", path.display()))?;
+    // LOCK_EX | LOCK_NB: fail IMMEDIATELY if another daemon holds it, never block.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(file);
+    }
+    let err = std::io::Error::last_os_error();
+    if matches!(err.raw_os_error(), Some(libc::EWOULDBLOCK)) {
+        anyhow::bail!(
+            "another lnrentd is already running on data dir {} (holds {}); refusing to start a second instance",
+            data_dir.display(),
+            path.display()
+        );
+    }
+    Err(anyhow::Error::new(err).context(format!("locking {}", path.display())))
+}
+
 /// Build the multi-thread tokio runtime explicitly (see [`main`]); an error is fatal.
 fn build_runtime() -> Result<tokio::runtime::Runtime, ExitCode> {
     tokio::runtime::Builder::new_multi_thread()
@@ -294,6 +323,16 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
              bootstrap with payment_backend=mock"
         );
     }
+    // Single-instance guard (lnrent-urw.9): resolve + create the data dir and take an exclusive
+    // advisory lock on `{data_dir}/lnrentd.lock` BEFORE bootstrap opens sqlite / runs migrations /
+    // writes the operator row (codex) — so a systemd restart racing a manual start fails fast
+    // WITHOUT mutating any state or rebinding the IPC socket, rather than double-driving
+    // subscriptions into duplicate droplets (ADR-0001 sole-writer). Held for the daemon's whole
+    // lifetime — the kernel frees the flock on clean exit OR crash, so a later start always succeeds.
+    let data_dir = config::prepare_data_dir(&raw)
+        .map_err(|e| anyhow::anyhow!("preparing data dir: {} ({})", e.message, e.code))?;
+    let _instance_lock = acquire_data_dir_lock(&data_dir)?;
+
     let (operator, store) = config::bootstrap_headless_with_store(std::mem::take(&mut *raw))
         .await
         .map_err(|e| anyhow::anyhow!("operator bootstrap failed: {} ({})", e.message, e.code))?;
@@ -746,5 +785,32 @@ mod tests {
             results.iter().all(|&scrubbed| scrubbed),
             "every SECRET_ENV_VARS entry is scrubbed from the daemon env"
         );
+    }
+
+    // lnrent-urw.9: the data-dir lock is exclusive — a second acquire while the first is held is
+    // refused, and releasing the first frees it for a subsequent start.
+    #[test]
+    fn data_dir_lock_is_exclusive_and_releases_on_drop() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lnrent-lock-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = acquire_data_dir_lock(&dir).expect("first daemon takes the lock");
+        let second = acquire_data_dir_lock(&dir);
+        assert!(second.is_err(), "a second daemon is refused while the first holds the lock");
+        assert!(
+            second.unwrap_err().to_string().contains("already running"),
+            "the refusal is the structured 'daemon already running' error"
+        );
+
+        drop(first); // clean exit / crash releases the flock
+        let _third = acquire_data_dir_lock(&dir).expect("lock is re-acquirable after release");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

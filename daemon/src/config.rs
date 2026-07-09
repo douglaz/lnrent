@@ -606,6 +606,17 @@ fn resolve_data_dir(raw: &RawConfig) -> PathBuf {
     normalize_path_lexically(&dir)
 }
 
+/// Resolve + create (0700, symlink-safe) the operator data dir WITHOUT opening the store, and return
+/// its path. The daemon calls this so it can take its single-instance lock (lnrent-urw.9) on
+/// `{data_dir}/lnrentd.lock` BEFORE bootstrap opens sqlite, runs migrations, or writes the operator
+/// row — closing the race where a second daemon mutates state before hitting the flock. Idempotent:
+/// a subsequent `bootstrap_headless_with_store` re-resolves + re-validates the SAME dir.
+pub fn prepare_data_dir(raw: &RawConfig) -> Result<PathBuf, IpcError> {
+    let dir = resolve_data_dir(raw);
+    create_private_dir_all(&dir)?;
+    Ok(dir)
+}
+
 /// Run a fully non-interactive bootstrap (ADR-0014 §4.7): create the private data dir, open the
 /// state DB + sole-writer store actor (ADR-0001) under it, and bootstrap the operator from `raw`.
 /// This is the executable entrypoint behind `lnrentd bootstrap`; the daemon-startup path (.21) can

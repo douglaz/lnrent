@@ -133,6 +133,8 @@ Share the listing coordinate / operator npub.
   daemon retries the (idempotent) hook automatically with backoff and DMs a `TeardownFailed` alert,
   but a persistent entry means you should delete the resource by hand (e.g. in the DigitalOcean UI).
 - **Run it durably** — under systemd (`Restart=always`); SIGTERM drains in-flight work + flushes the outbox.
+  Only one daemon may run per data dir: startup takes an exclusive lock on `{data_dir}/lnrentd.lock`, so a
+  restart racing a still-running instance fails fast with "already running" instead of double-provisioning.
 - **Back up on a cadence** — stop the daemon → `lnrentd backup --dest <dir>` → copy off-box → restart.
 - **Cancellations are automatic** — a buyer `sub.cancel` runs out the paid period, then reconcile destroys
   the VM. Renewals, reminders, and suspensions are automatic per the reconcile loop.
