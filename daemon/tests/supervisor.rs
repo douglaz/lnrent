@@ -981,3 +981,82 @@ async fn maintenance_retries_and_resolves_a_teardown_dead_letter() {
 
     running.shutdown().await.unwrap();
 }
+
+// ==============================================================================================
+// 7. urw.5 refund actuator: `lnrent refunds` lists a parked refund, and `refund-retry` re-drives
+//    it through the real refunder (resolver + capped pay) to SENT under a live Supervisor.
+// ==============================================================================================
+
+/// Seed a parked (FAILED) refund WITH INV-3 provenance (a PAID `order` invoice) and a dest the
+/// PassThroughResolver + MockPayment will pay, so a retry can reach SENT.
+async fn seed_parked_refund_with_provenance(store: &Store) {
+    store
+        .transaction(|tx| {
+            tx.execute(
+                "INSERT INTO invoice (id, subscription_id, external_id, kind, amount_sat, status, settled_at, issued_at)
+                 VALUES ('inv-order:sub-x', 'sub-x', 'order:sub-x', 'order', 500, 'PAID', 10, 0)",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO refund_attempt (id, subscription_id, dest, amount_sat, idempotency_key, status, attempts, created_at, updated_at)
+                 VALUES ('ref-order:sub-x', 'sub-x', 'lnaddr@buyer', 500, 'refund:order:sub-x', 'FAILED', 5, 10, 20)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+async fn refund_status(store: &Store, id: &str) -> Option<String> {
+    let id = id.to_string();
+    store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT status FROM refund_attempt WHERE id=?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refund_retry_redrives_a_parked_refund_to_sent() {
+    let relay = mock_relay().await;
+    let url = relay.url().await.to_string();
+    let op_keys = Keys::generate();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let payment = Arc::new(MockPayment::new());
+    payment.set_now(START);
+    let clock = Arc::new(TestClock::new(START));
+
+    seed_parked_refund_with_provenance(&store).await;
+    let (running, sock) = start_supervisor(&op_keys, &url, store.clone(), payment, clock).await;
+    let _ = wait_for_ipc_ok(&sock).await;
+
+    // It shows up parked.
+    let list = ipc::call(&sock, ipc::Request::Refunds).await.unwrap();
+    let arr = list.data.unwrap();
+    assert!(
+        arr.as_array().unwrap().iter().any(|r| r["id"] == "ref-order:sub-x" && r["status"] == "FAILED"),
+        "the parked refund is listed"
+    );
+
+    // Retry it → the refunder re-drives it to SENT.
+    let retry = ipc::call(&sock, ipc::Request::RefundRetry { id: "ref-order:sub-x".into() })
+        .await
+        .unwrap();
+    assert!(retry.ok, "retry accepted: {:?}", retry.error);
+
+    let store_for_poll = store.clone();
+    wait_until("refund reaches SENT", || {
+        let store = store_for_poll.clone();
+        async move { refund_status(&store, "ref-order:sub-x").await.as_deref() == Some("SENT") }
+    })
+    .await;
+
+    running.shutdown().await.unwrap();
+}

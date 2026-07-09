@@ -126,7 +126,10 @@ Share the listing coordinate / operator npub.
   blackout is the one condition that cannot be delivered (it queues), so a prolonged silence from a
   daemon you know is up still warrants a direct check.
 - **Refunds self-fund from sales** — you do not pre-fund; keep a small float for outbound Lightning fees.
-  A refund that can't be paid parks visibly (surfaced by `lnrent money` + the logs), it is never dropped.
+  A refund that can't be paid parks visibly (`lnrent money`'s parked count + a `RefundParked` alert), never
+  dropped. Inspect the per-item list with `lnrent refunds`; once the buyer's endpoint recovers, re-drive one
+  with `lnrent refund-retry <id>` (it reruns the real resolver + capped-pay path — there is no cancel verb,
+  abandoning a liability stays a manual decision).
 - **Watch for owed teardowns:** `lnrent teardowns` (and the `open_teardowns` count in `lnrent status`)
   lists provider resources the daemon failed to tear down — a `destroy` hook that failed, or a stuck
   provision-failure cleanup. A droplet that failed to delete keeps billing you until this clears; the
