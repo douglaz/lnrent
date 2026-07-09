@@ -1129,10 +1129,26 @@ pub(crate) fn parse_whole_sat(bolt11: &str) -> Result<u64, String> {
 /// The stable `external_id` the row was keyed on — strip `refund:` off the idempotency key (or
 /// `ref-` off the id). It anchors the deterministic outbox id so a re-drive never double-enqueues.
 fn external_id_of(row: &RefundRow) -> String {
-    if let Some(ext) = row.idempotency_key.strip_prefix("refund:") {
+    external_id_from(&row.idempotency_key, &row.id)
+}
+
+/// Derive a refund's external id from its `idempotency_key` (`refund:<ext>`) or, failing that, its
+/// row id (`ref-<ext>`). Public so the retry actuator (ipc.rs, lnrent-urw.5) computes the SAME id.
+pub fn external_id_from(idempotency_key: &str, refund_id: &str) -> String {
+    if let Some(ext) = idempotency_key.strip_prefix("refund:") {
         return ext.to_string();
     }
-    row.id.strip_prefix("ref-").unwrap_or(&row.id).to_string()
+    refund_id
+        .strip_prefix("ref-")
+        .unwrap_or(refund_id)
+        .to_string()
+}
+
+/// The STABLE `billing.refund` outbox row id for a refund. Single source of truth so the retry
+/// actuator can supersede the stale parked-FAILED DM before the refunder enqueues the success one
+/// (lnrent-urw.5 / codex): both derive the id here.
+pub fn refund_outbox_id(idempotency_key: &str, refund_id: &str) -> String {
+    format!("outbox:refund:{}", external_id_from(idempotency_key, refund_id))
 }
 
 /// Enqueue a `billing.refund` DM as a PENDING outbox row under a STABLE id (the OutboxSender

@@ -38,6 +38,12 @@ enum Cmd {
     /// List OPEN teardown dead-letters: failed `destroy` hooks + stuck provision cleanups. A
     /// provider resource (e.g. a droplet) may still be billing until these resolve.
     Teardowns,
+    /// List non-terminal + parked refunds (the per-item view behind `money`'s parked_count).
+    Refunds,
+    /// Re-drive one parked (FAILED) refund: reset it to PENDING so the refunder retries the real
+    /// resolver + capped-pay path. The only refund actuator — there is no cancel/abandon.
+    #[command(name = "refund-retry")]
+    RefundRetry { id: String },
     /// Admin: force-suspend a subscription.
     Suspend { id: String },
     /// Admin: force-resume a suspended subscription.
@@ -71,6 +77,7 @@ enum HumanRender {
     Generic,
     Money,
     Teardowns,
+    Refunds,
 }
 
 #[tokio::main]
@@ -83,6 +90,8 @@ async fn main() -> ExitCode {
         Cmd::Subs => (Request::Subs, HumanRender::Generic),
         Cmd::Sub { id } => (Request::Sub { id }, HumanRender::Generic),
         Cmd::Teardowns => (Request::Teardowns, HumanRender::Teardowns),
+        Cmd::Refunds => (Request::Refunds, HumanRender::Refunds),
+        Cmd::RefundRetry { id } => (Request::RefundRetry { id }, HumanRender::Generic),
         Cmd::Suspend { id } => (Request::AdminSuspend { id }, HumanRender::Generic),
         Cmd::Resume { id } => (Request::AdminResume { id }, HumanRender::Generic),
         Cmd::Dev {
@@ -126,6 +135,7 @@ fn render(reply: Reply, as_json: bool, human_render: HumanRender) -> ExitCode {
                 HumanRender::Generic => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
                 HumanRender::Money => render_money_human(&v),
                 HumanRender::Teardowns => render_teardowns_human(&v),
+                HumanRender::Refunds => render_refunds_human(&v),
             },
         }
     } else if let Some(err) = &reply.error {
@@ -216,5 +226,36 @@ fn render_teardowns_human(v: &serde_json::Value) {
     }
     if cleanups > 0 {
         println!("  + {cleanups} provision-failure cleanup(s) owed (auto-retried every reconcile tick)");
+    }
+}
+
+/// Human render for `lnrent refunds` (lnrent-urw.5): the non-terminal + parked refunds, or a clean
+/// line. `refund-retry <id>` re-drives a parked (FAILED) one.
+fn render_refunds_human(v: &serde_json::Value) {
+    let rows = v.as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        println!("No pending or parked refunds.");
+        return;
+    }
+    let parked = rows
+        .iter()
+        .filter(|r| r.get("status").and_then(serde_json::Value::as_str) == Some("FAILED"))
+        .count();
+    println!(
+        "Refunds: \x1b[1m{}\x1b[0m ({parked} parked FAILED — retry with `lnrent refund-retry <id>`)",
+        rows.len()
+    );
+    for r in &rows {
+        let s = |k: &str| r.get(k).and_then(serde_json::Value::as_str).unwrap_or("?");
+        let n = |k: &str| r.get(k).and_then(serde_json::Value::as_i64);
+        println!(
+            "  \u{2022} {} \u{b7} {} \u{b7} {} sat \u{b7} {} \u{b7} {} attempt(s) \u{b7} age {}s",
+            s("id"),
+            s("dest_form"),
+            n("amount_sat").map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
+            s("status"),
+            n("attempts").unwrap_or(0),
+            n("age_s").unwrap_or(0),
+        );
     }
 }

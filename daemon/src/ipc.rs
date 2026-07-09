@@ -8,6 +8,7 @@ use crate::backends::{PaymentBackend, DEV_SETTLE_UNSUPPORTED};
 use crate::clock::Clock;
 use crate::provision;
 use crate::recipe::Recipe;
+use crate::refund_resolver::{detect_form, DestForm};
 use crate::store::Store;
 use crate::supervisor::{refund_readiness_report_with_probe, RefundReadinessProbe};
 use crate::teardown;
@@ -32,6 +33,12 @@ pub enum Request {
     /// Open teardown dead-letters (lnrent-urw.2): failed retention `destroy` hooks + the
     /// provision-failure cleanup backlog — provider resources that may still be billing.
     Teardowns,
+    /// Non-terminal + parked-FAILED refunds (lnrent-urw.5): the per-item view behind `lnrent money`'s
+    /// `parked_count`.
+    Refunds,
+    /// Re-drive one parked-FAILED refund (lnrent-urw.5): reset it to PENDING so the refunder re-runs
+    /// the real resolver + capped-pay path. The only refund actuator — there is no cancel/abandon.
+    RefundRetry { id: String },
     AdminSuspend { id: String },
     AdminResume { id: String },
     DevSettle { subscription_id: String },
@@ -275,6 +282,16 @@ pub async fn dispatch(
             }
         }
 
+        Request::Refunds => {
+            let now = clock.now();
+            match store.read(move |c| query_refunds(c, now)).await {
+                Ok(list) => Reply::ok(json!(list)),
+                Err(e) => Reply::err("internal", e.to_string()),
+            }
+        }
+
+        Request::RefundRetry { id } => refund_retry(store, &id, clock.now()).await,
+
         Request::AdminSuspend { id } => {
             admin_transition(
                 store,
@@ -408,6 +425,107 @@ async fn admin_transition(
         Ok(false) => Reply::err(
             "invalid_state",
             format!("subscription `{id}` not in {from:?}"),
+        ),
+        Err(e) => Reply::err("internal", e.to_string()),
+    }
+}
+
+/// The short `dest_form` label for the `lnrent refunds` view: how the buyer's refund destination
+/// resolves (lnrent-urw.5). `none` = no dest recorded (a legacy/manual liability); `unknown` = a
+/// dest that no longer parses (surfaced, not hidden).
+fn dest_form_label(dest: Option<&str>) -> &'static str {
+    match dest.map(str::trim).filter(|d| !d.is_empty()) {
+        None => "none",
+        Some(d) => match detect_form(d) {
+            Ok(DestForm::LnAddress { .. }) => "ln_address",
+            Ok(DestForm::Lnurl(_)) => "lnurl",
+            Ok(DestForm::Bolt11) => "bolt11",
+            Err(_) => "unknown",
+        },
+    }
+}
+
+/// Non-terminal (`PENDING`) + parked (`FAILED`) refund rows — the per-item view behind
+/// `lnrent money`'s `parked_count` (lnrent-urw.5). Projects only PERSISTED fields (no fabricated
+/// error class) plus the derived `dest_form` and ages.
+fn query_refunds(c: &rusqlite::Connection, now: i64) -> Result<Vec<Value>> {
+    let mut stmt = c.prepare(
+        "SELECT id, subscription_id, dest, amount_sat, status, COALESCE(attempts, 0),
+                created_at, updated_at
+           FROM refund_attempt
+          WHERE status IN ('PENDING','FAILED')
+          ORDER BY updated_at DESC, id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            let dest: Option<String> = r.get(2)?;
+            let created_at: Option<i64> = r.get(6)?;
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "subscription_id": r.get::<_, Option<String>>(1)?,
+                "dest_form": dest_form_label(dest.as_deref()),
+                "amount_sat": r.get::<_, Option<i64>>(3)?,
+                "status": r.get::<_, String>(4)?,
+                "attempts": r.get::<_, i64>(5)?,
+                "created_at": created_at,
+                "updated_at": r.get::<_, Option<i64>>(7)?,
+                "age_s": created_at.map(|c| now - c),
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Re-drive one parked-FAILED refund (lnrent-urw.5): CAS it back to `PENDING` with `attempts=0` so
+/// the refunder re-runs the REAL resolver + INV-1-capped pay path on its next drive. Guarded on
+/// `status='FAILED'` — a retry of a non-parked id mutates nothing and returns a structured error.
+/// Journaled. This is the ONLY refund actuator; there is deliberately no cancel/abandon.
+async fn refund_retry(store: &Store, id: &str, now: i64) -> Reply {
+    let id = id.to_string();
+    let res: Result<bool> = store
+        .transaction({
+            let id = id.clone();
+            move |tx| {
+                // Read the row's identity BEFORE mutating, to (a) gate on FAILED and (b) compute the
+                // stable billing.refund outbox id for the supersede below.
+                let row: Option<(String, Option<String>, String)> =
+                    rusqlite::OptionalExtension::optional(tx.query_row(
+                        "SELECT status, subscription_id, idempotency_key FROM refund_attempt WHERE id=?1",
+                        rusqlite::params![id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    ))?;
+                let Some((status, sub, idempotency_key)) = row else {
+                    return Ok(false);
+                };
+                if status != "FAILED" {
+                    return Ok(false);
+                }
+
+                tx.execute(
+                    "UPDATE refund_attempt SET status='PENDING', attempts=0, updated_at=?2
+                     WHERE id=?1 AND status='FAILED'",
+                    rusqlite::params![id, now],
+                )?;
+                // SUPERSEDE the stale parked-FAILED billing.refund DM (codex): its stable id would
+                // otherwise ON CONFLICT-block the success DM commit_sent enqueues when the retry pays,
+                // so the buyer could be told "failed" for a refund that actually settled. Deleting it
+                // lets the next terminalization (SENT or a fresh FAILED) enqueue the CURRENT outcome.
+                let outbox_id = crate::refund::refund_outbox_id(&idempotency_key, &id);
+                tx.execute("DELETE FROM outbox WHERE id=?1", rusqlite::params![outbox_id])?;
+
+                tx.execute(
+                    "INSERT INTO event_log (subscription_id, kind, detail_json, at) VALUES (?, ?, ?, ?)",
+                    rusqlite::params![sub, "refund_retry_requested", json!({"refund": id}).to_string(), now],
+                )?;
+                Ok(true)
+            }
+        })
+        .await;
+    match res {
+        Ok(true) => Reply::ok(json!({"id": id, "status": "PENDING", "requeued": true})),
+        Ok(false) => Reply::err(
+            "invalid_state",
+            format!("refund `{id}` is not a parked (FAILED) refund — nothing to retry"),
         ),
         Err(e) => Reply::err("internal", e.to_string()),
     }
@@ -872,6 +990,150 @@ mod tests {
         let arr = subs.data.unwrap();
         assert_eq!(arr[0]["id"], "s1");
         assert_eq!(arr[0]["state"], "ACTIVE");
+    }
+
+    // urw.5: `refunds` lists non-terminal + parked rows with their persisted fields, and
+    // `refund-retry` resets a parked (FAILED) row to PENDING while rejecting a non-parked id.
+    #[tokio::test]
+    async fn refunds_lists_and_retry_requeues_only_parked() {
+        let store = mem_store();
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let payment: Arc<dyn PaymentBackend> = Arc::new(crate::backends::MockPayment::new());
+
+        store
+            .transaction(|tx| {
+                // A parked (FAILED) refund with an LN-address dest, and a PENDING one.
+                tx.execute(
+                    "INSERT INTO refund_attempt (id, subscription_id, dest, amount_sat, idempotency_key, status, attempts, created_at, updated_at)
+                     VALUES ('r-failed', 's1', 'a@b.com', 500, 'refund:r-failed', 'FAILED', 5, 100, 200)",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO refund_attempt (id, subscription_id, dest, amount_sat, idempotency_key, status, attempts, created_at, updated_at)
+                     VALUES ('r-pending', 's2', 'lnbc1...', 700, 'refund:r-pending', 'PENDING', 1, 100, 150)",
+                    [],
+                )?;
+                // A SENT row must NOT appear in the list.
+                tx.execute(
+                    "INSERT INTO refund_attempt (id, subscription_id, dest, amount_sat, idempotency_key, status, attempts, created_at, updated_at)
+                     VALUES ('r-sent', 's3', 'x@y.com', 300, 'refund:r-sent', 'SENT', 1, 100, 160)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // List: the two non-terminal rows, with dest_form + fields; the SENT row excluded.
+        let list = dispatch(Request::Refunds, &store, &recipes, &clock, &payment).await;
+        let arr = list.data.unwrap();
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "PENDING + FAILED listed, SENT excluded");
+        let failed = arr.iter().find(|r| r["id"] == "r-failed").unwrap();
+        assert_eq!(failed["dest_form"], "ln_address");
+        assert_eq!(failed["amount_sat"], json!(500));
+        assert_eq!(failed["status"], "FAILED");
+        assert_eq!(failed["attempts"], json!(5));
+
+        // Retry the parked row → PENDING/attempts=0.
+        let retry = dispatch(
+            Request::RefundRetry { id: "r-failed".into() },
+            &store,
+            &recipes,
+            &clock,
+            &payment,
+        )
+        .await;
+        assert!(retry.ok, "retry of a parked refund succeeds: {:?}", retry.error);
+        let (status, attempts): (String, i64) = store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT status, attempts FROM refund_attempt WHERE id='r-failed'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!((status.as_str(), attempts), ("PENDING", 0));
+
+        // Retry a non-parked id (the SENT row) → invalid_state, mutates nothing.
+        let bad = dispatch(
+            Request::RefundRetry { id: "r-sent".into() },
+            &store,
+            &recipes,
+            &clock,
+            &payment,
+        )
+        .await;
+        assert!(!bad.ok);
+        assert_eq!(bad.error.unwrap().code, "invalid_state");
+        let sent_status: String = store
+            .read(|c| Ok(c.query_row("SELECT status FROM refund_attempt WHERE id='r-sent'", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(sent_status, "SENT", "a non-parked refund is untouched");
+    }
+
+    // urw.5 (codex P2): retry must SUPERSEDE the stale parked-FAILED billing.refund DM at the
+    // deterministic outbox id, so the later success DM isn't ON CONFLICT-blocked (buyer told
+    // "failed" for a refund that actually paid).
+    #[tokio::test]
+    async fn retry_supersedes_the_stale_failed_refund_dm() {
+        let store = mem_store();
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let payment: Arc<dyn PaymentBackend> = Arc::new(crate::backends::MockPayment::new());
+
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO refund_attempt (id, subscription_id, dest, amount_sat, idempotency_key, status, attempts, created_at, updated_at)
+                     VALUES ('ref-order:s1', 's1', 'a@b.com', 500, 'refund:order:s1', 'FAILED', 5, 10, 20)",
+                    [],
+                )?;
+                // The stale parked-FAILED billing.refund DM at the deterministic outbox id.
+                tx.execute(
+                    "INSERT INTO outbox (id, recipient, subscription_id, msg_type, payload_json, state, attempts, created_at)
+                     VALUES ('outbox:refund:order:s1', 'buyerhex', 's1', 'billing.refund',
+                             '{\"type\":\"billing.refund\",\"subscription_id\":\"s1\",\"amount_sat\":500,\"status\":\"failed\"}',
+                             'PENDING', 0, 20)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let outbox_count = |store: Store| async move {
+            store
+                .read(|c| {
+                    Ok(c.query_row(
+                        "SELECT count(*) FROM outbox WHERE id='outbox:refund:order:s1'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )?)
+                })
+                .await
+                .unwrap()
+        };
+        assert_eq!(outbox_count(store.clone()).await, 1, "stale failed DM present");
+
+        let retry = dispatch(
+            Request::RefundRetry { id: "ref-order:s1".into() },
+            &store,
+            &recipes,
+            &clock,
+            &payment,
+        )
+        .await;
+        assert!(retry.ok, "retry: {:?}", retry.error);
+        assert_eq!(
+            outbox_count(store).await,
+            0,
+            "the stale failed DM is superseded so a fresh success DM can enqueue"
+        );
     }
 
     // urw.2: `teardowns` lists open dead-letters and `status` folds `open_teardowns`.
