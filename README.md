@@ -101,7 +101,7 @@ DO_TOKEN=<digitalocean_token> LNRENT_DATA_DIR=./data LNRENT_RECIPES_DIR=./recipe
 
 ```sh
 LNRENT_DATA_DIR=./data nix develop . --command cargo run -p lnrentd --bin lnrent -- money
-#   subcommands: status · recipes · subs · sub <id> · money · suspend <id> · resume <id>   (add --json for machine output)
+#   subcommands: status · recipes · subs · sub <id> · money · teardowns · suspend <id> · resume <id>   (add --json for machine output)
 ```
 
 **Buyer CLI** (talks to the operator over a relay; the buyer pays the returned invoice from their own

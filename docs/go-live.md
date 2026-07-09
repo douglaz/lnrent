@@ -127,6 +127,11 @@ Share the listing coordinate / operator npub.
   daemon you know is up still warrants a direct check.
 - **Refunds self-fund from sales** — you do not pre-fund; keep a small float for outbound Lightning fees.
   A refund that can't be paid parks visibly (surfaced by `lnrent money` + the logs), it is never dropped.
+- **Watch for owed teardowns:** `lnrent teardowns` (and the `open_teardowns` count in `lnrent status`)
+  lists provider resources the daemon failed to tear down — a `destroy` hook that failed, or a stuck
+  provision-failure cleanup. A droplet that failed to delete keeps billing you until this clears; the
+  daemon retries the (idempotent) hook automatically with backoff and DMs a `TeardownFailed` alert,
+  but a persistent entry means you should delete the resource by hand (e.g. in the DigitalOcean UI).
 - **Run it durably** — under systemd (`Restart=always`); SIGTERM drains in-flight work + flushes the outbox.
 - **Back up on a cadence** — stop the daemon → `lnrentd backup --dest <dir>` → copy off-box → restart.
 - **Cancellations are automatic** — a buyer `sub.cancel` runs out the paid period, then reconcile destroys

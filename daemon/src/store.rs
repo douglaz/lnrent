@@ -236,6 +236,18 @@ CREATE TABLE IF NOT EXISTS native_connect_session (  -- interactive-op tickets (
   expires_at      INTEGER,
   created_at      INTEGER
 );
+CREATE TABLE IF NOT EXISTS teardown_failure (  -- orphaned-instance dead-letter (lnrent-urw.2, GATE-1 PR-6)
+  id              TEXT PRIMARY KEY,  -- stable `td:<subscription_id>:<hook>` so a repeat failure upserts
+  subscription_id TEXT NOT NULL,
+  hook            TEXT NOT NULL,     -- the lifecycle hook that failed (M1a: `destroy`)
+  handles_json    TEXT,              -- the instance handles the retry re-runs the hook with
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  last_error      TEXT,              -- capped like MAX_TEARDOWN_ERROR_CHARS
+  first_failed_at INTEGER NOT NULL,
+  last_attempt_at INTEGER NOT NULL,
+  resolved_at     INTEGER            -- NULL = still open (provider-side cleanup owed)
+);
+CREATE INDEX IF NOT EXISTS teardown_failure_open_idx ON teardown_failure(resolved_at);
 "#;
 
 /// Migration 2 (lnrent-7fp.5): the transport-level inbound-DM dedup table. The Nostr engine
@@ -299,6 +311,25 @@ CREATE INDEX IF NOT EXISTS event_log_kind_idx ON event_log(kind);
 CREATE INDEX IF NOT EXISTS event_log_sub_kind_idx ON event_log(subscription_id, kind);
 ";
 
+// lnrent-urw.2 (GATE-1 PR-6): the orphaned-instance dead-letter table. A NEW table, so
+// `CREATE TABLE IF NOT EXISTS` is inherently idempotent — a fresh DB creates it from the §11 SCHEMA
+// above and this migration is a no-op; a legacy DB gets the table here. No duplicate-column dance.
+// Appended — never edit a shipped migration.
+const M7_TEARDOWN_FAILURE: &str = "
+CREATE TABLE IF NOT EXISTS teardown_failure (
+  id              TEXT PRIMARY KEY,
+  subscription_id TEXT NOT NULL,
+  hook            TEXT NOT NULL,
+  handles_json    TEXT,
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  last_error      TEXT,
+  first_failed_at INTEGER NOT NULL,
+  last_attempt_at INTEGER NOT NULL,
+  resolved_at     INTEGER
+);
+CREATE INDEX IF NOT EXISTS teardown_failure_open_idx ON teardown_failure(resolved_at);
+";
+
 /// Ordered migrations (lnrent-7fp.3): index `i` upgrades the DB from schema version `i` to
 /// `i+1`. Version 1 is the §11 schema; version 2 adds `seen_message` (lnrent-7fp.5); version 3 adds
 /// `subscription.suspend_not_before` (lnrent-7fp.22); version 4 adds the `refund_attempt` resolver
@@ -312,6 +343,7 @@ const MIGRATIONS: &[&str] = &[
     M4_REFUND_RESOLUTION,
     M5_IDEMPOTENCY_CACHE_INDEXES,
     M6_EVENT_LOG_INDEXES,
+    M7_TEARDOWN_FAILURE,
 ];
 
 /// The target schema version this binary expects (= number of migrations).
@@ -734,7 +766,8 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 15);
+        // 15 §11 tables + `teardown_failure` (lnrent-urw.2). `seen_message` is migration-only (M2).
+        assert_eq!(n, 16);
     }
 
     #[test]
@@ -752,8 +785,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // The §11 schema (15 tables) plus `seen_message` from migration 2 (lnrent-7fp.5).
-        assert_eq!(n, 16);
+        // The §11 schema (15 tables) plus `seen_message` (migration 2, lnrent-7fp.5) plus
+        // `teardown_failure` (SCHEMA + migration 7, lnrent-urw.2).
+        assert_eq!(n, 17);
     }
 
     // M6: the maintenance pass scans event_log every few seconds on the sole-writer connection;

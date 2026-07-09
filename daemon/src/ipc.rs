@@ -6,9 +6,11 @@
 
 use crate::backends::{PaymentBackend, DEV_SETTLE_UNSUPPORTED};
 use crate::clock::Clock;
+use crate::provision;
 use crate::recipe::Recipe;
 use crate::store::Store;
 use crate::supervisor::{refund_readiness_report_with_probe, RefundReadinessProbe};
+use crate::teardown;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -27,6 +29,9 @@ pub enum Request {
     Money,
     Subs,
     Sub { id: String },
+    /// Open teardown dead-letters (lnrent-urw.2): failed retention `destroy` hooks + the
+    /// provision-failure cleanup backlog — provider resources that may still be billing.
+    Teardowns,
     AdminSuspend { id: String },
     AdminResume { id: String },
     DevSettle { subscription_id: String },
@@ -186,19 +191,33 @@ pub async fn dispatch(
     payment: &Arc<dyn PaymentBackend>,
 ) -> Reply {
     match req {
-        Request::Status => match store
-            .read(|c| {
-                Ok(c.query_row("SELECT count(*) FROM subscription", [], |r| {
-                    r.get::<_, i64>(0)
-                })?)
-            })
-            .await
-        {
-            Ok(n) => {
-                Reply::ok(json!({"daemon": "ok", "recipes": recipes.len(), "subscriptions": n}))
+        Request::Status => {
+            let subs = store
+                .read(|c| {
+                    Ok(c.query_row("SELECT count(*) FROM subscription", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?)
+                })
+                .await;
+            let recipe_id = recipes.first().map(|r| r.service.id.clone()).unwrap_or_default();
+            // `open_teardowns` folds BOTH owed-cleanup sources (lnrent-urw.2): the reconcile
+            // `teardown_failure` rows and the provision-failure cleanup backlog.
+            let open_teardowns = async {
+                let failures = teardown::open_count(store).await?;
+                let (cleanups, _) = provision::open_cleanups_summary_for(store, &recipe_id).await?;
+                anyhow::Ok(failures + cleanups)
             }
-            Err(e) => Reply::err("internal", e.to_string()),
-        },
+            .await;
+            match (subs, open_teardowns) {
+                (Ok(n), Ok(t)) => Reply::ok(json!({
+                    "daemon": "ok",
+                    "recipes": recipes.len(),
+                    "subscriptions": n,
+                    "open_teardowns": t,
+                })),
+                (Err(e), _) | (_, Err(e)) => Reply::err("internal", e.to_string()),
+            }
+        }
 
         Request::Recipes => {
             let list: Vec<Value> = recipes
@@ -228,6 +247,30 @@ pub async fn dispatch(
             match store.read(move |c| query_sub(c, &id2)).await {
                 Ok(Some(v)) => Reply::ok(v),
                 Ok(None) => Reply::err("not_found", format!("no subscription `{id}`")),
+                Err(e) => Reply::err("internal", e.to_string()),
+            }
+        }
+
+        Request::Teardowns => {
+            let recipe_id = recipes.first().map(|r| r.service.id.clone()).unwrap_or_default();
+            let now = clock.now();
+            let result = async {
+                let failures = teardown::open_rows(store).await?;
+                let (cleanups_open, cleanups_oldest) =
+                    provision::open_cleanups_summary_for(store, &recipe_id).await?;
+                anyhow::Ok((failures, cleanups_open, cleanups_oldest))
+            }
+            .await;
+            match result {
+                Ok((failures, cleanups_open, cleanups_oldest)) => {
+                    let rows: Vec<Value> = failures.iter().map(|r| r.to_value(now)).collect();
+                    Reply::ok(json!({
+                        "teardown_failures": rows,
+                        "provision_cleanups_open": cleanups_open,
+                        "provision_cleanups_oldest_at": cleanups_oldest,
+                        "open_total": rows.len() as i64 + cleanups_open,
+                    }))
+                }
                 Err(e) => Reply::err("internal", e.to_string()),
             }
         }
@@ -829,6 +872,35 @@ mod tests {
         let arr = subs.data.unwrap();
         assert_eq!(arr[0]["id"], "s1");
         assert_eq!(arr[0]["state"], "ACTIVE");
+    }
+
+    // urw.2: `teardowns` lists open dead-letters and `status` folds `open_teardowns`.
+    #[tokio::test]
+    async fn teardowns_and_status_surface_open_dead_letters() {
+        let store = mem_store();
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let payment: Arc<dyn PaymentBackend> = Arc::new(crate::backends::MockPayment::new());
+
+        // Empty to start.
+        let td = dispatch(Request::Teardowns, &store, &recipes, &clock, &payment).await;
+        assert_eq!(td.data.unwrap()["open_total"], json!(0));
+        let st = dispatch(Request::Status, &store, &recipes, &clock, &payment).await;
+        assert_eq!(st.data.unwrap()["open_teardowns"], json!(0));
+
+        // Record a failed teardown → it surfaces in both.
+        crate::teardown::record_failure(&store, "s1", "destroy", None, "boom", 100)
+            .await
+            .unwrap();
+
+        let td = dispatch(Request::Teardowns, &store, &recipes, &clock, &payment).await;
+        let d = td.data.unwrap();
+        assert_eq!(d["open_total"], json!(1));
+        assert_eq!(d["teardown_failures"][0]["subscription_id"], "s1");
+        assert_eq!(d["teardown_failures"][0]["hook"], "destroy");
+
+        let st = dispatch(Request::Status, &store, &recipes, &clock, &payment).await;
+        assert_eq!(st.data.unwrap()["open_teardowns"], json!(1));
     }
 
     #[tokio::test]

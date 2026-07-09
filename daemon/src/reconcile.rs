@@ -49,11 +49,13 @@ use serde_json::{json, Value};
 
 use lnrent_wire::{BillingInvoice, BillingNotice, Msg};
 
+use crate::alerts::{Alert, AlertDispatcher, AlertKind};
 use crate::backends::{PaymentBackend, PaymentStatus};
 use crate::recipe::Recipe;
 use crate::reservation;
 use crate::runner::{run_hook, DEFAULT_TIMEOUT};
 use crate::store::Store;
+use crate::teardown;
 
 /// FLOOR for the soft-date auto-renewal invoice's Lightning expiry (seconds). The actual expiry is
 /// sized to the renewal WINDOW — from soft_date through the CREDITED resumable boundary
@@ -91,6 +93,10 @@ pub struct Reconciler {
     /// The recipe this operator serves (M1a is single-recipe): the `suspend`/`destroy` lifecycle
     /// hooks and the renewal price.
     recipe: Recipe,
+    /// Optional GATE-1 alert sink (lnrent-urw.2): a failed retention `destroy` hook records a
+    /// `teardown_failure` dead-letter and fires a `TeardownFailed` operator DM. `None` in focused
+    /// unit tests / mock wiring; the supervisor injects the real one via [`Reconciler::with_alerts`].
+    alerts: Option<Arc<AlertDispatcher>>,
 }
 
 /// A subscription whose deadline cursor is due this tick (`next_deadline <= now`).
@@ -142,6 +148,31 @@ impl Reconciler {
             store,
             payment,
             recipe,
+            alerts: None,
+        }
+    }
+
+    /// Inject the GATE-1 alert sink (lnrent-urw.2) so a failed retention `destroy` surfaces a
+    /// `TeardownFailed` operator DM; without it the dead-letter is still recorded + retried, just
+    /// not alerted.
+    pub fn with_alerts(mut self, alerts: Arc<AlertDispatcher>) -> Self {
+        self.alerts = Some(alerts);
+        self
+    }
+
+    /// Fire a `TeardownFailed` alert best-effort (cooldown-suppressed; keyed on the sub so repeated
+    /// retries collapse to one DM per 6h). Never fails the reconcile tick.
+    async fn alert_teardown(&self, sub_id: &str, hook: &str, attempts: i64, error: &str) {
+        let Some(alerts) = &self.alerts else { return };
+        let detail = format!(
+            "provider teardown owed: `{hook}` hook for sub {sub_id} has failed {attempts} time(s); \
+             the resource may still be billing. Latest error: {error}"
+        );
+        if let Err(e) = alerts
+            .dispatch(Alert::new(AlertKind::TeardownFailed, sub_id, detail))
+            .await
+        {
+            tracing::warn!(error = %format!("{e:#}"), "failed to enqueue TeardownFailed alert");
         }
     }
 
@@ -266,6 +297,16 @@ impl Reconciler {
                 "reconcile: idempotency cache sweep"
             ),
             Err(e) => tracing::warn!(error = %e, "reconcile: idempotency cache sweep failed (non-fatal)"),
+        }
+
+        // Retry any owed provider teardowns (lnrent-urw.2) whose backoff has elapsed. Best-effort:
+        // a retry error must not fail the tick — the row stays open for the next pass.
+        match self.retry_teardowns(now).await {
+            Ok(resolved) if resolved > 0 => {
+                tracing::info!(resolved, "reconcile: teardown dead-letters resolved")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "reconcile: teardown retry pass failed (non-fatal)"),
         }
 
         Ok(report)
@@ -617,9 +658,17 @@ impl Reconciler {
             .await
     }
 
-    async fn run_lifecycle_hook(&self, hook: &str, sub_id: &str, buyer_hex: &str) -> Result<()> {
+    /// Run a lifecycle hook. A hook FAILURE is non-fatal (logged) and returned as `Some(error)` so
+    /// the caller can act on it — `fire_destroy` dead-letters it (lnrent-urw.2), `fire_suspend`
+    /// ignores it (a failed suspend burns no money). `None` = the hook ran cleanly.
+    async fn run_lifecycle_hook(
+        &self,
+        hook: &str,
+        sub_id: &str,
+        buyer_hex: &str,
+    ) -> Result<Option<String>> {
         let input = self.lifecycle_hook_input(sub_id, buyer_hex).await?;
-        if let Err(e) = run_hook(
+        match run_hook(
             &self.recipe.hook(hook),
             &input,
             DEFAULT_TIMEOUT,
@@ -627,14 +676,70 @@ impl Reconciler {
         )
         .await
         {
-            tracing::warn!(
-                sub = %sub_id,
-                hook,
-                error = %e,
-                "reconcile lifecycle hook failed (non-fatal)"
-            );
+            Ok(_) => Ok(None),
+            Err(e) => {
+                let error = format!("{e:#}");
+                tracing::warn!(
+                    sub = %sub_id,
+                    hook,
+                    %error,
+                    "reconcile lifecycle hook failed (non-fatal)"
+                );
+                Ok(Some(error))
+            }
         }
-        Ok(())
+    }
+
+    /// Retry every OPEN teardown dead-letter whose backoff has elapsed (lnrent-urw.2): re-run its
+    /// hook with the persisted handles (§7.2 idempotent, so re-running is safe). Success resolves the
+    /// row; a repeat failure bumps attempts + re-alerts. Best-effort — never fails the tick. Returns
+    /// how many rows resolved this pass.
+    async fn retry_teardowns(&self, now: i64) -> Result<usize> {
+        let mut resolved = 0;
+        for row in teardown::open_due_rows(&self.store, now).await? {
+            // Re-run the hook from the persisted handles alone — at retry time the sub is TERMINATED
+            // and its instance row may be gone, so we do NOT re-read it.
+            let handles: Value = row
+                .handles_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(Value::Null);
+            let input = json!({
+                "subscription": { "id": row.subscription_id },
+                "instance": { "subscription_id": row.subscription_id, "handles": handles.clone() },
+                "handles": handles,
+            });
+            match run_hook(
+                &self.recipe.hook(&row.hook),
+                &input,
+                DEFAULT_TIMEOUT,
+                &self.recipe.provisioning.env,
+            )
+            .await
+            {
+                Ok(_) => {
+                    teardown::mark_resolved(&self.store, &row.subscription_id, &row.hook, now)
+                        .await?;
+                    tracing::info!(sub = %row.subscription_id, hook = %row.hook, "teardown retry succeeded; dead-letter resolved");
+                    resolved += 1;
+                }
+                Err(e) => {
+                    let error = format!("{e:#}");
+                    let attempts = teardown::record_failure(
+                        &self.store,
+                        &row.subscription_id,
+                        &row.hook,
+                        row.handles_json.clone(),
+                        &error,
+                        now,
+                    )
+                    .await?;
+                    self.alert_teardown(&row.subscription_id, &row.hook, attempts, &error)
+                        .await;
+                }
+            }
+        }
+        Ok(resolved)
     }
 
     async fn lifecycle_hook_input(&self, sub_id: &str, buyer_hex: &str) -> Result<Value> {
@@ -857,8 +962,8 @@ impl Reconciler {
         if self.renewal_settlement_pending(sub_id).await? {
             return Ok(false);
         }
-        self.run_lifecycle_hook("suspend", sub_id, buyer_hex)
-            .await?;
+        // A failed suspend is non-fatal and burns no money — log and proceed (no dead-letter).
+        let _ = self.run_lifecycle_hook("suspend", sub_id, buyer_hex).await?;
 
         let notice = Msg::BillingNotice(BillingNotice {
             subscription_id: sub_id.to_string(),
@@ -906,8 +1011,20 @@ impl Reconciler {
         if self.renewal_settlement_pending(sub_id).await? {
             return Ok(false);
         }
-        self.run_lifecycle_hook("destroy", sub_id, buyer_hex)
-            .await?;
+        // A failed retention `destroy` is DEAD-LETTERED (lnrent-urw.2): the provider resource may not
+        // have been torn down and keeps billing the operator invisibly. Purely additive — record the
+        // owed cleanup + alert, then still TERMINATE + release below (unchanged: §9.3). The retry
+        // loop re-runs the idempotent hook until it succeeds.
+        if let Some(error) = self.run_lifecycle_hook("destroy", sub_id, buyer_hex).await? {
+            let handles = self
+                .hook_instance(sub_id)
+                .await?
+                .and_then(|i| i.handles_json);
+            let attempts =
+                teardown::record_failure(&self.store, sub_id, "destroy", handles, &error, now)
+                    .await?;
+            self.alert_teardown(sub_id, "destroy", attempts, &error).await;
+        }
 
         let id = sub_id.to_string();
         self.store
@@ -1187,6 +1304,38 @@ mod tests {
 
     fn reconciler(store: Store, recipe: Recipe) -> Reconciler {
         Reconciler::new(store, Arc::new(crate::backends::MockPayment::new()), recipe)
+    }
+
+    /// A dummy-id recipe whose `destroy` hook FAILS (exit 1) — for the teardown dead-letter path
+    /// (lnrent-urw.2). Returns the recipe + its dir so a test can later overwrite `destroy` to
+    /// succeed and exercise the retry-resolution.
+    fn failing_destroy_recipe() -> (Recipe, PathBuf) {
+        let (mut r, _s, destroy) = marker_recipe();
+        let dir = destroy.parent().unwrap().to_path_buf();
+        std::fs::write(
+            dir.join("destroy"),
+            "#!/usr/bin/env bash\ncat >/dev/null; echo 'boom: droplet delete failed' >&2; exit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(dir.join("destroy"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        r.dir = dir.clone();
+        (r, dir)
+    }
+
+    /// A reconciler with an ENABLED alert sink delivering to `recipient`, so a teardown failure
+    /// enqueues an `operator.alert` outbox row.
+    fn reconciler_with_alerts(store: Store, recipe: Recipe, recipient: &str) -> Reconciler {
+        let dispatcher = Arc::new(crate::alerts::AlertDispatcher::new(
+            store.clone(),
+            Arc::new(TestClock::new(0)),
+            recipient.to_string(),
+        ));
+        reconciler(store, recipe).with_alerts(dispatcher)
+    }
+
+    async fn operator_alert_count(store: &Store) -> i64 {
+        count(store, "SELECT count(*) FROM outbox WHERE msg_type='operator.alert'").await
     }
 
     fn settlement(external_id: &str, settled_at: i64) -> crate::backends::Settlement {
@@ -1672,6 +1821,64 @@ mod tests {
             1,
             "the reservation was released in the terminate txn"
         );
+    }
+
+    // urw.2: a FAILING retention `destroy` still TERMINATES + releases the reservation (unchanged),
+    // AND records one open teardown_failure dead-letter + fires exactly one TeardownFailed alert.
+    #[tokio::test]
+    async fn failing_destroy_dead_letters_alerts_and_still_terminates() {
+        let store = mem_store();
+        let (recipe, _dir) = failing_destroy_recipe();
+        seed_sub(&store, "s1", "SUSPENDED", "buyerhex", Some(1000), 500, Some(1500)).await;
+        seed_reservation(&store, "s1").await;
+        let r = reconciler_with_alerts(store.clone(), recipe, "op-npub");
+
+        let rep = r.reconcile_tick(1500).await.unwrap();
+
+        // The terminate + release are UNCHANGED by the dead-letter (§9.3).
+        assert_eq!(rep.terminated, 1);
+        assert_eq!(sub_state(&store, "s1").await, "TERMINATED");
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM reservation WHERE order_id='s1' AND state='RELEASED'").await,
+            1,
+            "reservation still released in the terminate txn"
+        );
+        // The owed cleanup is recorded + alerted.
+        let row = crate::teardown::open_row(&store, "s1", "destroy").await.unwrap().unwrap();
+        assert_eq!(row.attempts, 1);
+        assert!(row.last_error.as_deref().unwrap_or("").contains("exit"), "hook error captured");
+        assert_eq!(operator_alert_count(&store).await, 1, "one TeardownFailed alert");
+    }
+
+    // urw.2: the retry loop re-runs the (now-fixed) destroy hook past its backoff and resolves the
+    // dead-letter; a resolved row drops out of the open view.
+    #[tokio::test]
+    async fn teardown_retry_resolves_when_hook_later_succeeds() {
+        let store = mem_store();
+        let (recipe, dir) = failing_destroy_recipe();
+        seed_sub(&store, "s1", "SUSPENDED", "buyerhex", Some(1000), 500, Some(1500)).await;
+        seed_reservation(&store, "s1").await;
+        let r = reconciler_with_alerts(store.clone(), recipe, "op-npub");
+
+        // First tick: destroy fails → open dead-letter (attempts=1, last_attempt_at=1500).
+        r.reconcile_tick(1500).await.unwrap();
+        assert_eq!(crate::teardown::open_count(&store).await.unwrap(), 1);
+
+        // Fix the destroy hook so the retry succeeds.
+        std::fs::write(
+            dir.join("destroy"),
+            "#!/usr/bin/env bash\ncat >/dev/null; echo '{\"ok\":true}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(dir.join("destroy"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A tick before the backoff (attempts=1 → 120s) elapses does NOT retry.
+        r.reconcile_tick(1600).await.unwrap();
+        assert_eq!(crate::teardown::open_count(&store).await.unwrap(), 1, "not yet due");
+
+        // Past the backoff: the retry runs the fixed hook and resolves the row.
+        r.reconcile_tick(1620).await.unwrap();
+        assert_eq!(crate::teardown::open_count(&store).await.unwrap(), 0, "retry resolved the dead-letter");
     }
 
     // Test 2: a renewal invoice expiring unpaid changes ONLY the invoice (-> EXPIRED), never the sub.
