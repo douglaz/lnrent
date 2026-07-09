@@ -26,6 +26,7 @@ use lnrentd::supervisor::{Intervals, Supervisor};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(
@@ -133,20 +134,133 @@ struct RestoreArgs {
     json: bool,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// Synchronous entrypoint (lnrent-y4m.7): each env-consuming path loads its config — which reads
+/// and CONSUMES the seed/secret env vars into a zeroizing guard — then scrubs those vars from the
+/// daemon's own env while STILL SINGLE-THREADED, and only THEN builds the tokio runtime. This
+/// ordering is why `main` is not `#[tokio::main]`: `std::env::remove_var` must not race a
+/// worker-thread `getenv`, and `#[tokio::main]` would spawn those workers before any `main`-body
+/// code runs. Backup/Restore consume no env secrets and need no runtime.
+fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
-        Some(Command::Bootstrap(args)) => run_bootstrap(args).await,
+        Some(Command::Bootstrap(args)) => run_bootstrap_entry(args),
         Some(Command::Backup(args)) => run_backup(args),
         Some(Command::Restore(args)) => run_restore(args),
-        None => match run_daemon().await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("lnrentd: {e:#}");
-                ExitCode::FAILURE
-            }
+        None => run_daemon_entry(),
+    }
+}
+
+/// The bootstrap SECRET env vars scrubbed after the config load consumes them (lnrent-y4m.7). Mirror
+/// of the `ENV_MNEMONIC` / `ENV_FEDIMINT_*` names in `config.rs`.
+const SECRET_ENV_VARS: &[&str] = &[
+    "LNRENT_MNEMONIC",
+    "LNRENT_FEDIMINT_INVITE",
+    "LNRENT_FEDIMINT_GATEWAY",
+];
+
+/// Remove the bootstrap secrets from the daemon's own process env, AFTER the synchronous config load
+/// has consumed them and BEFORE the tokio runtime spawns worker threads (so this `remove_var` cannot
+/// race a concurrent `getenv`). Defense-in-depth (lnrent-y4m.7): it does NOT overwrite the
+/// kernel-placed initial env block, so `/proc/self/environ` may still show these until the operator
+/// launches via systemd-credential/stdin — but the load-bearing guarantee is `run_hook`'s
+/// `.env_clear()`, which means no hook ever receives them regardless.
+fn scrub_secret_env() {
+    for name in SECRET_ENV_VARS {
+        std::env::remove_var(name);
+    }
+}
+
+/// Build the multi-thread tokio runtime explicitly (see [`main`]); an error is fatal.
+fn build_runtime() -> Result<tokio::runtime::Runtime, ExitCode> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            eprintln!("lnrentd: failed to build the async runtime: {e}");
+            ExitCode::FAILURE
+        })
+}
+
+/// Daemon-run path: load config (reads env), scrub secrets single-threaded, build the runtime, run.
+fn run_daemon_entry() -> ExitCode {
+    let input = BootstrapInput {
+        flags: RawConfig::default(),
+        config_path: None,
+        read_stdin: false,
+    };
+    let raw = match config::load_raw_config(input) {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!(
+                "lnrentd: operator bootstrap failed: {} ({})",
+                e.message, e.code
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    scrub_secret_env();
+    let rt = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    match rt.block_on(run_daemon(raw)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("lnrentd: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Bootstrap path: build the input from flags, load config (reads env), scrub, build runtime, run.
+fn run_bootstrap_entry(args: BootstrapArgs) -> ExitCode {
+    let json = args.json;
+    // The seed on the `--mnemonic` flag lands in the process table (`/proc/<pid>/cmdline`, `ps`),
+    // readable by other local users. Emit a runtime warning steering the operator to
+    // LNRENT_MNEMONIC / a config file / stdin. SUPPRESSED under `--json` (a `--json` error is a
+    // single JSON document on stderr; a free-text line ahead of it would corrupt that parse).
+    if args.mnemonic.is_some() && !json {
+        eprintln!(
+            "lnrentd bootstrap: warning: the seed passed via --mnemonic is visible in the process \
+             table to other local users; prefer LNRENT_MNEMONIC, a config file, or --stdin"
+        );
+    }
+    let raw = match config::load_raw_config(bootstrap_input(args)) {
+        Ok(raw) => raw,
+        Err(e) => return emit_bootstrap_error(&e, json),
+    };
+    scrub_secret_env();
+    let rt = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    rt.block_on(run_bootstrap(json, raw))
+}
+
+/// The [`BootstrapInput`] for the bootstrap CLI (flags from args + `--config` + `--stdin`).
+fn bootstrap_input(args: BootstrapArgs) -> BootstrapInput {
+    let flags = RawConfig {
+        data_dir: args.data_dir,
+        relays: if args.relays.is_empty() {
+            None
+        } else {
+            Some(args.relays)
         },
+        payment_backend: args.payment_backend,
+        // CUT-3: no CLI knob for the dead `compute_backend`; env (LNRENT_COMPUTE_BACKEND) and file
+        // layers still parse for back-compat, but a supplied value is ignored with a warning.
+        compute_backend: None,
+        fedimint_invite: args.fedimint_invite,
+        fedimint_gateway: args.fedimint_gateway,
+        mnemonic: args.mnemonic,
+    };
+    // Read stdin only when explicitly asked. Auto-reading every non-TTY stdin can block forever when
+    // an orchestrator launches us with an inherited open pipe even though flags/env/file already
+    // supplied all config.
+    BootstrapInput {
+        flags,
+        config_path: args.config,
+        read_stdin: args.stdin,
     }
 }
 
@@ -154,7 +268,7 @@ async fn main() -> ExitCode {
 /// ONCE, connect the Nostr engine, load the operator's recipe, and run the supervised M1a money path
 /// (IPC + Nostr inbound + settlement→capture + reconcile + maintenance) until a Ctrl-C / SIGTERM
 /// triggers a graceful shutdown.
-async fn run_daemon() -> Result<()> {
+async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
     tracing_subscriber::fmt::init();
 
     // With the `fedimint` feature the dependency tree has BOTH rustls providers (aws-lc-rs from
@@ -163,15 +277,9 @@ async fn run_daemon() -> Result<()> {
     #[cfg(feature = "fedimint")]
     fedimint_core::rustls::install_crypto_provider().await;
 
-    // Bootstrap is idempotent on a re-run (reads back the persisted seed); it opens the state DB
-    // ONCE and hands back the shared store handle (no double open).
-    let input = BootstrapInput {
-        flags: RawConfig::default(),
-        config_path: None,
-        read_stdin: false,
-    };
-    let mut raw = config::load_raw_config(input)
-        .map_err(|e| anyhow::anyhow!("operator bootstrap failed: {} ({})", e.message, e.code))?;
+    // Config was loaded + the seed/secret env vars scrubbed by the synchronous entrypoint
+    // (lnrent-y4m.7) before this runtime existed. Bootstrap is idempotent on a re-run (reads back
+    // the persisted seed); it opens the state DB ONCE and hands back the shared store handle.
     // Without the `fedimint` feature, FedimintPayment isn't compiled — reject `fedimint` BEFORE
     // bootstrap persists the operator row/seed (committing a `fedimint` row + `fedimint.json` would
     // brick a later `mock` retry, since the federation invite is never silently repointed). WITH the
@@ -365,57 +473,14 @@ async fn wait_for_term_signal() {
     }
 }
 
-/// The headless `lnrentd bootstrap` entrypoint: merge the four sources, run the bootstrap, and emit
-/// a structured result/error. Never prompts; always a deterministic exit code (ADR-0014, §4.7).
-async fn run_bootstrap(args: BootstrapArgs) -> ExitCode {
-    let json = args.json;
-    // The seed on the `--mnemonic` flag lands in the process table (`/proc/<pid>/cmdline`, `ps`),
-    // readable by other local users. The `--help` text says so, but that is invisible at the moment
-    // of misuse — emit a runtime warning to stderr steering the operator to LNRENT_MNEMONIC / a
-    // config file / stdin instead. SUPPRESSED under `--json`: a failing `--json` bootstrap writes
-    // its structured `{code,message,retryable}` error to STDERR (stdout stays empty on error), and
-    // machine callers parse that stderr as a SINGLE JSON document (see
-    // tests/bootstrap_cli.rs::json_error_with_mnemonic_flag_is_single_json_document) — a free-text
-    // warning line ahead of it would corrupt that parse. `--help` remains the nudge on the `--json`
-    // path (review R2 P3: the warning is stderr-bound, but so is the `--json` error channel).
-    if args.mnemonic.is_some() && !json {
-        eprintln!(
-            "lnrentd bootstrap: warning: the seed passed via --mnemonic is visible in the process \
-             table to other local users; prefer LNRENT_MNEMONIC, a config file, or --stdin"
-        );
-    }
-    let flags = RawConfig {
-        data_dir: args.data_dir,
-        relays: if args.relays.is_empty() {
-            None
-        } else {
-            Some(args.relays)
-        },
-        payment_backend: args.payment_backend,
-        // CUT-3: no CLI knob for the dead `compute_backend`; env (LNRENT_COMPUTE_BACKEND) and file
-        // layers still parse for back-compat, but a supplied value is ignored with a warning.
-        compute_backend: None,
-        fedimint_invite: args.fedimint_invite,
-        fedimint_gateway: args.fedimint_gateway,
-        mnemonic: args.mnemonic,
-    };
-    // Read stdin only when explicitly asked. Auto-reading every non-TTY stdin can block forever
-    // when an orchestrator launches us with an inherited open pipe even though flags/env/file
-    // already supplied all config.
-    let read_stdin = args.stdin;
-    let input = BootstrapInput {
-        flags,
-        config_path: args.config,
-        read_stdin,
-    };
-
-    let result = match config::load_raw_config(input) {
-        // `load_raw_config` returns the merged config in a `Zeroizing` guard (its plaintext mnemonic
-        // is wiped on drop); `mem::take` hands the real config to the headless bootstrap, leaving an
-        // empty default to drop harmlessly.
-        Ok(mut raw) => config::bootstrap_headless(std::mem::take(&mut *raw)).await,
-        Err(e) => Err(e),
-    };
+/// The headless `lnrentd bootstrap` entrypoint: run the bootstrap over the pre-loaded config and
+/// emit a structured result/error. Never prompts; always a deterministic exit code (ADR-0014, §4.7).
+/// Config load + secret-env scrub happened synchronously in [`run_bootstrap_entry`] before the
+/// runtime; here `raw` already holds the merged config in a zeroizing guard.
+async fn run_bootstrap(json: bool, mut raw: Zeroizing<RawConfig>) -> ExitCode {
+    // `mem::take` hands the real config to the headless bootstrap, leaving an empty default to drop
+    // harmlessly; the plaintext mnemonic is wiped on drop either way.
+    let result = config::bootstrap_headless(std::mem::take(&mut *raw)).await;
     match result {
         Ok(op) => {
             if json {
@@ -639,4 +704,47 @@ fn emit_bootstrap_error(err: &IpcError, json: bool) -> ExitCode {
         );
     }
     ExitCode::from(config::exit_code(&err.code))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Process-global env mutation must be serialized across tests.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // lnrent-y4m.7 Part A: the single-threaded scrub removes the seed/secret env vars from the
+    // daemon's own in-process environment, so `std::env::var` returns Err afterward. (We do NOT
+    // assert on /proc/self/environ — `remove_var` cannot overwrite the kernel-placed initial env
+    // block; that caveat is documented, and Part B's `.env_clear()` is the load-bearing guarantee.)
+    #[test]
+    fn scrub_removes_secret_env_vars() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prior: Vec<(&str, Option<String>)> = SECRET_ENV_VARS
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+
+        for k in SECRET_ENV_VARS {
+            std::env::set_var(k, "sensitive");
+        }
+        scrub_secret_env();
+        let results: Vec<bool> = SECRET_ENV_VARS
+            .iter()
+            .map(|k| std::env::var(k).is_err())
+            .collect();
+
+        // Restore before asserting so a failure can't leak state into other tests.
+        for (k, v) in prior {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        assert!(
+            results.iter().all(|&scrubbed| scrubbed),
+            "every SECRET_ENV_VARS entry is scrubbed from the daemon env"
+        );
+    }
 }

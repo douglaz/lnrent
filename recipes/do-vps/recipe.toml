@@ -21,6 +21,10 @@ backend = "cloud-do"
 isolation = "vm"
 tier = "0"
 resources = { cpu = 1, mem_mb = 1024, disk_gb = 25 }
+# Operator-env vars forwarded to this recipe's hooks (lnrent-y4m.7). Hooks otherwise get ONLY a
+# fixed base env — the daemon's own env (incl. the seed) never passes through. do-vps needs the
+# DigitalOcean API token plus the optional region/size/image overrides its hooks read.
+env = ["DO_TOKEN", "DO_REGION", "DO_SIZE", "DO_IMAGE"]
 
 [os]
 supports = ["debian"]

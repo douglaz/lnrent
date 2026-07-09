@@ -5,6 +5,13 @@
 //!
 //! A non-zero exit, a timeout, or non-JSON stdout is a failure — the daemon does not advance
 //! state on a failed hook (§7.2).
+//!
+//! **Hook env hygiene (lnrent-y4m.7, §13):** the child starts from a CLEARED environment. Only a
+//! fixed base allowlist ([`BASE_HOOK_ENV`], the vars a shell script needs to run tools) plus the
+//! recipe's own declared `provisioning.env` passthrough list reach the hook — each forwarded from
+//! the daemon env only if present. The daemon's `LNRENT*` namespace (which may hold the BIP39 seed)
+//! therefore NEVER reaches a hook by construction; secrets ride the stdin JSON, as the contract
+//! always intended.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
@@ -19,6 +26,35 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Cap on captured stdout/stderr (each), so a runaway hook cannot exhaust memory.
 pub const OUTPUT_CAP: usize = 1 << 20; // 1 MiB
 
+/// The fixed base env every hook receives (lnrent-y4m.7): the minimum for a shell script to find
+/// tools and behave sanely. Nothing else passes by default — in particular no `LNRENT*` var. Each
+/// is forwarded from the daemon env only when it is set there.
+const BASE_HOOK_ENV: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR"];
+
+/// Build the child env for a hook: the base allowlist plus the recipe's declared `env` passthrough,
+/// each taken from the daemon env only when present. `.env_clear()` + exactly these — so the seed
+/// and every other daemon var are excluded by construction. Recipe names are already
+/// `[A-Z0-9_]`-shaped and `LNRENT*`-free ([`crate::recipe::Recipe::validate`]).
+fn hook_env(env_passthrough: &[String]) -> Vec<(String, String)> {
+    hook_env_from(|k| std::env::var(k).ok(), env_passthrough)
+}
+
+/// The pure allowlist logic behind [`hook_env`], with the env lookup injected so it is testable
+/// without mutating the process environment: for each name in the base allowlist then the recipe
+/// passthrough, forward `(name, value)` iff `get` returns a value. Nothing outside those two lists
+/// is ever forwarded.
+fn hook_env_from(
+    get: impl Fn(&str) -> Option<String>,
+    env_passthrough: &[String],
+) -> Vec<(String, String)> {
+    BASE_HOOK_ENV
+        .iter()
+        .map(|s| s.to_string())
+        .chain(env_passthrough.iter().cloned())
+        .filter_map(|name| get(&name).map(|v| (name, v)))
+        .collect()
+}
+
 /// A successful hook run: the parsed stdout JSON (the delivery payload / op result data).
 #[derive(Debug, Clone)]
 pub struct HookOutput {
@@ -28,8 +64,16 @@ pub struct HookOutput {
 /// Run `hook` (an absolute path) with `input` on stdin, bounded by `timeout` and `OUTPUT_CAP`.
 /// A timeout, a cap breach on EITHER pipe, a non-zero exit, or non-JSON stdout is a failure —
 /// and the child is explicitly killed + reaped (not left to best-effort drop cleanup).
-pub async fn run_hook(hook: &Path, input: &Value, timeout: Duration) -> Result<HookOutput> {
-    let mut child = spawn_hook(hook).await?;
+///
+/// `env_passthrough` is the recipe's `provisioning.env` allowlist; the hook receives ONLY the base
+/// env + those vars (lnrent-y4m.7). Callers pass `&recipe.provisioning.env`.
+pub async fn run_hook(
+    hook: &Path,
+    input: &Value,
+    timeout: Duration,
+    env_passthrough: &[String],
+) -> Result<HookOutput> {
+    let mut child = spawn_hook(hook, env_passthrough).await?;
 
     let si = child.stdin.take();
     let input_bytes = serde_json::to_vec(input)?;
@@ -96,12 +140,18 @@ pub async fn run_hook(hook: &Path, input: &Value, timeout: Duration) -> Result<H
 /// still be momentarily open-for-write — and a parallel fork/exec can race the same way) and
 /// EAGAIN (fork hitting a transient resource limit under load). A real ENOENT/EACCES/etc. is NOT
 /// retried — a missing or non-executable hook fails fast. Worst-case added delay ~150ms.
-async fn spawn_hook(hook: &Path) -> Result<tokio::process::Child> {
+async fn spawn_hook(hook: &Path, env_passthrough: &[String]) -> Result<tokio::process::Child> {
     const ETXTBSY: i32 = 26; // "Text file busy"
     const EAGAIN: i32 = 11; // fork: resource temporarily unavailable
+    let env = hook_env(env_passthrough);
     let mut attempt = 0u32;
     loop {
         match Command::new(hook)
+            // Hook env hygiene (lnrent-y4m.7): start from EMPTY, add only the base allowlist + the
+            // recipe's declared passthrough. The daemon's env (incl. any LNRENT_MNEMONIC seed)
+            // never reaches the hook.
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -180,7 +230,7 @@ mod tests {
             "echo",
             "#!/usr/bin/env bash\nread -r line\necho '{\"ok\":true}'\n",
         );
-        let out = run_hook(&hook, &json!({"x": 1}), DEFAULT_TIMEOUT)
+        let out = run_hook(&hook, &json!({"x": 1}), DEFAULT_TIMEOUT, &[])
             .await
             .unwrap();
         assert_eq!(out.stdout_json, json!({"ok": true}));
@@ -189,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn nonzero_exit_is_failure() {
         let hook = write_hook("fail", "#!/usr/bin/env bash\necho '{}' ; exit 1\n");
-        let err = run_hook(&hook, &json!({}), DEFAULT_TIMEOUT)
+        let err = run_hook(&hook, &json!({}), DEFAULT_TIMEOUT, &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("failed (exit"), "got: {err}");
@@ -198,7 +248,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_and_fails() {
         let hook = write_hook("slow", "#!/usr/bin/env bash\nsleep 5\necho '{}'\n");
-        let err = run_hook(&hook, &json!({}), Duration::from_millis(200))
+        let err = run_hook(&hook, &json!({}), Duration::from_millis(200), &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out"));
@@ -211,7 +261,7 @@ mod tests {
     async fn large_stdin_to_a_nonreading_hook_times_out() {
         let hook = write_hook("ignore-stdin", "#!/usr/bin/env bash\nsleep 5\n");
         let big = json!({ "blob": "x".repeat(256 * 1024) }); // >> the ~64 KiB pipe buffer
-        let err = run_hook(&hook, &big, Duration::from_millis(300))
+        let err = run_hook(&hook, &big, Duration::from_millis(300), &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out"), "got: {err}");
@@ -230,6 +280,7 @@ mod tests {
             &r.hook("provision"),
             &json!({"subscription": {"id": "s1"}}),
             DEFAULT_TIMEOUT,
+            &r.provisioning.env,
         )
         .await
         .expect("provision runs");
@@ -239,7 +290,7 @@ mod tests {
         );
 
         let op = r.operation("status").expect("status op declared");
-        let res = run_hook(&r.op_hook(op), &json!({}), DEFAULT_TIMEOUT)
+        let res = run_hook(&r.op_hook(op), &json!({}), DEFAULT_TIMEOUT, &[])
             .await
             .expect("op runs");
         assert_eq!(res.stdout_json["state"], json!("running"));
@@ -248,7 +299,7 @@ mod tests {
     #[tokio::test]
     async fn non_json_stdout_is_failure() {
         let hook = write_hook("garbage", "#!/usr/bin/env bash\necho not-json\n");
-        let err = run_hook(&hook, &json!({}), DEFAULT_TIMEOUT)
+        let err = run_hook(&hook, &json!({}), DEFAULT_TIMEOUT, &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not JSON"));
@@ -262,7 +313,7 @@ mod tests {
             "flood-out",
             "#!/usr/bin/env bash\nhead -c 5000000 /dev/zero | tr '\\0' 'a'\n",
         );
-        let err = run_hook(&hook, &json!({}), Duration::from_millis(800))
+        let err = run_hook(&hook, &json!({}), Duration::from_millis(800), &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("exceeded the"), "got: {err}");
@@ -279,7 +330,7 @@ mod tests {
             "#!/usr/bin/env bash\nhead -c 5000000 /dev/zero | tr '\\0' 'a'\nsleep 5\n",
         );
         let big = json!({ "blob": "x".repeat(256 * 1024) }); // >> the pipe buffer; never drained
-        let err = run_hook(&hook, &big, Duration::from_millis(800))
+        let err = run_hook(&hook, &big, Duration::from_millis(800), &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("exceeded the"), "got: {err}");
@@ -292,9 +343,90 @@ mod tests {
             "flood-err",
             "#!/usr/bin/env bash\nhead -c 5000000 /dev/zero | tr '\\0' 'a' >&2\necho '{}'\n",
         );
-        let err = run_hook(&hook, &json!({}), Duration::from_millis(800))
+        let err = run_hook(&hook, &json!({}), Duration::from_millis(800), &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("exceeded the"), "got: {err}");
+    }
+
+    // lnrent-y4m.7: the pure allowlist logic. Forward ONLY the base env + the recipe passthrough,
+    // each only when the daemon env has it — never a seed/undeclared var, even if present in env.
+    #[test]
+    fn hook_env_forwards_only_base_and_declared_vars() {
+        let daemon_env = |k: &str| -> Option<String> {
+            match k {
+                "PATH" => Some("/usr/bin".into()),
+                "HOME" => Some("/root".into()),
+                "LNRENT_MNEMONIC" => Some("twelve seed words".into()),
+                "DO_TOKEN" => Some("dop_v1_secret".into()),
+                "UNDECLARED_X" => Some("nope".into()),
+                _ => None, // LANG/LC_ALL/TZ/TMPDIR unset here
+            }
+        };
+        let env = hook_env_from(daemon_env, &["DO_TOKEN".to_string()]);
+        let has = |k: &str| env.iter().any(|(name, _)| name == k);
+
+        assert!(has("PATH") && has("HOME"), "base allowlist forwarded when present");
+        assert!(has("DO_TOKEN"), "a recipe-declared var passes through");
+        assert!(!has("LNRENT_MNEMONIC"), "the seed is NEVER forwarded");
+        assert!(!has("UNDECLARED_X"), "an undeclared daemon var is not forwarded");
+        // Unset base vars are simply skipped (not forwarded empty).
+        assert!(!has("LANG"), "an unset base var is skipped");
+    }
+
+    // lnrent-y4m.7: prove the REAL `.env_clear()` at the process level — a hook spawned while the
+    // daemon (this test process) has LNRENT_MNEMONIC + an undeclared var set does NOT see them, but
+    // DOES see a recipe-declared var + the base PATH. Serialized (process-global env mutation) and
+    // restores prior values.
+    #[tokio::test]
+    async fn spawned_hook_never_sees_the_seed_or_undeclared_env() {
+        // A tokio mutex (not std) so the guard can be safely held across the `run_hook` await while
+        // the process-global env is mutated — no other env-mutating test runs concurrently.
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = ENV_LOCK.lock().await;
+
+        let prior_seed = std::env::var("LNRENT_MNEMONIC").ok();
+        let prior_tok = std::env::var("Y4M7_TEST_TOKEN").ok();
+        let prior_undecl = std::env::var("Y4M7_TEST_UNDECLARED").ok();
+        std::env::set_var("LNRENT_MNEMONIC", "twelve seed words");
+        std::env::set_var("Y4M7_TEST_TOKEN", "declared-value");
+        std::env::set_var("Y4M7_TEST_UNDECLARED", "leak-me");
+
+        // A hook that reports which vars it can see, as JSON booleans (declare -p succeeds iff set).
+        let hook = write_hook(
+            "dump-env",
+            "#!/usr/bin/env bash\nread -r _ 2>/dev/null || true\n\
+             chk() { if declare -p \"$1\" >/dev/null 2>&1; then echo true; else echo false; fi; }\n\
+             printf '{\"path\":%s,\"seed\":%s,\"token\":%s,\"undeclared\":%s}\\n' \
+             \"$(chk PATH)\" \"$(chk LNRENT_MNEMONIC)\" \"$(chk Y4M7_TEST_TOKEN)\" \"$(chk Y4M7_TEST_UNDECLARED)\"\n",
+        );
+        let out = run_hook(
+            &hook,
+            &json!({}),
+            DEFAULT_TIMEOUT,
+            &["Y4M7_TEST_TOKEN".to_string()],
+        )
+        .await
+        .unwrap();
+        let j = out.stdout_json;
+
+        // Restore before asserting so a failure can't leak env into other tests.
+        match prior_seed {
+            Some(v) => std::env::set_var("LNRENT_MNEMONIC", v),
+            None => std::env::remove_var("LNRENT_MNEMONIC"),
+        }
+        match prior_tok {
+            Some(v) => std::env::set_var("Y4M7_TEST_TOKEN", v),
+            None => std::env::remove_var("Y4M7_TEST_TOKEN"),
+        }
+        match prior_undecl {
+            Some(v) => std::env::set_var("Y4M7_TEST_UNDECLARED", v),
+            None => std::env::remove_var("Y4M7_TEST_UNDECLARED"),
+        }
+
+        assert_eq!(j["seed"], json!(false), "the LNRENT_MNEMONIC seed NEVER reaches a hook");
+        assert_eq!(j["undeclared"], json!(false), "an undeclared daemon var does not reach a hook");
+        assert_eq!(j["token"], json!(true), "a recipe-declared var passes through");
+        assert_eq!(j["path"], json!(true), "the base PATH is present");
     }
 }

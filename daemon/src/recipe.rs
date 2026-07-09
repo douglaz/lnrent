@@ -68,6 +68,13 @@ pub struct Provisioning {
     pub tier: String,
     #[serde(default)]
     pub resources: Resources,
+    /// Operator-environment variables this recipe's hooks are allowed to receive (lnrent-y4m.7).
+    /// Hooks otherwise get ONLY a fixed base env — the daemon's own env (incl. the seed) never
+    /// passes through. Each name present in the daemon env is forwarded; absent ones are skipped.
+    /// Bounded + `LNRENT*`-rejecting by [`Recipe::validate`]. Empty for recipes needing no operator
+    /// secrets (dummy, wireguard); do-vps declares `DO_TOKEN` + the DO_* knobs.
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 fn default_tier() -> String {
@@ -284,9 +291,43 @@ impl Recipe {
                 }
             }
         }
+
+        // Hook env-passthrough allowlist (lnrent-y4m.7): bound the list, enforce a strict env-name
+        // shape, and NEVER let the daemon's own `LNRENT*` namespace (which holds the seed) be
+        // forwardable — that is the whole point of the allowlist.
+        if self.provisioning.env.len() > MAX_RECIPE_ENV {
+            bail!(
+                "recipe `{}`: provisioning.env has {} entries (max {MAX_RECIPE_ENV})",
+                self.service.id,
+                self.provisioning.env.len()
+            );
+        }
+        for name in &self.provisioning.env {
+            if name.is_empty()
+                || name.len() > MAX_ENV_NAME_LEN
+                || !name.bytes().all(|b| matches!(b, b'A'..=b'Z' | b'0'..=b'9' | b'_'))
+            {
+                bail!(
+                    "recipe `{}`: provisioning.env name `{name}` must be 1..={MAX_ENV_NAME_LEN} chars of [A-Z0-9_]",
+                    self.service.id
+                );
+            }
+            if name.starts_with("LNRENT") {
+                bail!(
+                    "recipe `{}`: provisioning.env may not forward `{name}` — the LNRENT* namespace holds the operator seed and is never passable to hooks",
+                    self.service.id
+                );
+            }
+        }
         Ok(())
     }
 }
+
+/// Max recipe-declared env-passthrough entries (lnrent-y4m.7): a recipe needs a handful of operator
+/// vars (do-vps declares four); a small cap keeps the surface bounded.
+const MAX_RECIPE_ENV: usize = 16;
+/// Max env-var-name length in `provisioning.env`.
+const MAX_ENV_NAME_LEN: usize = 64;
 
 #[cfg(test)]
 mod tests {
@@ -406,6 +447,40 @@ hook = "get-config"
         let mut r = wireguard();
         r.dir = PathBuf::from("/nonexistent-recipe-dir");
         assert!(r.validate().is_err());
+    }
+
+    // lnrent-y4m.7: the recipe env-passthrough allowlist is bounded, shape-checked, and can NEVER
+    // forward the daemon's own `LNRENT*` namespace (which holds the seed).
+    #[test]
+    fn validate_rejects_bad_env_passthrough() {
+        for bad in [
+            vec!["LNRENT_MNEMONIC".to_string()],       // the seed's own namespace
+            vec!["LNRENT_FEDIMINT_INVITE".to_string()], // any LNRENT* prefix
+            vec!["do_token".to_string()],               // lowercase not allowed
+            vec!["DO-TOKEN".to_string()],               // hyphen not in [A-Z0-9_]
+            vec!["".to_string()],                       // empty
+            vec!["X".repeat(65)],                       // over the 64-char cap
+            (0..17).map(|i| format!("V{i}")).collect(), // over the 16-entry cap
+        ] {
+            let mut r = wireguard();
+            r.provisioning.env = bad.clone();
+            assert!(
+                r.validate().is_err(),
+                "expected validation failure for env = {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_the_do_vps_env_passthrough_shape() {
+        let mut r = wireguard();
+        r.provisioning.env = vec![
+            "DO_TOKEN".into(),
+            "DO_REGION".into(),
+            "DO_SIZE".into(),
+            "DO_IMAGE".into(),
+        ];
+        r.validate().expect("a well-formed non-LNRENT env list is accepted");
     }
 
     #[test]

@@ -619,7 +619,14 @@ impl Reconciler {
 
     async fn run_lifecycle_hook(&self, hook: &str, sub_id: &str, buyer_hex: &str) -> Result<()> {
         let input = self.lifecycle_hook_input(sub_id, buyer_hex).await?;
-        if let Err(e) = run_hook(&self.recipe.hook(hook), &input, DEFAULT_TIMEOUT).await {
+        if let Err(e) = run_hook(
+            &self.recipe.hook(hook),
+            &input,
+            DEFAULT_TIMEOUT,
+            &self.recipe.provisioning.env,
+        )
+        .await
+        {
             tracing::warn!(
                 sub = %sub_id,
                 hook,
