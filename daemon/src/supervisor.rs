@@ -1287,7 +1287,10 @@ async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) 
             return;
         }
     };
-    if report.liability_count == 0 {
+    // FederationDown is a ROOT infra failure (guardians unreachable) — it must alarm even at zero
+    // liabilities (the idle/pre-go-live case codex flagged); every other warning is a refund-coverage
+    // condition that only matters when something is owed.
+    if report.liability_count == 0 && report.warning != Some(RefundReadinessWarning::FederationDown) {
         return;
     }
 
@@ -1307,7 +1310,7 @@ async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) 
             federation_ok = report.federation_ok,
             gateway_ok = report.gateway_ok,
             parked_count = report.parked_count,
-            "refund readiness ALARM: the FEDERATION is unreachable (guardians down / no consensus) with liabilities outstanding — no invoices, payments, or refunds can settle; investigate the federation"
+            "refund readiness ALARM: the FEDERATION is unreachable (guardians down / no consensus) — no invoices, payments, or refunds can settle; investigate the federation"
         ),
         Some(RefundReadinessWarning::GatewayUnavailable) => tracing::warn!(
             liabilities = report.liability_count,
