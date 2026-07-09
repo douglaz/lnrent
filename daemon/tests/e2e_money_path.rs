@@ -155,12 +155,17 @@ async fn start_supervisor_with_sock(
     let engine = engine_for(op_keys, url, store.clone()).await;
     let sock = temp_sock();
     let payment_for_sync = payment.clone();
+    let alerts = Arc::new(lnrentd::alerts::AlertDispatcher::disabled(
+        store.clone(),
+        clock.clone(),
+    ));
     let sup = Supervisor::build(
         store,
         engine,
         payment,
         clock,
         Arc::new(PassThroughResolver),
+        alerts,
         recipe,
         sock.clone(),
         fast_intervals(),
@@ -3292,6 +3297,10 @@ async fn do_vps_real_payment_provisions_a_real_vm() {
         payment.clone(),
         clock.clone(),
         Arc::new(PassThroughResolver),
+        Arc::new(lnrentd::alerts::AlertDispatcher::disabled(
+            store.clone(),
+            clock.clone(),
+        )),
         recipe.clone(),
         temp_sock(),
         fast_intervals(),

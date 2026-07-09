@@ -280,6 +280,13 @@ const ENV_MAX_LIVE_HOLDS_PER_BUYER: &str = "LNRENT_MAX_LIVE_HOLDS_PER_BUYER";
 const ENV_INBOUND_RATE_CAPACITY: &str = "LNRENT_INBOUND_RATE_CAPACITY";
 const ENV_INBOUND_RATE_REFILL_PER_MIN: &str = "LNRENT_INBOUND_RATE_REFILL_PER_MIN";
 
+/// GATE-1 alert sink (PR-5, lnrent-urw.1). `LNRENT_ALERTS_ENABLED` overrides the payment-mode
+/// default (on for fedimint, off for mock); `LNRENT_ALERT_NPUB` is the operator's PERSONAL Nostr
+/// identity the daemon DMs alerts to (unset ⇒ self-DM to the operator key). Runtime knobs read at
+/// daemon start, not part of the persisted operator identity.
+const ENV_ALERTS_ENABLED: &str = "LNRENT_ALERTS_ENABLED";
+const ENV_ALERT_NPUB: &str = "LNRENT_ALERT_NPUB";
+
 /// Default for [`max_live_holds_per_buyer`]. Small and bounded: a legitimate buyer rarely needs more
 /// than one or two unpaid orders in flight, while a griefer wants many. `0` refuses ALL orders.
 pub const DEFAULT_MAX_LIVE_HOLDS_PER_BUYER: u32 = 2;
@@ -338,6 +345,36 @@ pub fn inbound_rate_refill_per_min() -> u32 {
         ENV_INBOUND_RATE_REFILL_PER_MIN,
         DEFAULT_INBOUND_RATE_REFILL_PER_MIN,
     )
+}
+
+/// Whether the GATE-1 alert sink (PR-5, lnrent-urw.1) is enabled. Default follows the payment
+/// backend — ON for `fedimint` (real money warrants surfacing), OFF for `mock` — and
+/// `LNRENT_ALERTS_ENABLED` (`true`/`false`/`1`/`0`) overrides it. A non-boolean value warns and
+/// keeps the default (a dead knob must never wedge startup).
+pub fn alerts_enabled(payment_backend: PaymentMode) -> bool {
+    let default = payment_backend == PaymentMode::Fedimint;
+    match std::env::var(ENV_ALERTS_ENABLED) {
+        Err(_) => default,
+        Ok(v) if v.trim().is_empty() => default,
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => true,
+            "false" | "0" | "no" | "off" => false,
+            _ => {
+                tracing::warn!(value = %v, "invalid {ENV_ALERTS_ENABLED}; using default {default}");
+                default
+            }
+        },
+    }
+}
+
+/// The operator's personal alert-recipient npub from `LNRENT_ALERT_NPUB`, or `None` (self-DM
+/// fallback). Returned as the raw configured string; `main` parses it to a pubkey when wiring the
+/// dispatcher, so a malformed value fails loudly there rather than being silently dropped here.
+pub fn alert_npub() -> Option<String> {
+    match std::env::var(ENV_ALERT_NPUB) {
+        Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+        _ => None,
+    }
 }
 
 impl RawConfig {

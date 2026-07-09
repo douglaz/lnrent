@@ -33,6 +33,7 @@ use rusqlite::{params, OptionalExtension, Transaction};
 
 use lnrent_wire::{BillingRefund, Msg};
 
+use crate::alerts::{Alert, AlertDispatcher, AlertKind};
 use crate::backends::{PayStatus, PaymentBackend};
 use crate::clock::Clock;
 use crate::refund_resolver::{
@@ -86,6 +87,11 @@ pub struct Refunder {
     clock: Arc<dyn Clock>,
     /// Turns a LN-address/LNURL `dest` into a payable bolt11 just before `pay()` (lnrent-ug8).
     resolver: Arc<dyn RefundResolver>,
+    /// Optional GATE-1 alert sink (lnrent-urw.1): surfaces a parked/stuck refund as a durable
+    /// operator DM, additive to the existing loud log. `None` in focused unit tests / mock wiring
+    /// that build via [`Refunder::new`]; the supervisor injects the real one via
+    /// [`Refunder::with_alerts`].
+    alerts: Option<Arc<AlertDispatcher>>,
 }
 
 /// One PENDING `refund_attempt` row to drain (just the fields the executor needs). `recipient` is the
@@ -212,6 +218,24 @@ impl Refunder {
             payment,
             clock,
             resolver,
+            alerts: None,
+        }
+    }
+
+    /// Inject the GATE-1 alert sink (lnrent-urw.1). The supervisor calls this so a parked/stuck
+    /// refund additionally surfaces as a durable operator DM; without it the refunder only logs.
+    pub fn with_alerts(mut self, alerts: Arc<AlertDispatcher>) -> Self {
+        self.alerts = Some(alerts);
+        self
+    }
+
+    /// Fire an alert best-effort: an enqueue failure is logged but NEVER fails the refund drive
+    /// (the loud log line at the call site already recorded the underlying condition).
+    async fn alert(&self, alert: Alert) {
+        if let Some(alerts) = &self.alerts {
+            if let Err(e) = alerts.dispatch(alert).await {
+                tracing::warn!(error = %format!("{e:#}"), "failed to enqueue operator alert");
+            }
         }
     }
 
@@ -869,6 +893,16 @@ impl Refunder {
                 %reason,
                 "refund parked FAILED — manual handling required"
             );
+            self.alert(Alert::new(
+                AlertKind::RefundParked,
+                row.id.clone(),
+                format!(
+                    "refund {} parked FAILED — manual handling required ({reason}); sub {}",
+                    row.id,
+                    row.subscription_id.as_deref().unwrap_or("-")
+                ),
+            ))
+            .await;
         }
         Ok(outcome)
     }
@@ -944,6 +978,16 @@ impl Refunder {
                 attempts = MAX_REFUND_ATTEMPTS,
                 "refund parked FAILED after exhausting retry attempts"
             );
+            self.alert(Alert::new(
+                AlertKind::RefundParked,
+                row.id.clone(),
+                format!(
+                    "refund {} parked FAILED after {MAX_REFUND_ATTEMPTS} pay attempts; sub {}",
+                    row.id,
+                    row.subscription_id.as_deref().unwrap_or("-")
+                ),
+            ))
+            .await;
         }
         Ok(outcome)
     }
@@ -988,6 +1032,18 @@ impl Refunder {
                     age_s = age,
                     "refund stuck PENDING without payment past the alert threshold (resolution/in-flight not progressing); operator attention needed"
                 );
+                // Edge-triggered: this logs EVERY drive past the threshold, but the dispatcher's
+                // per-(kind,subject) cooldown collapses it to one operator DM per 6h per refund.
+                self.alert(Alert::new(
+                    AlertKind::RefundStuck,
+                    row.id.clone(),
+                    format!(
+                        "refund {} stuck PENDING {age}s without payment (resolution/in-flight not progressing); sub {}",
+                        row.id,
+                        row.subscription_id.as_deref().unwrap_or("-")
+                    ),
+                ))
+                .await;
             }
         }
         Ok(outcome)
@@ -1305,6 +1361,44 @@ mod tests {
             Arc::new(clock.clone()),
             resolver,
         )
+    }
+
+    /// A refunder wired with an ENABLED GATE-1 alert sink (lnrent-urw.1) delivering to
+    /// `recipient_hex`, so a parked/stuck refund enqueues an `operator.alert` outbox row.
+    fn refunder_with_alerts(
+        store: &Store,
+        payment: &Arc<TestPayment>,
+        clock: &TestClock,
+        recipient_hex: &str,
+    ) -> Refunder {
+        let dispatcher = Arc::new(crate::alerts::AlertDispatcher::new(
+            store.clone(),
+            Arc::new(clock.clone()),
+            recipient_hex.to_string(),
+        ));
+        refunder(store, payment, clock).with_alerts(dispatcher)
+    }
+
+    /// Every enqueued `operator.alert` DM as `(recipient_hex, kind_wire, subject)`, id-ordered.
+    async fn operator_alerts(store: &Store) -> Vec<(String, String, String)> {
+        let rows: Vec<(String, String)> = store
+            .read(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT recipient, payload_json FROM outbox WHERE msg_type='operator.alert' ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        rows.into_iter()
+            .map(|(recipient, p)| match serde_json::from_str::<Msg>(&p).unwrap() {
+                Msg::OperatorAlert(a) => (recipient, a.kind, a.subject),
+                other => panic!("expected operator.alert, got {}", other.type_str()),
+            })
+            .collect()
     }
 
     /// A LN-address `dest` used throughout the executor tests: the DEFAULT [`PassThroughResolver`]
@@ -1778,6 +1872,67 @@ mod tests {
             refund_outbox_statuses(&store).await,
             vec!["failed".to_string()]
         );
+    }
+
+    // urw.1 site 1 (commit_pay_failure): a refund that exhausts its pay-retry cap parks FAILED and
+    // enqueues EXACTLY ONE RefundParked operator alert, addressed to the configured recipient — and
+    // only on the drive that reaches the cap, never on the earlier retried drives.
+    #[tokio::test]
+    async fn pay_exhaustion_park_enqueues_one_operator_alert() {
+        let store = mem_store();
+        let payment = Arc::new(TestPayment::new());
+        payment.set_fail(true);
+        let clock = TestClock::new(1_000);
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        seed_refund(&store, "sub-1", Some(LN_ADDR), Some(500)).await;
+        seed_reservation(&store, "sub-1").await;
+        let r = refunder_with_alerts(&store, &payment, &clock, "op-npub-hex");
+
+        for _ in 1..MAX_REFUND_ATTEMPTS {
+            r.drive().await.unwrap();
+            assert!(
+                operator_alerts(&store).await.is_empty(),
+                "no alert before the cap is reached"
+            );
+        }
+        let report = r.drive().await.unwrap();
+        assert_eq!(report.failed, 1);
+
+        let alerts = operator_alerts(&store).await;
+        assert_eq!(
+            alerts,
+            vec![(
+                "op-npub-hex".to_string(),
+                "refund_parked".to_string(),
+                "ref-order:sub-1".to_string()
+            )],
+            "exactly one RefundParked alert to the configured recipient, keyed on the refund id"
+        );
+    }
+
+    // urw.1 site 2 (commit_park_failed): a structural park (a legacy NULL destination that can never
+    // be paid) parks FAILED on the first drive and enqueues EXACTLY ONE RefundParked operator alert.
+    #[tokio::test]
+    async fn structural_park_enqueues_one_operator_alert() {
+        let store = mem_store();
+        let payment = Arc::new(TestPayment::new());
+        let clock = TestClock::new(1_000);
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        seed_refund(&store, "sub-1", None, Some(500)).await;
+        seed_reservation(&store, "sub-1").await;
+
+        let report = refunder_with_alerts(&store, &payment, &clock, "op-npub-hex")
+            .drive()
+            .await
+            .unwrap();
+        assert_eq!(report.failed, 1);
+        assert_eq!(payment.pay_calls(), 0, "structural park never calls pay");
+
+        let alerts = operator_alerts(&store).await;
+        assert_eq!(alerts.len(), 1, "exactly one alert on the structural park");
+        assert_eq!(alerts[0].0, "op-npub-hex");
+        assert_eq!(alerts[0].1, "refund_parked");
+        assert_eq!(alerts[0].2, "ref-order:sub-1");
     }
 
     // 3. No double-pay on retry: drive() twice in success mode -> pay invoked once (the row is SENT

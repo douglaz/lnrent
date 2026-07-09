@@ -149,12 +149,17 @@ async fn start_supervisor(
     let engine = engine_for(op_keys, url, store.clone()).await;
     let sock = temp_sock();
     let payment_for_sync = payment.clone();
+    let alerts = Arc::new(lnrentd::alerts::AlertDispatcher::disabled(
+        store.clone(),
+        clock.clone(),
+    ));
     let sup = Supervisor::build(
         store,
         engine,
         payment,
         clock,
         Arc::new(PassThroughResolver),
+        alerts,
         dummy_recipe(),
         sock.clone(),
         fast_intervals(),
@@ -819,4 +824,124 @@ async fn crash_recovery_redrives_provisioning_without_duplication() {
     );
 
     running_b.shutdown().await.unwrap();
+}
+
+// ==============================================================================================
+// 5. GATE-1 alert sink (lnrent-urw.1): a refund that parks FAILED under a real running Supervisor
+//    enqueues a durable `operator.alert` DM to the configured recipient. We assert the persisted
+//    outbox row, NOT relay delivery (the in-process test relay rate-limits / clamps filter limits,
+//    which can make a DM-delivery assertion silently vacuous).
+// ==============================================================================================
+
+/// Seed a PENDING `refund_attempt` with NO provenance invoice: the refunder's INV-3 execution-time
+/// guard finds no matching PAID `order` invoice, so it parks the row FAILED on the first drive —
+/// the simplest way to force a park-FAILED end to end without a full order→pay→provision-fail flow.
+async fn seed_unprovenanced_refund(store: &Store, sub_id: &str) {
+    let external_id = format!("order:{sub_id}");
+    let sub_id = sub_id.to_string();
+    store
+        .transaction(move |tx| {
+            tx.execute(
+                "INSERT INTO refund_attempt
+                    (id, subscription_id, dest, amount_sat, idempotency_key, status, attempts,
+                     created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 500, ?4, 'PENDING', 0, 0, 0)",
+                rusqlite::params![
+                    format!("ref-{external_id}"),
+                    sub_id,
+                    "lnaddr@buyer",
+                    format!("refund:{external_id}"),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+/// Count `operator.alert` outbox rows addressed to `recipient_hex`.
+async fn operator_alert_rows(store: &Store, recipient_hex: &str) -> i64 {
+    let recipient = recipient_hex.to_string();
+    store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM outbox WHERE msg_type='operator.alert' AND recipient=?1",
+                rusqlite::params![recipient],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refund_park_failed_enqueues_operator_alert_via_running_supervisor() {
+    let relay = mock_relay().await;
+    let url = relay.url().await.to_string();
+    let op_keys = Keys::generate();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let payment = Arc::new(MockPayment::new());
+    payment.set_now(START);
+    let clock = Arc::new(TestClock::new(START));
+
+    seed_unprovenanced_refund(&store, "sub-1").await;
+
+    // Build the Supervisor with the alert sink ENABLED, self-DM to the operator key. (The shared
+    // `start_supervisor` helper disables alerts; this test needs them on.)
+    let recipient_hex = op_keys.public_key().to_hex();
+    let engine = engine_for(&op_keys, &url, store.clone()).await;
+    let sock = temp_sock();
+    let payment_for_sync = payment.clone();
+    let alerts = Arc::new(lnrentd::alerts::AlertDispatcher::new(
+        store.clone(),
+        clock.clone(),
+        recipient_hex.clone(),
+    ));
+    let sup = Supervisor::build(
+        store.clone(),
+        engine,
+        payment,
+        clock,
+        Arc::new(PassThroughResolver),
+        alerts,
+        dummy_recipe(),
+        sock,
+        fast_intervals(),
+        u32::MAX,
+    )
+    .await
+    .expect("build supervisor");
+    let sup = sup.with_payment_clock_sync(move |now| payment_for_sync.set_now(now));
+    let running = sup.start().await.expect("start supervisor");
+
+    // The maintenance loop drives the refunder, which parks the unprovenanced refund FAILED and
+    // fires the alert. Poll the durable outbox row.
+    let store_for_poll = store.clone();
+    let recipient_for_poll = recipient_hex.clone();
+    wait_until("operator.alert enqueued", || {
+        let store = store_for_poll.clone();
+        let recipient = recipient_for_poll.clone();
+        async move { operator_alert_rows(&store, &recipient).await >= 1 }
+    })
+    .await;
+
+    // Exactly one, and the refund did park FAILED.
+    assert_eq!(operator_alert_rows(&store, &recipient_hex).await, 1);
+    assert_eq!(
+        scalar_status(&store, "SELECT status FROM refund_attempt WHERE subscription_id='sub-1'")
+            .await
+            .as_deref(),
+        Some("FAILED"),
+        "the refund parked FAILED"
+    );
+
+    running.shutdown().await.unwrap();
+}
+
+/// Read a single optional `TEXT` status column.
+async fn scalar_status(store: &Store, sql: &'static str) -> Option<String> {
+    store
+        .read(move |c| Ok(c.query_row(sql, [], |r| r.get::<_, String>(0)).optional()?))
+        .await
+        .unwrap()
 }

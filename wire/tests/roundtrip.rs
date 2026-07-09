@@ -106,6 +106,11 @@ fn sample_messages() -> Vec<Msg> {
                 retryable: true,
             },
         )),
+        Msg::OperatorAlert(OperatorAlert {
+            kind: "refund_parked".into(),
+            subject: "refund:ord:abc:1".into(),
+            detail: "refund parked FAILED after 5 attempts".into(),
+        }),
     ]
 }
 
