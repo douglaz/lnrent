@@ -1362,13 +1362,12 @@ pub(crate) async fn refund_readiness_report(
     store: &Store,
     payment: &Arc<dyn PaymentBackend>,
 ) -> Result<RefundReadinessReport> {
-    let liabilities = store.refund_readiness_liabilities().await?;
-    if liabilities.is_empty() {
-        return Ok(RefundReadinessReport::default());
-    }
-
+    // Always probe — the liveness check must run even at ZERO liabilities so a down federation
+    // surfaces to an idle operator (codex). Delegates to the shared builder, which folds the
+    // empty-liabilities + federation-down cases correctly. A `session_count()` guardian round-trip
+    // per readiness check is the intended cost of liveness monitoring.
     let probe = RefundReadinessProbe::query(payment).await;
-    refund_readiness_report_from_liabilities(liabilities, payment, &probe).await
+    refund_readiness_report_with_probe(store, payment, &probe).await
 }
 
 pub(crate) async fn refund_readiness_report_with_probe(
@@ -1378,7 +1377,18 @@ pub(crate) async fn refund_readiness_report_with_probe(
 ) -> Result<RefundReadinessReport> {
     let liabilities = store.refund_readiness_liabilities().await?;
     if liabilities.is_empty() {
-        return Ok(RefundReadinessReport::default());
+        // Even with NO refund liabilities, a down federation must still surface (codex): it is a
+        // fundamental infra failure (no invoices/payments can settle), not a refund-coverage
+        // question — otherwise an idle/pre-go-live operator sees READY and announces a listing while
+        // guardians are unreachable. Refund-coverage warnings (balance/parked/unpriceable) rightly
+        // stay silent with nothing owed.
+        probe.log_failures();
+        return Ok(RefundReadinessReport {
+            gateway_ok: probe.gateway_ok,
+            federation_ok: probe.federation_ok,
+            warning: (!probe.federation_ok).then_some(RefundReadinessWarning::FederationDown),
+            ..Default::default()
+        });
     }
 
     refund_readiness_report_from_liabilities(liabilities, payment, probe).await
@@ -2213,6 +2223,29 @@ mod tests {
             Some(RefundReadinessWarning::FederationDown),
             "federation-down takes priority over gateway-down"
         );
+    }
+
+    // urw.4 (codex): a down federation must surface even with ZERO refund liabilities — otherwise an
+    // idle operator sees READY and announces a listing while guardians are unreachable. A HEALTHY
+    // federation with zero liabilities stays ready (refund-coverage warnings rightly stay silent).
+    #[tokio::test]
+    async fn readiness_surfaces_federation_down_even_with_zero_liabilities() {
+        let store = mem_store(); // no liabilities seeded
+
+        let p = ReadinessPayment::new(Some(10_000), true);
+        p.set_federation_ok(false);
+        let down: Arc<dyn PaymentBackend> = Arc::new(p);
+        let report = readiness(&store, &down).await;
+        assert_eq!(
+            report.warning,
+            Some(RefundReadinessWarning::FederationDown),
+            "federation-down surfaces with no liabilities"
+        );
+        assert!(!report.federation_ok);
+
+        let ok_report = readiness(&store, &readiness_payment(Some(10_000), true)).await;
+        assert_eq!(ok_report.warning, None, "a healthy idle daemon is READY");
+        assert!(ok_report.federation_ok);
     }
 
     #[tokio::test]
