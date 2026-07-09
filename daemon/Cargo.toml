@@ -81,6 +81,9 @@ hex = "0.4"
 # ADR-0015); never compiled into the wasm buyer. All optional so mock builds don't pull this tree.
 fedimint-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
 fedimint-core = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
+# The federation-API trait (`IGlobalFederationApi`), for the lnrent-urw.4 liveness probe: a cheap
+# `session_count()` guardian round-trip. Not re-exported by fedimint-client, so a direct dep.
+fedimint-api-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
 fedimint-rocksdb = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
 fedimint-derive-secret = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
 fedimint-connectors = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
@@ -99,6 +102,7 @@ default = ["fedimint"]
 fedimint = [
     "dep:fedimint-client",
     "dep:fedimint-core",
+    "dep:fedimint-api-client",
     "dep:fedimint-rocksdb",
     "dep:fedimint-derive-secret",
     "dep:fedimint-connectors",

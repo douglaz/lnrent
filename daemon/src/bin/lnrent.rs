@@ -153,15 +153,15 @@ fn render_money_human(v: &serde_json::Value) {
         .and_then(serde_json::Value::as_u64)
         .map(|n| format!("{n} msat"))
         .unwrap_or_else(|| "unknown".to_string());
-    let gateway = if v
-        .get("gateway_ok")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        "ok"
-    } else {
-        "not ok"
+    let ok_str = |k: &str| {
+        if v.get(k).and_then(serde_json::Value::as_bool).unwrap_or(false) {
+            "ok"
+        } else {
+            "not ok"
+        }
     };
+    let gateway = ok_str("gateway_ok");
+    let federation = ok_str("federation_ok");
     let gross = v
         .get("gross_liability_sat")
         .and_then(serde_json::Value::as_u64)
@@ -181,6 +181,7 @@ fn render_money_human(v: &serde_json::Value) {
     let warning = v.get("warning").and_then(serde_json::Value::as_str);
 
     println!("Balance: {balance}");
+    println!("Federation: {federation}");
     println!("Gateway: {gateway}");
     println!("Outstanding liabilities: {gross} sat gross, {required} msat required");
     println!("Parked count: {parked}");

@@ -117,9 +117,11 @@ Share the listing coordinate / operator npub.
 
 ## 6. Operate
 
-- **Monitor money:** `lnrent money` — balance, gateway, and refund-liability coverage (`READY` /
-  `NOT READY (<reason>)`). `NOT READY` means an uncovered liability or an unreachable gateway; also watch
-  the daemon's WARN/ERROR logs (`refund readiness ALARM`, gateway warnings).
+- **Monitor money:** `lnrent money` — balance, gateway, **federation liveness**, and refund-liability
+  coverage (`READY` / `NOT READY (<reason>)`). The `<reason>` distinguishes `FederationDown` (guardians
+  unreachable — nothing settles; the root failure), `GatewayUnavailable`, an uncovered liability, and a
+  failed local balance query; `federation_ok`/`gateway_ok` are separate fields in `--json`. Also watch
+  the daemon's WARN/ERROR logs (`refund readiness ALARM`).
 - **Alert DMs (GATE-1 PR-5):** with `LNRENT_ALERT_NPUB` set, the daemon DMs you when a refund parks
   FAILED or sits stuck — no need to tail logs 24/7. The alert is a NIP-17 DM riding the durable
   outbox (edge-triggered, at most one per condition per 6h). One honest caveat: a total relay

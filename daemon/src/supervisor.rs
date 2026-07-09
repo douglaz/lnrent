@@ -1135,6 +1135,9 @@ pub(crate) struct RefundReadinessReport {
     required_msat: u128,
     balance_msat: Option<u64>,
     gateway_ok: bool,
+    /// LIVENESS: whether the federation guardians are reachable (lnrent-urw.4). Distinct from
+    /// `gateway_ok` — a down federation is a different failure than a down gateway.
+    federation_ok: bool,
     parked_count: usize,
     /// PENDING liabilities that could not be priced this pass (transient quote/gateway error). Their
     /// cost is absent from `required_msat`, so coverage cannot be confirmed — forces a warning.
@@ -1152,6 +1155,7 @@ impl Default for RefundReadinessReport {
             required_msat: 0,
             balance_msat: None,
             gateway_ok: true,
+            federation_ok: true,
             parked_count: 0,
             unpriceable_count: 0,
             balance_query_failed: false,
@@ -1161,10 +1165,16 @@ impl Default for RefundReadinessReport {
 }
 
 impl RefundReadinessReport {
-    pub(crate) fn to_money_value(&self, balance_msat: Option<u64>, gateway_ok: bool) -> Value {
+    pub(crate) fn to_money_value(
+        &self,
+        balance_msat: Option<u64>,
+        gateway_ok: bool,
+        federation_ok: bool,
+    ) -> Value {
         json!({
             "balance_msat": balance_msat,
             "gateway_ok": gateway_ok,
+            "federation_ok": federation_ok,
             "liability_count": self.liability_count,
             "gross_liability_sat": self.gross_liability_sat,
             "required_msat": self.required_msat,
@@ -1181,11 +1191,19 @@ pub(crate) struct RefundReadinessProbe {
     balance_error: Option<String>,
     gateway_ok: bool,
     gateway_error: Option<String>,
+    federation_ok: bool,
+    federation_error: Option<String>,
 }
 
 impl RefundReadinessProbe {
     pub(crate) async fn query(payment: &Arc<dyn PaymentBackend>) -> Self {
         let (gateway_ok, gateway_error) = match payment.refund_gateway_ready().await {
+            Ok(ok) => (ok, None),
+            Err(e) => (false, Some(format!("{e:#}"))),
+        };
+        // Federation LIVENESS (lnrent-urw.4): a guardian round-trip, distinct from the gateway/balance
+        // reads. An error OR an explicit `false` means the federation is not reachable.
+        let (federation_ok, federation_error) = match payment.backend_ready().await {
             Ok(ok) => (ok, None),
             Err(e) => (false, Some(format!("{e:#}"))),
         };
@@ -1199,6 +1217,8 @@ impl RefundReadinessProbe {
             balance_error,
             gateway_ok,
             gateway_error,
+            federation_ok,
+            federation_error,
         }
     }
 
@@ -1210,9 +1230,16 @@ impl RefundReadinessProbe {
         self.gateway_ok
     }
 
+    pub(crate) fn federation_ok(&self) -> bool {
+        self.federation_ok
+    }
+
     fn log_failures(&self) {
         if let Some(e) = &self.gateway_error {
             tracing::warn!(error = %e, "refund readiness: gateway readiness query failed");
+        }
+        if let Some(e) = &self.federation_error {
+            tracing::warn!(error = %e, "refund readiness: federation liveness probe failed (guardians unreachable)");
         }
         // A local ecash balance failure is a catastrophic client signal when liabilities exist.
         if let Some(e) = &self.balance_error {
@@ -1228,6 +1255,9 @@ impl RefundReadinessProbe {
 pub(crate) enum RefundReadinessWarning {
     /// The local ecash balance query failed — catastrophic (a corrupt/broken client). Highest priority.
     BalanceQueryFailed,
+    /// The federation guardians are unreachable (lnrent-urw.4): the root infra failure — nothing can
+    /// be invoiced, paid, or reconciled. Distinct from (and higher priority than) a down gateway.
+    FederationDown,
     GatewayUnavailable,
     InsufficientBalance,
     /// A real PENDING liability could not be priced (its outlay is missing from `required_msat`), so
@@ -1240,6 +1270,7 @@ impl RefundReadinessWarning {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             RefundReadinessWarning::BalanceQueryFailed => "BalanceQueryFailed",
+            RefundReadinessWarning::FederationDown => "FederationDown",
             RefundReadinessWarning::GatewayUnavailable => "GatewayUnavailable",
             RefundReadinessWarning::InsufficientBalance => "InsufficientBalance",
             RefundReadinessWarning::Unpriceable => "Unpriceable",
@@ -1256,7 +1287,10 @@ async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) 
             return;
         }
     };
-    if report.liability_count == 0 {
+    // FederationDown is a ROOT infra failure (guardians unreachable) — it must alarm even at zero
+    // liabilities (the idle/pre-go-live case codex flagged); every other warning is a refund-coverage
+    // condition that only matters when something is owed.
+    if report.liability_count == 0 && report.warning != Some(RefundReadinessWarning::FederationDown) {
         return;
     }
 
@@ -1268,6 +1302,15 @@ async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) 
             gateway_ok = report.gateway_ok,
             parked_count = report.parked_count,
             "refund readiness ALARM: the LOCAL ecash balance query failed with liabilities outstanding — likely a corrupt/broken fedimint client; refund coverage cannot be verified, investigate immediately"
+        ),
+        Some(RefundReadinessWarning::FederationDown) => tracing::error!(
+            liabilities = report.liability_count,
+            gross_liability_sat = %report.gross_liability_sat,
+            required_outlay_msat = %report.required_msat,
+            federation_ok = report.federation_ok,
+            gateway_ok = report.gateway_ok,
+            parked_count = report.parked_count,
+            "refund readiness ALARM: the FEDERATION is unreachable (guardians down / no consensus) — no invoices, payments, or refunds can settle; investigate the federation"
         ),
         Some(RefundReadinessWarning::GatewayUnavailable) => tracing::warn!(
             liabilities = report.liability_count,
@@ -1322,13 +1365,12 @@ pub(crate) async fn refund_readiness_report(
     store: &Store,
     payment: &Arc<dyn PaymentBackend>,
 ) -> Result<RefundReadinessReport> {
-    let liabilities = store.refund_readiness_liabilities().await?;
-    if liabilities.is_empty() {
-        return Ok(RefundReadinessReport::default());
-    }
-
+    // Always probe — the liveness check must run even at ZERO liabilities so a down federation
+    // surfaces to an idle operator (codex). Delegates to the shared builder, which folds the
+    // empty-liabilities + federation-down cases correctly. A `session_count()` guardian round-trip
+    // per readiness check is the intended cost of liveness monitoring.
     let probe = RefundReadinessProbe::query(payment).await;
-    refund_readiness_report_from_liabilities(liabilities, payment, &probe).await
+    refund_readiness_report_with_probe(store, payment, &probe).await
 }
 
 pub(crate) async fn refund_readiness_report_with_probe(
@@ -1338,7 +1380,18 @@ pub(crate) async fn refund_readiness_report_with_probe(
 ) -> Result<RefundReadinessReport> {
     let liabilities = store.refund_readiness_liabilities().await?;
     if liabilities.is_empty() {
-        return Ok(RefundReadinessReport::default());
+        // Even with NO refund liabilities, a down federation must still surface (codex): it is a
+        // fundamental infra failure (no invoices/payments can settle), not a refund-coverage
+        // question — otherwise an idle/pre-go-live operator sees READY and announces a listing while
+        // guardians are unreachable. Refund-coverage warnings (balance/parked/unpriceable) rightly
+        // stay silent with nothing owed.
+        probe.log_failures();
+        return Ok(RefundReadinessReport {
+            gateway_ok: probe.gateway_ok,
+            federation_ok: probe.federation_ok,
+            warning: (!probe.federation_ok).then_some(RefundReadinessWarning::FederationDown),
+            ..Default::default()
+        });
     }
 
     refund_readiness_report_from_liabilities(liabilities, payment, probe).await
@@ -1357,6 +1410,7 @@ async fn refund_readiness_report_from_liabilities(
         required_msat: 0,
         balance_msat: probe.balance_msat,
         gateway_ok: probe.gateway_ok,
+        federation_ok: probe.federation_ok,
         parked_count: 0,
         unpriceable_count: 0,
         balance_query_failed: probe.balance_error.is_some(),
@@ -1397,6 +1451,10 @@ async fn refund_readiness_report_from_liabilities(
 
     report.warning = if report.balance_query_failed {
         Some(RefundReadinessWarning::BalanceQueryFailed)
+    } else if !report.federation_ok {
+        // The federation is the root: if it's unreachable, gateway/balance checks are moot. Report
+        // it distinctly so the operator fixes the right thing (lnrent-urw.4).
+        Some(RefundReadinessWarning::FederationDown)
     } else if !report.gateway_ok {
         Some(RefundReadinessWarning::GatewayUnavailable)
     } else if report
@@ -1692,6 +1750,7 @@ mod tests {
     struct ReadinessPayment {
         balance_msat: StdMutex<Option<u64>>,
         gateway_ok: StdMutex<bool>,
+        federation_ok: StdMutex<bool>,
         statuses: StdMutex<HashMap<String, PayStatus>>,
         started: StdMutex<HashSet<String>>,
         required_by_gross: StdMutex<HashMap<u64, u128>>,
@@ -1704,12 +1763,17 @@ mod tests {
             Self {
                 balance_msat: StdMutex::new(balance_msat),
                 gateway_ok: StdMutex::new(gateway_ok),
+                federation_ok: StdMutex::new(true),
                 statuses: StdMutex::new(HashMap::new()),
                 started: StdMutex::new(HashSet::new()),
                 required_by_gross: StdMutex::new(HashMap::new()),
                 fail_pricing: StdMutex::new(false),
                 fail_balance: StdMutex::new(false),
             }
+        }
+
+        fn set_federation_ok(&self, ok: bool) {
+            *self.federation_ok.lock().unwrap() = ok;
         }
 
         fn set_pricing_fails(&self, fails: bool) {
@@ -1800,6 +1864,10 @@ mod tests {
 
         async fn refund_gateway_ready(&self) -> Result<bool> {
             Ok(*self.gateway_ok.lock().unwrap())
+        }
+
+        async fn backend_ready(&self) -> Result<bool> {
+            Ok(*self.federation_ok.lock().unwrap())
         }
 
         async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
@@ -2127,6 +2195,60 @@ mod tests {
             report.warning,
             Some(RefundReadinessWarning::GatewayUnavailable)
         );
+    }
+
+    // urw.4: a down FEDERATION is reported DISTINCTLY from a down gateway, and takes priority (it's
+    // the root — if guardians are unreachable, gateway/balance checks are moot).
+    #[tokio::test]
+    async fn readiness_warns_federation_down_distinct_from_gateway() {
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "PROVISIONING").await;
+        seed_invoice(&store, "sub-1", "order:sub-1", "order", 1, "PAID", Some(10), Some(10)).await;
+
+        let with_federation_down = |gateway_ok: bool| -> Arc<dyn PaymentBackend> {
+            let p = ReadinessPayment::new(Some(10_000), gateway_ok);
+            p.set_federation_ok(false);
+            Arc::new(p)
+        };
+
+        // Federation down, gateway UP → FederationDown (not GatewayUnavailable).
+        let report = readiness(&store, &with_federation_down(true)).await;
+        assert_eq!(
+            report.warning,
+            Some(RefundReadinessWarning::FederationDown),
+            "a down federation with an OK gateway is FederationDown, not GatewayUnavailable"
+        );
+
+        // Federation down AND gateway down → still FederationDown (the root wins).
+        let report2 = readiness(&store, &with_federation_down(false)).await;
+        assert_eq!(
+            report2.warning,
+            Some(RefundReadinessWarning::FederationDown),
+            "federation-down takes priority over gateway-down"
+        );
+    }
+
+    // urw.4 (codex): a down federation must surface even with ZERO refund liabilities — otherwise an
+    // idle operator sees READY and announces a listing while guardians are unreachable. A HEALTHY
+    // federation with zero liabilities stays ready (refund-coverage warnings rightly stay silent).
+    #[tokio::test]
+    async fn readiness_surfaces_federation_down_even_with_zero_liabilities() {
+        let store = mem_store(); // no liabilities seeded
+
+        let p = ReadinessPayment::new(Some(10_000), true);
+        p.set_federation_ok(false);
+        let down: Arc<dyn PaymentBackend> = Arc::new(p);
+        let report = readiness(&store, &down).await;
+        assert_eq!(
+            report.warning,
+            Some(RefundReadinessWarning::FederationDown),
+            "federation-down surfaces with no liabilities"
+        );
+        assert!(!report.federation_ok);
+
+        let ok_report = readiness(&store, &readiness_payment(Some(10_000), true)).await;
+        assert_eq!(ok_report.warning, None, "a healthy idle daemon is READY");
+        assert!(ok_report.federation_ok);
     }
 
     #[tokio::test]

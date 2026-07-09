@@ -238,7 +238,11 @@ pub async fn dispatch(
             let probe = RefundReadinessProbe::query(payment).await;
             match refund_readiness_report_with_probe(store, payment, &probe).await {
                 Ok(report) => {
-                    Reply::ok(report.to_money_value(probe.balance_msat(), probe.gateway_ok()))
+                    Reply::ok(report.to_money_value(
+                        probe.balance_msat(),
+                        probe.gateway_ok(),
+                        probe.federation_ok(),
+                    ))
                 }
                 Err(e) => Reply::err("internal", e.to_string()),
             }
