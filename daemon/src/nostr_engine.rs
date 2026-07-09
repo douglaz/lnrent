@@ -260,6 +260,26 @@ impl NostrEngine {
         self.keys.public_key()
     }
 
+    /// Project the live relay pool into a sorted per-relay liveness snapshot for the operator status
+    /// surface (lnrent-urw.6, GATE-1 PR-9c). A THIN read over the nostr-sdk pool — connected state,
+    /// spelled-out status, and last-connection time; no reconnection or failover logic.
+    pub async fn relay_status_snapshot(&self) -> Vec<crate::relay_status::RelayStatusRow> {
+        let relays = self.client.relays().await;
+        let mut rows: Vec<_> = relays
+            .iter()
+            .map(|(url, relay)| {
+                crate::relay_status::project(
+                    url.to_string(),
+                    relay.status(),
+                    relay.is_connected(),
+                    relay.stats().connected_at().as_secs(),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| a.url.cmp(&b.url));
+        rows
+    }
+
     /// Publish (or replace) the operator's NIP-99 30402 listing, signed with the engine's key, to
     /// every relay. A 30402 is a replaceable event keyed on `(30402, pubkey, d)`, so republishing
     /// the same `d` REPLACES the prior listing — price edits keep the coordinate

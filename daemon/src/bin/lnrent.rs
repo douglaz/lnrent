@@ -38,6 +38,9 @@ enum Cmd {
     /// List OPEN teardown dead-letters: failed `destroy` hooks + stuck provision cleanups. A
     /// provider resource (e.g. a droplet) may still be billing until these resolve.
     Teardowns,
+    /// Show per-relay connectivity (the out-of-band read for a relay blackout: the alert cannot be
+    /// delivered while the pool is down).
+    Relays,
     /// List non-terminal + parked refunds (the per-item view behind `money`'s parked_count).
     Refunds,
     /// Re-drive one parked (FAILED) refund: reset it to PENDING so the refunder retries the real
@@ -78,6 +81,7 @@ enum HumanRender {
     Money,
     Teardowns,
     Refunds,
+    Relays,
 }
 
 #[tokio::main]
@@ -90,6 +94,7 @@ async fn main() -> ExitCode {
         Cmd::Subs => (Request::Subs, HumanRender::Generic),
         Cmd::Sub { id } => (Request::Sub { id }, HumanRender::Generic),
         Cmd::Teardowns => (Request::Teardowns, HumanRender::Teardowns),
+        Cmd::Relays => (Request::Relays, HumanRender::Relays),
         Cmd::Refunds => (Request::Refunds, HumanRender::Refunds),
         Cmd::RefundRetry { id } => (Request::RefundRetry { id }, HumanRender::Generic),
         Cmd::Suspend { id } => (Request::AdminSuspend { id }, HumanRender::Generic),
@@ -136,6 +141,7 @@ fn render(reply: Reply, as_json: bool, human_render: HumanRender) -> ExitCode {
                 HumanRender::Money => render_money_human(&v),
                 HumanRender::Teardowns => render_teardowns_human(&v),
                 HumanRender::Refunds => render_refunds_human(&v),
+                HumanRender::Relays => render_relays_human(&v),
             },
         }
     } else if let Some(err) = &reply.error {
@@ -258,5 +264,42 @@ fn render_refunds_human(v: &serde_json::Value) {
             n("attempts").unwrap_or(0),
             n("age_s").unwrap_or(0),
         );
+    }
+}
+
+/// Human render for `lnrent relays` (lnrent-urw.6): per-relay connectivity, or a blackout warning
+/// when every relay is down. An empty list means the maintenance loop hasn't refreshed yet.
+fn render_relays_human(v: &serde_json::Value) {
+    let rows = v.as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        println!("No relay status yet (daemon starting, or no relays configured).");
+        return;
+    }
+    let connected = rows
+        .iter()
+        .filter(|r| r.get("connected").and_then(serde_json::Value::as_bool) == Some(true))
+        .count();
+    if connected == 0 {
+        println!(
+            "Relays: \x1b[1m{}/{} connected — BLACKOUT\x1b[0m (no inbound orders or outbound DMs are flowing)",
+            connected,
+            rows.len()
+        );
+    } else {
+        println!("Relays: \x1b[1m{}/{} connected\x1b[0m", connected, rows.len());
+    }
+    for r in &rows {
+        let s = |k: &str| r.get(k).and_then(serde_json::Value::as_str).unwrap_or("?");
+        let mark = if r.get("connected").and_then(serde_json::Value::as_bool) == Some(true) {
+            "\u{2022}"
+        } else {
+            "\u{00d7}"
+        };
+        let last = r
+            .get("last_connected_at")
+            .and_then(serde_json::Value::as_i64)
+            .map(|t| format!("last connected @{t}"))
+            .unwrap_or_else(|| "never connected".to_string());
+        println!("  {} {} \u{b7} {} \u{b7} {}", mark, s("url"), s("status"), last);
     }
 }
