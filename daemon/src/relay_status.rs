@@ -96,21 +96,36 @@ impl RelayBlackoutMonitor {
         Self::default()
     }
 
-    /// Feed this tick's projection + `now`. Returns `true` IFF the caller should fire the alert now:
-    /// the pool has been all-disconnected for at least [`RELAY_BLACKOUT_ALERT_S`] and no alert has
-    /// fired for this onset yet. Any connectivity re-arms the monitor.
-    pub fn observe(&mut self, rows: &[RelayStatusRow], now: i64) -> bool {
+    /// Feed this tick's projection + `now`. Returns `true` IFF the pool has been continuously
+    /// all-disconnected for at least [`RELAY_BLACKOUT_ALERT_S`] and no alert has been CONFIRMED for
+    /// this onset yet. Any connectivity re-arms the monitor.
+    ///
+    /// This deliberately does NOT stamp the onset as fired — the caller confirms via [`mark_fired`]
+    /// only once the alert is durably enqueued, so a failed dispatch leaves the onset eligible to
+    /// retry on the next tick (coderabbit) instead of being silently swallowed until reconnect.
+    pub fn onset_due(&mut self, rows: &[RelayStatusRow], now: i64) -> bool {
         if all_disconnected(rows) {
             let onset = *self.onset.get_or_insert(now);
-            if !self.fired && now.saturating_sub(onset) >= RELAY_BLACKOUT_ALERT_S {
-                self.fired = true;
-                return true;
-            }
-            false
+            !self.fired && now.saturating_sub(onset) >= RELAY_BLACKOUT_ALERT_S
         } else {
             self.onset = None;
             self.fired = false;
             false
+        }
+    }
+
+    /// The unix time the current all-disconnected window began, or `None` when not in one. The caller
+    /// keys the alert on this so a NEW blackout soon after recovery re-alerts despite the dispatcher's
+    /// per-`(kind, subject)` 6h cooldown (codex) — each distinct onset is a distinct subject.
+    pub fn onset(&self) -> Option<i64> {
+        self.onset
+    }
+
+    /// Confirm the alert for the current onset was durably enqueued — call ONLY after a successful
+    /// dispatch. A no-op if the monitor re-armed in between (no active onset).
+    pub fn mark_fired(&mut self) {
+        if self.onset.is_some() {
+            self.fired = true;
         }
     }
 }
@@ -154,6 +169,15 @@ mod tests {
         assert!(all_disconnected(&[row("a", false, Some(1)), row("b", false, None)]));
     }
 
+    /// Simulate the maintenance caller with a SUCCESSFUL dispatch: fire once, then confirm.
+    fn tick_ok(m: &mut RelayBlackoutMonitor, rows: &[RelayStatusRow], now: i64) -> bool {
+        let due = m.onset_due(rows, now);
+        if due {
+            m.mark_fired();
+        }
+        due
+    }
+
     #[test]
     fn monitor_fires_once_per_onset_after_threshold_and_rearms() {
         let mut m = RelayBlackoutMonitor::new();
@@ -161,35 +185,56 @@ mod tests {
         let up = [row("a", true, Some(100)), row("b", false, None)];
 
         // Onset at t=1000; not yet past the threshold -> no fire.
-        assert!(!m.observe(&down, 1000), "onset alone does not fire");
+        assert!(!tick_ok(&mut m, &down, 1000), "onset alone does not fire");
+        assert_eq!(m.onset(), Some(1000), "onset recorded at first all-disconnected tick");
         assert!(
-            !m.observe(&down, 1000 + RELAY_BLACKOUT_ALERT_S - 1),
+            !tick_ok(&mut m, &down, 1000 + RELAY_BLACKOUT_ALERT_S - 1),
             "one second short of the threshold does not fire"
         );
         // Crossing the threshold fires exactly once.
         assert!(
-            m.observe(&down, 1000 + RELAY_BLACKOUT_ALERT_S),
+            tick_ok(&mut m, &down, 1000 + RELAY_BLACKOUT_ALERT_S),
             "fires once the pool has been dark for the threshold"
         );
         assert!(
-            !m.observe(&down, 1000 + RELAY_BLACKOUT_ALERT_S + 60),
+            !tick_ok(&mut m, &down, 1000 + RELAY_BLACKOUT_ALERT_S + 60),
             "does not re-fire for the same onset"
         );
 
-        // A single connected relay re-arms.
-        assert!(!m.observe(&up, 2000));
-        // A NEW onset re-alerts after the threshold.
-        assert!(!m.observe(&down, 3000), "new onset, not yet past threshold");
+        // A single connected relay re-arms (onset cleared).
+        assert!(!tick_ok(&mut m, &up, 2000));
+        assert_eq!(m.onset(), None, "reconnect clears the onset");
+        // A NEW onset re-alerts after the threshold — and carries a distinct onset key.
+        assert!(!tick_ok(&mut m, &down, 3000), "new onset, not yet past threshold");
+        assert_eq!(m.onset(), Some(3000), "the second onset is keyed distinctly from the first");
         assert!(
-            m.observe(&down, 3000 + RELAY_BLACKOUT_ALERT_S),
+            tick_ok(&mut m, &down, 3000 + RELAY_BLACKOUT_ALERT_S),
             "the next onset re-alerts after reconnect"
         );
     }
 
     #[test]
+    fn failed_dispatch_leaves_the_onset_eligible_to_retry() {
+        let mut m = RelayBlackoutMonitor::new();
+        let down = [row("a", false, Some(100))];
+        // Record the onset at t=0, then cross the threshold.
+        assert!(!m.onset_due(&down, 0), "onset recorded, not yet due");
+        assert!(m.onset_due(&down, RELAY_BLACKOUT_ALERT_S), "due once past the threshold");
+        // The caller's dispatch FAILED, so it does NOT mark_fired -> the next tick is still due.
+        assert!(
+            m.onset_due(&down, RELAY_BLACKOUT_ALERT_S + 5),
+            "a failed enqueue keeps the onset eligible to retry"
+        );
+        // A successful confirm stamps it; subsequent ticks in the same onset stop firing.
+        m.mark_fired();
+        assert!(!m.onset_due(&down, RELAY_BLACKOUT_ALERT_S + 10));
+    }
+
+    #[test]
     fn empty_pool_never_fires() {
         let mut m = RelayBlackoutMonitor::new();
-        assert!(!m.observe(&[], 1_000_000));
-        assert!(!m.observe(&[], 1_000_000 + RELAY_BLACKOUT_ALERT_S * 10));
+        assert!(!tick_ok(&mut m, &[], 1_000_000));
+        assert!(!tick_ok(&mut m, &[], 1_000_000 + RELAY_BLACKOUT_ALERT_S * 10));
+        assert_eq!(m.onset(), None);
     }
 }

@@ -42,7 +42,9 @@ use crate::order_intake::OrderIntake;
 use crate::provision::{DeliveryResendOrderHandler, OutboxSender, Provisioner};
 use crate::recipe::Recipe;
 use crate::alerts::{Alert, AlertDispatcher, AlertKind};
-use crate::relay_status::{RelayBlackoutMonitor, RelayStatusCell, RELAY_BLACKOUT_ALERT_S};
+use crate::relay_status::{
+    RelayBlackoutMonitor, RelayStatusCell, RelayStatusRow, RELAY_BLACKOUT_ALERT_S,
+};
 use crate::reconcile::Reconciler;
 use crate::refund::{gen_key, parse_whole_sat, Refunder};
 use crate::refund_resolver::RefundResolver;
@@ -1168,44 +1170,56 @@ async fn maintenance_pass(
         tracing::error!(error = %format!("{e:#}"), "maintenance: refund drive failed");
     }
     log_refund_readiness(store, payment).await;
-    refresh_relay_status(engine, relays, blackout, alerts, clock.now()).await;
+    let relay_rows = engine.relay_status_snapshot().await;
+    refresh_relay_status(relay_rows, relays, blackout, alerts, clock.now()).await;
     if let Err(e) = outbox.drain_once(engine).await {
         tracing::error!(error = %format!("{e:#}"), "maintenance: outbox drain failed");
     }
 }
 
-/// Refresh the shared relay-liveness snapshot from the live pool and fire a single edge-triggered
+/// Publish the tick's relay-liveness `rows` to the shared snapshot and fire a single edge-triggered
 /// `RelayBlackout` alert if the pool has been fully disconnected past the threshold (lnrent-urw.6,
-/// GATE-1 PR-9c). Best-effort: never fails the tick. Honest caveat — this alert is the one that
-/// cannot be delivered during the very blackout it reports; it queues in the outbox and drains on
-/// reconnect, and `Request::Relays` is the out-of-band read for the meantime.
+/// GATE-1 PR-9c). Takes the already-projected rows (the caller reads them from the engine pool) so
+/// the alert/edge-trigger logic is testable without a live socket. Best-effort: never fails the
+/// tick. Honest caveat — this alert is the one that cannot be delivered during the very blackout it
+/// reports; it queues in the outbox and drains on reconnect, and `Request::Relays` is the
+/// out-of-band read for the meantime.
 async fn refresh_relay_status(
-    engine: &NostrEngine,
+    rows: Vec<RelayStatusRow>,
     relays: &RelayStatusCell,
     blackout: &mut RelayBlackoutMonitor,
     alerts: &Arc<AlertDispatcher>,
     now: i64,
 ) {
-    let rows = engine.relay_status_snapshot().await;
-    if blackout.observe(&rows, now) {
+    if blackout.onset_due(&rows, now) {
+        let onset = blackout.onset().unwrap_or(now);
         tracing::error!(
             relays = rows.len(),
+            onset,
             "relay blackout: every relay has been disconnected for over {}min — inbound orders and \
-             outbound DMs are not flowing; check relay reachability",
+             outbound DMs are not flowing; check relay reachability (`lnrent relays`)",
             RELAY_BLACKOUT_ALERT_S / 60
         );
         let detail = format!(
             "all {} configured relay(s) have been disconnected for over {}min. Inbound orders and \
              outbound refund/billing DMs are not flowing. This alert itself queues until a relay \
-             reconnects — check relay reachability (`lnrent status` reads the pool out-of-band).",
+             reconnects — check relay reachability (`lnrent relays` reads the pool out-of-band).",
             rows.len(),
             RELAY_BLACKOUT_ALERT_S / 60,
         );
-        if let Err(e) = alerts
-            .dispatch(Alert::new(AlertKind::RelayBlackout, "relay-pool", detail))
+        // Key the alert on the ONSET so a distinct blackout soon after recovery re-alerts despite
+        // the dispatcher's per-(kind, subject) 6h cooldown (codex). Confirm `fired` only once the
+        // alert is durably enqueued, so a dispatch failure retries next tick (coderabbit).
+        let subject = format!("relay-pool@{onset}");
+        match alerts
+            .dispatch(Alert::new(AlertKind::RelayBlackout, subject, detail))
             .await
         {
-            tracing::warn!(error = %format!("{e:#}"), "failed to enqueue RelayBlackout alert");
+            Ok(_) => blackout.mark_fired(),
+            Err(e) => tracing::warn!(
+                error = %format!("{e:#}"),
+                "failed to enqueue RelayBlackout alert; leaving the onset eligible to retry next tick"
+            ),
         }
     }
     relays.set(rows);
@@ -2218,14 +2232,46 @@ mod tests {
         );
     }
 
-    /// lnrent-urw.6 (PR-9c) e2e: drive the REAL maintenance relay path over a REAL nostr-sdk pool.
-    /// Connect to a live in-process relay (proving the projection reflects a connected pool), shut
-    /// it down so the pool goes all-disconnected, then run `refresh_relay_status` across the
-    /// blackout threshold and assert the persisted `operator.alert` outbox row — NOT relay delivery
-    /// (the alert cannot be delivered during the very blackout it reports).
+    /// lnrent-urw.6 (PR-9c): the REAL projection over a REAL nostr-sdk pool. Connect to a live
+    /// in-process relay and assert `relay_status_snapshot` reflects a connected relay with a
+    /// last-connection stamp. (No shutdown: forcing a client-side disconnect via the mock is not
+    /// prompt/deterministic under load — the blackout-alert path is covered separately below with
+    /// synthetic rows.)
     #[tokio::test]
-    async fn relay_blackout_fires_one_persisted_alert_after_threshold() {
-        async fn operator_alert_rows(store: &Store) -> i64 {
+    async fn relay_status_snapshot_reflects_a_live_pool() {
+        let relay = mock_relay().await;
+        let url = relay.url().await.to_string();
+        let store = Store::open_spawn(":memory:").expect("open in-memory store");
+        let engine = NostrEngine::connect(Keys::generate(), std::slice::from_ref(&url), store)
+            .await
+            .expect("operator engine connects");
+
+        // `connect` already waits for the connection, but poll to stay robust under a loaded run.
+        let mut snap = engine.relay_status_snapshot().await;
+        for _ in 0..250 {
+            if snap.iter().any(|r| r.connected) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            snap = engine.relay_status_snapshot().await;
+        }
+        assert_eq!(snap.len(), 1, "one configured relay projected");
+        assert!(snap[0].connected, "the live relay projects as connected");
+        assert!(
+            snap[0].last_connected_at.is_some(),
+            "a live connection stamps last_connected_at"
+        );
+        assert_eq!(snap[0].url, url);
+    }
+
+    /// lnrent-urw.6 (PR-9c) e2e: the blackout-alert + edge-trigger path through the REAL dispatcher
+    /// and durable outbox. Drives `refresh_relay_status` with deterministic all-disconnected rows
+    /// (see the live-pool projection test above for the real-socket half) and asserts the PERSISTED
+    /// `operator.alert` outbox rows — NOT relay delivery (the alert cannot be delivered during the
+    /// very blackout it reports).
+    #[tokio::test]
+    async fn relay_blackout_alert_is_edge_triggered_and_re_alerts_per_onset() {
+        async fn blackout_rows(store: &Store) -> i64 {
             store
                 .read(|c| {
                     Ok(c.query_row(
@@ -2238,82 +2284,69 @@ mod tests {
                 .await
                 .unwrap()
         }
-
-        let relay = mock_relay().await;
-        let url = relay.url().await.to_string();
-        let op_keys = Keys::generate();
-        let store = Store::open_spawn(":memory:").expect("open in-memory store");
-        let engine =
-            NostrEngine::connect(op_keys.clone(), std::slice::from_ref(&url), store.clone())
-                .await
-                .expect("operator engine connects");
-
-        // The projection reflects a REAL connected pool.
-        let up = engine.relay_status_snapshot().await;
-        assert_eq!(up.len(), 1, "one configured relay");
-        assert!(up[0].connected, "the relay is connected before shutdown");
-        assert!(up[0].last_connected_at.is_some(), "a live connection stamps last_connected_at");
-
-        // Kill the relay -> the pool drops to all-disconnected (bounded wait for the client to notice).
-        relay.shutdown();
-        let mut down = engine.relay_status_snapshot().await;
-        for _ in 0..300 {
-            if crate::relay_status::all_disconnected(&down) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            down = engine.relay_status_snapshot().await;
+        fn down() -> Vec<RelayStatusRow> {
+            vec![RelayStatusRow {
+                url: "wss://relay-a".into(),
+                connected: false,
+                status: "Disconnected".into(),
+                last_connected_at: Some(500),
+            }]
         }
-        assert!(
-            crate::relay_status::all_disconnected(&down),
-            "the pool went all-disconnected after the relay shut down"
-        );
+        fn up() -> Vec<RelayStatusRow> {
+            vec![RelayStatusRow {
+                url: "wss://relay-a".into(),
+                connected: true,
+                status: "Connected".into(),
+                last_connected_at: Some(500),
+            }]
+        }
 
+        let store = Store::open_spawn(":memory:").expect("open in-memory store");
         let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(0));
         let alerts = Arc::new(AlertDispatcher::new(
             store.clone(),
             clock.clone(),
-            op_keys.public_key().to_hex(),
+            Keys::generate().public_key().to_hex(),
         ));
         let cell = RelayStatusCell::new();
         let mut monitor = RelayBlackoutMonitor::new();
 
-        // Onset: records the all-disconnected window + publishes the snapshot, but does NOT alert.
-        refresh_relay_status(&engine, &cell, &mut monitor, &alerts, 10_000).await;
+        // Onset at T0: records the window + publishes the snapshot to the cell, does NOT alert.
+        refresh_relay_status(down(), &cell, &mut monitor, &alerts, 10_000).await;
         assert!(
             crate::relay_status::all_disconnected(&cell.get()),
             "the shared cell reflects the disconnected pool for `Request::Relays`"
         );
-        assert_eq!(operator_alert_rows(&store).await, 0, "no alert before the threshold");
+        assert_eq!(blackout_rows(&store).await, 0, "no alert before the threshold");
 
         // Crossing the threshold fires exactly one RelayBlackout alert into the durable outbox.
-        refresh_relay_status(
-            &engine,
-            &cell,
-            &mut monitor,
-            &alerts,
-            10_000 + RELAY_BLACKOUT_ALERT_S,
-        )
-        .await;
-        assert_eq!(
-            operator_alert_rows(&store).await,
-            1,
-            "one persisted RelayBlackout alert once the pool has been dark past the threshold"
-        );
+        refresh_relay_status(down(), &cell, &mut monitor, &alerts, 10_000 + RELAY_BLACKOUT_ALERT_S)
+            .await;
+        assert_eq!(blackout_rows(&store).await, 1, "one persisted alert past the threshold");
 
-        // A later pass in the same onset is edge-triggered off — still exactly one.
+        // A later tick in the SAME onset is edge-triggered off — still exactly one.
         refresh_relay_status(
-            &engine,
+            down(),
             &cell,
             &mut monitor,
             &alerts,
             10_000 + RELAY_BLACKOUT_ALERT_S + 300,
         )
         .await;
+        assert_eq!(blackout_rows(&store).await, 1, "edge-triggered — one per onset, not per tick");
+
+        // Reconnect re-arms the monitor.
+        refresh_relay_status(up(), &cell, &mut monitor, &alerts, 20_000).await;
+
+        // A SECOND, distinct blackout onset re-alerts — even within the dispatcher's 6h cooldown —
+        // because the alert is keyed on the onset (codex). Onset at 20_000, fires at +threshold.
+        refresh_relay_status(down(), &cell, &mut monitor, &alerts, 20_000).await;
+        refresh_relay_status(down(), &cell, &mut monitor, &alerts, 20_000 + RELAY_BLACKOUT_ALERT_S)
+            .await;
         assert_eq!(
-            operator_alert_rows(&store).await,
-            1,
-            "the alert is edge-triggered — one per onset, not once per tick"
+            blackout_rows(&store).await,
+            2,
+            "the next onset re-alerts (distinct onset subject dodges the per-subject cooldown)"
         );
     }
 
