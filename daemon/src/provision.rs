@@ -23,12 +23,18 @@ use serde_json::{json, Value};
 
 use lnrent_wire::{Msg, ProvisionReady, PublicKey};
 
+use crate::alerts::{Alert, AlertDispatcher, AlertKind};
 use crate::clock::Clock;
 use crate::nostr_engine::{OrderHandler, Outbound};
 use crate::recipe::Recipe;
 use crate::reservation;
 use crate::runner::{run_hook, HookOutput, DEFAULT_TIMEOUT};
 use crate::store::Store;
+
+/// How long a provision-failure cleanup may stay open (its idempotent `destroy` failing every
+/// maintenance retry) before the operator is alerted (lnrent-urw.2). The backlog itself is surfaced
+/// immediately in `lnrent teardowns`; this bounds the DM to genuinely-stuck cleanups.
+const CLEANUP_STUCK_ALERT_S: i64 = 3600;
 
 /// Bounded retry for the `provision` hook within one drive: the hook is idempotent (§7.2), so a
 /// transient failure is safe to re-run a few times before declaring a PERMANENT failure. A simple
@@ -63,6 +69,9 @@ pub struct Provisioner {
     recipe: Recipe,
     /// The box this operator provisions onto (M1a is single-box). Recorded on the `instance` row.
     box_id: String,
+    /// Optional GATE-1 alert sink (lnrent-urw.2): a provision-failure cleanup backlog stuck past a
+    /// threshold fires a `TeardownFailed` operator DM. `None` in focused tests.
+    alerts: Option<Arc<AlertDispatcher>>,
 }
 
 /// The subscription fields the provision step reads up front (before the hook), plus the SETTLED
@@ -88,7 +97,20 @@ impl Provisioner {
             clock,
             recipe,
             box_id,
+            alerts: None,
         }
+    }
+
+    /// Inject the GATE-1 alert sink (lnrent-urw.2) so a stuck provision-failure cleanup backlog
+    /// surfaces a `TeardownFailed` operator DM.
+    pub fn with_alerts(mut self, alerts: Arc<AlertDispatcher>) -> Self {
+        self.alerts = Some(alerts);
+        self
+    }
+
+    /// `(count, oldest_at)` of OPEN provision-failure cleanups for this provisioner's recipe.
+    pub async fn open_cleanups_summary(&self) -> Result<(i64, Option<i64>)> {
+        open_cleanups_summary_for(&self.store, &self.recipe.service.id).await
     }
 
     /// Provision one subscription (step A). Idempotent: safe to re-run on restart because the
@@ -265,7 +287,42 @@ impl Provisioner {
                 finished += 1;
             }
         }
+        // Surface a STUCK provision-cleanup backlog (lnrent-urw.2): whatever this pass couldn't
+        // finish stays open; alert once the oldest has been owed past the threshold. Cooldown-
+        // collapsed on a fixed subject; BEST-EFFORT — a summary-read error must not fail recovery.
+        match self.open_cleanups_summary().await {
+            Ok((open, Some(oldest_at))) => {
+                let now = self.clock.now();
+                if open > 0 && now - oldest_at >= CLEANUP_STUCK_ALERT_S {
+                    self.alert_cleanup_backlog(open, now - oldest_at).await;
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "provision cleanup backlog summary failed (non-fatal)")
+            }
+        }
         Ok(finished)
+    }
+
+    /// Best-effort `TeardownFailed` for a stuck provision-cleanup backlog. Fixed subject so repeats
+    /// collapse to one DM per cooldown; never fails the caller.
+    async fn alert_cleanup_backlog(&self, open: i64, oldest_age_s: i64) {
+        let Some(alerts) = &self.alerts else { return };
+        let detail = format!(
+            "{open} provision-failure cleanup(s) still owed (idempotent destroy failing on retry); \
+             oldest has been open {oldest_age_s}s — a resource may still be billing. See `lnrent teardowns`."
+        );
+        if let Err(e) = alerts
+            .dispatch(Alert::new(
+                AlertKind::TeardownFailed,
+                "provision-cleanup",
+                detail,
+            ))
+            .await
+        {
+            tracing::warn!(error = %format!("{e:#}"), "failed to enqueue provision-cleanup TeardownFailed alert");
+        }
     }
 
     /// Run the `provision` hook up to [`PROVISION_ATTEMPTS`] times, returning the first success or
@@ -629,6 +686,35 @@ impl Provisioner {
             })
             .await
     }
+}
+
+/// `(count, oldest_at)` of OPEN provision-failure cleanups for `recipe_id` — a
+/// `provision_cleanup_pending` journal row with no matching `_done`. Shared by the provisioner's
+/// stuck-backlog alert and the IPC `teardowns`/`status` fold (lnrent-urw.2).
+pub async fn open_cleanups_summary_for(
+    store: &Store,
+    recipe_id: &str,
+) -> Result<(i64, Option<i64>)> {
+    let recipe_id = recipe_id.to_string();
+    store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT count(*), MIN(p.at)
+                   FROM event_log p
+                   JOIN subscription s ON s.id=p.subscription_id
+                  WHERE p.kind=?1
+                    AND s.recipe_id=?3
+                    AND NOT EXISTS (
+                      SELECT 1 FROM event_log d
+                       WHERE d.subscription_id=p.subscription_id
+                         AND d.kind=?2
+                         AND d.detail_json=('{\"pending_event_id\":' || p.id || '}')
+                    )",
+                params![CLEANUP_PENDING, CLEANUP_DONE, recipe_id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )?)
+        })
+        .await
 }
 
 fn delivery_payload(stdout_json: &Value) -> Result<Value> {

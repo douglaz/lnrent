@@ -28,3 +28,6 @@ pub mod resume;
 pub mod runner;
 pub mod store;
 pub mod supervisor;
+/// Orphaned-instance teardown dead-letter (lnrent-urw.2): surfaces + retries a failed `destroy` hook
+/// so a droplet that failed to delete stops billing the operator invisibly.
+pub mod teardown;

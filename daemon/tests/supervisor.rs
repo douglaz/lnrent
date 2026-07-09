@@ -945,3 +945,39 @@ async fn scalar_status(store: &Store, sql: &'static str) -> Option<String> {
         .await
         .unwrap()
 }
+
+// ==============================================================================================
+// 6. urw.2 teardown dead-letter: the real maintenance loop retries an owed teardown and resolves
+//    it when the (dummy) destroy hook succeeds — proving the supervisor wires the reconciler's
+//    retry_teardowns end to end.
+// ==============================================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maintenance_retries_and_resolves_a_teardown_dead_letter() {
+    let relay = mock_relay().await;
+    let url = relay.url().await.to_string();
+    let op_keys = Keys::generate();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let payment = Arc::new(MockPayment::new());
+    payment.set_now(START);
+    let clock = Arc::new(TestClock::new(START));
+
+    // Seed a dead-letter as if a prior `destroy` failed. last_attempt_at=0, so by START the backoff
+    // (attempts=1 → 120s) has long elapsed → it is due on the first maintenance tick.
+    lnrentd::teardown::record_failure(&store, "sub-1", "destroy", None, "boom", 0)
+        .await
+        .unwrap();
+    assert_eq!(lnrentd::teardown::open_count(&store).await.unwrap(), 1);
+
+    // The dummy recipe's `destroy` hook SUCCEEDS, so retry_teardowns resolves the row.
+    let (running, _sock) =
+        start_supervisor(&op_keys, &url, store.clone(), payment, clock).await;
+
+    let store_for_poll = store.clone();
+    wait_until("teardown dead-letter resolved", || {
+        let store = store_for_poll.clone();
+        async move { lnrentd::teardown::open_count(&store).await.unwrap() == 0 }
+    })
+    .await;
+
+    running.shutdown().await.unwrap();
+}

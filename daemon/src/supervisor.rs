@@ -190,29 +190,24 @@ impl Supervisor {
             inbound_drain.clone(),
         ));
 
-        let provisioner = Arc::new(Provisioner::new(
-            store.clone(),
-            clock.clone(),
-            recipe.clone(),
-            box_id,
-        ));
+        // GATE-1 alert sink: shared into every condition owner (lnrent-urw.1 refunder + lnrent-urw.2
+        // reconciler teardown + provisioner cleanup backlog). Cheap Arc clones share one cooldown map.
+        let provisioner = Arc::new(
+            Provisioner::new(store.clone(), clock.clone(), recipe.clone(), box_id)
+                .with_alerts(alerts.clone()),
+        );
         let resume_driver = Arc::new(ResumeDriver::new(
             store.clone(),
             clock.clone(),
             recipe.clone(),
         ));
-        // GATE-1 alert sink (lnrent-urw.1): the refunder is the only PR-5 owner of a condition, so
-        // the dispatcher is moved straight in. Sibling beads (PR-6 teardown, PR-9c relay, PR-16
-        // holdings) will thread their own clone to their own call sites when they land.
         let refunder = Arc::new(
             Refunder::with_resolver(store.clone(), payment.clone(), clock.clone(), resolver)
-                .with_alerts(alerts),
+                .with_alerts(alerts.clone()),
         );
-        let reconciler = Arc::new(Reconciler::new(
-            store.clone(),
-            payment.clone(),
-            recipe.clone(),
-        ));
+        let reconciler = Arc::new(
+            Reconciler::new(store.clone(), payment.clone(), recipe.clone()).with_alerts(alerts),
+        );
         let recipes = Arc::new(vec![recipe.clone()]);
 
         Ok(Supervisor {

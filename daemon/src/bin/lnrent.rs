@@ -35,6 +35,9 @@ enum Cmd {
     Subs,
     /// Inspect one subscription.
     Sub { id: String },
+    /// List OPEN teardown dead-letters: failed `destroy` hooks + stuck provision cleanups. A
+    /// provider resource (e.g. a droplet) may still be billing until these resolve.
+    Teardowns,
     /// Admin: force-suspend a subscription.
     Suspend { id: String },
     /// Admin: force-resume a suspended subscription.
@@ -67,6 +70,7 @@ fn exit_for(err_code: &str) -> ExitCode {
 enum HumanRender {
     Generic,
     Money,
+    Teardowns,
 }
 
 #[tokio::main]
@@ -78,6 +82,7 @@ async fn main() -> ExitCode {
         Cmd::Money => (Request::Money, HumanRender::Money),
         Cmd::Subs => (Request::Subs, HumanRender::Generic),
         Cmd::Sub { id } => (Request::Sub { id }, HumanRender::Generic),
+        Cmd::Teardowns => (Request::Teardowns, HumanRender::Teardowns),
         Cmd::Suspend { id } => (Request::AdminSuspend { id }, HumanRender::Generic),
         Cmd::Resume { id } => (Request::AdminResume { id }, HumanRender::Generic),
         Cmd::Dev {
@@ -120,6 +125,7 @@ fn render(reply: Reply, as_json: bool, human_render: HumanRender) -> ExitCode {
             Some(v) => match human_render {
                 HumanRender::Generic => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
                 HumanRender::Money => render_money_human(&v),
+                HumanRender::Teardowns => render_teardowns_human(&v),
             },
         }
     } else if let Some(err) = &reply.error {
@@ -175,5 +181,40 @@ fn render_money_human(v: &serde_json::Value) {
             "Status: \x1b[1mNOT READY ({})\x1b[0m",
             warning.unwrap_or("unknown")
         );
+    }
+}
+
+/// Human render for `lnrent teardowns` (lnrent-urw.2): the owed provider teardowns, or a clean line.
+fn render_teardowns_human(v: &serde_json::Value) {
+    let get_i64 = |k: &str| v.get(k).and_then(serde_json::Value::as_i64).unwrap_or(0);
+    let failures = v
+        .get("teardown_failures")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let cleanups = get_i64("provision_cleanups_open");
+    let total = get_i64("open_total");
+    if total == 0 {
+        println!("No owed teardowns — every destroy/cleanup has completed.");
+        return;
+    }
+    println!("Owed teardowns: \x1b[1m{total}\x1b[0m (a provider resource may still be billing)");
+    for f in &failures {
+        let s = |k: &str| f.get(k).and_then(serde_json::Value::as_str).unwrap_or("?");
+        let n = |k: &str| f.get(k).and_then(serde_json::Value::as_i64).unwrap_or(0);
+        println!(
+            "  \u{2022} sub {} \u{b7} {} \u{b7} {} attempt(s) \u{b7} owed {}s \u{b7} next retry in {}s",
+            s("subscription_id"),
+            s("hook"),
+            n("attempts"),
+            n("owed_for_s"),
+            n("next_retry_in_s"),
+        );
+        if let Some(err) = f.get("last_error").and_then(serde_json::Value::as_str) {
+            println!("      last error: {err}");
+        }
+    }
+    if cleanups > 0 {
+        println!("  + {cleanups} provision-failure cleanup(s) owed (auto-retried every reconcile tick)");
     }
 }
