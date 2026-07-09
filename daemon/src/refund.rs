@@ -33,7 +33,7 @@ use rusqlite::{params, OptionalExtension, Transaction};
 
 use lnrent_wire::{BillingRefund, Msg};
 
-use crate::alerts::{Alert, AlertDispatcher, AlertKind};
+use crate::alerts::{Alert, AlertDispatcher, AlertKind, AlertRow};
 use crate::backends::{PayStatus, PaymentBackend};
 use crate::clock::Clock;
 use crate::refund_resolver::{
@@ -229,14 +229,29 @@ impl Refunder {
         self
     }
 
-    /// Fire an alert best-effort: an enqueue failure is logged but NEVER fails the refund drive
-    /// (the loud log line at the call site already recorded the underlying condition).
+    /// Fire a RECURRING alert best-effort (out of any txn): an enqueue failure is logged but NEVER
+    /// fails the refund drive (the loud log line at the call site already recorded the condition).
+    /// Terminal parks use [`Refunder::parked_alert_row`] instead, enqueued in their state txn.
     async fn alert(&self, alert: Alert) {
         if let Some(alerts) = &self.alerts {
             if let Err(e) = alerts.dispatch(alert).await {
                 tracing::warn!(error = %format!("{e:#}"), "failed to enqueue operator alert");
             }
         }
+    }
+
+    /// The `RefundParked` alert row to enqueue INSIDE a park-FAILED transaction, or `None` when
+    /// alerting is off. Terminal + atomic: it commits with the FAILED transition, so a crash can
+    /// never drop the alert for a park the row will never re-enter (codex).
+    fn parked_alert_row(&self, row: &RefundRow, reason: &str) -> Option<AlertRow> {
+        let detail = format!(
+            "refund {} parked FAILED ({reason}); sub {}",
+            row.id,
+            row.subscription_id.as_deref().unwrap_or("-")
+        );
+        self.alerts
+            .as_ref()?
+            .terminal_alert_row(AlertKind::RefundParked, &row.id, &detail)
     }
 
     /// Process every non-terminal (`PENDING`) `refund_attempt` row. Idempotent and safe to call
@@ -862,6 +877,10 @@ impl Refunder {
             amount_sat: amount,
             status: "failed".to_string(),
         }))?;
+        // The parked alert is enqueued INSIDE the terminalizing txn (codex): once FAILED commits the
+        // row is never re-selected, so a best-effort post-commit enqueue could lose the alert to a
+        // crash — the exact terminal park the sink exists to surface. Built here, inserted below.
+        let parked_alert = self.parked_alert_row(row, reason);
         let outcome = self
             .store
             .transaction(move |tx| {
@@ -883,6 +902,9 @@ impl Refunder {
                     &external_id,
                     now,
                 )?;
+                if let Some(alert) = &parked_alert {
+                    enqueue_alert_row(tx, alert, now)?;
+                }
                 Ok(Outcome::Failed)
             })
             .await?;
@@ -893,16 +915,6 @@ impl Refunder {
                 %reason,
                 "refund parked FAILED — manual handling required"
             );
-            self.alert(Alert::new(
-                AlertKind::RefundParked,
-                row.id.clone(),
-                format!(
-                    "refund {} parked FAILED — manual handling required ({reason}); sub {}",
-                    row.id,
-                    row.subscription_id.as_deref().unwrap_or("-")
-                ),
-            ))
-            .await;
         }
         Ok(outcome)
     }
@@ -928,6 +940,11 @@ impl Refunder {
             amount_sat: amount,
             status: "failed".to_string(),
         }))?;
+        // Parked alert enqueued IN the terminalizing txn (codex) — see `commit_park_failed`.
+        let parked_alert = self.parked_alert_row(
+            row,
+            &format!("exhausted {MAX_REFUND_ATTEMPTS} pay attempts"),
+        );
         let outcome = self
             .store
             .transaction(move |tx| {
@@ -968,26 +985,25 @@ impl Refunder {
                     &external_id,
                     now,
                 )?;
+                if let Some(alert) = &parked_alert {
+                    enqueue_alert_row(tx, alert, now)?;
+                }
                 Ok(Outcome::Failed)
             })
             .await?;
-        if matches!(outcome, Outcome::Failed) {
-            tracing::error!(
+        match outcome {
+            Outcome::Failed => tracing::error!(
                 refund = %row.id,
                 subscription = row.subscription_id.as_deref().unwrap_or(""),
                 attempts = MAX_REFUND_ATTEMPTS,
                 "refund parked FAILED after exhausting retry attempts"
-            );
-            self.alert(Alert::new(
-                AlertKind::RefundParked,
-                row.id.clone(),
-                format!(
-                    "refund {} parked FAILED after {MAX_REFUND_ATTEMPTS} pay attempts; sub {}",
-                    row.id,
-                    row.subscription_id.as_deref().unwrap_or("-")
-                ),
-            ))
-            .await;
+            ),
+            // A PENDING refund whose pay keeps failing ambiguously (Pending/Unknown, allow_terminal
+            // false) never reaches the cap and so never parks — it bypasses `commit_resolution_retry`'s
+            // stuck check entirely (codex). Cover it here: a retried pay-failure past the threshold is
+            // surfaced too, cooldown-collapsed like the resolution-stuck path.
+            Outcome::Retried => self.maybe_alert_stuck(row, now).await,
+            _ => {}
         }
         Ok(outcome)
     }
@@ -1019,34 +1035,40 @@ impl Refunder {
             .await?;
         // ESCALATION (review P2): a refund that keeps deferring WITHOUT a pay — a permanently
         // transient-looking buyer endpoint, or a legacy payment in flight forever — would otherwise
-        // strand money silently with nobody notified. Once it has been PENDING past the stuck
-        // threshold, surface it with an operator-LOUD error EVERY drive. The row stays PENDING and
-        // keeps retrying (a recovered endpoint can still refund the buyer); this is time-based, so it
-        // never consumes the pay-attempts cap.
+        // strand money silently with nobody notified. Surface it once it is PENDING past the stuck
+        // threshold (shared with the pay-stuck path in `commit_pay_failure`).
         if matches!(outcome, Outcome::Retried) {
-            let age = now - row.created_at;
-            if age >= RESOLUTION_STUCK_ALERT_S {
-                tracing::error!(
-                    refund = %row.id,
-                    subscription = row.subscription_id.as_deref().unwrap_or(""),
-                    age_s = age,
-                    "refund stuck PENDING without payment past the alert threshold (resolution/in-flight not progressing); operator attention needed"
-                );
-                // Edge-triggered: this logs EVERY drive past the threshold, but the dispatcher's
-                // per-(kind,subject) cooldown collapses it to one operator DM per 6h per refund.
-                self.alert(Alert::new(
-                    AlertKind::RefundStuck,
-                    row.id.clone(),
-                    format!(
-                        "refund {} stuck PENDING {age}s without payment (resolution/in-flight not progressing); sub {}",
-                        row.id,
-                        row.subscription_id.as_deref().unwrap_or("-")
-                    ),
-                ))
-                .await;
-            }
+            self.maybe_alert_stuck(row, now).await;
         }
         Ok(outcome)
+    }
+
+    /// A refund still PENDING past [`RESOLUTION_STUCK_ALERT_S`] — deferring without progress, whether
+    /// its `pay` keeps failing ambiguously or its destination keeps not resolving — is stranded money
+    /// nobody is watching. Log operator-LOUD EVERY drive and fire a `RefundStuck` alert; the
+    /// dispatcher's per-(kind,subject) 6h cooldown collapses the repeats to one DM. Time-based, so it
+    /// never consumes the pay-attempts cap; the row stays PENDING and keeps retrying.
+    async fn maybe_alert_stuck(&self, row: &RefundRow, now: i64) {
+        let age = now - row.created_at;
+        if age < RESOLUTION_STUCK_ALERT_S {
+            return;
+        }
+        tracing::error!(
+            refund = %row.id,
+            subscription = row.subscription_id.as_deref().unwrap_or(""),
+            age_s = age,
+            "refund stuck PENDING past the alert threshold (not progressing); operator attention needed"
+        );
+        self.alert(Alert::new(
+            AlertKind::RefundStuck,
+            row.id.clone(),
+            format!(
+                "refund {} stuck PENDING {age}s without progress; sub {}",
+                row.id,
+                row.subscription_id.as_deref().unwrap_or("-")
+            ),
+        ))
+        .await;
     }
 
     /// Every PENDING refund row, with the buyer's pubkey joined in for the DM recipient. A missing
@@ -1144,6 +1166,20 @@ fn enqueue_failed_refund(
 ) -> rusqlite::Result<()> {
     enqueue_refund(tx, outbox_id, recipient, sub_id, payload_json, now)?;
     journal(tx, sub_id, "refund_failed", external_id, now)?;
+    Ok(())
+}
+
+/// Insert a prepared terminal `operator.alert` outbox row (lnrent-urw.1) in the caller's txn, so the
+/// alert commits atomically with the state transition it reports. `ON CONFLICT DO NOTHING` on the
+/// stable id makes a re-drive idempotent.
+fn enqueue_alert_row(tx: &Transaction, row: &AlertRow, now: i64) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO outbox
+            (id, recipient, subscription_id, msg_type, payload_json, state, attempts, created_at)
+         VALUES (?1, ?2, NULL, 'operator.alert', ?3, 'PENDING', 0, ?4)
+         ON CONFLICT(id) DO NOTHING",
+        params![row.id, row.recipient, row.payload, now],
+    )?;
     Ok(())
 }
 
@@ -1933,6 +1969,48 @@ mod tests {
         assert_eq!(alerts[0].0, "op-npub-hex");
         assert_eq!(alerts[0].1, "refund_parked");
         assert_eq!(alerts[0].2, "ref-order:sub-1");
+    }
+
+    // urw.1 finding 2 (codex): a refund whose pay keeps failing AMBIGUOUSLY (Pending/Unknown,
+    // allow_terminal=false) never reaches the cap and never parks, so it bypassed the resolution-stuck
+    // path. Past the stuck threshold it must still emit a RefundStuck alert (cooldown-collapsed to one
+    // per 6h). Drive once well past the threshold and assert exactly one RefundStuck.
+    #[tokio::test]
+    async fn pay_stuck_ambiguous_refund_emits_refund_stuck_alert() {
+        let store = mem_store();
+        let payment = Arc::new(TestPayment::new());
+        payment.set_fail(true);
+        payment.set_failed_status(PayStatus::Pending);
+        // created_at is 0 (seed_refund); a clock past the stuck threshold makes the row "stuck".
+        let clock = TestClock::new(RESOLUTION_STUCK_ALERT_S + 1);
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        seed_refund(&store, "sub-1", Some(LN_ADDR), Some(500)).await;
+        seed_reservation(&store, "sub-1").await;
+        let r = refunder_with_alerts(&store, &payment, &clock, "op-npub-hex");
+
+        let report = r.drive().await.unwrap();
+        assert_eq!(report.retried, 1, "ambiguous pay stays PENDING/retried, never parks");
+        assert_eq!(report.failed, 0);
+
+        let alerts = operator_alerts(&store).await;
+        assert_eq!(
+            alerts,
+            vec![(
+                "op-npub-hex".to_string(),
+                "refund_stuck".to_string(),
+                "ref-order:sub-1".to_string()
+            )],
+            "a pay-stuck refund past the threshold emits exactly one RefundStuck alert"
+        );
+
+        // Cooldown collapses the repeat: a second drive within 6h adds no new alert row.
+        clock.set(RESOLUTION_STUCK_ALERT_S + 2);
+        r.drive().await.unwrap();
+        assert_eq!(
+            operator_alerts(&store).await.len(),
+            1,
+            "the recurring stuck alert is cooldown-collapsed within 6h"
+        );
     }
 
     // 3. No double-pay on retry: drive() twice in success mode -> pay invoked once (the row is SENT

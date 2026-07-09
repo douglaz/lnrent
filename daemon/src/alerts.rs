@@ -128,27 +128,36 @@ impl AlertDispatcher {
         self.enabled && !self.recipient_hex.is_empty()
     }
 
-    /// Enqueue a durable `operator.alert` DM for `alert`, unless disabled or suppressed by the
-    /// per-`(kind, subject)` cooldown. Edge-triggered: the first call for a `(kind, subject)` sends;
-    /// repeats within [`ALERT_COOLDOWN_S`] are dropped; a call past the window re-fires. Best-effort
-    /// by contract — the caller keeps its own log line and must not fail its work on an alert error.
+    /// The resolved recipient pubkey hex, for callers that enqueue the alert row inside their own
+    /// transaction (see [`terminal_alert_row`](Self::terminal_alert_row)).
+    pub fn recipient_hex(&self) -> &str {
+        &self.recipient_hex
+    }
+
+    /// Enqueue a durable `operator.alert` DM for a RECURRING condition (e.g. a refund stuck PENDING,
+    /// re-detected every drive), unless disabled or suppressed by the per-`(kind, subject)`
+    /// cooldown. Edge-triggered: the first call sends; repeats within [`ALERT_COOLDOWN_S`] are
+    /// dropped; a call past the window re-fires. Best-effort — the caller keeps its own log line and
+    /// must not fail its work on an alert error. NOT for terminal one-shot conditions: those enqueue
+    /// atomically via [`terminal_alert_row`](Self::terminal_alert_row) instead.
+    ///
+    /// The cooldown is stamped only AFTER the enqueue COMMITS, so a transient store failure lets the
+    /// next drive retry rather than muting the condition for the whole window (coderabbit/codex).
     pub async fn dispatch(&self, alert: Alert) -> Result<()> {
         if !self.is_enabled() {
             return Ok(());
         }
         let now = self.clock.now();
 
-        // Check-and-reserve under the lock (no await held): if within cooldown, drop; otherwise
-        // stamp `now` so a concurrent/next call is suppressed, then enqueue below.
+        // Cooldown check under the lock (no await held). Do NOT stamp yet — a failed enqueue below
+        // must be retryable on the next drive, not suppressed for 6h.
         {
-            let mut map = self.last_sent.lock().expect("alert cooldown map poisoned");
-            let key = (alert.kind, alert.subject.clone());
-            if let Some(&last) = map.get(&key) {
+            let map = self.last_sent.lock().expect("alert cooldown map poisoned");
+            if let Some(&last) = map.get(&(alert.kind, alert.subject.clone())) {
                 if now - last < ALERT_COOLDOWN_S {
                     return Ok(());
                 }
             }
-            map.insert(key, now);
         }
 
         let payload = serde_json::to_string(&Msg::OperatorAlert(OperatorAlert {
@@ -177,8 +186,50 @@ impl AlertDispatcher {
                 Ok(())
             })
             .await?;
+
+        // Committed — now stamp the cooldown so repeats within the window are suppressed.
+        self.last_sent
+            .lock()
+            .expect("alert cooldown map poisoned")
+            .insert((alert.kind, alert.subject), now);
         Ok(())
     }
+
+    /// Build a durable outbox row for a TERMINAL (one-shot) alert, for the caller to insert INSIDE
+    /// its own state-transition transaction so the alert commits atomically with the condition it
+    /// reports (codex: a parked refund must not lose its alert to a crash between commit and a
+    /// best-effort enqueue). `None` when disabled. No cooldown — a terminal condition fires once, and
+    /// the stable id + the caller's `ON CONFLICT DO NOTHING` make a re-drive idempotent.
+    pub fn terminal_alert_row(
+        &self,
+        kind: AlertKind,
+        subject: &str,
+        detail: &str,
+    ) -> Option<AlertRow> {
+        if !self.is_enabled() {
+            return None;
+        }
+        let payload = serde_json::to_string(&Msg::OperatorAlert(OperatorAlert {
+            kind: kind.wire_str().to_string(),
+            subject: subject.to_string(),
+            detail: detail.to_string(),
+        }))
+        .expect("serialize operator alert (three owned strings) is infallible");
+        Some(AlertRow {
+            id: format!("outbox:alert:{}:{subject}", kind.wire_str()),
+            recipient: self.recipient_hex.clone(),
+            payload,
+        })
+    }
+}
+
+/// A prepared `operator.alert` outbox row for a terminal alert. The caller inserts it inside its own
+/// transaction (see [`AlertDispatcher::terminal_alert_row`]); `msg_type`/`state`/`created_at` are
+/// fixed at insert time.
+pub struct AlertRow {
+    pub id: String,
+    pub recipient: String,
+    pub payload: String,
 }
 
 #[cfg(test)]
