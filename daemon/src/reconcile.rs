@@ -697,6 +697,14 @@ impl Reconciler {
     async fn retry_teardowns(&self, now: i64) -> Result<usize> {
         let mut resolved = 0;
         for row in teardown::open_due_rows(&self.store, now).await? {
+            // Defense-in-depth (codex P1): never re-run a destructive hook against a sub that is
+            // currently ALIVE. A dead-letter is only ever recorded for a terminated sub (the atomic
+            // record-iff-CAS-wins in `fire_destroy`), so this should never trip — but if a stale row
+            // somehow outlived a later resume, skip it rather than delete a live box.
+            if !self.sub_is_terminal_or_absent(&row.subscription_id).await? {
+                tracing::warn!(sub = %row.subscription_id, "teardown dead-letter for a non-terminal sub — skipping retry");
+                continue;
+            }
             // Re-run the hook from the persisted handles alone — at retry time the sub is TERMINATED
             // and its instance row may be gone, so we do NOT re-read it.
             let handles: Value = row
@@ -740,6 +748,25 @@ impl Reconciler {
             }
         }
         Ok(resolved)
+    }
+
+    /// True if the sub is TERMINATED or its row is gone — the only states in which re-running a
+    /// `destroy` teardown is safe (lnrent-urw.2). A live sub (ACTIVE/RESUMING/SUSPENDED/…) returns
+    /// false so the retry skips it.
+    async fn sub_is_terminal_or_absent(&self, sub_id: &str) -> Result<bool> {
+        let id = sub_id.to_string();
+        let state: Option<String> = self
+            .store
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT state FROM subscription WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?)
+            })
+            .await?;
+        Ok(state.map(|s| s == "TERMINATED").unwrap_or(true))
     }
 
     async fn lifecycle_hook_input(&self, sub_id: &str, buyer_hex: &str) -> Result<Value> {
@@ -1011,23 +1038,26 @@ impl Reconciler {
         if self.renewal_settlement_pending(sub_id).await? {
             return Ok(false);
         }
-        // A failed retention `destroy` is DEAD-LETTERED (lnrent-urw.2): the provider resource may not
-        // have been torn down and keeps billing the operator invisibly. Purely additive — record the
-        // owed cleanup + alert, then still TERMINATE + release below (unchanged: §9.3). The retry
-        // loop re-runs the idempotent hook until it succeeds.
-        if let Some(error) = self.run_lifecycle_hook("destroy", sub_id, buyer_hex).await? {
-            let handles = self
-                .hook_instance(sub_id)
-                .await?
-                .and_then(|i| i.handles_json);
-            let attempts =
-                teardown::record_failure(&self.store, sub_id, "destroy", handles, &error, now)
-                    .await?;
-            self.alert_teardown(sub_id, "destroy", attempts, &error).await;
-        }
+        // Run the retention `destroy` hook; capture a failure to DEAD-LETTER (lnrent-urw.2) only if
+        // the terminate CAS below actually wins. A hook failure alone must NOT persist a dead-letter:
+        // if a renewal settlement resumes the sub mid-hook, the CAS loses and the sub is ALIVE — a
+        // dead-letter here would later delete a paying buyer's live box (codex P1). Fetch handles
+        // best-effort (a read failure must not abort the tick — coderabbit).
+        let hook_error = self.run_lifecycle_hook("destroy", sub_id, buyer_hex).await?;
+        let handles = if hook_error.is_some() {
+            self.hook_instance(sub_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|i| i.handles_json)
+        } else {
+            None
+        };
 
         let id = sub_id.to_string();
-        self.store
+        let hook_error_txn = hook_error.clone();
+        let terminated = self
+            .store
             .transaction(move |tx| {
                 let n = tx.execute(
                     "UPDATE subscription SET state='TERMINATED', next_deadline=NULL, updated_at=?2
@@ -1040,9 +1070,28 @@ impl Reconciler {
                 // Free the capacity hold atomically with the terminate (§9.3). Idempotent.
                 reservation::release_txn(tx, &id, now)?;
                 journal(tx, &id, "reconcile_terminate", now)?;
+                // Dead-letter a failed destroy ATOMICALLY with the terminate: recorded iff the CAS
+                // won (the sub really terminated), in the SAME txn so it can never abort the tick.
+                if let Some(error) = &hook_error_txn {
+                    teardown::record_failure_txn(tx, &id, "destroy", handles.as_deref(), error, now)?;
+                }
                 Ok(true)
             })
-            .await
+            .await?;
+
+        // Alert best-effort AFTER commit — only when the sub actually terminated + we recorded.
+        if terminated {
+            if let Some(error) = &hook_error {
+                let attempts = teardown::open_row(&self.store, sub_id, "destroy")
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|r| r.attempts)
+                    .unwrap_or(1);
+                self.alert_teardown(sub_id, "destroy", attempts, error).await;
+            }
+        }
+        Ok(terminated)
     }
 
     /// Transition 5 — expire OPEN renewal invoices past their own expiry. Each flip is a CAS on
@@ -1879,6 +1928,45 @@ mod tests {
         // Past the backoff: the retry runs the fixed hook and resolves the row.
         r.reconcile_tick(1620).await.unwrap();
         assert_eq!(crate::teardown::open_count(&store).await.unwrap(), 0, "retry resolved the dead-letter");
+    }
+
+    // urw.2 (codex P1 defense): the retry loop must NEVER re-run a destructive hook against a sub
+    // that is currently ALIVE — even if a stale/racy dead-letter row exists for it. The guard skips
+    // it, leaving the box untouched and the row open.
+    #[tokio::test]
+    async fn retry_skips_a_dead_letter_whose_sub_is_alive() {
+        let store = mem_store();
+        let (recipe, _suspend_marker, destroy_marker) = marker_recipe();
+        // A LIVE (ACTIVE) sub with a far-future cursor so the due-scan ignores it entirely.
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO subscription (id, state, buyer_pubkey, next_deadline, created_at, updated_at)
+                     VALUES ('s1', 'ACTIVE', 'buyer', 9999999, 0, 0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // A stale/racy dead-letter for the now-live sub (last_attempt_at=0 → due by now=1000).
+        crate::teardown::record_failure(&store, "s1", "destroy", None, "boom", 0)
+            .await
+            .unwrap();
+        let r = reconciler(store.clone(), recipe);
+
+        r.reconcile_tick(1000).await.unwrap();
+
+        assert!(
+            !destroy_marker.exists(),
+            "destroy hook must NOT run against a live sub"
+        );
+        assert_eq!(
+            crate::teardown::open_count(&store).await.unwrap(),
+            1,
+            "the row is left open (skipped), never resolved by deleting a live box"
+        );
+        assert_eq!(sub_state(&store, "s1").await, "ACTIVE", "the live sub is untouched");
     }
 
     // Test 2: a renewal invoice expiring unpaid changes ONLY the invoice (-> EXPIRED), never the sub.

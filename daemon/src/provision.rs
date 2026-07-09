@@ -289,11 +289,17 @@ impl Provisioner {
         }
         // Surface a STUCK provision-cleanup backlog (lnrent-urw.2): whatever this pass couldn't
         // finish stays open; alert once the oldest has been owed past the threshold. Cooldown-
-        // collapsed on a fixed subject; best-effort, never fails recovery.
-        if let (open, Some(oldest_at)) = self.open_cleanups_summary().await? {
-            let now = self.clock.now();
-            if open > 0 && now - oldest_at >= CLEANUP_STUCK_ALERT_S {
-                self.alert_cleanup_backlog(open, now - oldest_at).await;
+        // collapsed on a fixed subject; BEST-EFFORT — a summary-read error must not fail recovery.
+        match self.open_cleanups_summary().await {
+            Ok((open, Some(oldest_at))) => {
+                let now = self.clock.now();
+                if open > 0 && now - oldest_at >= CLEANUP_STUCK_ALERT_S {
+                    self.alert_cleanup_backlog(open, now - oldest_at).await;
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "provision cleanup backlog summary failed (non-fatal)")
             }
         }
         Ok(finished)
