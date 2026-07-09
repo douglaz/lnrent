@@ -41,7 +41,8 @@ use crate::op_dispatch::OpDispatch;
 use crate::order_intake::OrderIntake;
 use crate::provision::{DeliveryResendOrderHandler, OutboxSender, Provisioner};
 use crate::recipe::Recipe;
-use crate::alerts::AlertDispatcher;
+use crate::alerts::{Alert, AlertDispatcher, AlertKind};
+use crate::relay_status::{RelayBlackoutMonitor, RelayStatusCell, RELAY_BLACKOUT_ALERT_S};
 use crate::reconcile::Reconciler;
 use crate::refund::{gen_key, parse_whole_sat, Refunder};
 use crate::refund_resolver::RefundResolver;
@@ -132,6 +133,12 @@ pub struct Supervisor {
     resume_driver: Arc<ResumeDriver>,
     refunder: Arc<Refunder>,
     reconciler: Arc<Reconciler>,
+    /// GATE-1 alert sink, retained for the maintenance loop's relay-blackout check (lnrent-urw.6);
+    /// the drivers each hold their own clone.
+    alerts: Arc<AlertDispatcher>,
+    /// Shared relay-liveness snapshot: the maintenance loop refreshes it each tick from the engine
+    /// pool, the IPC `Request::Relays`/`Status` paths read it (lnrent-urw.6).
+    relays: RelayStatusCell,
     sock_path: PathBuf,
     intervals: Intervals,
     /// Optional hook to keep a mock payment backend's internal clock in step with `clock` (M1a only;
@@ -206,7 +213,8 @@ impl Supervisor {
                 .with_alerts(alerts.clone()),
         );
         let reconciler = Arc::new(
-            Reconciler::new(store.clone(), payment.clone(), recipe.clone()).with_alerts(alerts),
+            Reconciler::new(store.clone(), payment.clone(), recipe.clone())
+                .with_alerts(alerts.clone()),
         );
         let recipes = Arc::new(vec![recipe.clone()]);
 
@@ -225,6 +233,8 @@ impl Supervisor {
             resume_driver,
             refunder,
             reconciler,
+            alerts,
+            relays: RelayStatusCell::new(),
             sock_path,
             intervals,
             payment_clock_sync: None,
@@ -452,20 +462,23 @@ impl Supervisor {
                 self.sock_path.clone(),
             );
             let payment = self.payment.clone();
+            let relays = self.relays.clone();
             tasks.push(tokio::spawn(supervise(
                 "ipc",
                 shutdown_rx.clone(),
                 RESTART_BACKOFF,
                 move |sd| {
-                    let (store, recipes, clock, payment, sock) = (
+                    let (store, recipes, clock, payment, relays, sock) = (
                         store.clone(),
                         recipes.clone(),
                         clock.clone(),
                         payment.clone(),
+                        relays.clone(),
                         sock.clone(),
                     );
                     async move {
-                        ipc::serve_with_shutdown(store, recipes, clock, payment, &sock, sd).await
+                        ipc::serve_with_shutdown(store, recipes, clock, payment, relays, &sock, sd)
+                            .await
                     }
                 },
             )));
@@ -539,9 +552,22 @@ impl Supervisor {
             )));
         }
 
-        // -- Single serialized maintenance loop (clock sync + periodic settlement catch-up + provision + resume + refund + outbox) --
+        // -- Single serialized maintenance loop (clock sync + periodic settlement catch-up + provision + resume + refund + relay-blackout check + outbox) --
         {
-            let (provisioner, resume_driver, refunder, payment, engine, store, clock, nudge2, sync) = (
+            #[allow(clippy::type_complexity)]
+            let (
+                provisioner,
+                resume_driver,
+                refunder,
+                payment,
+                engine,
+                store,
+                clock,
+                nudge2,
+                sync,
+                alerts,
+                relays,
+            ) = (
                 self.provisioner.clone(),
                 self.resume_driver.clone(),
                 self.refunder.clone(),
@@ -551,6 +577,8 @@ impl Supervisor {
                 self.clock.clone(),
                 nudge.clone(),
                 self.payment_clock_sync.clone(),
+                self.alerts.clone(),
+                self.relays.clone(),
             );
             let interval = self.intervals.maintenance;
             tasks.push(tokio::spawn(supervise(
@@ -568,6 +596,8 @@ impl Supervisor {
                         clock,
                         nudge2,
                         sync,
+                        alerts,
+                        relays,
                     ) = (
                         provisioner.clone(),
                         resume_driver.clone(),
@@ -578,6 +608,8 @@ impl Supervisor {
                         clock.clone(),
                         nudge2.clone(),
                         sync.clone(),
+                        alerts.clone(),
+                        relays.clone(),
                     );
                     async move {
                         run_maintenance_loop(
@@ -589,6 +621,8 @@ impl Supervisor {
                             clock,
                             engine,
                             sync,
+                            alerts,
+                            relays,
                             interval,
                             nudge2,
                             sd,
@@ -1052,11 +1086,16 @@ async fn run_maintenance_loop(
     clock: Arc<dyn Clock>,
     engine: NostrEngine,
     sync: Option<Arc<dyn Fn(i64) + Send + Sync>>,
+    alerts: Arc<AlertDispatcher>,
+    relays: RelayStatusCell,
     interval: Duration,
     nudge: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let outbox = OutboxSender::new(store.clone(), clock.clone());
+    // The relay-blackout edge-trigger state lives across ticks (lnrent-urw.6). A supervised restart
+    // of this loop re-arms it — worst case one duplicate alert for a blackout spanning the restart.
+    let mut blackout = RelayBlackoutMonitor::new();
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -1075,6 +1114,9 @@ async fn run_maintenance_loop(
             &outbox,
             &engine,
             sync.as_ref(),
+            &alerts,
+            &relays,
+            &mut blackout,
             run_catch_up,
         )
         .await;
@@ -1098,6 +1140,9 @@ async fn maintenance_pass(
     outbox: &OutboxSender,
     engine: &NostrEngine,
     sync: Option<&Arc<dyn Fn(i64) + Send + Sync>>,
+    alerts: &Arc<AlertDispatcher>,
+    relays: &RelayStatusCell,
+    blackout: &mut RelayBlackoutMonitor,
     run_catch_up: bool,
 ) {
     // Keep a mock payment backend's clock in step with ours so freshly-issued invoices stamp a live
@@ -1123,9 +1168,47 @@ async fn maintenance_pass(
         tracing::error!(error = %format!("{e:#}"), "maintenance: refund drive failed");
     }
     log_refund_readiness(store, payment).await;
+    refresh_relay_status(engine, relays, blackout, alerts, clock.now()).await;
     if let Err(e) = outbox.drain_once(engine).await {
         tracing::error!(error = %format!("{e:#}"), "maintenance: outbox drain failed");
     }
+}
+
+/// Refresh the shared relay-liveness snapshot from the live pool and fire a single edge-triggered
+/// `RelayBlackout` alert if the pool has been fully disconnected past the threshold (lnrent-urw.6,
+/// GATE-1 PR-9c). Best-effort: never fails the tick. Honest caveat — this alert is the one that
+/// cannot be delivered during the very blackout it reports; it queues in the outbox and drains on
+/// reconnect, and `Request::Relays` is the out-of-band read for the meantime.
+async fn refresh_relay_status(
+    engine: &NostrEngine,
+    relays: &RelayStatusCell,
+    blackout: &mut RelayBlackoutMonitor,
+    alerts: &Arc<AlertDispatcher>,
+    now: i64,
+) {
+    let rows = engine.relay_status_snapshot().await;
+    if blackout.observe(&rows, now) {
+        tracing::error!(
+            relays = rows.len(),
+            "relay blackout: every relay has been disconnected for over {}min — inbound orders and \
+             outbound DMs are not flowing; check relay reachability",
+            RELAY_BLACKOUT_ALERT_S / 60
+        );
+        let detail = format!(
+            "all {} configured relay(s) have been disconnected for over {}min. Inbound orders and \
+             outbound refund/billing DMs are not flowing. This alert itself queues until a relay \
+             reconnects — check relay reachability (`lnrent status` reads the pool out-of-band).",
+            rows.len(),
+            RELAY_BLACKOUT_ALERT_S / 60,
+        );
+        if let Err(e) = alerts
+            .dispatch(Alert::new(AlertKind::RelayBlackout, "relay-pool", detail))
+            .await
+        {
+            tracing::warn!(error = %format!("{e:#}"), "failed to enqueue RelayBlackout alert");
+        }
+    }
+    relays.set(rows);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2132,6 +2215,105 @@ mod tests {
             outbox_state(&store, "outbox-drain").await.as_deref(),
             Some("SENT"),
             "final shutdown outbox flush sends the DM enqueued by the drained handler"
+        );
+    }
+
+    /// lnrent-urw.6 (PR-9c) e2e: drive the REAL maintenance relay path over a REAL nostr-sdk pool.
+    /// Connect to a live in-process relay (proving the projection reflects a connected pool), shut
+    /// it down so the pool goes all-disconnected, then run `refresh_relay_status` across the
+    /// blackout threshold and assert the persisted `operator.alert` outbox row — NOT relay delivery
+    /// (the alert cannot be delivered during the very blackout it reports).
+    #[tokio::test]
+    async fn relay_blackout_fires_one_persisted_alert_after_threshold() {
+        async fn operator_alert_rows(store: &Store) -> i64 {
+            store
+                .read(|c| {
+                    Ok(c.query_row(
+                        "SELECT count(*) FROM outbox WHERE msg_type='operator.alert'
+                           AND payload_json LIKE '%relay_blackout%'",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .await
+                .unwrap()
+        }
+
+        let relay = mock_relay().await;
+        let url = relay.url().await.to_string();
+        let op_keys = Keys::generate();
+        let store = Store::open_spawn(":memory:").expect("open in-memory store");
+        let engine =
+            NostrEngine::connect(op_keys.clone(), std::slice::from_ref(&url), store.clone())
+                .await
+                .expect("operator engine connects");
+
+        // The projection reflects a REAL connected pool.
+        let up = engine.relay_status_snapshot().await;
+        assert_eq!(up.len(), 1, "one configured relay");
+        assert!(up[0].connected, "the relay is connected before shutdown");
+        assert!(up[0].last_connected_at.is_some(), "a live connection stamps last_connected_at");
+
+        // Kill the relay -> the pool drops to all-disconnected (bounded wait for the client to notice).
+        relay.shutdown();
+        let mut down = engine.relay_status_snapshot().await;
+        for _ in 0..300 {
+            if crate::relay_status::all_disconnected(&down) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            down = engine.relay_status_snapshot().await;
+        }
+        assert!(
+            crate::relay_status::all_disconnected(&down),
+            "the pool went all-disconnected after the relay shut down"
+        );
+
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(0));
+        let alerts = Arc::new(AlertDispatcher::new(
+            store.clone(),
+            clock.clone(),
+            op_keys.public_key().to_hex(),
+        ));
+        let cell = RelayStatusCell::new();
+        let mut monitor = RelayBlackoutMonitor::new();
+
+        // Onset: records the all-disconnected window + publishes the snapshot, but does NOT alert.
+        refresh_relay_status(&engine, &cell, &mut monitor, &alerts, 10_000).await;
+        assert!(
+            crate::relay_status::all_disconnected(&cell.get()),
+            "the shared cell reflects the disconnected pool for `Request::Relays`"
+        );
+        assert_eq!(operator_alert_rows(&store).await, 0, "no alert before the threshold");
+
+        // Crossing the threshold fires exactly one RelayBlackout alert into the durable outbox.
+        refresh_relay_status(
+            &engine,
+            &cell,
+            &mut monitor,
+            &alerts,
+            10_000 + RELAY_BLACKOUT_ALERT_S,
+        )
+        .await;
+        assert_eq!(
+            operator_alert_rows(&store).await,
+            1,
+            "one persisted RelayBlackout alert once the pool has been dark past the threshold"
+        );
+
+        // A later pass in the same onset is edge-triggered off — still exactly one.
+        refresh_relay_status(
+            &engine,
+            &cell,
+            &mut monitor,
+            &alerts,
+            10_000 + RELAY_BLACKOUT_ALERT_S + 300,
+        )
+        .await;
+        assert_eq!(
+            operator_alert_rows(&store).await,
+            1,
+            "the alert is edge-triggered — one per onset, not once per tick"
         );
     }
 

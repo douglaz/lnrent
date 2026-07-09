@@ -9,6 +9,7 @@ use crate::clock::Clock;
 use crate::provision;
 use crate::recipe::Recipe;
 use crate::refund_resolver::{detect_form, DestForm};
+use crate::relay_status::RelayStatusCell;
 use crate::store::Store;
 use crate::supervisor::{refund_readiness_report_with_probe, RefundReadinessProbe};
 use crate::teardown;
@@ -33,6 +34,10 @@ pub enum Request {
     /// Open teardown dead-letters (lnrent-urw.2): failed retention `destroy` hooks + the
     /// provision-failure cleanup backlog — provider resources that may still be billing.
     Teardowns,
+    /// Per-relay liveness (lnrent-urw.6): `{url, connected, status, last_connected_at}` from the
+    /// nostr-sdk pool. The out-of-band read for a relay blackout (the alert can't be delivered
+    /// during one).
+    Relays,
     /// Non-terminal + parked-FAILED refunds (lnrent-urw.5): the per-item view behind `lnrent money`'s
     /// `parked_count`.
     Refunds,
@@ -95,11 +100,12 @@ pub async fn serve(
     recipes: Arc<Vec<Recipe>>,
     clock: Arc<dyn Clock>,
     payment: Arc<dyn PaymentBackend>,
+    relays: RelayStatusCell,
     path: impl AsRef<Path>,
 ) -> Result<()> {
     // A signal that never fires: the loop only ends on a listener error.
     let (_never, rx) = tokio::sync::watch::channel(false);
-    serve_with_shutdown(store, recipes, clock, payment, path, rx).await
+    serve_with_shutdown(store, recipes, clock, payment, relays, path, rx).await
 }
 
 /// Like [`serve`] but stops accepting new connections once `shutdown` flips to `true`, returning
@@ -111,6 +117,7 @@ pub async fn serve_with_shutdown(
     recipes: Arc<Vec<Recipe>>,
     clock: Arc<dyn Clock>,
     payment: Arc<dyn PaymentBackend>,
+    relays: RelayStatusCell,
     path: impl AsRef<Path>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
@@ -133,14 +140,16 @@ pub async fn serve_with_shutdown(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _addr) = accepted?;
-                let (store, recipes, clock, payment) = (
+                let (store, recipes, clock, payment, relays) = (
                     store.clone(),
                     recipes.clone(),
                     clock.clone(),
                     payment.clone(),
+                    relays.clone(),
                 );
                 conns.spawn(async move {
-                    if let Err(e) = handle_conn(stream, store, recipes, clock, payment).await {
+                    if let Err(e) = handle_conn(stream, store, recipes, clock, payment, relays).await
+                    {
                         tracing::warn!(error = %e, "ipc connection error");
                     }
                 });
@@ -167,6 +176,7 @@ async fn handle_conn(
     recipes: Arc<Vec<Recipe>>,
     clock: Arc<dyn Clock>,
     payment: Arc<dyn PaymentBackend>,
+    relays: RelayStatusCell,
 ) -> Result<()> {
     let (rd, mut wr) = stream.into_split();
     // Bounded read: cap the request frame so an over-long line can't exhaust memory.
@@ -178,7 +188,7 @@ async fn handle_conn(
         Reply::err("bad_request", "request too large or unterminated")
     } else {
         match serde_json::from_str::<Request>(line.trim()) {
-            Ok(req) => dispatch(req, &store, &recipes, &clock, &payment).await,
+            Ok(req) => dispatch(req, &store, &recipes, &clock, &payment, &relays).await,
             Err(e) => Reply::err("bad_request", format!("invalid request: {e}")),
         }
     };
@@ -196,6 +206,7 @@ pub async fn dispatch(
     recipes: &Arc<Vec<Recipe>>,
     clock: &Arc<dyn Clock>,
     payment: &Arc<dyn PaymentBackend>,
+    relays: &RelayStatusCell,
 ) -> Reply {
     match req {
         Request::Status => {
@@ -215,16 +226,26 @@ pub async fn dispatch(
                 anyhow::Ok(failures + cleanups)
             }
             .await;
+            // A one-line relay-liveness summary (lnrent-urw.6): total vs currently-connected, from
+            // the maintenance loop's shared snapshot. `relays_connected < relays_total` (or 0/0
+            // before the first refresh) is the at-a-glance blackout signal; `Request::Relays` has
+            // the per-relay detail.
+            let relay_rows = relays.get();
+            let relays_connected = relay_rows.iter().filter(|r| r.connected).count();
             match (subs, open_teardowns) {
                 (Ok(n), Ok(t)) => Reply::ok(json!({
                     "daemon": "ok",
                     "recipes": recipes.len(),
                     "subscriptions": n,
                     "open_teardowns": t,
+                    "relays_total": relay_rows.len(),
+                    "relays_connected": relays_connected,
                 })),
                 (Err(e), _) | (_, Err(e)) => Reply::err("internal", e.to_string()),
             }
         }
+
+        Request::Relays => Reply::ok(json!(relays.get())),
 
         Request::Recipes => {
             let list: Vec<Value> = recipes
@@ -733,7 +754,9 @@ mod tests {
     async fn money_data(store: &Store, payment: &Arc<dyn PaymentBackend>) -> Value {
         let recipes = Arc::new(Vec::<Recipe>::new());
         let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
-        let reply = dispatch(Request::Money, store, &recipes, &clock, payment).await;
+        let reply =
+            dispatch(Request::Money, store, &recipes, &clock, payment, &RelayStatusCell::new())
+                .await;
         assert!(reply.ok, "money reply should be ok: {:?}", reply.error);
         reply.data.expect("money returns data")
     }
@@ -849,7 +872,7 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
         let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
         tokio::spawn(async move {
-            let _ = serve(s2, recipes, clock, payment, &sock2).await;
+            let _ = serve(s2, recipes, clock, payment, RelayStatusCell::new(), &sock2).await;
         });
         // wait for bind
         for _ in 0..50 {
@@ -1030,7 +1053,7 @@ mod tests {
             .unwrap();
 
         // List: the two non-terminal rows, with dest_form + fields; the SENT row excluded.
-        let list = dispatch(Request::Refunds, &store, &recipes, &clock, &payment).await;
+        let list = dispatch(Request::Refunds, &store, &recipes, &clock, &payment, &RelayStatusCell::new()).await;
         let arr = list.data.unwrap();
         let arr = arr.as_array().unwrap();
         assert_eq!(arr.len(), 2, "PENDING + FAILED listed, SENT excluded");
@@ -1047,6 +1070,7 @@ mod tests {
             &recipes,
             &clock,
             &payment,
+            &RelayStatusCell::new(),
         )
         .await;
         assert!(retry.ok, "retry of a parked refund succeeds: {:?}", retry.error);
@@ -1069,6 +1093,7 @@ mod tests {
             &recipes,
             &clock,
             &payment,
+            &RelayStatusCell::new(),
         )
         .await;
         assert!(!bad.ok);
@@ -1130,6 +1155,7 @@ mod tests {
             &recipes,
             &clock,
             &payment,
+            &RelayStatusCell::new(),
         )
         .await;
         assert!(retry.ok, "retry: {:?}", retry.error);
@@ -1149,9 +1175,9 @@ mod tests {
         let payment: Arc<dyn PaymentBackend> = Arc::new(crate::backends::MockPayment::new());
 
         // Empty to start.
-        let td = dispatch(Request::Teardowns, &store, &recipes, &clock, &payment).await;
+        let td = dispatch(Request::Teardowns, &store, &recipes, &clock, &payment, &RelayStatusCell::new()).await;
         assert_eq!(td.data.unwrap()["open_total"], json!(0));
-        let st = dispatch(Request::Status, &store, &recipes, &clock, &payment).await;
+        let st = dispatch(Request::Status, &store, &recipes, &clock, &payment, &RelayStatusCell::new()).await;
         assert_eq!(st.data.unwrap()["open_teardowns"], json!(0));
 
         // Record a failed teardown → it surfaces in both.
@@ -1159,14 +1185,69 @@ mod tests {
             .await
             .unwrap();
 
-        let td = dispatch(Request::Teardowns, &store, &recipes, &clock, &payment).await;
+        let td = dispatch(Request::Teardowns, &store, &recipes, &clock, &payment, &RelayStatusCell::new()).await;
         let d = td.data.unwrap();
         assert_eq!(d["open_total"], json!(1));
         assert_eq!(d["teardown_failures"][0]["subscription_id"], "s1");
         assert_eq!(d["teardown_failures"][0]["hook"], "destroy");
 
-        let st = dispatch(Request::Status, &store, &recipes, &clock, &payment).await;
+        let st = dispatch(Request::Status, &store, &recipes, &clock, &payment, &RelayStatusCell::new()).await;
         assert_eq!(st.data.unwrap()["open_teardowns"], json!(1));
+    }
+
+    // lnrent-urw.6: `Request::Relays` returns the shared snapshot verbatim, and `Status` folds a
+    // connected/total summary from the same cell.
+    #[tokio::test]
+    async fn relays_and_status_surface_pool_liveness() {
+        use crate::relay_status::RelayStatusRow;
+        let store = mem_store();
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let payment: Arc<dyn PaymentBackend> = Arc::new(crate::backends::MockPayment::new());
+        let cell = RelayStatusCell::new();
+        cell.set(vec![
+            RelayStatusRow {
+                url: "wss://a".into(),
+                connected: true,
+                status: "Connected".into(),
+                last_connected_at: Some(900),
+            },
+            RelayStatusRow {
+                url: "wss://b".into(),
+                connected: false,
+                status: "Disconnected".into(),
+                last_connected_at: None,
+            },
+        ]);
+
+        let relays = dispatch(Request::Relays, &store, &recipes, &clock, &payment, &cell).await;
+        let arr = relays.data.unwrap();
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["url"], "wss://a");
+        assert_eq!(arr[0]["connected"], json!(true));
+        assert_eq!(arr[0]["last_connected_at"], json!(900));
+        assert_eq!(arr[1]["connected"], json!(false));
+        assert_eq!(arr[1]["last_connected_at"], Value::Null);
+
+        let st = dispatch(Request::Status, &store, &recipes, &clock, &payment, &cell).await;
+        let d = st.data.unwrap();
+        assert_eq!(d["relays_total"], json!(2));
+        assert_eq!(d["relays_connected"], json!(1));
+
+        // An empty cell (pre-refresh / no relays) surfaces 0/0, never an error.
+        let st0 = dispatch(
+            Request::Status,
+            &store,
+            &recipes,
+            &clock,
+            &payment,
+            &RelayStatusCell::new(),
+        )
+        .await;
+        let d0 = st0.data.unwrap();
+        assert_eq!(d0["relays_total"], json!(0));
+        assert_eq!(d0["relays_connected"], json!(0));
     }
 
     #[tokio::test]

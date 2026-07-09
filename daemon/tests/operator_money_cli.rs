@@ -56,6 +56,7 @@ async fn json_money_returns_reply_envelope() {
             recipes,
             clock,
             payment,
+            lnrentd::relay_status::RelayStatusCell::new(),
             &sock_for_server,
             shutdown_rx,
         )

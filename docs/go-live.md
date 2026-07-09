@@ -127,6 +127,12 @@ Share the listing coordinate / operator npub.
   outbox (edge-triggered, at most one per condition per 6h). One honest caveat: a total relay
   blackout is the one condition that cannot be delivered (it queues), so a prolonged silence from a
   daemon you know is up still warrants a direct check.
+- **Watch relay connectivity (GATE-1 PR-9c):** `lnrent relays` shows per-relay connected state +
+  last-connected time (also summarized as `relays_connected/relays_total` in `lnrent status`). If
+  ALL relays sit disconnected past 15min the daemon fires a `RelayBlackout` alert — but that alert
+  is precisely the one that cannot be delivered during the blackout (it queues until a relay
+  returns), so `lnrent relays` is the **out-of-band read** to reach for when a daemon you know is up
+  has gone quiet. This is a transport-liveness view only — no reconnection/failover logic.
 - **Refunds self-fund from sales** — you do not pre-fund; keep a small float for outbound Lightning fees.
   A refund that can't be paid parks visibly (`lnrent money`'s parked count + a `RefundParked` alert), never
   dropped. Inspect the per-item list with `lnrent refunds`; once the buyer's endpoint recovers, re-drive one

@@ -23,6 +23,7 @@ pub mod recipe;
 pub mod reconcile;
 pub mod refund;
 pub mod refund_resolver;
+pub mod relay_status;
 pub mod reservation;
 pub mod resume;
 pub mod runner;
