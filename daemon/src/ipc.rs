@@ -486,19 +486,33 @@ async fn refund_retry(store: &Store, id: &str, now: i64) -> Reply {
         .transaction({
             let id = id.clone();
             move |tx| {
-                let n = tx.execute(
+                // Read the row's identity BEFORE mutating, to (a) gate on FAILED and (b) compute the
+                // stable billing.refund outbox id for the supersede below.
+                let row: Option<(String, Option<String>, String)> =
+                    rusqlite::OptionalExtension::optional(tx.query_row(
+                        "SELECT status, subscription_id, idempotency_key FROM refund_attempt WHERE id=?1",
+                        rusqlite::params![id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    ))?;
+                let Some((status, sub, idempotency_key)) = row else {
+                    return Ok(false);
+                };
+                if status != "FAILED" {
+                    return Ok(false);
+                }
+
+                tx.execute(
                     "UPDATE refund_attempt SET status='PENDING', attempts=0, updated_at=?2
                      WHERE id=?1 AND status='FAILED'",
                     rusqlite::params![id, now],
                 )?;
-                if n == 0 {
-                    return Ok(false);
-                }
-                let sub: Option<String> = rusqlite::OptionalExtension::optional(tx.query_row(
-                    "SELECT subscription_id FROM refund_attempt WHERE id=?1",
-                    rusqlite::params![id],
-                    |r| r.get(0),
-                ))?;
+                // SUPERSEDE the stale parked-FAILED billing.refund DM (codex): its stable id would
+                // otherwise ON CONFLICT-block the success DM commit_sent enqueues when the retry pays,
+                // so the buyer could be told "failed" for a refund that actually settled. Deleting it
+                // lets the next terminalization (SENT or a fresh FAILED) enqueue the CURRENT outcome.
+                let outbox_id = crate::refund::refund_outbox_id(&idempotency_key, &id);
+                tx.execute("DELETE FROM outbox WHERE id=?1", rusqlite::params![outbox_id])?;
+
                 tx.execute(
                     "INSERT INTO event_log (subscription_id, kind, detail_json, at) VALUES (?, ?, ?, ?)",
                     rusqlite::params![sub, "refund_retry_requested", json!({"refund": id}).to_string(), now],
@@ -1060,6 +1074,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sent_status, "SENT", "a non-parked refund is untouched");
+    }
+
+    // urw.5 (codex P2): retry must SUPERSEDE the stale parked-FAILED billing.refund DM at the
+    // deterministic outbox id, so the later success DM isn't ON CONFLICT-blocked (buyer told
+    // "failed" for a refund that actually paid).
+    #[tokio::test]
+    async fn retry_supersedes_the_stale_failed_refund_dm() {
+        let store = mem_store();
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let payment: Arc<dyn PaymentBackend> = Arc::new(crate::backends::MockPayment::new());
+
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO refund_attempt (id, subscription_id, dest, amount_sat, idempotency_key, status, attempts, created_at, updated_at)
+                     VALUES ('ref-order:s1', 's1', 'a@b.com', 500, 'refund:order:s1', 'FAILED', 5, 10, 20)",
+                    [],
+                )?;
+                // The stale parked-FAILED billing.refund DM at the deterministic outbox id.
+                tx.execute(
+                    "INSERT INTO outbox (id, recipient, subscription_id, msg_type, payload_json, state, attempts, created_at)
+                     VALUES ('outbox:refund:order:s1', 'buyerhex', 's1', 'billing.refund',
+                             '{\"type\":\"billing.refund\",\"subscription_id\":\"s1\",\"amount_sat\":500,\"status\":\"failed\"}',
+                             'PENDING', 0, 20)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let outbox_count = |store: Store| async move {
+            store
+                .read(|c| {
+                    Ok(c.query_row(
+                        "SELECT count(*) FROM outbox WHERE id='outbox:refund:order:s1'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )?)
+                })
+                .await
+                .unwrap()
+        };
+        assert_eq!(outbox_count(store.clone()).await, 1, "stale failed DM present");
+
+        let retry = dispatch(
+            Request::RefundRetry { id: "ref-order:s1".into() },
+            &store,
+            &recipes,
+            &clock,
+            &payment,
+        )
+        .await;
+        assert!(retry.ok, "retry: {:?}", retry.error);
+        assert_eq!(
+            outbox_count(store).await,
+            0,
+            "the stale failed DM is superseded so a fresh success DM can enqueue"
+        );
     }
 
     // urw.2: `teardowns` lists open dead-letters and `status` folds `open_teardowns`.
