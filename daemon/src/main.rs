@@ -323,6 +323,16 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
              bootstrap with payment_backend=mock"
         );
     }
+    // Single-instance guard (lnrent-urw.9): resolve + create the data dir and take an exclusive
+    // advisory lock on `{data_dir}/lnrentd.lock` BEFORE bootstrap opens sqlite / runs migrations /
+    // writes the operator row (codex) — so a systemd restart racing a manual start fails fast
+    // WITHOUT mutating any state or rebinding the IPC socket, rather than double-driving
+    // subscriptions into duplicate droplets (ADR-0001 sole-writer). Held for the daemon's whole
+    // lifetime — the kernel frees the flock on clean exit OR crash, so a later start always succeeds.
+    let data_dir = config::prepare_data_dir(&raw)
+        .map_err(|e| anyhow::anyhow!("preparing data dir: {} ({})", e.message, e.code))?;
+    let _instance_lock = acquire_data_dir_lock(&data_dir)?;
+
     let (operator, store) = config::bootstrap_headless_with_store(std::mem::take(&mut *raw))
         .await
         .map_err(|e| anyhow::anyhow!("operator bootstrap failed: {} ({})", e.message, e.code))?;
@@ -330,13 +340,6 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
         operator = %operator.identity.npub(),
         "lnrentd state opened; store actor up (sole writer); operator identity ready"
     );
-
-    // Single-instance guard (lnrent-urw.9): take an exclusive advisory lock on the data dir BEFORE
-    // the IPC bind + maintenance loop start, so a systemd restart racing a manual start (or any
-    // second daemon on the same data dir) fails fast instead of double-driving subscriptions into
-    // duplicate droplets (ADR-0001 sole-writer). Held for the daemon's whole lifetime — the kernel
-    // frees the flock on clean exit OR crash, so a subsequent start always succeeds.
-    let _instance_lock = acquire_data_dir_lock(&operator.config.data_dir)?;
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     // Select the payment backend. `mock` (the default) keeps an internal clock the supervisor syncs to
