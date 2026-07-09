@@ -71,6 +71,14 @@ systemd unit/EnvironmentFile** — they are bootstrap-only. The run daemon reads
 persisted 0600 `operator.seed`; putting the mnemonic in the run environment would hand it to every
 recipe hook the daemon spawns (until docs/specs/hook-env-hygiene.md lands and blocks that in code).
 
+**Set `LNRENT_ALERT_NPUB` on the RUN daemon** (GATE-1 PR-5): the daemon DMs operator alerts (a
+refund parked/stuck, and later teardown/relay/holdings conditions) to this npub. Use your PERSONAL
+Nostr identity — the one you read DMs on — NOT the operator key, so notifications reach a client you
+already carry without exposing the daemon's hot key. Alerts are ON by default on the fedimint
+backend; unset ⇒ the daemon self-DMs the operator key (still durable in the outbox, but you'd have
+to import the operator key into a DM client to read it). `LNRENT_ALERTS_ENABLED=false` turns the
+sink off.
+
 ## 4. Preflight — verify readiness BEFORE you announce it
 
 Run the daemon (the config is now persisted; run only needs the data dir, the recipes dir, and `DO_TOKEN`
@@ -105,6 +113,11 @@ Share the listing coordinate / operator npub.
 - **Monitor money:** `lnrent money` — balance, gateway, and refund-liability coverage (`READY` /
   `NOT READY (<reason>)`). `NOT READY` means an uncovered liability or an unreachable gateway; also watch
   the daemon's WARN/ERROR logs (`refund readiness ALARM`, gateway warnings).
+- **Alert DMs (GATE-1 PR-5):** with `LNRENT_ALERT_NPUB` set, the daemon DMs you when a refund parks
+  FAILED or sits stuck — no need to tail logs 24/7. The alert is a NIP-17 DM riding the durable
+  outbox (edge-triggered, at most one per condition per 6h). One honest caveat: a total relay
+  blackout is the one condition that cannot be delivered (it queues), so a prolonged silence from a
+  daemon you know is up still warrants a direct check.
 - **Refunds self-fund from sales** — you do not pre-fund; keep a small float for outbound Lightning fees.
   A refund that can't be paid parks visibly (surfaced by `lnrent money` + the logs), it is never dropped.
 - **Run it durably** — under systemd (`Restart=always`); SIGTERM drains in-flight work + flushes the outbox.

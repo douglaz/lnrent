@@ -1,5 +1,8 @@
 //! lnrent control-plane library. Pure Rust, no LLM in the runtime path (SPEC.md §4.1).
 
+/// GATE-1 alert dispatcher (lnrent-urw.1): a thin edge-triggered sink that surfaces
+/// money/provisioning conditions as durable NIP-17 operator DMs. NOT a monitoring framework.
+pub mod alerts;
 pub mod backends;
 /// COLD/OFFLINE operator backup + restore of the durable state (lnrent-7fp.14 PART A).
 pub mod backup;

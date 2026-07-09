@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use lnrentd::alerts::AlertDispatcher;
 use lnrentd::backends::{MockPayment, PaymentBackend};
 use lnrentd::backup;
 use lnrentd::clock::{Clock, SystemClock};
@@ -230,6 +231,27 @@ async fn run_daemon() -> Result<()> {
         lnrentd::config::inbound_rate_refill_per_min(),
     );
 
+    // GATE-1 alert sink (lnrent-urw.1, PR-5): resolve the recipient — the operator's personal
+    // `alert_npub` if set, else a self-DM to the operator key — and honor the enabled default (on
+    // for the fedimint money path, off for mock). Built before `store`/`clock` are moved into the
+    // supervisor. A malformed `LNRENT_ALERT_NPUB` fails startup loudly rather than silently muting.
+    let alerts = if lnrentd::config::alerts_enabled(operator.config.payment_backend) {
+        let recipient_hex = match lnrentd::config::alert_npub() {
+            Some(npub) => lnrent_wire::PublicKey::parse(&npub)
+                .with_context(|| format!("parsing LNRENT_ALERT_NPUB `{npub}`"))?
+                .to_hex(),
+            None => operator.identity.public_key().to_hex(),
+        };
+        tracing::info!(recipient = %recipient_hex, "operator alert sink enabled (GATE-1 PR-5)");
+        Arc::new(AlertDispatcher::new(
+            store.clone(),
+            clock.clone(),
+            recipient_hex,
+        ))
+    } else {
+        Arc::new(AlertDispatcher::disabled(store.clone(), clock.clone()))
+    };
+
     let sock = operator.config.data_dir.join("lnrent.sock");
     let mut supervisor = Supervisor::build(
         store,
@@ -237,6 +259,7 @@ async fn run_daemon() -> Result<()> {
         payment,
         clock,
         Arc::new(Resolver::new()),
+        alerts,
         recipe,
         sock,
         Intervals::production(),

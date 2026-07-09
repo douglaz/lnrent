@@ -98,12 +98,17 @@ async fn start_supervisor(
     let engine = engine_for(op_keys, url, store.clone()).await;
     let sock = temp_sock();
     let payment_for_sync = payment.clone();
+    let alerts = Arc::new(lnrentd::alerts::AlertDispatcher::disabled(
+        store.clone(),
+        clock.clone(),
+    ));
     let sup = Supervisor::build(
         store,
         engine,
         payment,
         clock,
         Arc::new(PassThroughResolver),
+        alerts,
         dummy_recipe(),
         sock.clone(),
         fast_intervals(),

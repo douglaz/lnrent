@@ -120,6 +120,18 @@ pub struct RenewRequest {
     pub subscription_id: String,
 }
 
+/// `operator.alert` — operator → operator's OWN chosen peer (lnrent-urw.1 / GATE-1 PR-5). NOT a
+/// buyer-facing message: it is a NIP-17 DM the daemon sends to the operator's personal npub (or
+/// itself) to surface a condition the money/provisioning path detected, riding the same durable
+/// outbox as every other DM. Buyers never receive or decode it. `kind` is one of the daemon's
+/// closed `AlertKind` wire spellings; `subject`/`detail` are human-readable context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorAlert {
+    pub kind: String,
+    pub subject: String,
+    pub detail: String,
+}
+
 /// `sub.cancel` — buyer → operator. Cancels a subscription. Naturally idempotent, so it
 /// carries no request id (SPEC.md §5.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,6 +332,8 @@ pub enum Msg {
     OpRequest(OpRequest),
     #[serde(rename = "op.result")]
     OpResult(OpResult),
+    #[serde(rename = "operator.alert")]
+    OperatorAlert(OperatorAlert),
 }
 
 impl Msg {
@@ -338,6 +352,7 @@ impl Msg {
             Msg::SubCancel(_) => "sub.cancel",
             Msg::OpRequest(_) => "op.request",
             Msg::OpResult(_) => "op.result",
+            Msg::OperatorAlert(_) => "operator.alert",
         }
     }
 

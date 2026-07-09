@@ -15,8 +15,8 @@ pub mod wrap;
 
 pub use dm::{
     BillingInvoice, BillingNotice, BillingRefund, DeliveryResendRequest, Msg, OpRequest, OpResult,
-    OpStatus, OrderError, OrderInvoice, OrderRequest, ProvisionReady, RenewRequest, SubCancel,
-    WireError,
+    OpStatus, OperatorAlert, OrderError, OrderInvoice, OrderRequest, ProvisionReady, RenewRequest,
+    SubCancel, WireError,
 };
 pub use error::Error;
 pub use listing::{

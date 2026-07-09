@@ -41,6 +41,7 @@ use crate::op_dispatch::OpDispatch;
 use crate::order_intake::OrderIntake;
 use crate::provision::{DeliveryResendOrderHandler, OutboxSender, Provisioner};
 use crate::recipe::Recipe;
+use crate::alerts::AlertDispatcher;
 use crate::reconcile::Reconciler;
 use crate::refund::{gen_key, parse_whole_sat, Refunder};
 use crate::refund_resolver::RefundResolver;
@@ -153,6 +154,7 @@ impl Supervisor {
         payment: Arc<dyn PaymentBackend>,
         clock: Arc<dyn Clock>,
         resolver: Arc<dyn RefundResolver>,
+        alerts: Arc<AlertDispatcher>,
         recipe: Recipe,
         sock_path: PathBuf,
         intervals: Intervals,
@@ -199,12 +201,13 @@ impl Supervisor {
             clock.clone(),
             recipe.clone(),
         ));
-        let refunder = Arc::new(Refunder::with_resolver(
-            store.clone(),
-            payment.clone(),
-            clock.clone(),
-            resolver,
-        ));
+        // GATE-1 alert sink (lnrent-urw.1): the refunder is the only PR-5 owner of a condition, so
+        // the dispatcher is moved straight in. Sibling beads (PR-6 teardown, PR-9c relay, PR-16
+        // holdings) will thread their own clone to their own call sites when they land.
+        let refunder = Arc::new(
+            Refunder::with_resolver(store.clone(), payment.clone(), clock.clone(), resolver)
+                .with_alerts(alerts),
+        );
         let reconciler = Arc::new(Reconciler::new(
             store.clone(),
             payment.clone(),
