@@ -68,8 +68,15 @@ listing author + DM peer. BACK UP the mnemonic now if you haven't (§0).
 
 **Never set `LNRENT_MNEMONIC` (or the `LNRENT_FEDIMINT_*` vars) on the RUN invocation or in the
 systemd unit/EnvironmentFile** — they are bootstrap-only. The run daemon reads the seed from the
-persisted 0600 `operator.seed`; putting the mnemonic in the run environment would hand it to every
-recipe hook the daemon spawns (until docs/specs/hook-env-hygiene.md lands and blocks that in code).
+persisted 0600 `operator.seed`. Even if you do supply the seed via the env, the daemon now closes
+the misuse path in code (lnrent-y4m.7): every recipe hook is spawned with a **cleared environment** —
+it receives ONLY a fixed base env (`PATH, HOME, LANG, LC_ALL, TZ, TMPDIR`) plus the recipe's own
+declared `provisioning.env` list, so `LNRENT_*` (the seed) **never reaches a hook**. `DO_TOKEN` (and
+`DO_REGION`/`DO_SIZE`/`DO_IMAGE`) still flow to the do-vps hooks because that recipe declares them.
+On startup the daemon also `remove_var`s the seed/fedimint secrets from its own process env — but
+that is defense-in-depth: it cannot overwrite the kernel-placed initial env block, so
+`/proc/<pid>/environ` may still show them. For a truly clean daemon environ, deliver the seed via a
+**systemd credential** (`LoadCredential=`) or **stdin** rather than the environment.
 
 **Set `LNRENT_ALERT_NPUB` on the RUN daemon** (GATE-1 PR-5): the daemon DMs operator alerts (a
 refund parked/stuck, and later teardown/relay/holdings conditions) to this npub. Use your PERSONAL

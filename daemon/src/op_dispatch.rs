@@ -232,7 +232,14 @@ impl OpDispatch {
             },
             "now": now,
         });
-        match run_hook(&hook_path, &input, runner::DEFAULT_TIMEOUT).await {
+        match run_hook(
+            &hook_path,
+            &input,
+            runner::DEFAULT_TIMEOUT,
+            &self.recipe.provisioning.env,
+        )
+        .await
+        {
             Ok(HookOutput { stdout_json }) => {
                 // `op.result` ok requires an OBJECT `data`; valid-but-non-object hook output would
                 // otherwise wedge the cached-resend path on a duplicate. Treat it as a hook failure.

@@ -851,6 +851,13 @@ hook = "status"             # bare name -> ops/status
 - Input: environment variables + a JSON document on stdin describing the
   subscription (if the Instance is rented), the Instance, validated params, and
   host facts (OS, backend handles).
+- **Child-env contract (lnrent-y4m.7):** a hook is spawned with a CLEARED environment
+  (`.env_clear()`). It receives ONLY a fixed base allowlist (`PATH, HOME, LANG, LC_ALL,
+  TZ, TMPDIR`, each forwarded when the daemon has it) plus the recipe's own
+  `provisioning.env` passthrough list — recipe-declared operator vars, bounded (≤16,
+  `[A-Z0-9_]`) and never `LNRENT*`. The daemon's own environment (in particular the
+  `LNRENT_MNEMONIC` seed) therefore never reaches a hook by construction. `runner::spawn_hook`
+  is the single enforcement point; do-vps declares `DO_TOKEN`/`DO_REGION`/`DO_SIZE`/`DO_IMAGE`.
 - Output: JSON on stdout. `provision` returns the **delivery payload** (the object
   DM'd to the buyer, e.g. a WireGuard config) plus internal handles the daemon
   records (container id, peer index) for later hooks.
@@ -1302,7 +1309,13 @@ CREATE TABLE native_connect_session ( -- interactive-op authorization tickets (�
 - Tenant isolation is the provisioning backend's job; the `host` backend (no
   isolation) is only for services that are safe to run unsandboxed (WireGuard).
 - Hooks run with least privilege; the daemon passes secrets via stdin JSON, not
-  argv or env where avoidable.
+  argv or env. This is now enforced, not just conventional (lnrent-y4m.7): hooks are
+  spawned with a cleared environment (base allowlist + the recipe's declared
+  `provisioning.env` only, §7.2), so the operator seed in `LNRENT_MNEMONIC` cannot leak
+  into a hook even if the operator supplied it via the daemon env. The daemon additionally
+  scrubs the seed/fedimint secrets from its own process env at startup — defense-in-depth,
+  since `remove_var` can't rewrite the kernel initial env block (`/proc/self/environ`); a
+  clean daemon environ needs a systemd-credential/stdin launch.
 - Recipes are trusted code (built-in or operator-authored). v1 does not install or
   run untrusted/third-party recipes. See ADR-0002.
 - Credential delivery is NIP-17 only (metadata-private). No plaintext creds on

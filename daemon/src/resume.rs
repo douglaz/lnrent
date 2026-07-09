@@ -132,7 +132,7 @@ impl ResumeDriver {
         let hook = self.recipe.hook("resume");
         let mut last_err = None;
         for attempt in 1..=RESUME_ATTEMPTS {
-            match run_hook(&hook, input, DEFAULT_TIMEOUT).await {
+            match run_hook(&hook, input, DEFAULT_TIMEOUT, &self.recipe.provisioning.env).await {
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     tracing::warn!(attempt, error = %e, "resume hook attempt failed");

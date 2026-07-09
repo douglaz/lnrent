@@ -90,8 +90,9 @@ LNRENT_PAYMENT_BACKEND=fedimint LNRENT_FEDIMINT_INVITE=fed1… LNRENT_FEDIMINT_G
 LNRENT_MNEMONIC="…" LNRENT_DATA_DIR=./data LNRENT_RELAYS=wss://relay.example \
   nix develop . --command cargo run -p lnrentd --bin lnrentd -- bootstrap
 
-# Run: the daemon reads the persisted seed/config. NEVER put the mnemonic (or LNRENT_FEDIMINT_*)
-# in the run environment — every recipe hook inherits it (docs/go-live.md §3).
+# Run: the daemon reads the persisted seed/config. Prefer NOT to put the mnemonic (or
+# LNRENT_FEDIMINT_*) in the run environment. Hooks are spawned env-cleared so they never receive it
+# (lnrent-y4m.7), but keeping it out of the daemon env avoids /proc/<pid>/environ exposure too.
 DO_TOKEN=<digitalocean_token> LNRENT_DATA_DIR=./data LNRENT_RECIPES_DIR=./recipes \
   nix develop . --command cargo run -p lnrentd --bin lnrentd
 ```

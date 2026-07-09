@@ -278,7 +278,7 @@ impl Provisioner {
         let mut last_err = None;
         let mut destroy_input = input.clone();
         for attempt in 1..=PROVISION_ATTEMPTS {
-            match run_hook(&hook, input, DEFAULT_TIMEOUT).await {
+            match run_hook(&hook, input, DEFAULT_TIMEOUT, &self.recipe.provisioning.env).await {
                 Ok(out) => match delivery_payload(&out.stdout_json) {
                     Ok(_) => return Ok(out),
                     Err(e) => {
@@ -307,7 +307,14 @@ impl Provisioner {
     /// Best-effort `destroy` to purge partial resources after a permanent provision failure — a
     /// destroy failure is logged, NOT fatal (§7.2).
     async fn best_effort_destroy(&self, input: &Value) -> bool {
-        match run_hook(&self.recipe.hook("destroy"), input, DEFAULT_TIMEOUT).await {
+        match run_hook(
+            &self.recipe.hook("destroy"),
+            input,
+            DEFAULT_TIMEOUT,
+            &self.recipe.provisioning.env,
+        )
+        .await
+        {
             Ok(_) => {
                 tracing::info!("destroy purged partial resources after provision failure");
                 true
