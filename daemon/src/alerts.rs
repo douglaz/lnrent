@@ -36,6 +36,50 @@ use std::sync::Arc;
 /// per this window, then re-fires after it.
 pub const ALERT_COOLDOWN_S: i64 = 6 * 3600;
 
+/// Cap on the alert `detail` before it is serialized into the outbox payload. `detail` can embed
+/// buyer/endpoint-derived text (e.g. a structural refund-resolution error from a hostile LNURL
+/// endpoint), so an unbounded detail would let the operator.alert row exceed the NIP-59 gift-wrap
+/// transport ceiling — the wrap fails, the drain treats it as transient, and the row wedges PENDING
+/// forever, undelivered (codex xhigh). Capping here (the single serialization point) bounds EVERY
+/// alert kind and keeps the wrapped DM far under [`lnrent_wire::MAX_INBOUND_CONTENT_BYTES`].
+const MAX_ALERT_DETAIL_CHARS: usize = 1024;
+/// Cap on the alert `subject` (the outbox-id tail / cooldown key); bounded for the same reason.
+const MAX_ALERT_SUBJECT_CHARS: usize = 256;
+
+/// Truncate `s` to at most `max` chars (on a char boundary), appending `…` when it was cut.
+fn cap_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// The subject form used in the outbox row **id** — bounded AND collision-resistant. A short subject
+/// (the real case: a refund id) is used verbatim; a subject past the cap is replaced by a hash of
+/// the FULL subject, so two distinct long subjects of the same kind can never collide on the id
+/// (codex: a plain truncation would make `ON CONFLICT DO NOTHING` drop the second alert while
+/// `dispatch` stamps it sent, suppressing it for the cooldown window without ever enqueuing a DM).
+fn id_subject(subject: &str) -> String {
+    if subject.chars().count() <= MAX_ALERT_SUBJECT_CHARS {
+        return subject.to_string();
+    }
+    use sha2::{Digest, Sha256};
+    format!("h:{}", hex::encode(Sha256::digest(subject.as_bytes())))
+}
+
+/// The serialized `operator.alert` payload with `subject`/`detail` capped so the wrapped DM can
+/// never exceed the transport ceiling. Serializing three owned strings is infallible.
+fn alert_payload(kind: AlertKind, subject: &str, detail: &str) -> String {
+    serde_json::to_string(&Msg::OperatorAlert(OperatorAlert {
+        kind: kind.wire_str().to_string(),
+        subject: cap_chars(subject, MAX_ALERT_SUBJECT_CHARS),
+        detail: cap_chars(detail, MAX_ALERT_DETAIL_CHARS),
+    }))
+    .expect("serialize operator alert (three owned strings) is infallible")
+}
+
 /// The CLOSED set of alertable conditions (production-readiness.md PR-5 §A). Extended ONLY by the
 /// owning beads listed in the module doc — do not add free-form kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -160,18 +204,15 @@ impl AlertDispatcher {
             }
         }
 
-        let payload = serde_json::to_string(&Msg::OperatorAlert(OperatorAlert {
-            kind: alert.kind.wire_str().to_string(),
-            subject: alert.subject.clone(),
-            detail: alert.detail.clone(),
-        }))?;
+        let payload = alert_payload(alert.kind, &alert.subject, &alert.detail);
         // Distinct id per fire (cooldown already bounds the rate), so a legitimate re-fire past the
         // window is never swallowed by ON CONFLICT; the conflict guard only absorbs a same-second
-        // boundary race.
+        // boundary race. `id_subject` keeps the id bounded WITHOUT letting two distinct long
+        // subjects collide (codex).
         let outbox_id = format!(
             "outbox:alert:{}:{}:{now}",
             alert.kind.wire_str(),
-            alert.subject
+            id_subject(&alert.subject)
         );
         let recipient = self.recipient_hex.clone();
         self.store
@@ -209,14 +250,9 @@ impl AlertDispatcher {
         if !self.is_enabled() {
             return None;
         }
-        let payload = serde_json::to_string(&Msg::OperatorAlert(OperatorAlert {
-            kind: kind.wire_str().to_string(),
-            subject: subject.to_string(),
-            detail: detail.to_string(),
-        }))
-        .expect("serialize operator alert (three owned strings) is infallible");
+        let payload = alert_payload(kind, subject, detail);
         Some(AlertRow {
-            id: format!("outbox:alert:{}:{subject}", kind.wire_str()),
+            id: format!("outbox:alert:{}:{}", kind.wire_str(), id_subject(subject)),
             recipient: self.recipient_hex.clone(),
             payload,
         })
@@ -334,5 +370,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(alert_rows(&store).await, 3, "re-fires past the cooldown");
+    }
+
+    // codex xhigh: a detail carrying hostile-endpoint text (a structural refund-resolution error
+    // relayed from a buyer-controlled LNURL endpoint) must be capped, so the operator.alert row can
+    // always be gift-wrapped — an over-cap payload would fail the wrap, be treated as transient, and
+    // wedge the row PENDING forever, undelivered. Both enqueue paths cap identically.
+    #[tokio::test]
+    async fn oversized_detail_is_capped_below_the_transport_ceiling() {
+        let store = mem_store();
+        let clock = Arc::new(TestClock::new(1000));
+        let d = AlertDispatcher::new(store.clone(), clock, "npub".into());
+
+        // 200 KiB — well past the ~40 KiB NIP-59 rumor-content ceiling.
+        let huge = "x".repeat(200 * 1024);
+        d.dispatch(Alert::new(AlertKind::RefundParked, "r1", huge.clone()))
+            .await
+            .unwrap();
+        let (_recipient, alert) = only_alert(&store).await;
+        assert!(
+            alert.detail.chars().count() <= MAX_ALERT_DETAIL_CHARS + 1,
+            "detail capped to the bound (+1 for the ellipsis)"
+        );
+        assert!(alert.detail.ends_with('…'), "truncation is marked");
+        let async_payload = serde_json::to_string(&Msg::OperatorAlert(alert)).unwrap();
+
+        // The terminal (in-txn) path caps identically.
+        let row = d
+            .terminal_alert_row(AlertKind::RefundParked, "r2", &huge)
+            .expect("enabled dispatcher builds a row");
+
+        // Both payloads sit far under the inbound content bound, so the wrapped DM is deliverable.
+        let ceiling = lnrent_wire::MAX_INBOUND_CONTENT_BYTES;
+        assert!(async_payload.len() < ceiling / 8, "async payload well under the ceiling");
+        assert!(row.payload.len() < ceiling / 8, "terminal payload well under the ceiling");
+    }
+
+    // codex (PR #15): two DISTINCT long subjects sharing the first 256 chars must NOT collide on the
+    // outbox id — else the second alert's ON CONFLICT would drop it while the sender is stamped sent.
+    // The id hashes the FULL subject once it exceeds the cap, so both terminal rows are distinct and
+    // both enqueue.
+    #[tokio::test]
+    async fn distinct_long_subjects_do_not_collide_on_the_outbox_id() {
+        let store = mem_store();
+        let clock = Arc::new(TestClock::new(1000));
+        let d = AlertDispatcher::new(store.clone(), clock, "npub".into());
+
+        let shared_prefix = "s".repeat(MAX_ALERT_SUBJECT_CHARS);
+        let subj_a = format!("{shared_prefix}-AAA");
+        let subj_b = format!("{shared_prefix}-BBB");
+        let row_a = d
+            .terminal_alert_row(AlertKind::RefundParked, &subj_a, "a")
+            .unwrap();
+        let row_b = d
+            .terminal_alert_row(AlertKind::RefundParked, &subj_b, "b")
+            .unwrap();
+        assert_ne!(row_a.id, row_b.id, "distinct long subjects get distinct ids");
+
+        // Both actually persist (no ON CONFLICT drop) when inserted in the same txn window.
+        let (a, b) = (row_a, row_b);
+        store
+            .transaction(move |tx| {
+                for r in [&a, &b] {
+                    tx.execute(
+                        "INSERT INTO outbox
+                            (id, recipient, subscription_id, msg_type, payload_json, state, attempts, created_at)
+                         VALUES (?1, ?2, NULL, 'operator.alert', ?3, 'PENDING', 0, 1000)
+                         ON CONFLICT(id) DO NOTHING",
+                        rusqlite::params![r.id, r.recipient, r.payload],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(alert_rows(&store).await, 2, "both long-subject alerts enqueue");
     }
 }
