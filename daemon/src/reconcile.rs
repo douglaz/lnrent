@@ -176,6 +176,28 @@ impl Reconciler {
         }
     }
 
+    /// Fire a `PaidServiceDestroyed` alert best-effort (lnrent-urw.8): a retention `destroy` raced a
+    /// renewal settlement and tore down a box the buyer just paid for. Cooldown-keyed on the sub so
+    /// repeats collapse to one DM per 6h. Never fails the reconcile tick — the loud ERROR log at the
+    /// call site remains the record when no dispatcher is wired.
+    async fn alert_paid_destroyed(&self, sub_id: &str, why: &str) {
+        let Some(alerts) = &self.alerts else { return };
+        // Deliberately hedged: the re-check path fires on a CONFIRMED payment OR an unresolved
+        // backend lookup, so do not assert a refund is coming — only a confirmed renewal produces
+        // one. The one certainty is that the destructive hook already ran (a resource was torn down).
+        let detail = format!(
+            "a service was torn down mid-renewal: sub {sub_id} — {why}. The subscription stays alive; \
+             if the renewal settled, a refund for the un-provided period follows. Verify no provider \
+             resource leaked."
+        );
+        if let Err(e) = alerts
+            .dispatch(Alert::new(AlertKind::PaidServiceDestroyed, sub_id, detail))
+            .await
+        {
+            tracing::warn!(error = %format!("{e:#}"), "failed to enqueue PaidServiceDestroyed alert");
+        }
+    }
+
     /// Scan every subscription whose `next_deadline` is due (`<= now`) and fire its single DUE
     /// transition, then expire any OPEN renewal invoice past its own expiry. Each transition is a
     /// guarded CAS, so a replay/stale fire is a no-op. Returns a per-transition [`TickReport`].
@@ -753,10 +775,11 @@ impl Reconciler {
     /// True if the sub is TERMINATED or its row is gone — the only states in which re-running a
     /// `destroy` teardown is safe (lnrent-urw.2). A live sub (ACTIVE/RESUMING/SUSPENDED/…) returns
     /// false so the retry skips it.
-    async fn sub_is_terminal_or_absent(&self, sub_id: &str) -> Result<bool> {
+    /// Re-read a subscription's current `state` (`None` if the row is absent). The compensating
+    /// paths after a lost CAS (lnrent-urw.8) use this to decide whether a concurrent renewal won.
+    async fn sub_state(&self, sub_id: &str) -> Result<Option<String>> {
         let id = sub_id.to_string();
-        let state: Option<String> = self
-            .store
+        self.store
             .read(move |c| {
                 Ok(c.query_row(
                     "SELECT state FROM subscription WHERE id=?1",
@@ -765,8 +788,15 @@ impl Reconciler {
                 )
                 .optional()?)
             })
-            .await?;
-        Ok(state.map(|s| s == "TERMINATED").unwrap_or(true))
+            .await
+    }
+
+    async fn sub_is_terminal_or_absent(&self, sub_id: &str) -> Result<bool> {
+        Ok(self
+            .sub_state(sub_id)
+            .await?
+            .map(|s| s == "TERMINATED")
+            .unwrap_or(true))
     }
 
     async fn lifecycle_hook_input(&self, sub_id: &str, buyer_hex: &str) -> Result<Value> {
@@ -999,7 +1029,8 @@ impl Reconciler {
         });
         let notice_json = serde_json::to_string(&notice)?;
         let (id, buyer) = (sub_id.to_string(), buyer_hex.to_string());
-        self.store
+        let suspended = self
+            .store
             .transaction(move |tx| {
                 let n = tx.execute(
                     "UPDATE subscription SET state='SUSPENDED', next_deadline=?2, updated_at=?3
@@ -1021,7 +1052,29 @@ impl Reconciler {
                 journal(tx, &id, "reconcile_suspend", now)?;
                 Ok(true)
             })
-            .await
+            .await?;
+
+        // Compensating repower (lnrent-urw.8). The `suspend` hook ALREADY ran (the instance is
+        // powered off), but the CAS above lost. A renewal that captured DURING the hook extends
+        // paid_through and moves `next_deadline` while the sub stays ACTIVE (capture.rs), so our CAS
+        // (`state='ACTIVE' AND next_deadline=nd`) matched 0 rows and the row now reads ACTIVE with a
+        // dark box. Re-run the idempotent `resume` hook so the row and the instance agree again. A
+        // non-ACTIVE loser (already SUSPENDED/TERMINATED by another path) is left untouched.
+        if !suspended && self.sub_state(sub_id).await?.as_deref() == Some("ACTIVE") {
+            tracing::error!(
+                sub = %sub_id,
+                "suspend hook ran but a concurrent renewal kept the sub ACTIVE (lost suspend-CAS); \
+                 compensating with `resume` to repower the instance"
+            );
+            if let Some(err) = self.run_lifecycle_hook("resume", sub_id, buyer_hex).await? {
+                tracing::error!(
+                    sub = %sub_id, error = %err,
+                    "compensating `resume` FAILED after a lost suspend-CAS — the instance may remain \
+                     powered off; operator attention needed (the buyer can also renew again)"
+                );
+            }
+        }
+        Ok(suspended)
     }
 
     /// Transition 4 — destroy / terminate. CAS guarded on
@@ -1044,6 +1097,24 @@ impl Reconciler {
         // dead-letter here would later delete a paying buyer's live box (codex P1). Fetch handles
         // best-effort (a read failure must not abort the tick — coderabbit).
         let hook_error = self.run_lifecycle_hook("destroy", sub_id, buyer_hex).await?;
+
+        // Re-check for a renewal settlement that landed DURING the hook (lnrent-urw.8). The pre-check
+        // above passed, but the `destroy` hook window is up to 120s — long enough for a buyer to pay.
+        // `renewal_settlement_pending` is true on a CONFIRMED payment OR an unresolvable backend
+        // lookup (defer-on-uncertainty): either way the box is already torn down, so do NOT terminate
+        // (a confirmed capture RESUMES the sub onto a now-gone box -> resume fails -> refund; an
+        // unconfirmed one is re-tried next tick). Alert so the torn-down box is visible, not silent.
+        if self.renewal_settlement_pending(sub_id).await? {
+            tracing::error!(
+                sub = %sub_id,
+                "a renewal settlement is pending AFTER the destroy hook ran — a service was torn \
+                 down; NOT terminating (a refund follows a confirmed payment)"
+            );
+            self.alert_paid_destroyed(sub_id, "a renewal settlement was pending after the destroy hook ran")
+                .await;
+            return Ok(false);
+        }
+
         let handles = if hook_error.is_some() {
             self.hook_instance(sub_id)
                 .await
@@ -1089,6 +1160,23 @@ impl Reconciler {
                     .map(|r| r.attempts)
                     .unwrap_or(1);
                 self.alert_teardown(sub_id, "destroy", attempts, error).await;
+            }
+        } else if let Some(state) = self.sub_state(sub_id).await? {
+            // The terminate CAS lost (lnrent-urw.8). If a renewal captured in the narrow window
+            // between the re-check above and this CAS it flipped the sub SUSPENDED -> RESUMING
+            // (capture.rs): the box is destroyed but the sub is ALIVE -> alert (paid-then-destroyed).
+            // A benign loser (already TERMINATED / stale replay) does NOT alert.
+            if state != "TERMINATED" {
+                tracing::error!(
+                    sub = %sub_id, %state,
+                    "destroy CAS lost to a concurrent renewal — the box was torn down but the sub is \
+                     alive (a refund will follow)"
+                );
+                self.alert_paid_destroyed(
+                    sub_id,
+                    &format!("a renewal won the destroy race (sub now {state})"),
+                )
+                .await;
             }
         }
         Ok(terminated)
@@ -1370,6 +1458,80 @@ mod tests {
             .unwrap();
         r.dir = dir.clone();
         (r, dir)
+    }
+
+    /// A recipe whose `suspend`/`destroy` hooks touch a `<hook>-ran` marker and then BLOCK until a
+    /// `<hook>-release` file appears; its `resume` hook touches `resume-ran` and returns at once.
+    /// This lets a urw.8 race test inject a concurrent mutation DURING a hook and provably order it
+    /// before the post-hook CAS (no timing luck). Returns (recipe, hook dir).
+    fn blocking_hook_recipe() -> (Recipe, PathBuf) {
+        let (mut r, suspend_marker, _d) = marker_recipe();
+        let dir = suspend_marker.parent().unwrap().to_path_buf();
+        for h in ["suspend", "destroy"] {
+            let ran = dir.join(format!("{h}-ran"));
+            let release = dir.join(format!("{h}-release"));
+            std::fs::write(
+                dir.join(h),
+                format!(
+                    "#!/usr/bin/env bash\ncat >/dev/null\ntouch '{}'\n\
+                     for _ in $(seq 1 1000); do [ -f '{}' ] && break; sleep 0.01; done\n\
+                     echo '{{\"ok\":true}}'\n",
+                    ran.display(),
+                    release.display(),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(dir.join(h), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let resume_ran = dir.join("resume-ran");
+        std::fs::write(
+            dir.join("resume"),
+            format!(
+                "#!/usr/bin/env bash\ncat >/dev/null; touch '{}'; echo '{{\"ok\":true}}'\n",
+                resume_ran.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(dir.join("resume"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        r.dir = dir.clone();
+        (r, dir)
+    }
+
+    /// Wait until `<hook>-ran` appears (the hook has started and is now blocking), run `inject` (a
+    /// concurrent mutation the store actor commits BEFORE the hook returns), then release the hook.
+    /// Deterministically orders the injected mutation ahead of the post-hook CAS.
+    async fn race_during_hook<F, Fut>(dir: &std::path::Path, hook: &str, inject: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let ran = dir.join(format!("{hook}-ran"));
+        for _ in 0..1000 {
+            if ran.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(ran.exists(), "hook `{hook}` never started");
+        inject().await;
+        std::fs::write(dir.join(format!("{hook}-release")), b"go").unwrap();
+    }
+
+    /// A reconciler over a caller-owned `MockPayment` (so a test can settle invoices mid-hook) with
+    /// an ENABLED alert sink to `recipient`.
+    fn reconciler_with_payment_and_alerts(
+        store: Store,
+        payment: Arc<crate::backends::MockPayment>,
+        recipe: Recipe,
+        recipient: &str,
+    ) -> Reconciler {
+        let dispatcher = Arc::new(crate::alerts::AlertDispatcher::new(
+            store.clone(),
+            Arc::new(TestClock::new(0)),
+            recipient.to_string(),
+        ));
+        Reconciler::new(store, payment, recipe).with_alerts(dispatcher)
     }
 
     /// A reconciler with an ENABLED alert sink delivering to `recipient`, so a teardown failure
@@ -1967,6 +2129,196 @@ mod tests {
             "the row is left open (skipped), never resolved by deleting a live box"
         );
         assert_eq!(sub_state(&store, "s1").await, "ACTIVE", "the live sub is untouched");
+    }
+
+    // urw.8 (suspend race): a renewal that captures DURING the suspend hook keeps the sub ACTIVE and
+    // moves next_deadline out from under the CAS. The suspend hook already powered the box off, so
+    // the reconciler must COMPENSATE by re-running `resume` — leaving the row ACTIVE and the box on.
+    #[tokio::test]
+    async fn suspend_lost_to_renewal_compensates_with_resume() {
+        let store = mem_store();
+        let (recipe, dir) = blocking_hook_recipe();
+        // ACTIVE, cursor at paid_through=1000 (due to suspend at now=1000), retention 500.
+        seed_sub(&store, "s1", "ACTIVE", "buyerhex", Some(1000), 500, Some(1000)).await;
+        let r = reconciler(store.clone(), recipe);
+
+        let s = store.clone();
+        let inject = move || async move {
+            // A renewal capture on an ACTIVE sub extends paid_through + moves next_deadline (stays
+            // ACTIVE, capture.rs). Model it: move the deadline forward so the suspend CAS loses.
+            s.transaction(|tx| {
+                tx.execute("UPDATE subscription SET next_deadline=5000 WHERE id='s1'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        };
+        let (rep, _) = tokio::join!(
+            r.reconcile_tick(1000),
+            race_during_hook(&dir, "suspend", inject)
+        );
+        let rep = rep.unwrap();
+
+        assert_eq!(rep.suspended, 0, "the suspend CAS lost to the renewal");
+        assert_eq!(sub_state(&store, "s1").await, "ACTIVE", "the sub stays ACTIVE");
+        assert_eq!(
+            sub_next_deadline(&store, "s1").await,
+            Some(5000),
+            "the renewal's deadline stands"
+        );
+        assert!(dir.join("suspend-ran").exists(), "suspend hook ran (box off)");
+        assert!(
+            dir.join("resume-ran").exists(),
+            "compensating resume ran (box repowered)"
+        );
+    }
+
+    // urw.8 (guard): when the suspend CAS loses to a NON-ACTIVE state (e.g. a concurrent admin
+    // suspend), the box is correctly off and the reconciler must NOT fire the compensating resume.
+    #[tokio::test]
+    async fn suspend_lost_to_non_active_does_not_compensate() {
+        let store = mem_store();
+        let (recipe, dir) = blocking_hook_recipe();
+        seed_sub(&store, "s1", "ACTIVE", "buyerhex", Some(1000), 500, Some(1000)).await;
+        let r = reconciler(store.clone(), recipe);
+
+        let s = store.clone();
+        let inject = move || async move {
+            s.transaction(|tx| {
+                tx.execute("UPDATE subscription SET state='SUSPENDED' WHERE id='s1'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        };
+        let (rep, _) = tokio::join!(
+            r.reconcile_tick(1000),
+            race_during_hook(&dir, "suspend", inject)
+        );
+        rep.unwrap();
+
+        assert_eq!(sub_state(&store, "s1").await, "SUSPENDED");
+        assert!(dir.join("suspend-ran").exists(), "suspend hook ran");
+        assert!(
+            !dir.join("resume-ran").exists(),
+            "no compensating resume: the sub is legitimately SUSPENDED"
+        );
+    }
+
+    // urw.8 (destroy race, re-check): a renewal that SETTLES during the destroy hook (paid but not
+    // yet captured) must abort the terminate — the buyer paid for a box we already tore down. No
+    // terminate, the reservation stays held, and a PaidServiceDestroyed alert fires.
+    #[tokio::test]
+    async fn destroy_aborts_and_alerts_when_renewal_settles_during_hook() {
+        let store = mem_store();
+        let (recipe, dir) = blocking_hook_recipe();
+        let payment = Arc::new(crate::backends::MockPayment::new());
+        seed_sub(&store, "s1", "SUSPENDED", "buyerhex", Some(1000), 500, Some(1500)).await;
+        seed_reservation(&store, "s1").await;
+        let inv = payment
+            .create_invoice(100, "renew", 1_000_000, "renew-ext-s1")
+            .await
+            .unwrap();
+        seed_invoice(
+            &store,
+            &inv.id,
+            "s1",
+            "renew-ext-s1",
+            "renewal",
+            "OPEN",
+            Some(1_000_000),
+        )
+        .await;
+        let r =
+            reconciler_with_payment_and_alerts(store.clone(), payment.clone(), recipe, "npubhex");
+
+        let p = payment.clone();
+        let inject = move || async move {
+            p.settle("renew-ext-s1", 1400).unwrap(); // buyer pays DURING the destroy hook
+        };
+        let (rep, _) = tokio::join!(
+            r.reconcile_tick(1500),
+            race_during_hook(&dir, "destroy", inject)
+        );
+        let rep = rep.unwrap();
+
+        assert_eq!(rep.terminated, 0, "the destroy was aborted");
+        assert!(
+            dir.join("destroy-ran").exists(),
+            "the destroy hook ran (box torn down)"
+        );
+        assert_eq!(
+            sub_state(&store, "s1").await,
+            "SUSPENDED",
+            "the sub stays alive"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM reservation WHERE order_id='s1' AND state='RELEASED'"
+            )
+            .await,
+            0,
+            "the reservation is NOT released (no terminate)"
+        );
+        assert_eq!(
+            operator_alert_count(&store).await,
+            1,
+            "a PaidServiceDestroyed alert fired"
+        );
+    }
+
+    // urw.8 (destroy race, post-CAS): a renewal that captures in the narrow window AFTER the
+    // post-hook re-check but before the terminate CAS flips SUSPENDED -> RESUMING (capture.rs). The
+    // box is already destroyed but the sub is alive: the CAS loses and an alert fires.
+    #[tokio::test]
+    async fn destroy_alerts_when_cas_loses_to_resuming() {
+        let store = mem_store();
+        let (recipe, dir) = blocking_hook_recipe();
+        seed_sub(&store, "s1", "SUSPENDED", "buyerhex", Some(1000), 500, Some(1500)).await;
+        seed_reservation(&store, "s1").await;
+        let r = reconciler_with_alerts(store.clone(), recipe, "npubhex");
+
+        let s = store.clone();
+        let inject = move || async move {
+            // The capture already completed: state flipped to RESUMING, no OPEN invoice remains.
+            s.transaction(|tx| {
+                tx.execute("UPDATE subscription SET state='RESUMING' WHERE id='s1'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        };
+        let (rep, _) = tokio::join!(
+            r.reconcile_tick(1500),
+            race_during_hook(&dir, "destroy", inject)
+        );
+        let rep = rep.unwrap();
+
+        assert_eq!(rep.terminated, 0, "the terminate CAS lost to RESUMING");
+        assert!(
+            dir.join("destroy-ran").exists(),
+            "the destroy hook ran (box torn down)"
+        );
+        assert_eq!(
+            sub_state(&store, "s1").await,
+            "RESUMING",
+            "the sub is alive (resuming)"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM reservation WHERE order_id='s1' AND state='RELEASED'"
+            )
+            .await,
+            0,
+            "the reservation is NOT released (no terminate)"
+        );
+        assert_eq!(
+            operator_alert_count(&store).await,
+            1,
+            "a PaidServiceDestroyed alert fired"
+        );
     }
 
     // Test 2: a renewal invoice expiring unpaid changes ONLY the invoice (-> EXPIRED), never the sub.
