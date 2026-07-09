@@ -56,6 +56,19 @@ fn cap_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// The subject form used in the outbox row **id** — bounded AND collision-resistant. A short subject
+/// (the real case: a refund id) is used verbatim; a subject past the cap is replaced by a hash of
+/// the FULL subject, so two distinct long subjects of the same kind can never collide on the id
+/// (codex: a plain truncation would make `ON CONFLICT DO NOTHING` drop the second alert while
+/// `dispatch` stamps it sent, suppressing it for the cooldown window without ever enqueuing a DM).
+fn id_subject(subject: &str) -> String {
+    if subject.chars().count() <= MAX_ALERT_SUBJECT_CHARS {
+        return subject.to_string();
+    }
+    use sha2::{Digest, Sha256};
+    format!("h:{}", hex::encode(Sha256::digest(subject.as_bytes())))
+}
+
 /// The serialized `operator.alert` payload with `subject`/`detail` capped so the wrapped DM can
 /// never exceed the transport ceiling. Serializing three owned strings is infallible.
 fn alert_payload(kind: AlertKind, subject: &str, detail: &str) -> String {
@@ -194,11 +207,12 @@ impl AlertDispatcher {
         let payload = alert_payload(alert.kind, &alert.subject, &alert.detail);
         // Distinct id per fire (cooldown already bounds the rate), so a legitimate re-fire past the
         // window is never swallowed by ON CONFLICT; the conflict guard only absorbs a same-second
-        // boundary race. Cap the subject in the id too (a huge subject would bloat the id row).
+        // boundary race. `id_subject` keeps the id bounded WITHOUT letting two distinct long
+        // subjects collide (codex).
         let outbox_id = format!(
             "outbox:alert:{}:{}:{now}",
             alert.kind.wire_str(),
-            cap_chars(&alert.subject, MAX_ALERT_SUBJECT_CHARS)
+            id_subject(&alert.subject)
         );
         let recipient = self.recipient_hex.clone();
         self.store
@@ -238,11 +252,7 @@ impl AlertDispatcher {
         }
         let payload = alert_payload(kind, subject, detail);
         Some(AlertRow {
-            id: format!(
-                "outbox:alert:{}:{}",
-                kind.wire_str(),
-                cap_chars(subject, MAX_ALERT_SUBJECT_CHARS)
-            ),
+            id: format!("outbox:alert:{}:{}", kind.wire_str(), id_subject(subject)),
             recipient: self.recipient_hex.clone(),
             payload,
         })
@@ -394,5 +404,46 @@ mod tests {
         let ceiling = lnrent_wire::MAX_INBOUND_CONTENT_BYTES;
         assert!(async_payload.len() < ceiling / 8, "async payload well under the ceiling");
         assert!(row.payload.len() < ceiling / 8, "terminal payload well under the ceiling");
+    }
+
+    // codex (PR #15): two DISTINCT long subjects sharing the first 256 chars must NOT collide on the
+    // outbox id — else the second alert's ON CONFLICT would drop it while the sender is stamped sent.
+    // The id hashes the FULL subject once it exceeds the cap, so both terminal rows are distinct and
+    // both enqueue.
+    #[tokio::test]
+    async fn distinct_long_subjects_do_not_collide_on_the_outbox_id() {
+        let store = mem_store();
+        let clock = Arc::new(TestClock::new(1000));
+        let d = AlertDispatcher::new(store.clone(), clock, "npub".into());
+
+        let shared_prefix = "s".repeat(MAX_ALERT_SUBJECT_CHARS);
+        let subj_a = format!("{shared_prefix}-AAA");
+        let subj_b = format!("{shared_prefix}-BBB");
+        let row_a = d
+            .terminal_alert_row(AlertKind::RefundParked, &subj_a, "a")
+            .unwrap();
+        let row_b = d
+            .terminal_alert_row(AlertKind::RefundParked, &subj_b, "b")
+            .unwrap();
+        assert_ne!(row_a.id, row_b.id, "distinct long subjects get distinct ids");
+
+        // Both actually persist (no ON CONFLICT drop) when inserted in the same txn window.
+        let (a, b) = (row_a, row_b);
+        store
+            .transaction(move |tx| {
+                for r in [&a, &b] {
+                    tx.execute(
+                        "INSERT INTO outbox
+                            (id, recipient, subscription_id, msg_type, payload_json, state, attempts, created_at)
+                         VALUES (?1, ?2, NULL, 'operator.alert', ?3, 'PENDING', 0, 1000)
+                         ON CONFLICT(id) DO NOTHING",
+                        rusqlite::params![r.id, r.recipient, r.payload],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(alert_rows(&store).await, 2, "both long-subject alerts enqueue");
     }
 }
