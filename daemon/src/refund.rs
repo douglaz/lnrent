@@ -54,14 +54,14 @@ const MAX_REFUND_ATTEMPTS: i64 = 5;
 /// resolution defer, attempts UNCHANGED) and is retried next drive.
 const RESOLUTION_DEADLINE: Duration = Duration::from_secs(60);
 
-/// How long a refund may sit PENDING — repeatedly deferred WITHOUT a `pay` (a transient resolution
-/// failure, which does not bump the pay-attempts cap) — before every
-/// drive logs an operator-LOUD error. A buyer endpoint stuck transiently-broken forever (always
-/// 5xx / timeout / DNS failure) would otherwise retry silently with nobody notified and the buyer
-/// never refunded; this surfaces it for operator action while STILL retrying, so a recovered endpoint
-/// can yet refund the buyer (review P2). Time-based, NOT attempts-based, so it never starves the real
-/// payment of its retry budget.
-const RESOLUTION_STUCK_ALERT_S: i64 = 7 * 24 * 3600;
+/// How long a refund may sit PENDING — deferred WITHOUT progress (a transient resolution failure that
+/// doesn't bump the pay cap, OR a pay stuck in-flight forever) — before every drive logs an
+/// operator-LOUD error AND fires a `RefundStuck` alert (lnrent-urw.1, cooldown-collapsed). Retuned
+/// 7d → 6h (lnrent-urw.4): a week is far too long for stranded money to stay silent; the refund
+/// keeps retrying either way, and the alert cooldown bounds the noise. Time-based, NOT attempts-based,
+/// so it never starves the real payment of its retry budget. A const, not a knob (revisit only if
+/// dogfood shows the need).
+const RESOLUTION_STUCK_ALERT_S: i64 = 6 * 3600;
 
 /// What one [`Refunder::drive`] did. Every count is a normal result, not an error; the supervisor
 /// (lnrent-7fp.21) can log it and tests assert on rows directly.

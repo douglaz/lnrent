@@ -98,6 +98,13 @@ pub trait PaymentBackend: Send + Sync {
     async fn refund_gateway_ready(&self) -> Result<bool> {
         Ok(true)
     }
+    /// LIVENESS: whether the backend's federation is reachable — a cheap authenticated round-trip
+    /// that actually hits the guardians (NOT a local-DB read), so an offline/no-consensus federation
+    /// is distinguishable from a down gateway or a low balance (lnrent-urw.4). Default `Ok(true)` for
+    /// backends with no federation (the mock).
+    async fn backend_ready(&self) -> Result<bool> {
+        Ok(true)
+    }
     /// DEV-ONLY test/operator affordance: force-settle an inbound invoice by backend external id.
     /// Real money backends must leave this unsupported.
     async fn dev_settle(&self, _external_id: &str, _settled_at: i64) -> Result<()> {

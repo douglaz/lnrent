@@ -839,6 +839,18 @@ impl PaymentBackend for FedimintPayment {
         Ok(ln.get_gateway(self.gateway, false).await?.is_some())
     }
 
+    async fn backend_ready(&self) -> Result<bool> {
+        // Federation LIVENESS (lnrent-urw.4): `session_count()` is a cheap authenticated round-trip
+        // to the guardians that reaches consensus — NOT a local-DB read like `available_balance_msat`.
+        // Any success means the federation is reachable; an error means guardians down / no consensus.
+        self.client
+            .api()
+            .session_count()
+            .await
+            .map(|_| true)
+            .map_err(|e| anyhow::anyhow!("fedimint federation unreachable (session_count): {e}"))
+    }
+
     async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
         let (tx, rx) = mpsc::channel(64);
         *self.settle_tx.lock().unwrap() = Some(tx.clone());

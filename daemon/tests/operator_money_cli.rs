@@ -94,6 +94,7 @@ async fn json_money_returns_reply_envelope() {
         keys,
         vec![
             "balance_msat",
+            "federation_ok",
             "gateway_ok",
             "gross_liability_sat",
             "liability_count",

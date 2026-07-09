@@ -3677,6 +3677,7 @@ dependencies = [
  "bip39",
  "bitcoin",
  "clap",
+ "fedimint-api-client",
  "fedimint-client",
  "fedimint-connectors",
  "fedimint-core",
