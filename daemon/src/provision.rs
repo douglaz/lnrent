@@ -975,7 +975,11 @@ impl RefundDueWrite {
     /// transaction unless a racer already owns a live instance.
     fn write(self, tx: &rusqlite::Transaction) -> Result<RefundDueWriteOutcome> {
         let n = tx.execute(
-            "UPDATE subscription SET state='REFUND_DUE', updated_at=?2 WHERE id=?1 AND state='PROVISIONING'",
+            // Clear the deadline cursor on the REFUND_DUE transition (lnrent-y4m.4): the refund is
+            // driven by the Refunder's `refund_attempt`-ledger scan, not by `subscription.next_deadline`,
+            // and reconcile has no REFUND_DUE arm (falls to `noops`) — so a stale cursor only re-selects
+            // the row each tick to no-op. CAS guard (`state='PROVISIONING'`) unchanged.
+            "UPDATE subscription SET state='REFUND_DUE', next_deadline=NULL, updated_at=?2 WHERE id=?1 AND state='PROVISIONING'",
             params![self.subscription_id, self.now],
         )?;
         if n == 0 {
@@ -2212,6 +2216,14 @@ echo '{"payload":{"credential":"checked"},"handles":{"instance":"checked"}}'
             5000,
         )
         .await;
+        // Seed a stale deadline cursor so the REFUND_DUE transition provably clears it (lnrent-y4m.4).
+        store
+            .transaction(|tx| {
+                tx.execute("UPDATE subscription SET next_deadline=1 WHERE id='sub-1'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
         let (recipe, marker) = failing_provision_recipe();
         let prov = Provisioner::new(
             store.clone(),
@@ -2226,6 +2238,17 @@ echo '{"payload":{"credential":"checked"},"handles":{"instance":"checked"}}'
         assert_eq!(
             scalar_str(&store, "SELECT state FROM subscription WHERE id='sub-1'").await,
             "REFUND_DUE"
+        );
+        // lnrent-y4m.4: the REFUND_DUE transition cleared the stale cursor (the Refunder drives off the
+        // refund_attempt ledger, not next_deadline), so reconcile stops re-selecting it each tick.
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM subscription WHERE id='sub-1' AND next_deadline IS NULL"
+            )
+            .await,
+            1,
+            "REFUND_DUE clears next_deadline (lnrent-y4m.4)"
         );
         assert_eq!(
             count(&store, "SELECT count(*) FROM instance").await,

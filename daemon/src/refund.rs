@@ -830,7 +830,12 @@ impl Refunder {
                 }
                 if let Some(sub_id) = sub_id.as_deref() {
                     let moved = tx.execute(
-                        "UPDATE subscription SET state='REFUNDED', updated_at=?2
+                        // Clear the deadline cursor on the terminal transition (lnrent-y4m.4), exactly
+                        // as reconcile does for EXPIRED/TERMINATED: a REFUNDED row is driven by neither
+                        // the reconcile scan (no REFUNDED arm — it falls to `noops`) nor by
+                        // `next_deadline`, so a stale `next_deadline <= now` only makes every tick
+                        // re-select it to no-op. CAS guard (`state='REFUND_DUE'`) unchanged.
+                        "UPDATE subscription SET state='REFUNDED', next_deadline=NULL, updated_at=?2
                          WHERE id=?1 AND state='REFUND_DUE'",
                         params![sub_id, now],
                     )?;
@@ -1767,6 +1772,14 @@ mod tests {
         seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
         seed_refund(&store, "sub-1", Some(LN_ADDR), Some(500)).await;
         seed_reservation(&store, "sub-1").await;
+        // Seed a STALE deadline cursor so the terminal transition provably clears it (lnrent-y4m.4).
+        store
+            .transaction(|tx| {
+                tx.execute("UPDATE subscription SET next_deadline=1 WHERE id='sub-1'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
 
         let report = refunder(&store, &payment, &clock).drive().await.unwrap();
 
@@ -1782,6 +1795,19 @@ mod tests {
             scalar(&store, "SELECT state FROM subscription WHERE id='sub-1'").await,
             Some("REFUNDED".to_string())
         );
+        // lnrent-y4m.4: the terminal transition cleared the stale deadline cursor, so the reconcile
+        // `next_deadline <= now` scan no longer re-selects this REFUNDED row every tick.
+        let next_deadline: Option<i64> = store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT next_deadline FROM subscription WHERE id='sub-1'",
+                    [],
+                    |r| r.get::<_, Option<i64>>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(next_deadline, None, "REFUNDED clears next_deadline (lnrent-y4m.4)");
         assert_eq!(
             scalar(
                 &store,

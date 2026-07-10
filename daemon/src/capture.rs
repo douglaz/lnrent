@@ -185,7 +185,13 @@ fn apply_paid(
                 }
             }
             tx.execute(
-                "UPDATE subscription SET state='PROVISIONING', updated_at=?2 WHERE id=?1",
+                // Clear the stale order-invoice deadline cursor on the PROVISIONING transition
+                // (lnrent-y4m.4): a PROVISIONING sub is driven by the Provisioner's state-scan
+                // (`WHERE state='PROVISIONING'`), not by `next_deadline`, and reconcile has no
+                // PROVISIONING arm (falls to `noops`) — so leaving the old cursor only re-selects the
+                // row every tick to no-op. The Provisioner sets the real ACTIVE timers when it moves
+                // the row on; NULL until then is correct. CAS-free single-row move unchanged.
+                "UPDATE subscription SET state='PROVISIONING', next_deadline=NULL, updated_at=?2 WHERE id=?1",
                 params![sub_id, now],
             )?;
             journal(tx, Some(sub_id), "capture_order", s, now)?;
@@ -496,11 +502,31 @@ mod tests {
             &s, "o1", "PENDING", None, 100, 10, 0, None, "order", "OPEN", "ext1",
         )
         .await;
+        // Seed the stale order-invoice deadline cursor so the PROVISIONING move provably clears it.
+        s.transaction(|tx| {
+            tx.execute("UPDATE subscription SET next_deadline=1 WHERE id='o1'", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
         assert_eq!(
             capture(&s, settlement("ext1", 500), 1).await.unwrap(),
             Capture::Captured
         );
         assert_eq!(sub_state(&s, "o1").await, "PROVISIONING");
+        // lnrent-y4m.4: the PROVISIONING move cleared the stale cursor so reconcile stops re-selecting
+        // the row every tick (the Provisioner drives it by state, not by next_deadline).
+        let next_deadline: Option<i64> = s
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT next_deadline FROM subscription WHERE id='o1'",
+                    [],
+                    |r| r.get::<_, Option<i64>>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(next_deadline, None, "PROVISIONING clears next_deadline (lnrent-y4m.4)");
         let (st, applied) = inv_status(&s, "ext1").await;
         assert_eq!(st, "PAID");
         assert_eq!(applied, Some(500), "applied_at stamped from the settlement");
