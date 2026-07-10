@@ -408,12 +408,23 @@ CREATE INDEX IF NOT EXISTS teardown_failure_subscription_idx ON teardown_failure
 CREATE INDEX IF NOT EXISTS native_connect_session_subscription_idx ON native_connect_session(subscription_id, state);
 ";
 
+// lnrent-y4m.4: one-time backfill for rows that reached PROVISIONING/REFUND_DUE/REFUNDED BEFORE the
+// transition sites learned to NULL the cursor. Those rows — a terminal REFUNDED persists until the
+// y4m.2 GC reaps it (~30d) — keep a stale `next_deadline <= now` and are re-selected by the reconcile
+// scan every tick, the exact accumulated scan cost PR-17 targets (codex). New transitions clear it
+// going forward; this clears the pre-upgrade backlog once. A fresh DB has no such rows -> no-op.
+const M10_CLEAR_STALE_DEADLINE_CURSORS: &str = "
+UPDATE subscription SET next_deadline=NULL
+ WHERE state IN ('PROVISIONING', 'REFUND_DUE', 'REFUNDED') AND next_deadline IS NOT NULL;
+";
+
 /// Ordered migrations (lnrent-7fp.3): index `i` upgrades the DB from schema version `i` to
 /// `i+1`. Version 1 is the §11 schema; version 2 adds `seen_message` (lnrent-7fp.5); version 3 adds
 /// `subscription.suspend_not_before` (lnrent-7fp.22); version 4 adds the `refund_attempt` resolver
 /// columns (lnrent-ug8); version 5 adds the idempotency-cache TTL-sweep indexes (lnrent-xjn);
 /// version 6 adds the event_log scan indexes; version 7 adds teardown failures; version 8 adds
-/// operator sweeps; version 9 adds terminal-row reaper indexes. A future
+/// operator sweeps; version 9 adds terminal-row reaper indexes; version 10 backfills stale terminal
+/// deadline cursors (lnrent-y4m.4). A future
 /// schema change appends a new entry of `ALTER`/`CREATE` statements; **never edit a shipped migration**.
 const MIGRATIONS: &[&str] = &[
     SCHEMA,
@@ -425,6 +436,7 @@ const MIGRATIONS: &[&str] = &[
     M7_TEARDOWN_FAILURE,
     M8_SWEEP_ATTEMPT,
     M9_TERMINAL_ROW_REAPER_INDEXES,
+    M10_CLEAR_STALE_DEADLINE_CURSORS,
 ];
 
 /// The target schema version this binary expects (= number of migrations).
@@ -1251,6 +1263,47 @@ mod tests {
         }
     }
 
+    // lnrent-y4m.4: the M10 backfill clears a stale deadline cursor on rows that reached
+    // PROVISIONING/REFUND_DUE/REFUNDED BEFORE the transition sites learned to NULL it, so an upgrading
+    // DB stops re-selecting them each reconcile tick. A live ACTIVE row's cursor is left untouched.
+    #[test]
+    fn migrate_v10_backfills_stale_terminal_deadline_cursors() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO subscription (id, state, next_deadline, created_at, updated_at) VALUES
+               ('s-refunded',  'REFUNDED',     100, 0, 0),
+               ('s-provision', 'PROVISIONING', 100, 0, 0),
+               ('s-refunddue', 'REFUND_DUE',   100, 0, 0),
+               ('s-active',    'ACTIVE',       100, 0, 0);
+             PRAGMA user_version = 9;",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(
+            conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0)).unwrap(),
+            SCHEMA_VERSION
+        );
+
+        let cleared = |id: &str| -> Option<i64> {
+            conn.query_row(
+                "SELECT next_deadline FROM subscription WHERE id=?1",
+                [id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(cleared("s-refunded"), None, "REFUNDED cursor backfilled to NULL");
+        assert_eq!(cleared("s-provision"), None, "PROVISIONING cursor backfilled to NULL");
+        assert_eq!(cleared("s-refunddue"), None, "REFUND_DUE cursor backfilled to NULL");
+        assert_eq!(
+            cleared("s-active"),
+            Some(100),
+            "a live ACTIVE row's deadline cursor is untouched by the backfill"
+        );
+    }
+
     #[test]
     fn migrate_is_idempotent_on_current_db() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1324,7 +1377,7 @@ mod tests {
              CREATE TABLE invoice (id TEXT PRIMARY KEY, subscription_id TEXT, external_id TEXT,
                                    status TEXT, settled_at INTEGER, expires_at INTEGER, issued_at INTEGER);
              CREATE TABLE instance (id TEXT PRIMARY KEY, subscription_id TEXT, state TEXT, updated_at INTEGER);
-             CREATE TABLE subscription (id TEXT PRIMARY KEY, state TEXT, updated_at INTEGER);
+             CREATE TABLE subscription (id TEXT PRIMARY KEY, state TEXT, next_deadline INTEGER, updated_at INTEGER);
              CREATE TABLE outbox (id TEXT PRIMARY KEY, subscription_id TEXT, state TEXT);
              CREATE TABLE native_connect_session (id TEXT PRIMARY KEY, subscription_id TEXT, state TEXT);
              PRAGMA user_version = 3;",

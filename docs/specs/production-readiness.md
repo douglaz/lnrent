@@ -281,9 +281,11 @@ Three operability blind spots that leave the operator able to *see* trouble but 
   (and reset on `PROVISIONING`).
   _LANDED (lnrent-y4m.4): `next_deadline=NULL` added to the three transition UPDATEs — capture
   →PROVISIONING, provision →REFUND_DUE, refund →REFUNDED — mirroring EXPIRED/TERMINATED, CAS guards
-  unchanged. Safe: reconcile has no arm for those states (falls to `noops`), the Provisioner selects
-  `WHERE state='PROVISIONING'`, and the Refunder drives off the `refund_attempt` ledger — none read
-  `subscription.next_deadline`. Tested: each transition clears a seeded stale cursor._
+  unchanged, PLUS a one-time M10 backfill (`UPDATE … WHERE state IN (…) AND next_deadline IS NOT NULL`)
+  so rows already in those states on upgrade stop being re-selected too. Safe: reconcile has no arm for
+  those states (falls to `noops`), the Provisioner selects `WHERE state='PROVISIONING'`, and the
+  Refunder drives off the `refund_attempt` ledger — none read `subscription.next_deadline`. Tested:
+  each transition clears a seeded stale cursor, and the M10 backfill clears pre-existing ones._
 - **PR-18 — Migration + `user_version` bump in one transaction.** `store.rs:313,331` — a future
   multi-statement migration could half-apply. Wrap each migration+bump in one `BEGIN…COMMIT`.
 - **PR-19 — Optional structured (JSON) logging.** `main.rs:160` uses `fmt::init()` (unstructured plaintext)
