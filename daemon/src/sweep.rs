@@ -443,6 +443,19 @@ impl Sweeper {
                     .await?
                 }
                 PayStatus::Unknown => {
+                    // Not-started: no funds committed yet, so this branch may START a fresh pay.
+                    // Re-validate the stored invoice against the CURRENT clock first (codex): an
+                    // intent written shortly before downtime can have expired since — paying it would
+                    // either park PENDING forever (cap stuck, blocking new sweeps) or, on a
+                    // no-validation backend, record an expired invoice SENT. Terminalize instead. (The
+                    // started/re-await branches above do NOT re-validate — their funds are committed.)
+                    if let Err(e) = parse_sweep_invoice(&bolt11, self.clock.now()) {
+                        let reason = format!("intent no longer payable during recovery: {}", e.message());
+                        self.commit_failed(&row.id, &payment_hash, self.clock.now(), &reason)
+                            .await?;
+                        report.failed += 1;
+                        continue;
+                    }
                     let surplus = {
                         let id = row.id.clone();
                         self.store
@@ -651,7 +664,9 @@ impl Sweeper {
         }
     }
 
-    /// CAS the row to SENT (guarded on `status='PENDING'`) + journal. Returns whether it committed.
+    /// Record the row SENT after a confirmed pay + journal. Guarded on `status IN (PENDING, FAILED)`
+    /// so a successful (idempotent) pay corrects a concurrent supersede but never re-touches an
+    /// already-SENT row. Returns whether it committed.
     async fn commit_sent(
         &self,
         id: &str,
@@ -662,15 +677,35 @@ impl Sweeper {
         let (id_s, hash_s) = (id.to_string(), payment_hash.to_string());
         self.store
             .transaction(move |tx| {
+                // A successful pay is AUTHORITATIVE — the money already left the wallet — so record
+                // SENT even if the concurrent maintenance drive superseded this PENDING row to FAILED
+                // in the pay's not-started window (the two-payer race, codex). `pay_capped` is
+                // idempotent on `sweep:<hash>`, so the payment leaves EXACTLY once; correcting
+                // FAILED->SENT keeps the cap counted in `paid_out_msat` and stops the CLI reporting
+                // success while the ledger drops the payout. Never touches an already-SENT row.
+                let prior: Option<String> = tx
+                    .query_row(
+                        "SELECT status FROM sweep_attempt WHERE id=?1",
+                        params![id_s],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
                 let updated = tx.execute(
                     "UPDATE sweep_attempt
                         SET status='SENT', backend_payment_id=COALESCE(?2, backend_payment_id),
-                            attempts=COALESCE(attempts, 0)+1, sent_at=?3
-                      WHERE id=?1 AND status='PENDING'",
+                            attempts=COALESCE(attempts, 0)+1, sent_at=?3, last_error=NULL
+                      WHERE id=?1 AND status IN ('PENDING', 'FAILED')",
                     params![id_s, backend_payment_id, now],
                 )?;
                 if updated == 0 {
-                    return Ok(false);
+                    return Ok(false); // already SENT (idempotent) or the row is gone
+                }
+                if prior.as_deref() == Some("FAILED") {
+                    tracing::warn!(
+                        sweep = %id_s,
+                        "sweep pay SUCCEEDED after a concurrent drive superseded it FAILED; corrected \
+                         to SENT (a spurious SweepFailed alert may have fired)"
+                    );
                 }
                 journal_sweep(tx, &json!({ "payment_hash": hash_s, "phase": "sent" }), now)?;
                 Ok(true)
@@ -1464,8 +1499,11 @@ mod tests {
         // A PENDING sweep (cap 100_000_000) whose funds a NEW at-risk liability has since consumed.
         let store = mem_store();
         // earned 100_000_000, but the whole 100k receipt is now at-risk (PROVISIONING) -> reserved.
+        // A VALID, non-expired stored invoice (recovery re-validates it before re-gating), so the
+        // ONLY reason the drive refuses is the superseding liability.
+        let bolt11 = mint_bolt11(100_000 * 1000, META, 1_000, 3_600);
         store
-            .transaction(|tx| {
+            .transaction(move |tx| {
                 tx.execute(
                     "INSERT INTO subscription (id, state, created_at, updated_at) VALUES ('B', 'PROVISIONING', 0, 0)",
                     [],
@@ -1477,8 +1515,8 @@ mod tests {
                 )?;
                 tx.execute(
                     "INSERT INTO sweep_attempt (id, bolt11, amount_sat, max_outlay_msat, status, attempts, created_at)
-                     VALUES ('sweep:x', 'lnbc1', 100000, 100000000, 'PENDING', 0, 0)",
-                    [],
+                     VALUES ('sweep:x', ?1, 100000, 100000000, 'PENDING', 0, 0)",
+                    params![bolt11],
                 )?;
                 Ok(())
             })
@@ -1497,6 +1535,64 @@ mod tests {
             .await
             .unwrap();
         assert!(last_error.unwrap().contains("superseded_by_liability"));
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_pay_records_sent_even_over_a_concurrent_supersede() {
+        // Two-payer race (codex P1): the maintenance drive superseded a PENDING row to FAILED while
+        // the live execute was mid-pay; the pay then SUCCEEDED. commit_sent must record SENT — the
+        // money left the wallet exactly once (idempotent key) — never leave the payout uncounted.
+        let store = mem_store();
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO sweep_attempt (id, bolt11, amount_sat, max_outlay_msat, status, attempts, created_at, last_error)
+                     VALUES ('sweep:x', 'lnbc1', 40000, 41000000, 'FAILED', 1, 0, 'superseded_by_liability: ...')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let s = sweeper(&store, Arc::new(SweepPayment::new()));
+
+        let committed = s
+            .commit_sent("sweep:x", "hash", Some("pid-1".to_string()), 2_000)
+            .await
+            .unwrap();
+        assert!(committed, "a confirmed pay overrides a concurrent supersede");
+        let (status, _, _) = sweep_row(&store, "sweep:x").await.unwrap();
+        assert_eq!(status, "SENT", "the payout is recorded SENT, not lost as FAILED");
+    }
+
+    #[tokio::test]
+    async fn drive_terminalizes_a_pending_sweep_whose_invoice_expired_during_downtime() {
+        // codex P2: a not-started PENDING intent written before downtime whose invoice has since
+        // expired must be terminalized on recovery, never paid (else it parks forever or a
+        // no-validation backend records an expired invoice SENT). Surplus is available, so the ONLY
+        // reason not to pay is the expiry.
+        let store = mem_store();
+        seed_final_receipt(&store, "order:A", "A", 100_000).await;
+        let expired = mint_bolt11(40_000 * 1000, META, 100, 10); // expired at 110 << clock now 1_000
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO sweep_attempt (id, bolt11, amount_sat, max_outlay_msat, status, attempts, created_at)
+                     VALUES ('sweep:x', ?1, 40000, 41000000, 'PENDING', 0, 0)",
+                    params![expired],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let payment = Arc::new(SweepPayment::new()); // not-started
+        let s = sweeper(&store, payment.clone());
+
+        let report = s.drive().await.unwrap();
+        assert_eq!(report.failed, 1);
+        assert_eq!(payment.sends(), 0, "an expired invoice is never paid on recovery");
+        let (status, _, _) = sweep_row(&store, "sweep:x").await.unwrap();
+        assert_eq!(status, "FAILED", "the doomed intent is terminalized, freeing the in-flight slot");
     }
 
     #[tokio::test]
