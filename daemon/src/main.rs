@@ -295,6 +295,10 @@ fn bootstrap_input(args: BootstrapArgs) -> BootstrapInput {
         compute_backend: None,
         fedimint_invite: args.fedimint_invite,
         fedimint_gateway: args.fedimint_gateway,
+        // No bootstrap CLI flag for the failover fallback list (lnrent-y4m.8): gateway fallbacks are
+        // supplied via the config file / stdin JSON `fedimint_gateway_fallbacks` array (or already
+        // durable in fedimint.json). The single-gateway `--fedimint-gateway` flag is unchanged.
+        fedimint_gateway_fallbacks: None,
         mnemonic: args.mnemonic,
         // No bootstrap CLI flag for the draining-holdings floor (lnrent-urw.7); it is a runtime
         // warning-condition knob read from env (LNRENT_MIN_HOLDINGS_WARN_MSAT) / the config file.
@@ -449,8 +453,9 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
 
 /// Construct the real Fedimint payment backend for `payment_backend=fedimint` (lnrent-o6p go-live):
 /// join the configured federation with the operator's deterministic root secret and honor the
-/// configured gateway. Compiled only with `--features fedimint`; the non-feature build rejects
-/// `fedimint` at bootstrap, so its variant just fails clearly if ever reached.
+/// operator's ORDERED gateway list (`[gateway] ++ gateway_fallbacks`), which the backend fails over
+/// through in order (lnrent-y4m.8). Compiled only with `--features fedimint`; the non-feature build
+/// rejects `fedimint` at bootstrap, so its variant just fails clearly if ever reached.
 #[cfg(feature = "fedimint")]
 async fn build_fedimint_backend(
     operator: &config::Operator,
@@ -461,11 +466,13 @@ async fn build_fedimint_backend(
         .fedimint
         .as_ref()
         .context("payment_backend=fedimint requires a [fedimint] config (invite + gateway)")?;
-    let backend = FedimintPayment::join_or_open(
+    // The ordered failover list: the primary gateway first, then each configured fallback.
+    let gateways = fedi.gateways();
+    let backend = FedimintPayment::join_or_open_with_gateways(
         &fedi.invite,
         &operator.config.data_dir,
         operator.identity.fedimint_root_secret(),
-        Some(&fedi.gateway),
+        &gateways,
         clock,
     )
     .await
