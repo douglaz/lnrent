@@ -49,6 +49,9 @@ Three money-path defects exist now that the daemon can move real ecash (o6p, com
   read remains — the only balance call site is the explicit operator `reconcile` command). The
   liability-gating rule above is UNCHANGED; a separate liability-independent ledger-holdings floor
   warning (PR-16) exists alongside it and is not a readiness warning.
+  *Landed (lnrent-urw.10):* `daemon/src/ledger.rs::expected_msat` is the ledger lower bound; readiness
+  compares `expected_msat >= required_msat` (supervisor.rs), `BalanceQueryFailed` is removed, and the
+  sole `available_balance_msat` call site is the `reconcile` handler (ipc.rs).
 
 - **INV-3 — refund provenance.** A refund MUST NOT be executed unless it corresponds to a payment
   actually received for that order. Refunding before/without a received payment is forbidden and is a

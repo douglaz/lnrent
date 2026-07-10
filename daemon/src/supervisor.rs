@@ -1230,7 +1230,9 @@ pub(crate) struct RefundReadinessReport {
     liability_count: usize,
     gross_liability_sat: u128,
     required_msat: u128,
-    balance_msat: Option<u64>,
+    /// The ledger's conservative LOWER bound on spendable holdings (`ledger::expected_msat`, §D) —
+    /// the balance operand the readiness compare now uses instead of a live federation query (§E).
+    expected_msat: u128,
     gateway_ok: bool,
     /// LIVENESS: whether the federation guardians are reachable (lnrent-urw.4). Distinct from
     /// `gateway_ok` — a down federation is a different failure than a down gateway.
@@ -1239,8 +1241,6 @@ pub(crate) struct RefundReadinessReport {
     /// PENDING liabilities that could not be priced this pass (transient quote/gateway error). Their
     /// cost is absent from `required_msat`, so coverage cannot be confirmed — forces a warning.
     unpriceable_count: usize,
-    /// The (local) ecash balance query itself failed — a catastrophic signal; forces a loud warning.
-    balance_query_failed: bool,
     warning: Option<RefundReadinessWarning>,
 }
 
@@ -1250,26 +1250,20 @@ impl Default for RefundReadinessReport {
             liability_count: 0,
             gross_liability_sat: 0,
             required_msat: 0,
-            balance_msat: None,
+            expected_msat: 0,
             gateway_ok: true,
             federation_ok: true,
             parked_count: 0,
             unpriceable_count: 0,
-            balance_query_failed: false,
             warning: None,
         }
     }
 }
 
 impl RefundReadinessReport {
-    pub(crate) fn to_money_value(
-        &self,
-        balance_msat: Option<u64>,
-        gateway_ok: bool,
-        federation_ok: bool,
-    ) -> Value {
+    pub(crate) fn to_money_value(&self, gateway_ok: bool, federation_ok: bool) -> Value {
         json!({
-            "balance_msat": balance_msat,
+            "expected_msat": self.expected_msat,
             "gateway_ok": gateway_ok,
             "federation_ok": federation_ok,
             "liability_count": self.liability_count,
@@ -1282,10 +1276,11 @@ impl RefundReadinessReport {
     }
 }
 
+/// The two LIVENESS probes the readiness path still makes (§E): the refund gateway and the
+/// federation guardians. NO balance read — that is retired from every automatic path (ledger
+/// `expected_msat` is the balance operand now); the wallet is read solely by `reconcile` (§F).
 #[derive(Debug, Clone)]
 pub(crate) struct RefundReadinessProbe {
-    balance_msat: Option<u64>,
-    balance_error: Option<String>,
     gateway_ok: bool,
     gateway_error: Option<String>,
     federation_ok: bool,
@@ -1298,29 +1293,19 @@ impl RefundReadinessProbe {
             Ok(ok) => (ok, None),
             Err(e) => (false, Some(format!("{e:#}"))),
         };
-        // Federation LIVENESS (lnrent-urw.4): a guardian round-trip, distinct from the gateway/balance
-        // reads. An error OR an explicit `false` means the federation is not reachable.
+        // Federation LIVENESS (lnrent-urw.4): a guardian round-trip, distinct from the gateway read.
+        // An error OR an explicit `false` means the federation is not reachable.
         let (federation_ok, federation_error) = match payment.backend_ready().await {
             Ok(ok) => (ok, None),
             Err(e) => (false, Some(format!("{e:#}"))),
         };
-        let (balance_msat, balance_error) = match payment.available_balance_msat().await {
-            Ok(balance) => (balance, None),
-            Err(e) => (None, Some(format!("{e:#}"))),
-        };
 
         Self {
-            balance_msat,
-            balance_error,
             gateway_ok,
             gateway_error,
             federation_ok,
             federation_error,
         }
-    }
-
-    pub(crate) fn balance_msat(&self) -> Option<u64> {
-        self.balance_msat
     }
 
     pub(crate) fn gateway_ok(&self) -> bool {
@@ -1338,24 +1323,17 @@ impl RefundReadinessProbe {
         if let Some(e) = &self.federation_error {
             tracing::warn!(error = %e, "refund readiness: federation liveness probe failed (guardians unreachable)");
         }
-        // A local ecash balance failure is a catastrophic client signal when liabilities exist.
-        if let Some(e) = &self.balance_error {
-            tracing::error!(
-                error = %e,
-                "refund readiness: LOCAL ecash balance query FAILED — likely a corrupt/broken fedimint client; refund coverage CANNOT be verified"
-            );
-        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefundReadinessWarning {
-    /// The local ecash balance query failed — catastrophic (a corrupt/broken client). Highest priority.
-    BalanceQueryFailed,
     /// The federation guardians are unreachable (lnrent-urw.4): the root infra failure — nothing can
     /// be invoiced, paid, or reconciled. Distinct from (and higher priority than) a down gateway.
     FederationDown,
     GatewayUnavailable,
+    /// The ledger's expected holdings (`expected_msat`, §D) are below the required refund outlay: the
+    /// books say we cannot cover what is owed. (Was a live balance compare; ledger-derived since §E.)
     InsufficientBalance,
     /// A real PENDING liability could not be priced (its outlay is missing from `required_msat`), so
     /// coverage cannot be confirmed — warn rather than falsely report "covered".
@@ -1366,7 +1344,6 @@ pub(crate) enum RefundReadinessWarning {
 impl RefundReadinessWarning {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            RefundReadinessWarning::BalanceQueryFailed => "BalanceQueryFailed",
             RefundReadinessWarning::FederationDown => "FederationDown",
             RefundReadinessWarning::GatewayUnavailable => "GatewayUnavailable",
             RefundReadinessWarning::InsufficientBalance => "InsufficientBalance",
@@ -1392,14 +1369,6 @@ async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) 
     }
 
     match report.warning {
-        Some(RefundReadinessWarning::BalanceQueryFailed) => tracing::error!(
-            liabilities = report.liability_count,
-            gross_liability_sat = %report.gross_liability_sat,
-            required_outlay_msat = %report.required_msat,
-            gateway_ok = report.gateway_ok,
-            parked_count = report.parked_count,
-            "refund readiness ALARM: the LOCAL ecash balance query failed with liabilities outstanding — likely a corrupt/broken fedimint client; refund coverage cannot be verified, investigate immediately"
-        ),
         Some(RefundReadinessWarning::FederationDown) => tracing::error!(
             liabilities = report.liability_count,
             gross_liability_sat = %report.gross_liability_sat,
@@ -1413,7 +1382,7 @@ async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) 
             liabilities = report.liability_count,
             gross_liability_sat = %report.gross_liability_sat,
             required_outlay_msat = %report.required_msat,
-            balance_msat = ?report.balance_msat,
+            expected_msat = %report.expected_msat,
             gateway_ok = report.gateway_ok,
             parked_count = report.parked_count,
             "refund readiness warning: gateway unreachable: cannot create invoices or pay refunds"
@@ -1422,16 +1391,16 @@ async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) 
             liabilities = report.liability_count,
             gross_liability_sat = %report.gross_liability_sat,
             required_outlay_msat = %report.required_msat,
-            balance_msat = ?report.balance_msat,
+            expected_msat = %report.expected_msat,
             gateway_ok = report.gateway_ok,
             parked_count = report.parked_count,
-            "refund readiness warning: available balance is below required refund outlay"
+            "refund readiness warning: ledger expected holdings are below required refund outlay"
         ),
         Some(RefundReadinessWarning::ParkedManual) => tracing::warn!(
             liabilities = report.liability_count,
             gross_liability_sat = %report.gross_liability_sat,
             required_outlay_msat = %report.required_msat,
-            balance_msat = ?report.balance_msat,
+            expected_msat = %report.expected_msat,
             gateway_ok = report.gateway_ok,
             parked_count = report.parked_count,
             "refund readiness warning: parked refund liabilities require manual handling"
@@ -1440,7 +1409,7 @@ async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) 
             liabilities = report.liability_count,
             gross_liability_sat = %report.gross_liability_sat,
             required_outlay_msat = %report.required_msat,
-            balance_msat = ?report.balance_msat,
+            expected_msat = %report.expected_msat,
             gateway_ok = report.gateway_ok,
             parked_count = report.parked_count,
             unpriceable_count = report.unpriceable_count,
@@ -1450,7 +1419,7 @@ async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) 
             liabilities = report.liability_count,
             gross_liability_sat = %report.gross_liability_sat,
             required_outlay_msat = %report.required_msat,
-            balance_msat = ?report.balance_msat,
+            expected_msat = %report.expected_msat,
             gateway_ok = report.gateway_ok,
             parked_count = report.parked_count,
             "refund liabilities covered"
@@ -1475,6 +1444,11 @@ pub(crate) async fn refund_readiness_report_with_probe(
     payment: &Arc<dyn PaymentBackend>,
     probe: &RefundReadinessProbe,
 ) -> Result<RefundReadinessReport> {
+    // §D/§E: the ledger's conservative lower bound on spendable holdings is the balance operand now
+    // — a pure LOCAL read (no federation balance call). Computed UNCONDITIONALLY so `lnrent money`
+    // reports real expected holdings even at zero liabilities (as the old view showed the real
+    // balance), and so the money display value is exactly the figure the verdict compares.
+    let expected_msat = crate::ledger::expected_msat(store, payment).await?;
     let liabilities = store.refund_readiness_liabilities().await?;
     if liabilities.is_empty() {
         // Even with NO refund liabilities, a down federation must still surface (codex): it is a
@@ -1484,6 +1458,7 @@ pub(crate) async fn refund_readiness_report_with_probe(
         // stay silent with nothing owed.
         probe.log_failures();
         return Ok(RefundReadinessReport {
+            expected_msat,
             gateway_ok: probe.gateway_ok,
             federation_ok: probe.federation_ok,
             warning: (!probe.federation_ok).then_some(RefundReadinessWarning::FederationDown),
@@ -1491,11 +1466,12 @@ pub(crate) async fn refund_readiness_report_with_probe(
         });
     }
 
-    refund_readiness_report_from_liabilities(liabilities, payment, probe).await
+    refund_readiness_report_from_liabilities(liabilities, expected_msat, payment, probe).await
 }
 
 async fn refund_readiness_report_from_liabilities(
     liabilities: Vec<RefundReadinessLiability>,
+    expected_msat: u128,
     payment: &Arc<dyn PaymentBackend>,
     probe: &RefundReadinessProbe,
 ) -> Result<RefundReadinessReport> {
@@ -1505,12 +1481,11 @@ async fn refund_readiness_report_from_liabilities(
         liability_count: liabilities.len(),
         gross_liability_sat: 0,
         required_msat: 0,
-        balance_msat: probe.balance_msat,
+        expected_msat,
         gateway_ok: probe.gateway_ok,
         federation_ok: probe.federation_ok,
         parked_count: 0,
         unpriceable_count: 0,
-        balance_query_failed: probe.balance_error.is_some(),
         warning: None,
     };
 
@@ -1546,18 +1521,15 @@ async fn refund_readiness_report_from_liabilities(
         }
     }
 
-    report.warning = if report.balance_query_failed {
-        Some(RefundReadinessWarning::BalanceQueryFailed)
-    } else if !report.federation_ok {
+    report.warning = if !report.federation_ok {
         // The federation is the root: if it's unreachable, gateway/balance checks are moot. Report
         // it distinctly so the operator fixes the right thing (lnrent-urw.4).
         Some(RefundReadinessWarning::FederationDown)
     } else if !report.gateway_ok {
         Some(RefundReadinessWarning::GatewayUnavailable)
-    } else if report
-        .balance_msat
-        .is_some_and(|balance| u128::from(balance) < report.required_msat)
-    {
+    } else if report.expected_msat < report.required_msat {
+        // §E: the ledger's expected holdings (a pure local read) — not a live federation query —
+        // are the coverage operand. Below the required outlay ⇒ the books can't cover what's owed.
         Some(RefundReadinessWarning::InsufficientBalance)
     } else if report.unpriceable_count > 0 {
         // A pending liability we could not price (e.g. a transient quote failure while the gateway
@@ -1843,29 +1815,28 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use tokio::sync::mpsc;
 
+    // §E: readiness is ledger-derived — the balance operand is `ledger::expected_msat` (seeded via
+    // the store), NOT a backend balance call. So this double has NO balance and its
+    // `available_balance_msat` PANICS: every readiness test proves the path never reads the wallet.
     #[derive(Default)]
     struct ReadinessPayment {
-        balance_msat: StdMutex<Option<u64>>,
         gateway_ok: StdMutex<bool>,
         federation_ok: StdMutex<bool>,
         statuses: StdMutex<HashMap<String, PayStatus>>,
         started: StdMutex<HashSet<String>>,
         required_by_gross: StdMutex<HashMap<u64, u128>>,
         fail_pricing: StdMutex<bool>,
-        fail_balance: StdMutex<bool>,
     }
 
     impl ReadinessPayment {
-        fn new(balance_msat: Option<u64>, gateway_ok: bool) -> Self {
+        fn new(gateway_ok: bool) -> Self {
             Self {
-                balance_msat: StdMutex::new(balance_msat),
                 gateway_ok: StdMutex::new(gateway_ok),
                 federation_ok: StdMutex::new(true),
                 statuses: StdMutex::new(HashMap::new()),
                 started: StdMutex::new(HashSet::new()),
                 required_by_gross: StdMutex::new(HashMap::new()),
                 fail_pricing: StdMutex::new(false),
-                fail_balance: StdMutex::new(false),
             }
         }
 
@@ -1875,10 +1846,6 @@ mod tests {
 
         fn set_pricing_fails(&self, fails: bool) {
             *self.fail_pricing.lock().unwrap() = fails;
-        }
-
-        fn set_balance_query_fails(&self, fails: bool) {
-            *self.fail_balance.lock().unwrap() = fails;
         }
 
         fn set_status(&self, key: &str, status: PayStatus) {
@@ -1953,10 +1920,7 @@ mod tests {
         }
 
         async fn available_balance_msat(&self) -> Result<Option<u64>> {
-            if *self.fail_balance.lock().unwrap() {
-                anyhow::bail!("simulated local balance query failure");
-            }
-            Ok(*self.balance_msat.lock().unwrap())
+            panic!("readiness is ledger-derived (§E) and must never read the federation balance");
         }
 
         async fn refund_gateway_ready(&self) -> Result<bool> {
@@ -1978,8 +1942,30 @@ mod tests {
         Store::spawn(conn)
     }
 
-    fn readiness_payment(balance_msat: Option<u64>, gateway_ok: bool) -> Arc<dyn PaymentBackend> {
-        Arc::new(ReadinessPayment::new(balance_msat, gateway_ok))
+    fn readiness_payment(gateway_ok: bool) -> Arc<dyn PaymentBackend> {
+        Arc::new(ReadinessPayment::new(gateway_ok))
+    }
+
+    /// Create the urw.3-owned `sweep_attempt` table locally and insert an in-flight (SENT/PENDING)
+    /// cap, so a readiness test can drive `expected_msat` BELOW `required_msat` the way a real sweep
+    /// draining reserved funds would — the genuine ledger-derived InsufficientBalance condition.
+    async fn seed_sweep_cap(store: &Store, id: &str, status: &str, max_outlay_msat: i64) {
+        let (id, status) = (id.to_string(), status.to_string());
+        store
+            .transaction(move |tx| {
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS sweep_attempt (
+                       id TEXT PRIMARY KEY, status TEXT NOT NULL, max_outlay_msat INTEGER NOT NULL
+                     );",
+                )?;
+                tx.execute(
+                    "INSERT INTO sweep_attempt (id, status, max_outlay_msat) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![id, status, max_outlay_msat],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     async fn readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) -> RefundReadinessReport {
@@ -2351,18 +2337,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_no_warning_at_zero_balance_with_zero_liability() {
+    async fn readiness_no_warning_at_zero_expected_with_zero_liability() {
         let store = mem_store();
-        let payment = readiness_payment(Some(0), true);
+        let payment = readiness_payment(true);
 
         let report = readiness(&store, &payment).await;
 
         assert_eq!(report.liability_count, 0);
+        assert_eq!(report.expected_msat, 0);
         assert_eq!(report.warning, None);
     }
 
     #[tokio::test]
-    async fn readiness_warns_when_required_exceeds_balance() {
+    async fn readiness_warns_when_required_exceeds_expected() {
+        // The books hold a 2-sat receipt (expected 2_000), but a SENT sweep locked 1_000 of it out
+        // — the genuine ledger-derived InsufficientBalance: expected (1_000) < required (2_000).
         let store = mem_store();
         seed_subscription(&store, "sub-1", "PROVISIONING").await;
         seed_invoice(
@@ -2376,11 +2365,13 @@ mod tests {
             Some(10),
         )
         .await;
-        let payment = readiness_payment(Some(1_999), true);
+        seed_sweep_cap(&store, "sw-1", "SENT", 1_000).await;
+        let payment = readiness_payment(true);
 
         let report = readiness(&store, &payment).await;
 
         assert_eq!(report.required_msat, 2_000);
+        assert_eq!(report.expected_msat, 1_000);
         assert_eq!(
             report.warning,
             Some(RefundReadinessWarning::InsufficientBalance)
@@ -2402,7 +2393,7 @@ mod tests {
             Some(10),
         )
         .await;
-        let payment = readiness_payment(Some(10_000), false);
+        let payment = readiness_payment(false);
 
         let report = readiness(&store, &payment).await;
 
@@ -2421,7 +2412,7 @@ mod tests {
         seed_invoice(&store, "sub-1", "order:sub-1", "order", 1, "PAID", Some(10), Some(10)).await;
 
         let with_federation_down = |gateway_ok: bool| -> Arc<dyn PaymentBackend> {
-            let p = ReadinessPayment::new(Some(10_000), gateway_ok);
+            let p = ReadinessPayment::new(gateway_ok);
             p.set_federation_ok(false);
             Arc::new(p)
         };
@@ -2450,7 +2441,7 @@ mod tests {
     async fn readiness_surfaces_federation_down_even_with_zero_liabilities() {
         let store = mem_store(); // no liabilities seeded
 
-        let p = ReadinessPayment::new(Some(10_000), true);
+        let p = ReadinessPayment::new(true);
         p.set_federation_ok(false);
         let down: Arc<dyn PaymentBackend> = Arc::new(p);
         let report = readiness(&store, &down).await;
@@ -2461,7 +2452,7 @@ mod tests {
         );
         assert!(!report.federation_ok);
 
-        let ok_report = readiness(&store, &readiness_payment(Some(10_000), true)).await;
+        let ok_report = readiness(&store, &readiness_payment(true)).await;
         assert_eq!(ok_report.warning, None, "a healthy idle daemon is READY");
         assert!(ok_report.federation_ok);
     }
@@ -2483,7 +2474,7 @@ mod tests {
             )
             .await;
         }
-        let payment = readiness_payment(Some(0), true);
+        let payment = readiness_payment(true);
 
         let report = readiness(&store, &payment).await;
 
@@ -2507,7 +2498,7 @@ mod tests {
         )
         .await;
         seed_refund_attempt(&store, "sub-1", "order:sub-1", 2, "FAILED", None, 0).await;
-        let payment = readiness_payment(Some(10_000), true);
+        let payment = readiness_payment(true);
 
         let report = readiness(&store, &payment).await;
 
@@ -2518,7 +2509,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_compares_balance_in_msats_exactly() {
+    async fn readiness_covers_when_expected_equals_required_exactly() {
+        // The compare is `expected < required`, in msats: expected == required is COVERED (not
+        // InsufficientBalance), proving the boundary is `<` not `<=`. A 2-sat receipt with a 500-msat
+        // SENT sweep leaves expected 1_500, exactly the 1_500-msat required outlay.
         let store = mem_store();
         seed_subscription(&store, "sub-1", "REFUND_DUE").await;
         seed_invoice(
@@ -2533,14 +2527,15 @@ mod tests {
         )
         .await;
         seed_refund_attempt(&store, "sub-1", "order:sub-1", 2, "PENDING", None, 0).await;
-        let payment = Arc::new(ReadinessPayment::new(Some(1_500), true));
+        seed_sweep_cap(&store, "sw-1", "SENT", 500).await;
+        let payment = Arc::new(ReadinessPayment::new(true));
         payment.set_required(2, 1_500);
         let payment: Arc<dyn PaymentBackend> = payment;
 
         let report = readiness(&store, &payment).await;
 
         assert_eq!(report.required_msat, 1_500);
-        assert_eq!(report.balance_msat, Some(1_500));
+        assert_eq!(report.expected_msat, 1_500);
         assert_eq!(report.warning, None);
     }
 
@@ -2569,7 +2564,7 @@ mod tests {
             1,
         )
         .await;
-        let payment = Arc::new(ReadinessPayment::new(Some(0), true));
+        let payment = Arc::new(ReadinessPayment::new(true));
         payment.set_status("refund:order:sub-1:g1", PayStatus::Pending);
         payment.set_required(2, 2_000);
         let payment: Arc<dyn PaymentBackend> = payment;
@@ -2583,7 +2578,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_unpriceable_pending_liability_warns_not_covered() {
-        // Gateway reports ready and the balance is ample, but pricing this PENDING refund fails
+        // Gateway reports ready and the books are ample, but pricing this PENDING refund fails
         // transiently. Its cost is then absent from required_msat, so coverage cannot be confirmed —
         // the report MUST warn (Unpriceable) rather than fall through to "covered" and silently
         // suppress a real liability (codex P2).
@@ -2610,7 +2605,7 @@ mod tests {
             1,
         )
         .await;
-        let payment = Arc::new(ReadinessPayment::new(Some(1_000_000), true));
+        let payment = Arc::new(ReadinessPayment::new(true));
         // The prior pay op returned funds (Failed) so a NEW pay must be priced — and pricing fails.
         payment.set_status("refund:order:sub-1:g1", PayStatus::Failed);
         payment.set_pricing_fails(true);
@@ -2621,36 +2616,6 @@ mod tests {
         assert_eq!(report.unpriceable_count, 1);
         assert_eq!(report.required_msat, 0);
         assert_eq!(report.warning, Some(RefundReadinessWarning::Unpriceable));
-    }
-
-    #[tokio::test]
-    async fn readiness_local_balance_query_failure_alarms_not_covered() {
-        // The ecash balance is a LOCAL read; a failure is catastrophic. With a liability outstanding it
-        // must raise the highest-priority alarm, never fall through to "covered" (operator guidance).
-        let store = mem_store();
-        seed_subscription(&store, "sub-1", "PROVISIONING").await;
-        seed_invoice(
-            &store,
-            "sub-1",
-            "order:sub-1",
-            "order",
-            2,
-            "PAID",
-            Some(10),
-            Some(10),
-        )
-        .await;
-        let payment = Arc::new(ReadinessPayment::new(Some(1_000_000), true));
-        payment.set_balance_query_fails(true);
-        let payment: Arc<dyn PaymentBackend> = payment;
-
-        let report = readiness(&store, &payment).await;
-
-        assert!(report.balance_query_failed);
-        assert_eq!(
-            report.warning,
-            Some(RefundReadinessWarning::BalanceQueryFailed)
-        );
     }
 
     #[tokio::test]
@@ -2678,7 +2643,11 @@ mod tests {
             1,
         )
         .await;
-        let payment = Arc::new(ReadinessPayment::new(Some(0), true));
+        // An Unknown pay with NO started evidence still requires FULL liquidity (required 2_000), and
+        // is NOT subtracted from expected. A 1-msat sweep drops expected below required → the books
+        // can't cover it (InsufficientBalance), distinguishing this from the started shape below.
+        seed_sweep_cap(&store, "sw-1", "PENDING", 1).await;
+        let payment = Arc::new(ReadinessPayment::new(true));
         payment.set_status("refund:order:sub-1:g1", PayStatus::Unknown);
         payment.set_required(2, 2_000);
         let payment: Arc<dyn PaymentBackend> = payment;
@@ -2686,6 +2655,7 @@ mod tests {
         let report = readiness(&store, &payment).await;
 
         assert_eq!(report.required_msat, 2_000);
+        assert_eq!(report.expected_msat, 1_999);
         assert_eq!(
             report.warning,
             Some(RefundReadinessWarning::InsufficientBalance)
@@ -2717,7 +2687,7 @@ mod tests {
             1,
         )
         .await;
-        let payment = Arc::new(ReadinessPayment::new(Some(0), true));
+        let payment = Arc::new(ReadinessPayment::new(true));
         payment.set_status("refund:order:sub-1:g1", PayStatus::Unknown);
         payment.set_started("refund:order:sub-1:g1");
         payment.set_required(2, 2_000);
@@ -2727,6 +2697,9 @@ mod tests {
 
         assert_eq!(report.gross_liability_sat, 2);
         assert_eq!(report.required_msat, 0);
+        // The started pay is subtracted from expected too (its funds are locked), so expected and
+        // required both net to 0 — consistently covered, no false InsufficientBalance.
+        assert_eq!(report.expected_msat, 0);
         assert_eq!(report.warning, None);
     }
 
@@ -2745,7 +2718,7 @@ mod tests {
             None,
         )
         .await;
-        let payment = readiness_payment(Some(1_000), true);
+        let payment = readiness_payment(true);
 
         let report = readiness(&store, &payment).await;
 
@@ -2771,7 +2744,7 @@ mod tests {
         )
         .await;
         seed_refund_attempt(&store, "sub-1", "order:sub-1", 2, "SENT", None, 0).await;
-        let payment = readiness_payment(Some(0), true);
+        let payment = readiness_payment(true);
 
         let report = readiness(&store, &payment).await;
 

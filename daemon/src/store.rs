@@ -11,7 +11,10 @@ use std::collections::HashSet;
 use std::path::Path;
 use tokio::sync::{mpsc, oneshot};
 
-const SETTLE_REFUND_KINDS_SQL: &str = "'settle_unmatched_refund', 'settle_terminal_refund',
+// `pub(crate)` so the ledger `expected_msat` helper (lnrent-urw.10) reuses the SAME settle-refund
+// journal-kind list this module's readiness liability scan uses — one definition of the INV-3
+// Class-B receipt provenance.
+pub(crate) const SETTLE_REFUND_KINDS_SQL: &str = "'settle_unmatched_refund', 'settle_terminal_refund',
                                          'settle_orphan_refund', 'settle_expired_refund'";
 
 /// How long durable business idempotency rows are retained. Deliberately LONGER than the transport
