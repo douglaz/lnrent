@@ -372,6 +372,24 @@ fn encrypted_backup_restore_round_trip_reproduces_state_and_fedimint() {
         (key.as_str(), rstatus.as_str(), res_gen),
         ("refund:ext-1", "PENDING", 0)
     );
+    // Verify the SAME full state-DB fidelity as the plaintext round-trip (CodeRabbit): the crypto path
+    // must round-trip every table, not a subset.
+    let (inv_ext, inv_status2, inv_amt): (String, String, i64) = conn
+        .query_row(
+            "SELECT external_id, status, amount_sat FROM invoice WHERE id='inv1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((inv_ext.as_str(), inv_status2.as_str(), inv_amt), ("ext-1", "PAID", 1234));
+    let (order, rsstate): (String, String) = conn
+        .query_row(
+            "SELECT order_id, state FROM reservation WHERE id='res1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((order.as_str(), rsstate.as_str()), ("order-1", "HELD"));
     drop(conn);
 
     // --- the fedimint subtree reproduces: rocksdb sentinel + the lnrent index rows ---
@@ -393,6 +411,14 @@ fn encrypted_backup_restore_round_trip_reproduces_state_and_fedimint() {
         )
         .unwrap();
     assert_eq!((inv_status.as_str(), inv_amount), ("PAID", 1234));
+    let (pay_status, pay_kind): (String, String) = idx
+        .query_row(
+            "SELECT status, pay_kind FROM fedimint_pay WHERE idempotency_key='refund:ext-1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((pay_status.as_str(), pay_kind.as_str()), ("SENT", "ln"));
     drop(idx);
 
     // --- config + seed reproduce byte-for-byte ---
