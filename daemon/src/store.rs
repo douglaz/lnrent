@@ -393,6 +393,7 @@ CREATE TABLE IF NOT EXISTS sweep_attempt (
 // the sole-writer store actor.
 const M9_TERMINAL_ROW_REAPER_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS reservation_state_created_at_idx ON reservation(state, created_at);
+CREATE INDEX IF NOT EXISTS invoice_reap_predicate_idx ON invoice(status, settled_at, expires_at, issued_at);
 CREATE INDEX IF NOT EXISTS invoice_subscription_id_idx ON invoice(subscription_id);
 CREATE INDEX IF NOT EXISTS event_log_at_kind_idx ON event_log(at, kind);
 CREATE INDEX IF NOT EXISTS instance_updated_at_idx ON instance(updated_at);
@@ -637,20 +638,15 @@ impl Store {
     ///   * A *settled* invoice (`status='PAID' OR settled_at IS NOT NULL`) is a Class-A receipt and a
     ///     `settle_*_refund` `event_log` row is a Class-B receipt (`ledger::sum_receipts_msat`); the
     ///     `refund_attempt`/`sweep_attempt` rows that offset them are never reaped.
-    ///   * A never-settled `EXPIRED` invoice IS reaped past the window — but only once its owning
-    ///     `subscription` is itself terminal-and-past-window (or gone), the same sub-window gate the
-    ///     `reservation`/`instance` reaps use, plus an open-refund guard. A live/PENDING order's invoice
-    ///     is always kept: that is where a still-arriving settlement would land, and `capture_txn` reads
-    ///     `invoice.external_id` to route it to the subscription's refund dest. The residual edge — a
-    ///     settlement delivered for an invoice whose order has been terminal AND unpaid for the whole
-    ///     retention window — cannot occur at the protocol level (a lightning/fedimint invoice cannot
-    ///     settle after its own expiry; the only "late" delivery is oplog-replay of a *pre-expiry*
-    ///     settlement, i.e. a multi-week daemon outage). Even then `capture_txn`'s unmatched branch
-    ///     records a single refund intent rather than swallow money (`capture.rs`), so the money is
-    ///     conserved as a parked+alerted refund, not lost. Reaping dead orders' invoices is the bead's
-    ///     whole point (an unpaid `request_id` flood mints one per order); keeping them forever also
-    ///     pins their subscriptions forever (the sub reap requires no invoice child). Fail closed:
-    ///     unsure ⇒ keep (settled, live-sub, or open-refund invoices all stay).
+    ///   * A never-settled `EXPIRED` invoice IS reaped past the window, regardless of its owning sub's
+    ///     state (an unpaid `request_id`/`renew.request` flood mints one invoice per order OR renewal,
+    ///     and expired renewals accrue on long-lived ACTIVE subs — so gating on sub-liveness would leak
+    ///     the renewal flood). The retention window is itself the "settlement can no longer arrive"
+    ///     proof: a lightning/fedimint invoice cannot settle after its own expiry; the only "late"
+    ///     delivery is oplog-replay of a *pre-expiry* settlement (a multi-week outage), and even then
+    ///     `capture_txn`'s unmatched branch records a single refund intent rather than swallow money
+    ///     (`capture.rs`) — conserved as a parked+alerted refund, not lost. Fail closed: a settled
+    ///     invoice (Class-A receipt) and an invoice behind an open refund both stay.
     ///   * A `subscription` still referenced by a non-terminal (`status <> 'SENT'`) `refund_attempt` is
     ///     money owed and is kept. Fail closed: unsure ⇒ keep.
     ///
@@ -668,24 +664,21 @@ impl Store {
                     END
                FROM refund_attempt ra
               WHERE ra.status <> 'SENT'";
-        // Only a never-settled EXPIRED invoice of a fully-lapsed order is reaped: a PAID/settled invoice
-        // is a Class-A ledger receipt (kept via `settled_at IS NULL`), an open refund referencing it is
-        // money still owed (kept via the open-refund guard), and a live/PENDING order's invoice — where
-        // an actually-arriving settlement would land — is kept via the SAME owning-subscription window
-        // gate the reservation/instance reaps use. See the money-safety note above for why reaping the
-        // rest is money-safe (a settlement cannot arrive after invoice expiry; the unmatched branch
-        // conserves any replayed pre-expiry settlement as a parked refund).
+        // A never-settled EXPIRED invoice past the window is reaped REGARDLESS of its owning sub's
+        // state. The retention window itself is the "settlement can no longer arrive" proof — a
+        // lightning/fedimint invoice cannot settle after its own expiry, and 30d dwarfs any oplog-replay
+        // horizon — so no sub-liveness gate is needed. Gating on one would in fact leak the RENEWAL
+        // flood: an ACTIVE/SUSPENDED sub accrues one `kind='renewal'` invoice per `renew.request`
+        // (order_intake.rs), and an expired unpaid renewal on a long-lived sub would then never reap,
+        // growing `invoice` without bound (codex P2). KEPT: a settled invoice (Class-A receipt, via
+        // `settled_at IS NULL`) and an invoice behind an open refund (money owed, via the open-refund
+        // guard). If the (impossible) late settlement of a reaped invoice still lands, capture's
+        // unmatched branch conserves it as a parked refund — money is never swallowed.
         let invoice_sql = format!(
             "DELETE FROM invoice
               WHERE status = 'EXPIRED' AND settled_at IS NULL
                 AND COALESCE(expires_at, issued_at) < MIN(unixepoch(), ?1) - ?2
-                AND external_id NOT IN ({open_refund_ext})
-                AND NOT EXISTS (
-                     SELECT 1 FROM subscription s
-                      WHERE s.id = invoice.subscription_id
-                        AND ( s.state NOT IN ('EXPIRED', 'TERMINATED', 'REFUNDED')
-                           OR s.updated_at >= MIN(unixepoch(), ?1) - ?2 )
-                    )"
+                AND external_id NOT IN ({open_refund_ext})"
         );
         // Every settle-refund journal row is a Class-B ledger receipt (and backs refund readiness), so
         // it is kept. Non-money journals are reaped once past the window except durable recovery
@@ -1093,6 +1086,7 @@ mod tests {
         migrate(&conn).unwrap();
         for idx in [
             "reservation_state_created_at_idx",
+            "invoice_reap_predicate_idx",
             "invoice_subscription_id_idx",
             "event_log_at_kind_idx",
             "instance_updated_at_idx",
@@ -2080,41 +2074,38 @@ mod tests {
         );
     }
 
-    // lnrent-y4m.2: an EXPIRED invoice is reaped against its OWNING subscription's terminal window, the
-    // same gate reservations/instances use. A still-resolvable order (sub not yet terminal) keeps its
-    // invoice as the late-settlement correlation row `capture_txn` needs; a fully-lapsed terminal order
-    // past the window is reaped whole. Directly addresses the round-3 P1 (don't drop a settlement's
-    // routing while the order can still resolve) without pinning dead orders forever.
+    // lnrent-y4m.2 (codex P2): an EXPIRED-unsettled invoice past the window is reaped REGARDLESS of its
+    // owning sub's state — the window itself is the settlement-can't-arrive proof. A live ACTIVE sub's
+    // expired RENEWAL invoices are reaped (else a renew.request flood grows `invoice` without bound)
+    // while the live sub itself stays; a settled invoice and a within-window invoice are kept; a
+    // recently-EXPIRED invoice is kept until it too is past the window.
     #[tokio::test]
-    async fn reap_invoice_follows_owning_subscription_window() {
+    async fn reap_expired_invoices_regardless_of_sub_liveness() {
         let s = mem_store();
         let now = 2 * TERMINAL_ROW_RETENTION_SECS;
         let old = TERMINAL_ROW_RETENTION_SECS - 1;
         let recent = now;
 
         s.transaction(move |tx| {
-            // sub-pending: NOT terminal (a still-resolvable order) — its EXPIRED invoice is kept so a
-            // late settlement can still route to the sub's refund dest, even though the invoice is old.
+            // sub-live: an ACTIVE (paid, running) sub that accrued unpaid renewal invoices — the renewal
+            // flood. Its old EXPIRED renewal is reaped; a settled renewal (receipt) and a recently-
+            // expired one are kept; the live sub itself is never reaped.
             tx.execute(
-                "INSERT INTO subscription (id, state, updated_at) VALUES ('sub-pending', 'PENDING', ?1)",
+                "INSERT INTO subscription (id, state, updated_at) VALUES ('sub-live', 'ACTIVE', ?1)",
                 rusqlite::params![old],
             )?;
-            // sub-fresh: terminal but only RECENTLY — its invoice is kept until the sub is past window.
-            tx.execute(
-                "INSERT INTO subscription (id, state, updated_at) VALUES ('sub-fresh', 'EXPIRED', ?1)",
-                rusqlite::params![recent],
-            )?;
-            // sub-dead: terminal AND past window — its invoice (and then the childless sub) are reaped.
+            // sub-dead: terminal AND past window — its order invoice, then the childless sub, are reaped.
             tx.execute(
                 "INSERT INTO subscription (id, state, updated_at) VALUES ('sub-dead', 'EXPIRED', ?1)",
                 rusqlite::params![old],
             )?;
             tx.execute(
-                "INSERT INTO invoice (id, subscription_id, external_id, kind, status, expires_at, issued_at) VALUES
-                   ('i-pending', 'sub-pending', 'x-pending', 'order', 'EXPIRED', ?1, ?1),
-                   ('i-fresh',   'sub-fresh',   'x-fresh',   'order', 'EXPIRED', ?1, ?1),
-                   ('i-dead',    'sub-dead',    'x-dead',    'order', 'EXPIRED', ?1, ?1)",
-                rusqlite::params![old],
+                "INSERT INTO invoice (id, subscription_id, external_id, kind, status, expires_at, issued_at, settled_at) VALUES
+                   ('i-renew-old',     'sub-live', 'x-renew-old',     'renewal', 'EXPIRED', ?1, ?1, NULL),
+                   ('i-renew-recent',  'sub-live', 'x-renew-recent',  'renewal', 'EXPIRED', ?2, ?2, NULL),
+                   ('i-renew-settled', 'sub-live', 'x-renew-settled', 'renewal', 'PAID',    ?1, ?1, ?1),
+                   ('i-dead',          'sub-dead', 'x-dead',          'order',   'EXPIRED', ?1, ?1, NULL)",
+                rusqlite::params![old, recent],
             )?;
             Ok(())
         })
@@ -2122,21 +2113,30 @@ mod tests {
         .unwrap();
 
         let reaped = s.reap_terminal_rows(now).await.unwrap();
-        assert_eq!(reaped.invoice, 1, "only the terminal-past-window order's invoice is reaped");
-        assert_eq!(reaped.subscription, 1, "and its now-childless sub");
+        assert_eq!(reaped.invoice, 2, "both fully-expired-past-window invoices reap (live-sub renewal + dead-sub order)");
+        assert_eq!(reaped.subscription, 1, "only the terminal childless sub is reaped");
         assert_eq!(
-            count(&s, "SELECT count(*) FROM invoice WHERE id='i-pending'").await,
-            1,
-            "a still-resolvable (non-terminal sub) order keeps its EXPIRED invoice for late-settlement routing"
+            count(&s, "SELECT count(*) FROM invoice WHERE id='i-renew-old'").await,
+            0,
+            "an expired renewal invoice on a LIVE sub is reaped (closes the renewal flood)"
         );
         assert_eq!(
-            count(&s, "SELECT count(*) FROM invoice WHERE id='i-fresh'").await,
+            count(&s, "SELECT count(*) FROM invoice WHERE id='i-renew-recent'").await,
             1,
-            "a recently-terminal order's invoice is kept until its sub is past the window"
+            "a within-window renewal invoice is kept"
+        );
+        assert_eq!(
+            count(&s, "SELECT count(*) FROM invoice WHERE id='i-renew-settled'").await,
+            1,
+            "a settled renewal invoice (Class-A receipt) is kept"
         );
         assert_eq!(count(&s, "SELECT count(*) FROM invoice WHERE id='i-dead'").await, 0);
+        assert_eq!(
+            count(&s, "SELECT count(*) FROM subscription WHERE id='sub-live'").await,
+            1,
+            "the live ACTIVE sub is never reaped, even with all its old invoices gone"
+        );
         assert_eq!(count(&s, "SELECT count(*) FROM subscription WHERE id='sub-dead'").await, 0);
-        assert_eq!(count(&s, "SELECT count(*) FROM subscription WHERE id='sub-pending'").await, 1);
     }
 
     // lnrent-y4m.2: a terminal, past-window sub is NOT reaped while an OPEN operational obligation
