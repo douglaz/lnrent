@@ -195,9 +195,13 @@ impl AlertDispatcher {
     ///
     /// The cooldown is stamped only AFTER the enqueue COMMITS, so a transient store failure lets the
     /// next drive retry rather than muting the condition for the whole window (coderabbit/codex).
-    pub async fn dispatch(&self, alert: Alert) -> Result<()> {
+    /// Enqueue the alert unless disabled or within the `(kind, subject)` cooldown. Returns `Ok(true)`
+    /// iff a fresh outbox DM was enqueued (so a caller that re-detects a LEVEL condition every tick —
+    /// e.g. the holdings floor — can log in lockstep with the DM instead of spamming logs every tick,
+    /// codex); `Ok(false)` when disabled or cooldown-suppressed.
+    pub async fn dispatch(&self, alert: Alert) -> Result<bool> {
         if !self.is_enabled() {
-            return Ok(());
+            return Ok(false);
         }
         let now = self.clock.now();
 
@@ -207,7 +211,7 @@ impl AlertDispatcher {
             let map = self.last_sent.lock().expect("alert cooldown map poisoned");
             if let Some(&last) = map.get(&(alert.kind, alert.subject.clone())) {
                 if now - last < ALERT_COOLDOWN_S {
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
@@ -241,7 +245,7 @@ impl AlertDispatcher {
             .lock()
             .expect("alert cooldown map poisoned")
             .insert((alert.kind, alert.subject), now);
-        Ok(())
+        Ok(true)
     }
 
     /// Build a durable outbox row for a TERMINAL (one-shot) alert, for the caller to insert INSIDE

@@ -282,6 +282,9 @@ fn bootstrap_input(args: BootstrapArgs) -> BootstrapInput {
         fedimint_invite: args.fedimint_invite,
         fedimint_gateway: args.fedimint_gateway,
         mnemonic: args.mnemonic,
+        // No bootstrap CLI flag for the draining-holdings floor (lnrent-urw.7); it is a runtime
+        // warning-condition knob read from env (LNRENT_MIN_HOLDINGS_WARN_MSAT) / the config file.
+        min_holdings_warn_msat: None,
     };
     // Read stdin only when explicitly asked. Auto-reading every non-TTY stdin can block forever when
     // an orchestrator launches us with an inherited open pipe even though flags/env/file already
@@ -412,7 +415,11 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
         Intervals::production(),
         lnrentd::config::max_live_holds_per_buyer(),
     )
-    .await?;
+    .await?
+    // GATE-1 draining-holdings warning (lnrent-urw.7): opt in with the operator-configured float
+    // floor (`0` = disabled). A builder, mirroring `with_payment_clock_sync`, so `build`'s signature
+    // stays fixed for the integration-test callers.
+    .with_holdings_floor(operator.config.min_holdings_warn_msat);
     // The mock backend's internal clock is kept synced to SystemClock; the real Fedimint backend uses
     // real time and needs no sync.
     if let Some(mock) = mock_clock_sync {

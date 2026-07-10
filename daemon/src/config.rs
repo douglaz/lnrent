@@ -113,6 +113,19 @@ pub struct OperatorConfig {
     pub compute_backend: String,
     /// Present iff `payment_backend = fedimint`.
     pub fedimint: Option<FedimintConfig>,
+    /// Draining-holdings warning floor in msats (lnrent-urw.7, spec §D; ADR-0016). `0` DISABLES the
+    /// warning; a positive value is a **BOOKS floor**, compared against `ledger::expected_msat` — the
+    /// ledger's conservative lower bound = Σ captured receipts − SENT/started refunds − sweep caps.
+    /// Each maintenance tick dispatches one `HoldingsLow` alert (the dispatcher's per-`(kind, subject)`
+    /// 6h cooldown collapses repeats) while `expected_msat` sits below it. IMPORTANT: this is a
+    /// books/net-receipts figure, NOT the wallet balance — ecash the operator SEEDED directly (funded
+    /// outside lnrent invoicing) never appears in it (per ADR-0016 no automatic path reads the
+    /// balance; wallet-vs-books drift is the explicit `lnrent reconcile`). So set it to your expected
+    /// NET-LEDGER position, not your wallet float; if you rely on a directly-seeded buffer, leave it
+    /// `0` (else it perpetually false-alarms). LIABILITY-INDEPENDENT (fires even with nothing owed).
+    /// A runtime warning-condition knob, NOT persisted to the operator row (retunable by restart,
+    /// like [`max_live_holds_per_buyer`]).
+    pub min_holdings_warn_msat: u128,
 }
 
 impl fmt::Debug for OperatorConfig {
@@ -123,6 +136,7 @@ impl fmt::Debug for OperatorConfig {
             .field("payment_backend", &self.payment_backend)
             .field("compute_backend", &self.compute_backend)
             .field("fedimint", &self.fedimint)
+            .field("min_holdings_warn_msat", &self.min_holdings_warn_msat)
             .finish()
     }
 }
@@ -143,6 +157,12 @@ pub struct RawConfig {
     /// The BIP39 seed (mnemonic). Optional here because a re-bootstrap reads the persisted seed
     /// from the data dir; a FIRST bootstrap must supply it (else a structured `seed_missing`).
     pub mnemonic: Option<String>,
+    /// The draining-holdings warning floor in msats (lnrent-urw.7). `u64` here — NOT the `u128` the
+    /// resolved [`OperatorConfig`] carries — because a TOML config document only deserializes 64-bit
+    /// integers (verified: `toml` rejects `u128`); a realistic float floor fits in `u64` with orders
+    /// of magnitude to spare. [`resolve_config`] widens it to `u128` for the `ledger::expected_msat`
+    /// compare. Absent ⇒ the default (`0`, disabled).
+    pub min_holdings_warn_msat: Option<u64>,
 }
 
 impl Zeroize for RawConfig {
@@ -287,6 +307,14 @@ const ENV_INBOUND_RATE_REFILL_PER_MIN: &str = "LNRENT_INBOUND_RATE_REFILL_PER_MI
 const ENV_ALERTS_ENABLED: &str = "LNRENT_ALERTS_ENABLED";
 const ENV_ALERT_NPUB: &str = "LNRENT_ALERT_NPUB";
 
+/// GATE-1 draining-holdings warning floor (PR-16, lnrent-urw.7). A BOOKS floor in msats compared
+/// against `ledger::expected_msat` (net ledger receipts − refunds − sweeps, NOT the wallet balance,
+/// and NOT counting directly-seeded ecash): below it, the maintenance loop dispatches a
+/// liability-independent `HoldingsLow` alert. Read at daemon start as a runtime knob (not part of the
+/// persisted operator identity). Blank/absent/`0` leaves the warning DISABLED. Also settable in a
+/// config file (`min_holdings_warn_msat`).
+const ENV_MIN_HOLDINGS_WARN_MSAT: &str = "LNRENT_MIN_HOLDINGS_WARN_MSAT";
+
 /// Default for [`max_live_holds_per_buyer`]. Small and bounded: a legitimate buyer rarely needs more
 /// than one or two unpaid orders in flight, while a griefer wants many. `0` refuses ALL orders.
 pub const DEFAULT_MAX_LIVE_HOLDS_PER_BUYER: u32 = 2;
@@ -329,6 +357,35 @@ fn u32_env_or_default(name: &str, default: u32) -> u32 {
             tracing::warn!(value = %v, "invalid {name}; using default {default}");
             default
         }),
+    }
+}
+
+/// The default draining-holdings warning floor (lnrent-urw.7, spec §D): `0` DISABLES the warning.
+/// An operator opts in by setting a positive floor matching their float; below it, each maintenance
+/// tick dispatches a `HoldingsLow` alert (the dispatcher's 6h cooldown collapses repeats). The knob
+/// is `u128` on [`OperatorConfig`] to compare directly against `ledger::expected_msat`.
+fn default_min_holdings_warn_msat() -> u128 {
+    0
+}
+
+/// Parse the `LNRENT_MIN_HOLDINGS_WARN_MSAT` env layer (lnrent-urw.7). A blank/absent value is UNSET
+/// (`None`, so a lower-precedence config-file value still applies). An explicit non-numeric value is
+/// a structured config error rather than a trace warning: this path runs before the daemon initializes
+/// tracing, and silently treating a typo as unset would disable the operator's opted-in alert.
+/// `0` is a VALID value that DISABLES the warning.
+fn parse_min_holdings_warn_msat_env(raw: Option<String>) -> Result<Option<u64>, IpcError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed.parse::<u64>() {
+        Ok(v) => Ok(Some(v)),
+        Err(_) => Err(config_err(format!(
+            "{ENV_MIN_HOLDINGS_WARN_MSAT} must be an unsigned 64-bit integer in millisatoshis"
+        ))),
     }
 }
 
@@ -419,6 +476,8 @@ impl RawConfig {
             fedimint_invite: sanitize_secret_string(self.fedimint_invite.take()),
             fedimint_gateway: sanitize_secret_string(self.fedimint_gateway.take()),
             mnemonic,
+            // A numeric knob has no blank/whitespace form to strip; carry it through unchanged.
+            min_holdings_warn_msat: self.min_holdings_warn_msat,
         }
     }
 
@@ -438,6 +497,9 @@ impl RawConfig {
             fedimint_invite,
             fedimint_gateway,
             mnemonic,
+            min_holdings_warn_msat: self
+                .min_holdings_warn_msat
+                .or(lower.min_holdings_warn_msat),
         }
     }
 }
@@ -465,14 +527,14 @@ fn overlay_secret_string(high: Option<String>, low: Option<String>) -> Option<St
 /// Build the `env` source layer from an environment lookup (`get` returns a var's value, or `None`
 /// when unset). Pure given `get`, so tests can inject a fake environment. Blank values are
 /// sanitized away by [`RawConfig::from_sources`].
-fn raw_config_from_env(get: impl Fn(&str) -> Option<String>) -> RawConfig {
+fn raw_config_from_env(get: impl Fn(&str) -> Option<String>) -> Result<RawConfig, IpcError> {
     let relays = get(ENV_RELAYS).map(|s| {
         s.split(',')
             .map(|x| x.trim().to_string())
             .filter(|x| !x.is_empty())
             .collect::<Vec<_>>()
     });
-    RawConfig {
+    Ok(RawConfig {
         data_dir: get(ENV_DATA_DIR),
         relays,
         payment_backend: get(ENV_PAYMENT_BACKEND),
@@ -480,7 +542,8 @@ fn raw_config_from_env(get: impl Fn(&str) -> Option<String>) -> RawConfig {
         fedimint_invite: get(ENV_FEDIMINT_INVITE),
         fedimint_gateway: get(ENV_FEDIMINT_GATEWAY),
         mnemonic: get(ENV_MNEMONIC),
-    }
+        min_holdings_warn_msat: parse_min_holdings_warn_msat_env(get(ENV_MIN_HOLDINGS_WARN_MSAT))?,
+    })
 }
 
 /// The 1-based line number at `byte_offset` within `text` — for SAFE parse-error locations that
@@ -562,7 +625,7 @@ pub fn load_raw_config(input: BootstrapInput) -> Result<Zeroizing<RawConfig>, Ip
         read_stdin,
     } = input;
     let mut flags = Zeroizing::new(flags);
-    let mut env = Zeroizing::new(raw_config_from_env(|k| std::env::var(k).ok()));
+    let mut env = Zeroizing::new(raw_config_from_env(|k| std::env::var(k).ok())?);
 
     let config_path = resolve_config_path(config_path, std::env::var(ENV_CONFIG).ok());
     let mut file = Zeroizing::new(match config_path {
@@ -735,6 +798,13 @@ fn resolve_config(raw: &RawConfig) -> Result<OperatorConfig, IpcError> {
         payment_backend,
         compute_backend,
         fedimint,
+        // Widen the config-file/env `u64` floor to the `u128` the `ledger::expected_msat` compare
+        // uses; absent ⇒ the default (`0`, disabled). This runtime knob is NOT reconciled against the
+        // persisted operator row (unlike relays/compute/backend) — it is retunable by restart.
+        min_holdings_warn_msat: raw
+            .min_holdings_warn_msat
+            .map(u128::from)
+            .unwrap_or_else(default_min_holdings_warn_msat),
     })
 }
 
@@ -3204,11 +3274,89 @@ mod tests {
                 invite: "fed11SECRET".into(),
                 gateway: "03SECRETGATEWAY".into(),
             }),
+            min_holdings_warn_msat: 0,
         };
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("fed11SECRET"));
         assert!(!debug.contains("03SECRETGATEWAY"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    // lnrent-urw.7: the draining-holdings floor defaults to 0 (DISABLED) when unset, and a supplied
+    // config-file/env `u64` is widened to the `u128` the `ledger::expected_msat` compare uses.
+    #[test]
+    fn min_holdings_warn_msat_defaults_to_zero_and_widens() {
+        let cfg = resolve_config(&RawConfig::default()).expect("defaults resolve");
+        assert_eq!(cfg.min_holdings_warn_msat, 0, "unset ⇒ disabled (0)");
+
+        let raw = RawConfig {
+            min_holdings_warn_msat: Some(5_000_000_000),
+            ..Default::default()
+        };
+        let cfg = resolve_config(&raw).expect("floor resolves");
+        assert_eq!(cfg.min_holdings_warn_msat, 5_000_000_000u128);
+    }
+
+    // The env layer parses a numeric floor, treats blank/absent as UNSET (so a lower-precedence
+    // config-file value still applies), and surfaces an explicit typo as a structured config error
+    // through `load_raw_config`'s normal stderr/JSON path. A config document (JSON here — TOML has no
+    // u128, but u64 is fine either way) also deserializes the floor.
+    #[test]
+    fn min_holdings_warn_msat_env_and_doc_parse() {
+        let env = raw_config_from_env(|k| match k {
+            ENV_MIN_HOLDINGS_WARN_MSAT => Some("1000000".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(env.min_holdings_warn_msat, Some(1_000_000));
+
+        assert_eq!(parse_min_holdings_warn_msat_env(Some("  ".into())).unwrap(), None);
+        assert_eq!(parse_min_holdings_warn_msat_env(None).unwrap(), None);
+        assert_eq!(parse_min_holdings_warn_msat_env(Some("0".into())).unwrap(), Some(0));
+        let err = parse_min_holdings_warn_msat_env(Some("not-a-number".into())).unwrap_err();
+        assert_eq!(err.code, "config_invalid");
+        assert!(
+            err.message.contains(ENV_MIN_HOLDINGS_WARN_MSAT),
+            "unexpected error message: {}",
+            err.message
+        );
+
+        let doc = parse_raw_config_doc(r#"{"min_holdings_warn_msat": 2500000}"#, "doc").unwrap();
+        assert_eq!(doc.min_holdings_warn_msat, Some(2_500_000));
+        let toml_doc = parse_raw_config_doc("min_holdings_warn_msat = 7500000", "doc").unwrap();
+        assert_eq!(toml_doc.min_holdings_warn_msat, Some(7_500_000));
+    }
+
+    // Precedence flags > env > file: a floor set in a lower-precedence source is used only when the
+    // higher ones leave it unset, matching every other merged field.
+    #[test]
+    fn min_holdings_warn_msat_honors_source_precedence() {
+        let env = RawConfig {
+            min_holdings_warn_msat: Some(111),
+            ..Default::default()
+        };
+        let file = RawConfig {
+            min_holdings_warn_msat: Some(222),
+            ..Default::default()
+        };
+        let merged = RawConfig::from_sources(
+            RawConfig::default(),
+            env,
+            file,
+            RawConfig::default(),
+        );
+        assert_eq!(merged.min_holdings_warn_msat, Some(111), "env outranks file");
+
+        let file_only = RawConfig::from_sources(
+            RawConfig::default(),
+            RawConfig::default(),
+            RawConfig {
+                min_holdings_warn_msat: Some(333),
+                ..Default::default()
+            },
+            RawConfig::default(),
+        );
+        assert_eq!(file_only.min_holdings_warn_msat, Some(333), "file fills when unset above");
     }
 
     // ===== Headless multi-source bootstrap surface (P1, ADR-0014 §4.7) ============================
@@ -3286,7 +3434,8 @@ mod tests {
             ENV_PAYMENT_BACKEND => Some("fedimint".into()),
             ENV_RELAYS => Some("wss://a.example, wss://b.example".into()),
             _ => None,
-        });
+        })
+        .unwrap();
         assert_eq!(env.data_dir.as_deref(), Some("/env/data"));
         assert_eq!(env.payment_backend.as_deref(), Some("fedimint"));
         assert_eq!(
@@ -3364,7 +3513,8 @@ mod tests {
             ENV_DATA_DIR => Some(dir.to_string_lossy().into_owned()),
             ENV_MNEMONIC => Some(TEST_MNEMONIC.into()),
             _ => None,
-        });
+        })
+        .unwrap();
         let file = parse_raw_config_doc(
             r#"
                 payment_backend = "fedimint"
@@ -3409,7 +3559,8 @@ mod tests {
         let env = raw_config_from_env(|k| match k {
             ENV_DATA_DIR => Some(dir.to_string_lossy().into_owned()),
             _ => None, // no mnemonic anywhere
-        });
+        })
+        .unwrap();
         let merged = RawConfig::from_sources(
             RawConfig::default(),
             env,

@@ -52,6 +52,7 @@ Three money-path defects exist now that the daemon can move real ecash (o6p, com
   *Landed (lnrent-urw.10):* `daemon/src/ledger.rs::expected_msat` is the ledger lower bound; readiness
   compares `expected_msat >= required_msat` (supervisor.rs), `BalanceQueryFailed` is removed, and the
   sole `available_balance_msat` call site is the `reconcile` handler (ipc.rs).
+  *Landed (lnrent-urw.7, PR-16):* the liability-INDEPENDENT holdings floor warning lives in `daemon/src/supervisor.rs::check_holdings_floor` (maintenance loop), reusing `expected_msat` (no balance read) and dispatching `AlertKind::HoldingsLow` when it falls below the operator-configured `min_holdings_warn_msat` (config.rs; `0` disables).
 
 - **INV-3 — refund provenance.** A refund MUST NOT be executed unless it corresponds to a payment
   actually received for that order. Refunding before/without a received payment is forbidden and is a
