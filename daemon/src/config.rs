@@ -572,15 +572,20 @@ fn overlay_secret_string(high: Option<String>, low: Option<String>) -> Option<St
 }
 
 /// The [`sanitize_secret_string`] analogue for the gateway-fallback list: drop blank/whitespace-only
-/// entries (they must not shadow a lower-precedence source) and map an all-blank/empty list to
-/// `None`. The dropped source strings are zeroized, matching the primary gateway's secret handling.
+/// entries and zeroize the dropped source strings (matching the primary gateway's secret handling).
+/// UNLIKE the scalar sanitizer, an explicit EMPTY list (or an all-blank one) is PRESERVED as
+/// `Some(vec![])`, NOT folded to `None` (codex/CodeRabbit): the resolve/write paths read `None` as
+/// "field omitted → preserve the durable fallbacks" and `Some(vec![])` as "CLEAR the durable
+/// fallbacks", so an operator CAN remove all fallbacks (e.g. decommission a standby gateway) through
+/// the normal config surface. `overlay_secret_string_list` then lets a higher-precedence `Some(vec![])`
+/// win whole, shadowing a lower non-empty list — an explicit clear beats an inherited list.
 fn sanitize_secret_string_list(value: Option<Vec<String>>) -> Option<Vec<String>> {
-    value.and_then(|mut list| {
+    value.map(|mut list| {
         let cleaned: Vec<String> = list.iter().filter_map(|s| non_empty(Some(s))).collect();
         for s in list.iter_mut() {
             s.zeroize();
         }
-        (!cleaned.is_empty()).then_some(cleaned)
+        cleaned
     })
 }
 
@@ -1070,11 +1075,10 @@ fn resolve_durable_fedimint_config(
 
     // Fallbacks-ONLY re-bootstrap (codex): no new invite/gateway supplied — `supplied_fedimint_config`
     // returned None — but a fallback list WAS supplied. Apply it to the durable config so an operator
-    // can UPDATE failover WITHOUT re-supplying the sensitive invite + primary gateway. The durable
-    // invite/primary are untouched (no federation repoint), only the fungible fallback list is
-    // rewritten. (A sanitized empty list arrives here as `None`, so this is UPDATE-to-non-empty;
-    // CLEARING all fallbacks via the config surface is a separate gap — shorten the list or edit
-    // `fedimint.json` — tracked in lnrent-y4m.17.)
+    // can UPDATE or CLEAR failover WITHOUT re-supplying the sensitive invite + primary gateway. The
+    // durable invite/primary are untouched (no federation repoint), only the fungible fallback list is
+    // rewritten. `Some(vec![])` (an explicit empty list, preserved by `sanitize_secret_string_list`)
+    // CLEARS the durable fallbacks; `None` (omitted) reaches here as a plain reload (list unchanged).
     let mut durable = read_fedimint_config(data_dir)?;
     if let Some(supplied) = raw.fedimint_gateway_fallbacks.as_ref() {
         durable.gateway_fallbacks = clean_gateway_fallbacks(Some(supplied));
@@ -1085,8 +1089,9 @@ fn resolve_durable_fedimint_config(
 
 /// Trim + drop blank entries from a gateway-fallback list (a supplied `RawConfig` array or a parsed
 /// durable list), yielding the clean ordered `Vec<String>` the [`FedimintConfig`] carries. An absent
-/// list is an empty one. Distinct from [`sanitize_secret_string_list`], which also maps empty→`None`
-/// and zeroizes for the source-layering path; here the empty list is the natural "no fallbacks".
+/// list is an empty one. Distinct from [`sanitize_secret_string_list`] (which zeroizes the dropped
+/// source strings for the layering path and preserves `Some(vec![])` as an explicit-clear signal);
+/// here the empty list is just the natural "no fallbacks".
 fn clean_gateway_fallbacks(list: Option<&[String]>) -> Vec<String> {
     list.map(|l| l.iter().filter_map(|s| non_empty(Some(s))).collect())
         .unwrap_or_default()
@@ -1180,15 +1185,12 @@ fn write_fedimint_config(
                 ));
             }
             // The legacy flag/env bootstrap surfaces can re-supply invite + primary gateway but have
-            // no fallback field. Treat that omission (`preserve_omitted_fallbacks`) as "leave the
-            // durable fallback list alone"; otherwise an ordinary re-bootstrap would silently erase
-            // failover configuration. Only a supplied NON-EMPTY list replaces the durable one. NOTE on
-            // the real config surface an explicit empty `fedimint_gateway_fallbacks = []` is folded to
-            // `None` by `sanitize_secret_string_list` (empty == absent for source layering), so it too
-            // PRESERVES the durable list rather than clearing it — to drop ALL fallbacks, shorten the
-            // list to the ones to keep or edit the durable `fedimint.json`. (Only a direct
-            // `RawConfig{ fedimint_gateway_fallbacks: Some(vec![]) }` that bypasses sanitize — i.e. a
-            // unit test — reaches this branch as `preserve == false` and replaces with the empty list.)
+            // no fallback field. Treat that OMISSION (`preserve_omitted_fallbacks`, i.e. the raw field
+            // was `None`) as "leave the durable fallback list alone"; otherwise an ordinary re-bootstrap
+            // would silently erase failover configuration. A SUPPLIED list replaces the durable one:
+            // `Some(vec![...])` sets it, and an explicit `Some(vec![])` — preserved (NOT folded to
+            // `None`) by `sanitize_secret_string_list` — CLEARS it, so an operator can decommission all
+            // fallbacks through the normal config surface (codex/CodeRabbit).
             if preserve_omitted_fallbacks {
                 cfg.gateway_fallbacks = clean_gateway_fallbacks(Some(&existing.gateway_fallbacks));
             }
@@ -2782,6 +2784,52 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // An operator CAN decommission ALL fallbacks via config: a re-bootstrap supplying an EXPLICIT empty
+    // `fedimint_gateway_fallbacks = []` CLEARS the durable list, distinct from omitting the field
+    // (codex/CodeRabbit). (The sanitize-level preservation of `Some(vec![])` is pinned separately in
+    // `empty_fallbacks_preserved_as_explicit_clear_distinct_from_omitted`.)
+    #[tokio::test]
+    async fn rebootstrap_with_explicit_empty_fallbacks_clears_the_durable_list() {
+        let dir = temp_data_dir();
+        let store = mem_store();
+        // First bootstrap (single-gateway, carries the mnemonic), then add a fallback.
+        bootstrap(raw_fedimint(&dir), &store)
+            .await
+            .expect("first single-gateway bootstrap");
+        let add = RawConfig {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            payment_backend: Some("fedimint".into()),
+            fedimint_invite: Some("fed11invite".into()),
+            fedimint_gateway: Some("03gateway".into()),
+            fedimint_gateway_fallbacks: Some(vec!["03standby".into()]),
+            ..Default::default()
+        };
+        bootstrap(add, &store).await.expect("add a fallback");
+        assert_eq!(
+            read_fedimint_config(&dir).unwrap().gateway_fallbacks,
+            vec!["03standby".to_string()]
+        );
+
+        let clear = RawConfig {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            payment_backend: Some("fedimint".into()),
+            fedimint_invite: Some("fed11invite".into()),
+            fedimint_gateway: Some("03gateway".into()),
+            fedimint_gateway_fallbacks: Some(vec![]), // explicit clear
+            ..Default::default()
+        };
+        let op = bootstrap(clear, &store)
+            .await
+            .expect("clear-fallbacks re-bootstrap");
+        assert!(op.config.fedimint.as_ref().unwrap().gateway_fallbacks.is_empty());
+        let stored = read_fedimint_config(&dir).expect("durable fedimint config");
+        assert!(
+            stored.gateway_fallbacks.is_empty(),
+            "an explicit empty fallbacks list clears the durable failover list"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // Re-supplying the legacy invite + primary-gateway pair without the optional fallback field must
     // not erase a durable failover list. This is the normal flag/env re-bootstrap shape because those
     // legacy surfaces only carry the primary gateway.
@@ -3862,36 +3910,46 @@ mod tests {
         assert_eq!(merged.data_dir.as_deref(), Some("/env/dir"));
     }
 
-    // y4m.8 review: an explicit empty (or all-blank) `fedimint_gateway_fallbacks` folds to `None` in
-    // sanitize, so on the real config surface it is INDISTINGUISHABLE from an omitted field — both read
-    // as "no supplied list" and therefore PRESERVE any durable fallback list on re-bootstrap (see
-    // `write_fedimint_config`'s `preserve_omitted_fallbacks`). This pins the documented fold so the
-    // preserve-vs-replace contract can't silently drift into clearing the durable list.
+    // y4m.8 review (codex/CodeRabbit): an EXPLICIT empty (or all-blank) `fedimint_gateway_fallbacks`
+    // is PRESERVED as `Some(vec![])` — distinct from an OMITTED field (`None`) — so it reads as "CLEAR
+    // the durable fallbacks", not "preserve them". This is what lets an operator decommission a standby
+    // gateway through the normal config surface (see `write_fedimint_config`'s `preserve_omitted_fallbacks`).
     #[test]
-    fn empty_fallbacks_fold_to_none_so_they_read_as_omitted() {
-        assert!(sanitize_secret_string_list(Some(vec![])).is_none());
-        assert!(sanitize_secret_string_list(Some(vec!["   ".into(), "\t".into()])).is_none());
+    fn empty_fallbacks_preserved_as_explicit_clear_distinct_from_omitted() {
+        assert_eq!(sanitize_secret_string_list(Some(vec![])), Some(vec![]));
+        assert_eq!(
+            sanitize_secret_string_list(Some(vec!["   ".into(), "\t".into()])),
+            Some(vec![]),
+            "an all-blank list is an explicit (empty) clear, not omitted"
+        );
+        assert_eq!(sanitize_secret_string_list(None), None, "an omitted field stays None (preserve)");
         // A non-empty list keeps only its non-blank entries (blank ones must not shadow a lower layer).
         assert_eq!(
             sanitize_secret_string_list(Some(vec!["03a".into(), "  ".into(), "03b".into()])),
             Some(vec!["03a".to_string(), "03b".to_string()])
         );
 
-        // End to end through source-merging: an explicit empty higher-precedence fallbacks list does
-        // not shadow — it folds to `None`, so `resolve_durable_fedimint_config` treats it as omitted.
+        // End to end through source-merging: an explicit empty higher-precedence fallbacks list WINS
+        // (shadows a lower list) and stays `Some(vec![])`, so `resolve_durable_fedimint_config` treats
+        // it as an explicit CLEAR — an operator's `[]` beats a durable/inherited list.
         let flags = RawConfig {
             fedimint_gateway_fallbacks: Some(vec![]),
+            ..Default::default()
+        };
+        let lower = RawConfig {
+            fedimint_gateway_fallbacks: Some(vec!["03inherited".into()]),
             ..Default::default()
         };
         let merged = RawConfig::from_sources(
             flags,
             RawConfig::default(),
-            RawConfig::default(),
+            lower,
             RawConfig::default(),
         );
-        assert!(
-            merged.fedimint_gateway_fallbacks.is_none(),
-            "an explicit empty fallbacks list folds to None (== omitted) on the real config surface"
+        assert_eq!(
+            merged.fedimint_gateway_fallbacks,
+            Some(vec![]),
+            "an explicit empty fallbacks list clears (shadows the lower list), distinct from omitted"
         );
     }
 
