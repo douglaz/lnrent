@@ -572,7 +572,10 @@ fn load_refund_readiness_liabilities(conn: &Connection) -> Result<Vec<RefundRead
     let refund_sql = format!(
         "WITH journal AS (
              SELECT json_extract(detail_json, '$.external_id') AS external_id,
-                    CAST(json_extract(detail_json, '$.amount_sat') AS INTEGER) AS amount_sat
+                    -- MAX (not a bare grouped column): a REDELIVERED settlement re-journals the same
+                    -- external_id, so aggregate deterministically — a NULL/malformed duplicate must
+                    -- not zero out the real gross and understate `required_msat` (false coverage).
+                    MAX(CAST(json_extract(detail_json, '$.amount_sat') AS INTEGER)) AS amount_sat
                FROM event_log
               WHERE kind IN ({SETTLE_REFUND_KINDS_SQL})
               GROUP BY external_id
@@ -701,13 +704,15 @@ fn load_refund_readiness_liabilities(conn: &Connection) -> Result<Vec<RefundRead
 
     let journal_sql = format!(
         "SELECT json_extract(e.detail_json, '$.external_id') AS external_id,
-                CAST(json_extract(e.detail_json, '$.amount_sat') AS INTEGER) AS amount_sat
+                -- MAX for deterministic dedup across a redelivered settlement (see the refund CTE
+                -- above): a NULL/malformed duplicate must not understate this unreconciled liability.
+                MAX(CAST(json_extract(e.detail_json, '$.amount_sat') AS INTEGER)) AS amount_sat
            FROM event_log e
            LEFT JOIN subscription s ON s.id = e.subscription_id
           WHERE e.kind IN ({SETTLE_REFUND_KINDS_SQL})
             AND COALESCE(s.state, '') NOT IN ('ACTIVE', 'REFUNDED')
           GROUP BY external_id
-          ORDER BY e.id"
+          ORDER BY external_id"
     );
     let mut stmt = conn.prepare(&journal_sql)?;
     let rows = stmt.query_map([], |r| {

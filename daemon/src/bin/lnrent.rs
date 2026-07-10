@@ -33,7 +33,8 @@ enum Cmd {
     /// refund-liability coverage. Network-free apart from the gateway/federation liveness probes.
     Money,
     /// Reconcile the live federation wallet against the ledger books (the ONLY command that reads the
-    /// wallet balance): reports wallet vs expected holdings + an OK/DRIFT verdict. Report-only.
+    /// wallet balance): reports wallet vs expected holdings + an OK/DRIFT/UNKNOWN verdict (UNKNOWN =
+    /// a backend with no observable balance, e.g. the mock). Report-only.
     Reconcile,
     /// List subscriptions.
     Subs,

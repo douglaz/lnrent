@@ -4,12 +4,16 @@
 //! books figure the operator `reconcile` command (§F) compares the real wallet against. The single
 //! sanctioned live-balance read is the reconcile handler in `ipc.rs`; this module never reads it.
 //!
-//! `expected_msat = Σ gross receipts − Σ gross committed refunds − Σ sweep caps`. Receipts are
-//! summed at gross; sweep caps subtract each row's MAX outlay (≥ the real spend, INV-1); every
-//! subtraction saturates at 0, so the result is ≥ 0 and never underflows. Committed refunds subtract
-//! their GROSS amount only, NOT the gateway fee on top — so `expected_msat` can sit ABOVE the real
-//! wallet by the fees of outstanding refunds. That benign, fee-sized gap is exactly what the
-//! `reconcile` DRIFT verdict exists to surface; the figure is otherwise a conservative books floor.
+//! `expected_msat = Σ gross receipts − Σ gross committed refunds − Σ sweep caps`, a CONSERVATIVE
+//! LOWER bound (≤ the real spendable wallet), `u128` with saturating subtraction (never underflows).
+//! Receipts are summed at gross — a Fedimint LNv1 receive claims the full invoice amount, no
+//! receiver-side fee. Committed refunds and sweeps subtract at their GROSS / MAX-outlay, which by
+//! INV-1 is ≥ the REAL outlay: `pay_refund_capped` (and the capped sweep) refuse any pay whose net
+//! payout + fee exceeds the received gross (`refund_attempt.amount_sat` IS that gross, refund.rs),
+//! so the fee comes OUT of the gross, never on top. Subtracting gross is therefore an
+//! over-subtraction — `expected_msat` never sits ABOVE the real wallet. The wallet legitimately runs
+//! ABOVE this floor (fee savings run it up), which is exactly why `reconcile` reads wallet ≥ expected
+//! as OK and only wallet < expected as DRIFT (a genuine loss / accounting gap for a human).
 //! Reading the balance in automatic paths creates reconciliation races and an automatic
 //! balance-query failure class; the ledger is the same history the balance aggregates, on a clock
 //! we control (ADR-0016 / §E rationale).
