@@ -212,6 +212,14 @@ Three operability blind spots that leave the operator able to *see* trouble but 
   90d). Expiry only flips state (RELEASED/EXPIRED); rows persist forever, so a distinct-request-id flood
   (compounding PR-1/PR-2) grows the DB without bound → disk exhaustion. Add a terminal-row reaper beside
   the existing idempotency prune, with a retention window.
+  _LANDED (lnrent-y4m.2): `Store::reap_terminal_rows` (`store.rs`), `TERMINAL_ROW_RETENTION_SECS` (30d),
+  called best-effort beside `prune_idempotency_caches` in the reconcile tick, with scan indexes on the
+  reaped columns. Reaps only non-ledger, resolved rows past the window: old audit `event_log`, RELEASED
+  reservations, instances of terminal past-window subs, EXPIRED-unsettled invoices of fully-lapsed
+  orders, and the childless terminal subs behind them (FK-safe, one txn). Kept: every ledger receipt
+  (settled invoices + settle-refund journals), unresolved recovery journals (`provision_cleanup_pending`
+  / `renew_resume`), rows behind an open refund, and any invoice whose order is still resolvable — so
+  `expected_msat`, cleanup/resume recovery, and late-settlement routing stay intact._
 - **PR-11 — Disk-full / corruption handling on the money write path.** ENOSPC / `SQLITE_CORRUPT` /
   `SQLITE_IOERR` on a money commit propagates as a bare `Err` with no integrity-check-on-open or degraded
   mode. Combined with PR-10, a flood can fill disk and fail money writes. Add an integrity check on open
