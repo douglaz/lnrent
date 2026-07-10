@@ -461,15 +461,15 @@ impl FedimintPayment {
         // Refresh the federation's gateway-registration cache BEFORE the ordered probe (adversarial
         // codex): `get_gateway(Some(pk), false)` returns a STALE locally-cached hit WITHOUT refreshing
         // (it only refreshes on a MISS), so a primary that DEREGISTERED but still sits in our local
-        // cache would be selected forever and failover would never engage. Best-effort: a refresh
-        // error (e.g. federation unreachable) leaves the cache as-is and the ordered probe below then
-        // fails closed on its own — do NOT block selection on a transient refresh failure.
-        if let Err(e) = ln.update_gateway_cache().await {
-            tracing::debug!(
-                error = %e,
-                "fedimint: gateway-registration refresh before failover selection failed; using cached registrations"
-            );
-        }
+        // cache would be selected forever and failover would never engage. FAIL CLOSED on a refresh
+        // error (CodeRabbit): the refresh is a federation round-trip, so its failure means the
+        // FEDERATION is unreachable — proceeding on stale data could route money through, or report
+        // ready for, a gateway that is actually gone. (A mere gateway DEREGISTRATION — the failover
+        // case — does NOT fail this: the federation is up, so the refresh succeeds and the ordered
+        // probe below then skips the absent primary to a live fallback.)
+        ln.update_gateway_cache()
+            .await
+            .context("refreshing the fedimint gateway registrations before failover selection")?;
         select_first_reachable(&self.gateways, |pk| ln.get_gateway(Some(pk), false)).await
     }
 

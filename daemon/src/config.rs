@@ -1068,7 +1068,19 @@ fn resolve_durable_fedimint_config(
         return Ok(Some(cfg));
     }
 
-    Ok(Some(read_fedimint_config(data_dir)?))
+    // Fallbacks-ONLY re-bootstrap (codex): no new invite/gateway supplied — `supplied_fedimint_config`
+    // returned None — but a fallback list WAS supplied. Apply it to the durable config so an operator
+    // can UPDATE failover WITHOUT re-supplying the sensitive invite + primary gateway. The durable
+    // invite/primary are untouched (no federation repoint), only the fungible fallback list is
+    // rewritten. (A sanitized empty list arrives here as `None`, so this is UPDATE-to-non-empty;
+    // CLEARING all fallbacks via the config surface is a separate gap — shorten the list or edit
+    // `fedimint.json` — tracked in lnrent-y4m.17.)
+    let mut durable = read_fedimint_config(data_dir)?;
+    if let Some(supplied) = raw.fedimint_gateway_fallbacks.as_ref() {
+        durable.gateway_fallbacks = clean_gateway_fallbacks(Some(supplied));
+        write_fedimint_config(data_dir, &mut durable, false)?;
+    }
+    Ok(Some(durable))
 }
 
 /// Trim + drop blank entries from a gateway-fallback list (a supplied `RawConfig` array or a parsed
@@ -1239,12 +1251,26 @@ fn validate_fedimint_config_reconcile(
     };
     let parsed = serde_json::from_slice::<FedimintConfig>(&existing_bytes);
     existing_bytes.zeroize();
-    if let Ok(existing) = parsed {
-        if existing.invite.trim() != cfg.invite.trim() {
+    match parsed {
+        Ok(existing) => {
+            if existing.invite.trim() != cfg.invite.trim() {
+                return Err(config_conflict_err(
+                    "operator already bootstrapped with a different Fedimint federation invite; \
+                     refusing to repoint to a new federation on re-bootstrap (this could orphan \
+                     the ecash position — clear the data dir to start a fresh federation)",
+                ));
+            }
+        }
+        // Fail closed on a present-but-UNPARSEABLE durable config HERE — this runs pre-persist (before
+        // `persist_operator_row`), so bootstrap stays all-or-nothing (codex): the same guard lives in
+        // `write_fedimint_config` as belt-and-suspenders, but rejecting a corrupt config only there
+        // would error AFTER the operator row was written. A corrupt file could hide a federation-invite
+        // mismatch, and repointing to a new federation would orphan the ecash.
+        Err(_) => {
             return Err(config_conflict_err(
-                "operator already bootstrapped with a different Fedimint federation invite; \
-                 refusing to repoint to a new federation on re-bootstrap (this could orphan \
-                 the ecash position — clear the data dir to start a fresh federation)",
+                "a Fedimint config is present but cannot be parsed; refusing to re-bootstrap over it \
+                 (a corrupt config could hide a federation-invite mismatch, and repointing to a new \
+                 federation would orphan the ecash) — restore it from backup or clear the data dir",
             ));
         }
     }
@@ -2716,6 +2742,43 @@ mod tests {
         // Durable: the new fallback is written, not dropped by the same-gateway idempotency path.
         let stored = read_fedimint_config(&dir).expect("durable fedimint config");
         assert_eq!(stored.gateway_fallbacks, vec!["03standby".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // A FALLBACKS-ONLY re-bootstrap — NO invite/gateway re-supplied (they are durable) — must still
+    // apply the supplied fallback list (codex): failover config is updatable WITHOUT re-supplying the
+    // sensitive invite + primary gateway.
+    #[tokio::test]
+    async fn rebootstrap_with_only_fallbacks_updates_the_durable_list() {
+        let dir = temp_data_dir();
+        let store = mem_store();
+        bootstrap(raw_fedimint(&dir), &store)
+            .await
+            .expect("first (single-gateway) bootstrap");
+
+        let raw2 = RawConfig {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            payment_backend: Some("fedimint".into()),
+            // NO fedimint_invite / fedimint_gateway — only the fallback list.
+            fedimint_gateway_fallbacks: Some(vec!["03standby".into(), "03third".into()]),
+            ..Default::default()
+        };
+        let op2 = bootstrap(raw2, &store)
+            .await
+            .expect("fallbacks-only re-bootstrap");
+        assert_eq!(
+            op2.config.fedimint.as_ref().unwrap().gateway_fallbacks,
+            vec!["03standby".to_string(), "03third".to_string()]
+        );
+        let stored = read_fedimint_config(&dir).expect("durable fedimint config");
+        assert_eq!(
+            stored.gateway_fallbacks,
+            vec!["03standby".to_string(), "03third".to_string()],
+            "a fallbacks-only re-bootstrap persists the new list without re-supplying invite/gateway"
+        );
+        // The durable invite + primary gateway are untouched.
+        assert_eq!(stored.invite, "fed11invite");
+        assert_eq!(stored.gateway, "03gateway");
         let _ = fs::remove_dir_all(&dir);
     }
 
