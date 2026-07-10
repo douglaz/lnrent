@@ -29,6 +29,10 @@ pub enum Request {
     Status,
     Recipes,
     Money,
+    /// Wallet-vs-books reconciliation (lnrent-urw.10 §F): the SOLE place the live federation balance
+    /// is read. Report-only — compares `available_balance_msat()` against the ledger `expected_msat`
+    /// and returns `{wallet_msat, expected_msat, verdict}`; never mutates state or gates a payment.
+    Reconcile,
     Subs,
     Sub { id: String },
     /// Open teardown dead-letters (lnrent-urw.2): failed retention `destroy` hooks + the
@@ -256,16 +260,50 @@ pub async fn dispatch(
         }
 
         Request::Money => {
+            // §E: network-free apart from the gateway + federation LIVENESS probes. The balance
+            // operand is the ledger `expected_msat` (carried in the report), NOT a wallet read — a
+            // plain `lnrent money` makes NO `available_balance_msat` call.
             let probe = RefundReadinessProbe::query(payment).await;
             match refund_readiness_report_with_probe(store, payment, &probe).await {
                 Ok(report) => {
-                    Reply::ok(report.to_money_value(
-                        probe.balance_msat(),
-                        probe.gateway_ok(),
-                        probe.federation_ok(),
-                    ))
+                    Reply::ok(report.to_money_value(probe.gateway_ok(), probe.federation_ok()))
                 }
                 Err(e) => Reply::err("internal", e.to_string()),
+            }
+        }
+
+        Request::Reconcile => {
+            // §F: the SINGLE sanctioned `available_balance_msat` call site. Report-only — read the
+            // live wallet ONCE, compute the ledger books (`expected_msat`), and report drift for a
+            // HUMAN. It MUST NOT mutate state, gate a payment, or auto-refuse anything.
+            match crate::ledger::expected_msat(store, payment).await {
+                Err(e) => Reply::err("internal", e.to_string()),
+                Ok(expected_msat) => match payment.available_balance_msat().await {
+                    // wallet >= books ⇒ OK (fee savings run the wallet above the lower bound); below
+                    // ⇒ DRIFT (a fedimint-level loss, a missed sweep/refund accounting, or a ledger
+                    // bug — for a human to investigate).
+                    Ok(Some(wallet_msat)) => {
+                        let verdict = if u128::from(wallet_msat) >= expected_msat {
+                            "OK"
+                        } else {
+                            "DRIFT"
+                        };
+                        Reply::ok(json!({
+                            "wallet_msat": wallet_msat,
+                            "expected_msat": expected_msat,
+                            "verdict": verdict,
+                        }))
+                    }
+                    // A backend with no observable balance (e.g. MockPayment): report it, never panic.
+                    Ok(None) => Reply::ok(json!({
+                        "wallet_msat": Value::Null,
+                        "expected_msat": expected_msat,
+                        "verdict": "UNKNOWN",
+                    })),
+                    // A failed wallet query here just errors the command — the operator retries; there
+                    // is no alert class and no daemon state to change.
+                    Err(e) => Reply::err("internal", format!("wallet balance query failed: {e:#}")),
+                },
             }
         }
 
@@ -631,6 +669,9 @@ mod tests {
     #[derive(Default)]
     struct RecordingPayment {
         balance_msat: StdMutex<Option<u64>>,
+        // §E/§F: `available_balance_msat` PANICS unless explicitly armed — so every `money` test
+        // proves the plain view makes NO wallet read, and only `reconcile` (which arms it) sees it.
+        allow_balance_read: StdMutex<bool>,
         gateway_ok: StdMutex<bool>,
         gateway_sequence: StdMutex<VecDeque<bool>>,
         statuses: StdMutex<HashMap<String, PayStatus>>,
@@ -642,6 +683,7 @@ mod tests {
         fn new(balance_msat: Option<u64>, gateway_ok: bool) -> Self {
             Self {
                 balance_msat: StdMutex::new(balance_msat),
+                allow_balance_read: StdMutex::new(false),
                 gateway_ok: StdMutex::new(gateway_ok),
                 gateway_sequence: StdMutex::new(VecDeque::new()),
                 statuses: StdMutex::new(HashMap::new()),
@@ -653,12 +695,18 @@ mod tests {
         fn with_gateway_sequence(balance_msat: Option<u64>, gateway_ok: Vec<bool>) -> Self {
             Self {
                 balance_msat: StdMutex::new(balance_msat),
+                allow_balance_read: StdMutex::new(false),
                 gateway_ok: StdMutex::new(false),
                 gateway_sequence: StdMutex::new(VecDeque::from(gateway_ok)),
                 statuses: StdMutex::new(HashMap::new()),
                 started: StdMutex::new(HashSet::new()),
                 calls: StdMutex::new(Vec::new()),
             }
+        }
+
+        /// Arm the wallet read for the `reconcile` test — the ONE sanctioned balance call site.
+        fn allow_balance_read(&self) {
+            *self.allow_balance_read.lock().unwrap() = true;
         }
 
         fn record(&self, call: &'static str) {
@@ -727,6 +775,10 @@ mod tests {
         }
 
         async fn available_balance_msat(&self) -> Result<Option<u64>> {
+            assert!(
+                *self.allow_balance_read.lock().unwrap(),
+                "only reconcile may read the wallet balance (§F); this call site must not"
+            );
             self.record("available_balance_msat");
             Ok(*self.balance_msat.lock().unwrap())
         }
@@ -759,6 +811,22 @@ mod tests {
                 .await;
         assert!(reply.ok, "money reply should be ok: {:?}", reply.error);
         reply.data.expect("money returns data")
+    }
+
+    async fn reconcile_data(store: &Store, payment: &Arc<dyn PaymentBackend>) -> Value {
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let reply = dispatch(
+            Request::Reconcile,
+            store,
+            &recipes,
+            &clock,
+            payment,
+            &RelayStatusCell::new(),
+        )
+        .await;
+        assert!(reply.ok, "reconcile reply should be ok: {:?}", reply.error);
+        reply.data.expect("reconcile returns data")
     }
 
     async fn seed_pending_refund_liability(store: &Store) {
@@ -894,22 +962,40 @@ mod tests {
         assert_eq!(data["ready"], json!(true));
         assert_eq!(data["warning"], Value::Null);
         assert_eq!(data["liability_count"], json!(0));
-        assert_eq!(data["balance_msat"], Value::Null);
+        assert_eq!(data["expected_msat"], json!(0));
         assert_eq!(data["gateway_ok"], json!(true));
     }
 
     #[tokio::test]
-    async fn money_covered_zero_liabilities_uses_direct_backend_probes() {
+    async fn money_reports_ledger_expected_and_probe_gateway_at_zero_liabilities() {
+        // Proves money reports the LEDGER `expected_msat` (a settled receipt on the books) and the
+        // probe gateway UNCONDITIONALLY — even with nothing owed — and makes NO wallet read (the
+        // double PANICS on `available_balance_msat`).
         let store = mem_store();
-        let payment = Arc::new(RecordingPayment::new(Some(12_345), false));
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO invoice (id, subscription_id, external_id, kind, amount_sat, status)
+                     VALUES ('inv-1', 'sub-1', 'order:sub-1', 'order', 12, 'PAID')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let payment = Arc::new(RecordingPayment::new(None, false));
         let payment_dyn: Arc<dyn PaymentBackend> = payment.clone();
 
         let data = money_data(&store, &payment_dyn).await;
 
-        assert_eq!(data["balance_msat"], json!(12_345));
+        assert_eq!(data["expected_msat"], json!(12_000));
         assert_eq!(data["gateway_ok"], json!(false));
-        assert_eq!(data["ready"], json!(true));
+        assert_eq!(data["ready"], json!(true)); // nothing owed → covered
         assert_eq!(data["warning"], Value::Null);
+        assert!(
+            !payment.calls().contains(&"available_balance_msat"),
+            "plain money must not read the wallet balance"
+        );
     }
 
     #[tokio::test]
@@ -941,7 +1027,24 @@ mod tests {
     async fn money_reports_uncovered_refund_liability() {
         let store = mem_store();
         seed_pending_refund_liability(&store).await;
-        let payment = Arc::new(RecordingPayment::new(Some(1), true));
+        // A SENT sweep locked 1_000 msat of the 2_000-msat receipt out of the books, so the ledger's
+        // expected holdings (1_000) fall below the 2_000-msat required refund outlay.
+        store
+            .transaction(|tx| {
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS sweep_attempt (
+                       id TEXT PRIMARY KEY, status TEXT NOT NULL, max_outlay_msat INTEGER NOT NULL
+                     );",
+                )?;
+                tx.execute(
+                    "INSERT INTO sweep_attempt (id, status, max_outlay_msat) VALUES ('sw-1', 'SENT', 1000)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let payment = Arc::new(RecordingPayment::new(None, true));
         let payment_dyn: Arc<dyn PaymentBackend> = payment;
 
         let data = money_data(&store, &payment_dyn).await;
@@ -951,6 +1054,7 @@ mod tests {
         assert_eq!(data["liability_count"], json!(1));
         assert_eq!(data["gross_liability_sat"], json!(2));
         assert_eq!(data["required_msat"], json!(2_000));
+        assert_eq!(data["expected_msat"], json!(1_000));
     }
 
     #[tokio::test]
@@ -966,8 +1070,9 @@ mod tests {
         assert_eq!(data["ready"], json!(true));
         assert_eq!(store_money_snapshot(&store).await, before);
         let calls = payment.calls();
+        // §E: money reads only the two liveness probes + the readiness liability-pricing probes —
+        // NEVER `available_balance_msat` (the double panics if it is, so its absence is enforced).
         for required in [
-            "available_balance_msat",
             "refund_gateway_ready",
             "refund_required_outlay_msat",
             "payment_status_by_key",
@@ -982,15 +1087,114 @@ mod tests {
             assert!(
                 matches!(
                     *call,
-                    "available_balance_msat"
-                        | "refund_gateway_ready"
+                    "refund_gateway_ready"
                         | "refund_required_outlay_msat"
                         | "payment_status_by_key"
                         | "payment_started_by_key"
                 ),
-                "money made a non-read-only payment call: {calls:?}"
+                "money made a non-read-only or balance-reading payment call: {calls:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn reconcile_reports_ok_when_wallet_covers_books_reads_once_and_mutates_nothing() {
+        let store = mem_store();
+        seed_pending_refund_liability(&store).await; // a 2-sat receipt on the books → expected 2_000
+        let before = store_money_snapshot(&store).await;
+        let payment = Arc::new(RecordingPayment::new(Some(9_000), true));
+        payment.allow_balance_read(); // reconcile is the ONE sanctioned wallet read
+        let payment_dyn: Arc<dyn PaymentBackend> = payment.clone();
+
+        let data = reconcile_data(&store, &payment_dyn).await;
+
+        assert_eq!(data["wallet_msat"], json!(9_000));
+        assert_eq!(data["expected_msat"], json!(2_000));
+        assert_eq!(data["verdict"], json!("OK")); // wallet 9_000 ≥ books 2_000
+        assert_eq!(
+            payment
+                .calls()
+                .iter()
+                .filter(|c| **c == "available_balance_msat")
+                .count(),
+            1,
+            "reconcile reads the wallet EXACTLY once"
+        );
+        assert_eq!(
+            store_money_snapshot(&store).await,
+            before,
+            "reconcile is report-only — it mutates nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_reports_drift_when_wallet_below_books() {
+        let store = mem_store();
+        seed_pending_refund_liability(&store).await; // expected 2_000
+        let payment = Arc::new(RecordingPayment::new(Some(1_500), true));
+        payment.allow_balance_read();
+        let payment_dyn: Arc<dyn PaymentBackend> = payment.clone();
+
+        let data = reconcile_data(&store, &payment_dyn).await;
+
+        assert_eq!(data["wallet_msat"], json!(1_500));
+        assert_eq!(data["expected_msat"], json!(2_000));
+        assert_eq!(data["verdict"], json!("DRIFT")); // wallet 1_500 < books 2_000
+        assert_eq!(
+            payment
+                .calls()
+                .iter()
+                .filter(|c| **c == "available_balance_msat")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_reports_unknown_when_backend_has_no_balance() {
+        // A backend with no observable balance (MockPayment) → wallet null, verdict UNKNOWN, no panic.
+        let store = mem_store();
+        let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
+
+        let data = reconcile_data(&store, &payment).await;
+
+        assert_eq!(data["wallet_msat"], Value::Null);
+        assert_eq!(data["expected_msat"], json!(0));
+        assert_eq!(data["verdict"], json!("UNKNOWN"));
+    }
+
+    #[test]
+    fn available_balance_msat_has_exactly_one_non_test_call_site() {
+        // §F invariant: after urw.10 the live wallet balance is read at EXACTLY one place — the
+        // reconcile handler. Scan the daemon source, exclude test code (everything from the first
+        // `#[cfg(test)]` onward, per this crate's file convention) and the trait def/impl (a `.`
+        // method call, so `fn available_balance_msat` never matches), and assert exactly one
+        // `.available_balance_msat(` call remains.
+        fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect_rs(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs(&src, &mut files);
+
+        let mut calls = 0usize;
+        for f in &files {
+            let text = std::fs::read_to_string(f).unwrap();
+            // Non-test code precedes the first `#[cfg(test)]` in every file (Rust convention here).
+            let non_test = text.split("#[cfg(test)]").next().unwrap_or("");
+            calls += non_test.matches(".available_balance_msat(").count();
+        }
+        assert_eq!(
+            calls, 1,
+            "available_balance_msat must have exactly one non-test call site (the reconcile handler)"
+        );
     }
 
     #[tokio::test]

@@ -372,19 +372,13 @@ impl FedimintPayment {
         Ok(me)
     }
 
-    /// On open, log a one-line Fedimint operability summary: the ecash balance and whether the
-    /// CONFIGURED gateway is reachable. A zero balance is fine when the daemon has no liabilities; the
-    /// supervisor owns the money-readiness warning because it can see the store. This backend-level log
-    /// warns only when the gateway is unreachable, since that blocks invoice creation and refunds.
-    /// Observability ONLY — enables no payment and never fails open.
+    /// On open, log a one-line Fedimint operability summary: whether the CONFIGURED gateway is
+    /// reachable. The ecash balance is deliberately NOT read here (lnrent-urw.10 §F) — a startup
+    /// balance query was an implicit automatic wallet read with its own could-not-query failure
+    /// branch; the operator gets wallet-vs-books on demand via `lnrent reconcile`. This backend-level
+    /// log is a GATEWAY LIVENESS probe only, warning when the gateway is unreachable (that blocks
+    /// invoice creation and refunds). Observability ONLY — enables no payment and never fails open.
     async fn log_readiness(&self) {
-        let balance_msat = match self.available_balance_msat().await {
-            Ok(msat) => msat,
-            Err(e) => {
-                tracing::info!(error = %e, "fedimint: could not query ecash balance at startup");
-                None
-            }
-        };
         let gateway_ok = match self.refund_gateway_ready().await {
             Ok(ok) => ok,
             Err(e) => {
@@ -392,16 +386,9 @@ impl FedimintPayment {
                 false
             }
         };
-        tracing::info!(
-            balance_msat = ?balance_msat,
-            balance_sat = ?balance_msat.map(|msat| msat / 1000),
-            gateway_ok,
-            "fedimint readiness"
-        );
-        if fedimint_readiness_warns(balance_msat, gateway_ok) {
+        tracing::info!(gateway_ok, "fedimint readiness");
+        if fedimint_readiness_warns(gateway_ok) {
             tracing::warn!(
-                balance_msat = ?balance_msat,
-                balance_sat = ?balance_msat.map(|msat| msat / 1000),
                 gateway_ok,
                 "fedimint gateway unreachable: cannot create invoices or pay refunds"
             );
@@ -1363,7 +1350,7 @@ fn net_payout_sat(base_msat: u64, ppm: u64, gross_sat: u64) -> u64 {
     lo
 }
 
-fn fedimint_readiness_warns(_balance_msat: Option<u64>, gateway_ok: bool) -> bool {
+fn fedimint_readiness_warns(gateway_ok: bool) -> bool {
     !gateway_ok
 }
 
@@ -1672,9 +1659,9 @@ mod net_payout_tests {
     }
 
     #[test]
-    fn readiness_warns_on_gateway_only_not_zero_balance() {
-        assert!(!super::fedimint_readiness_warns(Some(0), true));
-        assert!(!super::fedimint_readiness_warns(Some(1_500), true));
-        assert!(super::fedimint_readiness_warns(Some(0), false));
+    fn readiness_warns_on_gateway_only() {
+        // §F: readiness no longer looks at the balance — only the gateway liveness half remains.
+        assert!(!super::fedimint_readiness_warns(true));
+        assert!(super::fedimint_readiness_warns(false));
     }
 }

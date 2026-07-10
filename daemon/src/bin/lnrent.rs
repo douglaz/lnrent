@@ -29,8 +29,13 @@ enum Cmd {
     Status,
     /// List loaded recipes.
     Recipes,
-    /// Show the daemon's ecash position: balance, gateway, and refund-liability coverage.
+    /// Show the daemon's ecash position: ledger-expected holdings, gateway, federation, and
+    /// refund-liability coverage. Network-free apart from the gateway/federation liveness probes.
     Money,
+    /// Reconcile the live federation wallet against the ledger books (the ONLY command that reads the
+    /// wallet balance): reports wallet vs expected holdings + an OK/DRIFT/UNKNOWN verdict (UNKNOWN =
+    /// a backend with no observable balance, e.g. the mock). Report-only.
+    Reconcile,
     /// List subscriptions.
     Subs,
     /// Inspect one subscription.
@@ -79,6 +84,7 @@ fn exit_for(err_code: &str) -> ExitCode {
 enum HumanRender {
     Generic,
     Money,
+    Reconcile,
     Teardowns,
     Refunds,
     Relays,
@@ -91,6 +97,7 @@ async fn main() -> ExitCode {
         Cmd::Status => (Request::Status, HumanRender::Generic),
         Cmd::Recipes => (Request::Recipes, HumanRender::Generic),
         Cmd::Money => (Request::Money, HumanRender::Money),
+        Cmd::Reconcile => (Request::Reconcile, HumanRender::Reconcile),
         Cmd::Subs => (Request::Subs, HumanRender::Generic),
         Cmd::Sub { id } => (Request::Sub { id }, HumanRender::Generic),
         Cmd::Teardowns => (Request::Teardowns, HumanRender::Teardowns),
@@ -139,6 +146,7 @@ fn render(reply: Reply, as_json: bool, human_render: HumanRender) -> ExitCode {
             Some(v) => match human_render {
                 HumanRender::Generic => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
                 HumanRender::Money => render_money_human(&v),
+                HumanRender::Reconcile => render_reconcile_human(&v),
                 HumanRender::Teardowns => render_teardowns_human(&v),
                 HumanRender::Refunds => render_refunds_human(&v),
                 HumanRender::Relays => render_relays_human(&v),
@@ -154,8 +162,10 @@ fn render(reply: Reply, as_json: bool, human_render: HumanRender) -> ExitCode {
 }
 
 fn render_money_human(v: &serde_json::Value) {
-    let balance = v
-        .get("balance_msat")
+    // §E: the balance operand is the LEDGER lower bound (`expected_msat`), not a live wallet read.
+    // Wallet-vs-books drift is the `reconcile` command's job.
+    let expected = v
+        .get("expected_msat")
         .and_then(serde_json::Value::as_u64)
         .map(|n| format!("{n} msat"))
         .unwrap_or_else(|| "unknown".to_string());
@@ -186,7 +196,7 @@ fn render_money_human(v: &serde_json::Value) {
         .unwrap_or(false);
     let warning = v.get("warning").and_then(serde_json::Value::as_str);
 
-    println!("Balance: {balance}");
+    println!("Expected holdings (ledger): {expected}");
     println!("Federation: {federation}");
     println!("Gateway: {gateway}");
     println!("Outstanding liabilities: {gross} sat gross, {required} msat required");
@@ -198,6 +208,28 @@ fn render_money_human(v: &serde_json::Value) {
             "Status: \x1b[1mNOT READY ({})\x1b[0m",
             warning.unwrap_or("unknown")
         );
+    }
+}
+
+/// Human render for `lnrent reconcile` (lnrent-urw.10 §F): the live wallet vs the ledger books and
+/// the OK/DRIFT verdict. Report-only — a DRIFT verdict is a signal for a human to investigate.
+fn render_reconcile_human(v: &serde_json::Value) {
+    let msat = |k: &str| {
+        v.get(k)
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| format!("{n} msat"))
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    let verdict = v.get("verdict").and_then(serde_json::Value::as_str).unwrap_or("?");
+
+    println!("Wallet (federation): {}", msat("wallet_msat"));
+    println!("Expected (ledger books): {}", msat("expected_msat"));
+    match verdict {
+        "OK" => println!("Verdict: \x1b[1mOK\x1b[0m (wallet covers the books)"),
+        "DRIFT" => println!(
+            "Verdict: \x1b[1mDRIFT\x1b[0m (wallet holds less than the books — investigate)"
+        ),
+        other => println!("Verdict: \x1b[1m{other}\x1b[0m (no observable wallet balance for this backend)"),
     }
 }
 

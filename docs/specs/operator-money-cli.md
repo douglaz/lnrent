@@ -6,6 +6,7 @@ the `balance_msat` field and the `BalanceQueryFailed` warning variant below are 
 `lnrent money` becomes ledger-only (`expected_msat` + earned/reserved/paid-out), and the federation
 balance is read solely by the explicit `lnrent reconcile` command. This doc records the landed v1
 contract; the §E spec is the forward contract.*
+*Landed (lnrent-urw.10): `money` now reports `expected_msat` (the ledger lower bound, `daemon/src/ledger.rs`) in place of `balance_msat` and makes NO wallet read; `BalanceQueryFailed` is retired (taxonomy is 4); the federation balance is read only by the new `lnrent reconcile` command.*
 Scope: `daemon/src/{ipc.rs, supervisor.rs, bin/lnrent.rs}` (thread the payment backend into IPC + one
 new command). Reuses the INV-2 readiness report; adds NO new money logic.
 Audience: the rb-lite implementer. This spec is the contract; the tests below are mandatory ship gates.

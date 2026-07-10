@@ -15,6 +15,9 @@ pub mod domain;
 pub mod fedimint_backend;
 pub mod identity;
 pub mod ipc;
+/// Ledger-authoritative money core (lnrent-urw.10): `expected_msat`, the LOCAL sqlite lower bound on
+/// spendable wallet holdings that replaces the live federation balance in every automatic path.
+pub mod ledger;
 pub mod nostr_engine;
 pub mod op_dispatch;
 pub mod order_intake;
