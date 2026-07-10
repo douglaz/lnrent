@@ -218,6 +218,10 @@ fn render_money_human(v: &serde_json::Value) {
         .get("ready")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let degraded = v
+        .get("degraded_read_only")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let warning = v.get("warning").and_then(serde_json::Value::as_str);
 
     println!("Expected holdings (ledger): {expected}");
@@ -225,7 +229,15 @@ fn render_money_human(v: &serde_json::Value) {
     println!("Gateway: {gateway}");
     println!("Outstanding liabilities: {gross} sat gross, {required} msat required");
     println!("Parked count: {parked}");
-    if ready {
+    // The degraded/read-only latch (lnrent-y4m.3) takes precedence over reserve readiness: the daemon
+    // is refusing money writes after a fatal DB error, so a human operator must see it here — not only
+    // in the daemon log — regardless of whether reserves are sufficient.
+    if degraded {
+        println!(
+            "Status: \x1b[1;31mDEGRADED (read-only)\x1b[0m — money writes refused after a fatal DB \
+             error; restore the state DB from backup and restart"
+        );
+    } else if ready {
         println!("Status: \x1b[1mREADY\x1b[0m");
     } else {
         println!(

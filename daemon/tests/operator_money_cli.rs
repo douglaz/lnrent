@@ -94,6 +94,9 @@ async fn json_money_returns_reply_envelope() {
     assert_eq!(
         keys,
         vec![
+            // lnrent-y4m.3: the degraded/read-only latch is surfaced so a status poll (not just the
+            // daemon log) reveals a money daemon that is refusing writes after a fatal DB error.
+            "degraded_read_only",
             // gate1-operator-sweep (urw.3): `money` also folds the operator-sweep surplus breakdown
             // (earned/reserved/paid_out/surplus) + last_sweep — all pure LOCAL ledger reads.
             "earned_msat",
@@ -115,6 +118,7 @@ async fn json_money_returns_reply_envelope() {
     // §E (lnrent-urw.10): the balance operand is now the ledger `expected_msat` (0 on a fresh store),
     // NOT a live wallet read — plain `money` makes no `available_balance_msat` call.
     assert_eq!(data["expected_msat"], serde_json::json!(0));
+    assert_eq!(data["degraded_read_only"], serde_json::json!(false));
     assert_eq!(data["gateway_ok"], serde_json::json!(true));
     assert_eq!(data["liability_count"], 0);
     assert_eq!(data["ready"], serde_json::json!(true));

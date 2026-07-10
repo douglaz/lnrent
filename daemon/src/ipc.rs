@@ -279,12 +279,19 @@ pub async fn dispatch(
                     // breakdown + the last sweep — all pure LOCAL ledger reads, no network.
                     match crate::sweep::money_sweep_view(store).await {
                         Ok(sweep_view) => {
-                            if let (Some(obj), Some(extra)) =
-                                (money.as_object_mut(), sweep_view.as_object())
-                            {
-                                for (k, v) in extra {
-                                    obj.insert(k.clone(), v.clone());
+                            if let Some(obj) = money.as_object_mut() {
+                                if let Some(extra) = sweep_view.as_object() {
+                                    for (k, v) in extra {
+                                        obj.insert(k.clone(), v.clone());
+                                    }
                                 }
+                                // Surface the degraded/read-only latch (lnrent-y4m.3): a status poll
+                                // must reveal that money writes are being refused after a fatal DB
+                                // error — otherwise the report looks healthy while every write fails.
+                                obj.insert(
+                                    "degraded_read_only".to_string(),
+                                    serde_json::json!(store.is_degraded()),
+                                );
                             }
                             Reply::ok(money)
                         }

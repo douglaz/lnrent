@@ -227,6 +227,14 @@ Three operability blind spots that leave the operator able to *see* trouble but 
   `SQLITE_IOERR` on a money commit propagates as a bare `Err` with no integrity-check-on-open or degraded
   mode. Combined with PR-10, a flood can fill disk and fail money writes. Add an integrity check on open
   and a defined degraded/read-only mode.
+  _LANDED (lnrent-y4m.3): `open()` rejects an existing zero-length state DB (truncation/data-loss guard,
+  so a truncated DB is never silently re-initialized) and runs `PRAGMA quick_check` (fails startup loudly
+  on a corrupt DB); `Store::transaction` — the sole write choke point — classifies the
+  disk-full/corruption/IO family (`is_fatal_db_error`) and latches a process-lifetime `degraded` flag that
+  refuses further writes while `read()`/status keep serving. A guard around the money core, not a new
+  subsystem; recovery is the operator's restore-then-restart. The transition logs `tracing::error!` (a
+  store-backed alert can't deliver when writes are refused) AND `Store::is_degraded()` is surfaced in the
+  `lnrent money` readiness report so a status poll reveals it, not just the daemon log._
 - **PR-12 — Hook secret hygiene: `.env_clear()` when spawning hooks.** `spawn_hook`
   (`runner.rs:104-110`) spawns with **no `.env_clear()`**, so hooks inherit the daemon's full
   environment. If the operator supplies the seed via `LNRENT_MNEMONIC` — the path `main.rs:358`
