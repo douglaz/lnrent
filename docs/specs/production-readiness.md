@@ -215,7 +215,8 @@ Three operability blind spots that leave the operator able to *see* trouble but 
   _LANDED (lnrent-y4m.2): `Store::reap_terminal_rows` (`store.rs`), `TERMINAL_ROW_RETENTION_SECS` (30d),
   called best-effort beside `prune_idempotency_caches` in the reconcile tick, with scan indexes matching
   every reap predicate. Reaps only non-ledger, resolved rows past the window: old audit `event_log`,
-  RELEASED reservations, instances of terminal past-window subs, EXPIRED-unsettled invoices (both
+  RELEASED reservations, destroyed/orphaned instances (of a terminal past-window sub, or with no sub
+  on their own `updated_at`), EXPIRED-unsettled invoices (both
   fully-lapsed orders AND unpaid renewals on live subs — the retention window is itself the
   settlement-can't-arrive proof), and the childless terminal subs behind them (FK-safe, one txn). Kept:
   every ledger receipt (settled invoices + settle-refund journals), unresolved recovery journals

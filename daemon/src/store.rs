@@ -399,6 +399,11 @@ CREATE INDEX IF NOT EXISTS event_log_at_kind_idx ON event_log(at, kind);
 CREATE INDEX IF NOT EXISTS instance_updated_at_idx ON instance(updated_at);
 CREATE INDEX IF NOT EXISTS instance_subscription_id_idx ON instance(subscription_id);
 CREATE INDEX IF NOT EXISTS subscription_state_updated_at_idx ON subscription(state, updated_at);
+-- The sub reap correlates on each open-obligation table (codex P2); back those guards too so a large
+-- flood-grown outbox (SENT rows are not pruned) or dead-letter set can't force a per-candidate scan.
+CREATE INDEX IF NOT EXISTS outbox_subscription_state_idx ON outbox(subscription_id, state);
+CREATE INDEX IF NOT EXISTS teardown_failure_subscription_idx ON teardown_failure(subscription_id, resolved_at);
+CREATE INDEX IF NOT EXISTS native_connect_session_subscription_idx ON native_connect_session(subscription_id, state);
 ";
 
 /// Ordered migrations (lnrent-7fp.3): index `i` upgrades the DB from schema version `i` to
@@ -656,7 +661,9 @@ impl Store {
     pub async fn reap_terminal_rows(&self, now: i64) -> Result<ReapCounts> {
         // The external_id a still-open (non-SENT) refund_attempt is keyed to — the SAME derivation
         // `load_refund_attempt_external_ids` uses. An invoice referenced by such a row is money owed
-        // and is kept even past the window.
+        // and is kept even past the window. `NOT IN` is NULL-safe here: the CASE only ever returns a
+        // substr of `idempotency_key` (TEXT NOT NULL) or `id` (PRIMARY KEY, NOT NULL), so the set can
+        // never contain NULL — the set-based form matches the sibling sweep/refund readiness queries.
         let open_refund_ext = "SELECT CASE
                       WHEN ra.idempotency_key LIKE 'refund:%' THEN substr(ra.idempotency_key, 8)
                       WHEN ra.id LIKE 'ref-%' THEN substr(ra.id, 5)
@@ -1092,6 +1099,9 @@ mod tests {
             "instance_updated_at_idx",
             "instance_subscription_id_idx",
             "subscription_state_updated_at_idx",
+            "outbox_subscription_state_idx",
+            "teardown_failure_subscription_idx",
+            "native_connect_session_subscription_idx",
         ] {
             let n: i64 = conn
                 .query_row(
@@ -1178,6 +1188,8 @@ mod tests {
                                    status TEXT, settled_at INTEGER, expires_at INTEGER, issued_at INTEGER);
              CREATE TABLE instance (id TEXT PRIMARY KEY, subscription_id TEXT, state TEXT, updated_at INTEGER);
              CREATE TABLE subscription (id TEXT PRIMARY KEY, state TEXT, updated_at INTEGER);
+             CREATE TABLE outbox (id TEXT PRIMARY KEY, subscription_id TEXT, state TEXT);
+             CREATE TABLE native_connect_session (id TEXT PRIMARY KEY, subscription_id TEXT, state TEXT);
              PRAGMA user_version = 3;",
         )
         .unwrap();
