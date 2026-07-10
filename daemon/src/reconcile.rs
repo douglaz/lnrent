@@ -321,6 +321,22 @@ impl Reconciler {
             Err(e) => tracing::warn!(error = %e, "reconcile: idempotency cache sweep failed (non-fatal)"),
         }
 
+        // Terminal-row GC (lnrent-y4m.2) runs beside the idempotency sweep, same BEST-EFFORT
+        // handling: reaping terminal, unreferenced business rows past their retention window is a
+        // housekeeping chore, so a reap DB error must not fail the tick.
+        match self.store.reap_terminal_rows(now).await {
+            Ok(reaped) if reaped.total() > 0 => tracing::info!(
+                reservation = reaped.reservation,
+                invoice = reaped.invoice,
+                event_log = reaped.event_log,
+                instance = reaped.instance,
+                subscription = reaped.subscription,
+                "reconcile: terminal-row reap"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "reconcile: terminal-row reap failed (non-fatal)"),
+        }
+
         // Retry any owed provider teardowns (lnrent-urw.2) whose backoff has elapsed. Best-effort:
         // a retry error must not fail the tick — the row stays open for the next pass.
         match self.retry_teardowns(now).await {
