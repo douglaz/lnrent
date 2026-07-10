@@ -661,16 +661,21 @@ impl Store {
     pub async fn reap_terminal_rows(&self, now: i64) -> Result<ReapCounts> {
         // The external_id a still-open (non-SENT) refund_attempt is keyed to — the SAME derivation
         // `load_refund_attempt_external_ids` uses. An invoice referenced by such a row is money owed
-        // and is kept even past the window. `NOT IN` is NULL-safe here: the CASE only ever returns a
-        // substr of `idempotency_key` (TEXT NOT NULL) or `id` (PRIMARY KEY, NOT NULL), so the set can
-        // never contain NULL — the set-based form matches the sibling sweep/refund readiness queries.
-        let open_refund_ext = "SELECT CASE
+        // and is kept even past the window. The set is filtered `ext IS NOT NULL` so the outer `NOT IN`
+        // is exact: a TEXT PRIMARY KEY is NOT implicitly NOT-NULL in SQLite (unlike INTEGER/WITHOUT
+        // ROWID/STRICT — CodeRabbit), so the `ELSE ra.id` branch could in principle be NULL, and a
+        // single NULL in a `NOT IN` set makes the predicate UNKNOWN for every row — suppressing all
+        // deletes (fail-closed, but it would stall the GC). Filtering keeps the efficient set-based form
+        // (built once, vs a per-candidate correlated scan).
+        let open_refund_ext = "SELECT ext FROM (
+                    SELECT CASE
                       WHEN ra.idempotency_key LIKE 'refund:%' THEN substr(ra.idempotency_key, 8)
                       WHEN ra.id LIKE 'ref-%' THEN substr(ra.id, 5)
                       ELSE ra.id
-                    END
-               FROM refund_attempt ra
-              WHERE ra.status <> 'SENT'";
+                    END AS ext
+                    FROM refund_attempt ra
+                    WHERE ra.status <> 'SENT'
+                  ) WHERE ext IS NOT NULL";
         // A never-settled EXPIRED invoice past the window is reaped REGARDLESS of its owning sub's
         // state. The retention window itself is the "settlement can no longer arrive" proof — a
         // lightning/fedimint invoice cannot settle after its own expiry, and 30d dwarfs any oplog-replay
@@ -2084,6 +2089,41 @@ mod tests {
             2,
             "settle-refund journal rows (ledger receipts) kept even with all refunds SENT"
         );
+    }
+
+    // lnrent-y4m.2 (CodeRabbit): a NULL-derived open-refund key must NOT poison the `NOT IN` set and
+    // stall the whole invoice GC. A TEXT PRIMARY KEY is not implicitly NOT-NULL in SQLite, so
+    // refund_attempt.id CAN be NULL; the `ELSE ra.id` derivation would then be NULL. The set is filtered
+    // IS NOT NULL, so an unrelated fully-lapsed invoice still reaps.
+    #[tokio::test]
+    async fn reap_invoice_gc_survives_a_null_derived_open_refund_key() {
+        let s = mem_store();
+        let now = 2 * TERMINAL_ROW_RETENTION_SECS;
+        let old = TERMINAL_ROW_RETENTION_SECS - 1;
+
+        s.transaction(move |tx| {
+            // A non-SENT refund_attempt whose derived ext is NULL: NULL id + a non-'refund:' key, so the
+            // CASE falls to `ELSE ra.id` = NULL. Without the IS NOT NULL filter this single NULL would
+            // make `external_id NOT IN (…NULL…)` UNKNOWN for every invoice, suppressing all deletes.
+            tx.execute(
+                "INSERT INTO refund_attempt (id, idempotency_key, status, created_at, updated_at)
+                 VALUES (NULL, 'legacy-non-refund-key', 'PENDING', ?1, ?1)",
+                rusqlite::params![old],
+            )?;
+            // An unrelated fully-lapsed EXPIRED invoice that must still reap.
+            tx.execute(
+                "INSERT INTO invoice (id, subscription_id, external_id, kind, status, expires_at, issued_at)
+                 VALUES ('i-unrelated', NULL, 'x-unrelated', 'order', 'EXPIRED', ?1, ?1)",
+                rusqlite::params![old],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let reaped = s.reap_terminal_rows(now).await.unwrap();
+        assert_eq!(reaped.invoice, 1, "a NULL-derived open-refund key does not stall the invoice GC");
+        assert_eq!(count(&s, "SELECT count(*) FROM invoice WHERE id='i-unrelated'").await, 0);
     }
 
     // lnrent-y4m.2 (codex P2): an EXPIRED-unsettled invoice past the window is reaped REGARDLESS of its
