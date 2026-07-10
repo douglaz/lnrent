@@ -21,8 +21,32 @@
 //! are copied as opaque bytes (cold copy is safe since the daemon is stopped). A `MANIFEST.json`
 //! records exactly which files were present, so restore can sanity-check the set and surface a clear
 //! error if it is incomplete/corrupt rather than silently dropping a commitment-bearing file.
+//!
+//! ## Optional passphrase-encrypted mode (lnrent-y4m.6)
+//!
+//! The default path above writes the FUND-CONTROLLING secrets (the BIP39 `operator.seed`, the ecash-
+//! bearing `fedimint/` dir + `fedimint.json`, and the state DB) in PLAINTEXT — fine for a cold,
+//! operator-controlled data dir, but a backup exists to be MOVED (USB stick, cloud bucket), and at
+//! rest those bytes are a sweepable seed to anyone who gets the media. So `backup`/`restore` take an
+//! OPTIONAL passphrase: when present, the sensitive set is bundled into ONE `tar` stream that is fed
+//! through the audited `age` crate (scrypt passphrase KDF + ChaCha20-Poly1305 AEAD; we NEVER hand-roll
+//! crypto) and written as a single `dest/backup.age`. The `MANIFEST.json` stays PLAINTEXT (metadata
+//! only — no secret bytes) so restore reads it first and routes on `Manifest.encrypted`. Because that
+//! routing flag is not authenticated, restore also refuses the plaintext path when a passphrase or
+//! `backup.age` is present: tampering cannot silently downgrade an encrypted restore into an
+//! unauthenticated plaintext restore. (That guard covers SAME-media tampering — a flipped
+//! `encrypted` bit or a lingering `backup.age`. A WHOLLY substituted plaintext backup — attacker-
+//! swapped media carrying its own `encrypted: false` manifest and NO `backup.age`, restored WITHOUT a
+//! passphrase — is inherent to unauthenticated plaintext backups and out of scope; the operator rule
+//! is therefore to ALWAYS restore an encrypted backup WITH its passphrase, never let a runbook fall
+//! back to the plaintext path.) A wrong passphrase or any ciphertext tamper fails cleanly on
+//! the AEAD tag; because restore decrypts+untars INSIDE the transactional staging dir, the atomic
+//! swap runs only on FULL success, so a bad passphrase leaves the target data dir UNTOUCHED. The
+//! default (no-passphrase) backup path is byte-for-byte unchanged.
 
 use std::fs;
+use std::io::BufReader;
+use std::iter;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,6 +54,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// The data-dir state DB (matches `config.rs`'s `STATE_DB_FILE`).
 const STATE_DB_FILE: &str = "lnrent.sqlite";
@@ -44,6 +69,11 @@ const FEDIMINT_DIR: &str = "fedimint";
 const IPC_SOCK_FILE: &str = "lnrent.sock";
 /// The backup self-description, written/read by [`backup`]/[`restore`].
 const MANIFEST_FILE: &str = "MANIFEST.json";
+/// The single age-encrypted `tar` artifact in an ENCRYPTED backup dir (lnrent-y4m.6): it holds the
+/// sqlite snapshot + `operator.seed` + `fedimint.json` + the `fedimint/` subtree. In encrypted mode
+/// `dest/` contains ONLY this file plus the plaintext [`MANIFEST_FILE`]; the secret files never touch
+/// disk in `dest`.
+const BACKUP_AGE_FILE: &str = "backup.age";
 /// The manifest `schema` stamp — restore refuses anything that is not an lnrent backup.
 const BACKUP_SCHEMA: &str = "lnrent-backup";
 /// The backup-format version this build writes and understands. Bump on a breaking layout change.
@@ -71,6 +101,19 @@ pub struct Manifest {
     pub fedimint_dir: bool,
     /// The federation ids (the `fedimint/<id>/` subdir names) captured, sorted for determinism.
     pub federations: Vec<String>,
+    /// `true` iff the sensitive set was written to [`BACKUP_AGE_FILE`] under a passphrase instead of
+    /// as plaintext files (lnrent-y4m.6). `#[serde(default)]` keeps OLD v1 plaintext manifests (which
+    /// lack the field) deserializing as `false`, so the format version stays 1 — the manifest itself
+    /// carries NO secret bytes either way, only this descriptive flag. `skip_serializing_if` OMITS the
+    /// field when `false`, so a PLAINTEXT manifest is byte-for-byte identical to a pre-y4m.6 one
+    /// (adversarial codex — the plaintext path must be unchanged); only an encrypted backup writes it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub encrypted: bool,
+}
+
+/// `skip_serializing_if` predicate for the `encrypted` flag (omit it when `false`).
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Cheap, best-effort liveness check: a daemon is *running against* `data_dir` iff its IPC socket
@@ -108,7 +151,20 @@ pub fn daemon_appears_running(data_dir: &Path) -> bool {
 ///
 /// `dest` must be empty or not-yet-exist — a backup is a clean, self-contained set, so we never mix
 /// it with stale artifacts (and `VACUUM INTO` itself refuses to overwrite an existing file).
-pub fn backup(data_dir: &Path, dest: &Path) -> Result<Manifest> {
+///
+/// `passphrase` selects the mode (lnrent-y4m.6):
+/// - `None` → today's PLAINTEXT layout (flat secret files + `MANIFEST.json`), byte-for-byte unchanged.
+/// - `Some(pw)` → the sensitive set is tar'd + age-encrypted into `dest/backup.age`; the secret files
+///   never touch disk in `dest`, and the plaintext `MANIFEST.json` records `encrypted: true`. An
+///   EMPTY `pw` is REFUSED here — age would encrypt under it and stamp `encrypted: true`, yet the
+///   fund-controlling seed would be protected by a trivially guessable secret. The CLI already
+///   rejects an empty passphrase FILE, but this public API is the real fund-safety boundary (a non-CLI
+///   caller could hand us `Some("")`), so the invariant is enforced here too (review R1 P2).
+pub fn backup(
+    data_dir: &Path,
+    dest: &Path,
+    passphrase: Option<Zeroizing<String>>,
+) -> Result<Manifest> {
     let src_db = data_dir.join(STATE_DB_FILE);
     if !is_regular_file(&src_db) {
         bail!(
@@ -118,10 +174,20 @@ pub fn backup(data_dir: &Path, dest: &Path) -> Result<Manifest> {
         );
     }
 
+    // Refuse an empty OR whitespace-only passphrase BEFORE creating anything: it selects encrypted
+    // mode but gives ~zero protection to the fund-controlling seed the mode exists to protect (review
+    // R1 P2 + adversarial codex — `"   "` must be rejected too, at this fund-safety boundary).
+    if passphrase.as_ref().is_some_and(|pw| pw.trim().is_empty()) {
+        bail!(
+            "refusing to create an encrypted backup with an empty/whitespace-only passphrase — it \
+             offers no protection for the seed + ecash; supply a real passphrase"
+        );
+    }
+
     // A `dest` INSIDE the data dir would make the fedimint copy below recurse into its own freshly
     // written output (`<dest>/fedimint/<dest-rel>/fedimint/...`) until the disk fills, and a
     // `data_dir` inside `dest` is an equally nonsensical self-overlap. Reject either BEFORE creating
-    // anything (review R1 P2).
+    // anything (review R1 P2). This guards BOTH the plaintext copy and the encrypted tar walk.
     assert_disjoint(data_dir, dest, "data dir", "backup dest")?;
 
     prepare_empty_dest(dest)?;
@@ -130,10 +196,19 @@ pub fn backup(data_dir: &Path, dest: &Path) -> Result<Manifest> {
     // per-file + manifest-last fsync ordering. Harmless when `dest` already existed.
     fsync_dir(&parent_dir(dest))?;
 
+    match passphrase {
+        None => backup_plaintext(data_dir, dest, &src_db),
+        Some(pw) => backup_encrypted(data_dir, dest, &src_db, &pw),
+    }
+}
+
+/// The default PLAINTEXT backup body (unchanged from lnrent-7fp.14): the secret files land flat in
+/// `dest`, each hardened + fsynced, with the manifest written LAST.
+fn backup_plaintext(data_dir: &Path, dest: &Path, src_db: &Path) -> Result<Manifest> {
     // 1. The state DB: VACUUM INTO folds the WAL into ONE coherent file and never emits -wal/-shm
     //    sidecars, so the artifact is internally consistent without raw-copying journal state.
     let dest_db = dest.join(STATE_DB_FILE);
-    vacuum_into(&src_db, &dest_db)?;
+    vacuum_into(src_db, &dest_db)?;
     // The state DB can carry credential-bearing rows (outbox payloads, native session tickets);
     // VACUUM INTO writes it at the process umask, so tighten it to owner-only like the seed file.
     harden_file_0600(&dest_db)?;
@@ -171,9 +246,88 @@ pub fn backup(data_dir: &Path, dest: &Path) -> Result<Manifest> {
         operator_seed,
         fedimint_dir,
         federations,
+        encrypted: false,
     };
     write_manifest(&dest.join(MANIFEST_FILE), &manifest)?;
     // Re-fsync the dest dir so the manifest's own directory entry is durable strictly after the data.
+    fsync_dir(dest)?;
+    Ok(manifest)
+}
+
+/// The OPTIONAL passphrase-encrypted backup body (lnrent-y4m.6): VACUUM the state DB into a private
+/// temp, tar {snapshot, seed, config, fedimint subtree} through the `age` passphrase writer into ONE
+/// `dest/backup.age`, then write the plaintext manifest LAST. The secret files never land in `dest`;
+/// the only bytes at rest there are the AEAD ciphertext + the metadata-only manifest.
+fn backup_encrypted(
+    data_dir: &Path,
+    dest: &Path,
+    src_db: &Path,
+    passphrase: &Zeroizing<String>,
+) -> Result<Manifest> {
+    // Determine the present set WITHOUT copying (the tar walk below reads the sources directly). Same
+    // symlink-refusal on the config/seed as the plaintext `copy_if_present`.
+    let src_fed = data_dir.join(FEDIMINT_DIR);
+    // `Path::is_dir()` FOLLOWS a symlink, so a symlinked `fedimint` ROOT would let the tar walk escape
+    // the data dir and pull bytes from OUTSIDE the captured set — the entry-level guard in
+    // `tar_append_dir_recursive` only refuses symlinks INSIDE the tree. Apply the module's
+    // symlink-refusal invariant to the root too, before walking it (review R1 P2).
+    let fedimint_dir = fedimint_root_is_real_dir(&src_fed)?;
+    let federations = if fedimint_dir {
+        list_subdirs(&src_fed)?
+    } else {
+        Vec::new()
+    };
+    let fedimint_config = present_regular_or_reject(&data_dir.join(FEDIMINT_CONFIG_FILE))?;
+    let operator_seed = present_regular_or_reject(&data_dir.join(SEED_FILE))?;
+
+    // VACUUM the state DB into a PRIVATE scratch file on the already-trusted SOURCE filesystem,
+    // tar+encrypt it with the rest, then delete it — win OR lose. It must never touch the portable
+    // destination: unlinking a plaintext file there would still leave recoverable blocks and gives
+    // sync tooling/crashes a window to observe it (review round 1 P1).
+    let vacuum_tmp = data_dir.join(format!(
+        ".lnrent-backup-vacuum-{}-{}.tmp",
+        std::process::id(),
+        now_nanos()
+    ));
+    let age_path = dest.join(BACKUP_AGE_FILE);
+    let bundled = (|| -> Result<()> {
+        vacuum_into(src_db, &vacuum_tmp)?;
+        harden_file_0600(&vacuum_tmp)?;
+        write_encrypted_bundle(
+            &age_path,
+            &vacuum_tmp,
+            data_dir,
+            fedimint_dir,
+            fedimint_config,
+            operator_seed,
+            passphrase,
+        )
+    })();
+    // Always remove the plaintext snapshot, whether the bundle succeeded or failed, and make the
+    // unlink durable. A cleanup failure is a backup failure: reporting success while a fund-bearing
+    // plaintext scratch file remains would violate encrypted-at-rest mode.
+    remove_file_if_exists(&vacuum_tmp).context("removing plaintext encrypted-backup scratch file")?;
+    fsync_dir(data_dir).context("making encrypted-backup scratch cleanup durable")?;
+    bundled?;
+
+    // The AEAD artifact is at least as sensitive as the seed — tighten it to owner-only and fsync.
+    harden_file_0600(&age_path)?;
+    fsync_file(&age_path)?;
+    // Make the artifact's directory entry durable BEFORE the manifest (manifest-last ordering).
+    fsync_dir(dest)?;
+
+    let manifest = Manifest {
+        schema: BACKUP_SCHEMA.to_string(),
+        version: BACKUP_FORMAT_VERSION,
+        created_unix: now_unix(),
+        state_db: true,
+        fedimint_config,
+        operator_seed,
+        fedimint_dir,
+        federations,
+        encrypted: true,
+    };
+    write_manifest(&dest.join(MANIFEST_FILE), &manifest)?;
     fsync_dir(dest)?;
     Ok(manifest)
 }
@@ -196,14 +350,32 @@ pub fn backup(data_dir: &Path, dest: &Path) -> Result<Manifest> {
 ///   data dir or the complete new one — never a half-written merge, and never a momentarily-ABSENT
 ///   data dir that a restarting daemon could mistake for a first boot and overwrite with a fresh
 ///   identity (review R1 P1).
-pub fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifest> {
+///
+/// `passphrase` (lnrent-y4m.6): required when `manifest.encrypted`; an encrypted backup with no
+/// passphrase is rejected up front with a clear message. Conversely, supplying one for a manifest
+/// that claims plaintext is rejected rather than silently ignoring the operator's authentication
+/// intent. A wrong passphrase fails on the AEAD tag INSIDE staging, so the swap never runs and the
+/// target data dir is left UNTOUCHED.
+pub fn restore(
+    src: &Path,
+    data_dir: &Path,
+    force: bool,
+    passphrase: Option<Zeroizing<String>>,
+) -> Result<Manifest> {
     // 0. The backup source and the restore target must be DISJOINT: restoring INTO a subdir of the
     //    backup (or backing the target up into the source) would let the staged swap move part of the
     //    source out from under the copy. Reject the overlap up front (mirror of the backup-side
     //    guard, review R1 P2).
     assert_disjoint(src, data_dir, "restore source", "data dir")?;
 
-    // 1. Read + validate the manifest.
+    // Reject a whitespace-only passphrase at THIS API boundary too (adversarial codex): it is not a
+    // real passphrase, and letting it through would only surface later as a confusing wrong-passphrase
+    // decrypt error.
+    if passphrase.as_ref().is_some_and(|pw| pw.trim().is_empty()) {
+        bail!("refusing to restore with an empty/whitespace-only passphrase — supply the real passphrase");
+    }
+
+    // 1. Read + validate the manifest (PLAINTEXT in both modes; restore routes on `encrypted`).
     let manifest = read_manifest(&src.join(MANIFEST_FILE))?;
     if manifest.schema != BACKUP_SCHEMA {
         bail!(
@@ -221,33 +393,64 @@ pub fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifest> {
     }
 
     // 2. Verify the backup set is COMPLETE before mutating the target — never silently drop a file
-    //    the manifest says was captured.
-    let src_db = src.join(STATE_DB_FILE);
-    if !manifest.state_db || !is_regular_file(&src_db) {
-        bail!(
-            "backup is incomplete/corrupt: missing state DB {} (a restore must reproduce the \
-             operator's commitments exactly)",
-            src_db.display()
-        );
-    }
-    if manifest.fedimint_config && !is_regular_file(&src.join(FEDIMINT_CONFIG_FILE)) {
-        bail!(
-            "backup is incomplete/corrupt: manifest records {FEDIMINT_CONFIG_FILE} but it is missing"
-        );
-    }
-    if manifest.operator_seed && !is_regular_file(&src.join(SEED_FILE)) {
-        bail!("backup is incomplete/corrupt: manifest records {SEED_FILE} but it is missing");
-    }
-    if manifest.fedimint_dir {
-        let src_fed = src.join(FEDIMINT_DIR);
-        if !src_fed.is_dir() {
-            bail!("backup is incomplete/corrupt: manifest records the {FEDIMINT_DIR}/ subtree but it is missing");
+    //    the manifest says was captured. In encrypted mode the sensitive files live inside
+    //    `backup.age`, so here we only confirm that artifact + a passphrase are present; the inner set
+    //    is re-checked AFTER decrypt, still inside staging (so the target is never touched on failure).
+    if manifest.encrypted {
+        if !is_regular_file(&src.join(BACKUP_AGE_FILE)) {
+            bail!("backup is incomplete/corrupt: manifest records an encrypted backup but {BACKUP_AGE_FILE} is missing");
         }
-        for fed in &manifest.federations {
-            if !src_fed.join(fed).is_dir() {
-                bail!(
-                    "backup is incomplete/corrupt: federation dir {FEDIMINT_DIR}/{fed} is missing"
-                );
+        if passphrase.is_none() {
+            bail!(
+                "this backup is encrypted; pass --passphrase-file to restore it (the {BACKUP_AGE_FILE} \
+                 artifact holds the seed + ecash under a passphrase)"
+            );
+        }
+    } else {
+        // `MANIFEST.json` is intentionally plaintext metadata, so its `encrypted` bit cannot by
+        // itself authenticate the restore mode. Never silently ignore an operator-supplied
+        // passphrase, and never route around a present age artifact: either condition means treating
+        // this as plaintext could install attacker-supplied fund state after a manifest downgrade.
+        if passphrase.is_some() {
+            bail!(
+                "backup manifest says plaintext but a passphrase was supplied; refusing a possible encrypted-backup downgrade"
+            );
+        }
+        let age_path = src.join(BACKUP_AGE_FILE);
+        match fs::symlink_metadata(&age_path) {
+            Ok(_) => bail!(
+                "backup manifest says plaintext but {BACKUP_AGE_FILE} is present; refusing a possible encrypted-backup downgrade"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow!("stat {}: {e}", age_path.display())),
+        }
+        let src_db = src.join(STATE_DB_FILE);
+        if !manifest.state_db || !is_regular_file(&src_db) {
+            bail!(
+                "backup is incomplete/corrupt: missing state DB {} (a restore must reproduce the \
+                 operator's commitments exactly)",
+                src_db.display()
+            );
+        }
+        if manifest.fedimint_config && !is_regular_file(&src.join(FEDIMINT_CONFIG_FILE)) {
+            bail!(
+                "backup is incomplete/corrupt: manifest records {FEDIMINT_CONFIG_FILE} but it is missing"
+            );
+        }
+        if manifest.operator_seed && !is_regular_file(&src.join(SEED_FILE)) {
+            bail!("backup is incomplete/corrupt: manifest records {SEED_FILE} but it is missing");
+        }
+        if manifest.fedimint_dir {
+            let src_fed = src.join(FEDIMINT_DIR);
+            if !src_fed.is_dir() {
+                bail!("backup is incomplete/corrupt: manifest records the {FEDIMINT_DIR}/ subtree but it is missing");
+            }
+            for fed in &manifest.federations {
+                if !src_fed.join(fed).is_dir() {
+                    bail!(
+                        "backup is incomplete/corrupt: federation dir {FEDIMINT_DIR}/{fed} is missing"
+                    );
+                }
             }
         }
     }
@@ -277,23 +480,38 @@ pub fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifest> {
         .with_context(|| format!("creating restore parent dir {}", parent.display()))?;
 
     let staging = with_staging(&parent, |stage| {
-        let dst_db = stage.join(STATE_DB_FILE);
-        fs::copy(&src_db, &dst_db)
-            .with_context(|| format!("restoring {} -> {}", src_db.display(), dst_db.display()))?;
-        harden_file_0600(&dst_db)?;
-        fsync_file(&dst_db)?;
+        if manifest.encrypted {
+            // Decrypt + untar the sensitive set INTO staging. A wrong passphrase / truncated / tampered
+            // artifact fails here (AEAD tag) — before the swap — so the target stays untouched. The
+            // passphrase presence was checked above, so `expect` cannot fire.
+            let pw = passphrase
+                .as_ref()
+                .expect("encrypted restore requires a passphrase (checked above)");
+            decrypt_and_unpack(&src.join(BACKUP_AGE_FILE), stage, pw)?;
+            // The decrypted set must match what the manifest promised, and every extracted file/dir is
+            // re-hardened (0600/0700) + fsynced — the untar wrote at the tar entries' modes.
+            finalize_decrypted_staging(stage, &manifest)?;
+        } else {
+            let src_db = src.join(STATE_DB_FILE);
+            let dst_db = stage.join(STATE_DB_FILE);
+            fs::copy(&src_db, &dst_db).with_context(|| {
+                format!("restoring {} -> {}", src_db.display(), dst_db.display())
+            })?;
+            harden_file_0600(&dst_db)?;
+            fsync_file(&dst_db)?;
 
-        if manifest.fedimint_dir {
-            copy_dir_recursive(&src.join(FEDIMINT_DIR), &stage.join(FEDIMINT_DIR))?;
-        }
-        if manifest.fedimint_config {
-            restore_secret_file(
-                &src.join(FEDIMINT_CONFIG_FILE),
-                &stage.join(FEDIMINT_CONFIG_FILE),
-            )?;
-        }
-        if manifest.operator_seed {
-            restore_secret_file(&src.join(SEED_FILE), &stage.join(SEED_FILE))?;
+            if manifest.fedimint_dir {
+                copy_dir_recursive(&src.join(FEDIMINT_DIR), &stage.join(FEDIMINT_DIR))?;
+            }
+            if manifest.fedimint_config {
+                restore_secret_file(
+                    &src.join(FEDIMINT_CONFIG_FILE),
+                    &stage.join(FEDIMINT_CONFIG_FILE),
+                )?;
+            }
+            if manifest.operator_seed {
+                restore_secret_file(&src.join(SEED_FILE), &stage.join(SEED_FILE))?;
+            }
         }
         // Make the staged set's own directory entries durable before the swap.
         fsync_dir(stage)
@@ -389,6 +607,240 @@ fn copy_if_present(src: &Path, dst: &Path) -> Result<bool> {
     }
 }
 
+// ===== encrypted-mode helpers (lnrent-y4m.6) =====================================================
+
+/// Report whether the fedimint subtree ROOT at `src` is a present REAL directory to archive, refusing
+/// a symlink. `Path::is_dir()` follows a symlink; the encrypted tar would then walk the link target
+/// and pull in bytes from OUTSIDE the data dir, breaking the captured-set boundary the symlink-refusal
+/// contract exists to hold (review R1 P2). A symlink → error; a real dir → `Ok(true)`; a missing root
+/// → `Ok(false)` (fedimint simply isn't configured); any other non-dir → `Ok(false)`, matching the
+/// plaintext path's `is_dir()` skip for a stray non-directory at that path.
+fn fedimint_root_is_real_dir(src: &Path) -> Result<bool> {
+    match fs::symlink_metadata(src) {
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "{} is a symlink; refusing to back up the fedimint subtree via a symlink (expected a real \
+             directory)",
+            src.display()
+        ),
+        Ok(meta) => Ok(meta.file_type().is_dir()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow!("stat {}: {e}", src.display())),
+    }
+}
+
+/// Report whether `src` is a present regular file WITHOUT copying it — the encrypted path's analogue
+/// of [`copy_if_present`] (the tar walk reads the source directly). Applies the SAME symlink-refusal:
+/// we never bundle a secret reached via a symlink. Absence is `Ok(false)`.
+fn present_regular_or_reject(src: &Path) -> Result<bool> {
+    match fs::symlink_metadata(src) {
+        Ok(meta) if meta.file_type().is_file() => Ok(true),
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "{} is a symlink; refusing to back up a secret/config via a symlink",
+            src.display()
+        ),
+        Ok(_) => bail!("{} is not a regular file", src.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow!("stat {}: {e}", src.display())),
+    }
+}
+
+/// Wrap the passphrase bytes in age's zeroizing `SecretString` at the crypto boundary. The transient
+/// `String` copy becomes owned by the `SecretString` (wiped on drop); the caller's [`Zeroizing`]
+/// buffer is wiped independently. The passphrase is NEVER logged or placed in an error message.
+fn passphrase_secret(passphrase: &Zeroizing<String>) -> age::secrecy::SecretString {
+    age::secrecy::SecretString::from(passphrase.as_str().to_owned())
+}
+
+/// Stream {`sqlite_snapshot` as `lnrent.sqlite`, `operator.seed`, `fedimint.json`, the `fedimint/`
+/// subtree} through a `tar` builder wrapped in the `age` passphrase writer, producing `age_path`. The
+/// output file is tightened to 0600 the instant it exists — BEFORE any encrypted payload is written —
+/// then the sensitive bytes are STREAMED (the ecash `client.db` is never buffered whole in memory).
+/// age's default scrypt work factor + ChaCha20-Poly1305 AEAD are used as-is (no hand-tuning). The
+/// `finish()` calls are load-bearing: skipping the age `finish` truncates the file and makes it
+/// undecryptable.
+fn write_encrypted_bundle(
+    age_path: &Path,
+    sqlite_snapshot: &Path,
+    data_dir: &Path,
+    fedimint_dir: bool,
+    fedimint_config: bool,
+    operator_seed: bool,
+    passphrase: &Zeroizing<String>,
+) -> Result<()> {
+    let file =
+        fs::File::create(age_path).with_context(|| format!("creating {}", age_path.display()))?;
+    // Tighten BEFORE writing the encrypted payload, so the AEAD bytes are never world-readable.
+    harden_file_0600(age_path)?;
+
+    let encryptor = age::Encryptor::with_user_passphrase(passphrase_secret(passphrase));
+    let mut age_writer = encryptor
+        .wrap_output(file)
+        .context("initializing the age passphrase writer")?;
+    {
+        let mut tar = tar::Builder::new(&mut age_writer);
+        tar_append_file(&mut tar, sqlite_snapshot, Path::new(STATE_DB_FILE))?;
+        if operator_seed {
+            tar_append_file(&mut tar, &data_dir.join(SEED_FILE), Path::new(SEED_FILE))?;
+        }
+        if fedimint_config {
+            tar_append_file(
+                &mut tar,
+                &data_dir.join(FEDIMINT_CONFIG_FILE),
+                Path::new(FEDIMINT_CONFIG_FILE),
+            )?;
+        }
+        if fedimint_dir {
+            tar_append_dir_recursive(
+                &mut tar,
+                &data_dir.join(FEDIMINT_DIR),
+                Path::new(FEDIMINT_DIR),
+            )?;
+        }
+        tar.finish().context("finalizing the backup tar stream")?;
+    }
+    // Write age's final AEAD chunk; the caller fsyncs the completed artifact.
+    age_writer
+        .finish()
+        .context("finalizing the age-encrypted backup")?;
+    Ok(())
+}
+
+/// Append the regular file `path` to the tar builder under the archive path `arch`. Reads via a file
+/// handle so the entry's size/mode come from the actual file; long paths are handled by tar's GNU
+/// long-name extension, so deep rocksdb/federation paths do not overflow the ustar header.
+fn tar_append_file<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    path: &Path,
+    arch: &Path,
+) -> Result<()> {
+    let mut f = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    builder
+        .append_file(arch, &mut f)
+        .with_context(|| format!("adding {} to the backup tar", path.display()))?;
+    Ok(())
+}
+
+/// Recursively append `src` into the tar builder under the archive path `arch` (files + subdirs). A
+/// symlink is REFUSED (never dereferenced), mirroring [`copy_dir_recursive`]'s guard — the fedimint
+/// subtree is plain files/dirs, and following a link could pull bytes from outside the captured set.
+/// Stored modes are not load-bearing: RESTORE re-hardens every extracted entry to 0600/0700.
+fn tar_append_dir_recursive<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    src: &Path,
+    arch: &Path,
+) -> Result<()> {
+    builder
+        .append_dir(arch, src)
+        .with_context(|| format!("adding dir {} to the backup tar", src.display()))?;
+    for entry in fs::read_dir(src).with_context(|| format!("listing {}", src.display()))? {
+        let entry = entry?;
+        let from = entry.path();
+        let child_arch = arch.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            bail!(
+                "refusing to back up symlink {} in the fedimint subtree (expected plain files/dirs only)",
+                from.display()
+            );
+        } else if file_type.is_dir() {
+            tar_append_dir_recursive(builder, &from, &child_arch)?;
+        } else {
+            tar_append_file(builder, &from, &child_arch)?;
+        }
+    }
+    Ok(())
+}
+
+/// Decrypt `age_path` with `passphrase` and untar the sensitive set INTO `stage`. Called only from
+/// inside the restore staging closure, so a wrong passphrase / truncated / tampered artifact fails
+/// here (age's AEAD tag) BEFORE the atomic swap — the live target is never touched. The passphrase is
+/// never included in the surfaced error.
+fn decrypt_and_unpack(age_path: &Path, stage: &Path, passphrase: &Zeroizing<String>) -> Result<()> {
+    let file =
+        fs::File::open(age_path).with_context(|| format!("opening {}", age_path.display()))?;
+    let decryptor = age::Decryptor::new_buffered(BufReader::new(file))
+        .context("reading the encrypted backup header")?;
+    let identity = age::scrypt::Identity::new(passphrase_secret(passphrase));
+    let reader = decryptor
+        .decrypt(iter::once(&identity as &dyn age::Identity))
+        .context("decrypting backup (wrong passphrase or corrupt/tampered artifact)")?;
+    // Extract at the tar entries' modes into the 0700 staging dir (not world-reachable); every entry
+    // is re-hardened afterward by `finalize_decrypted_staging`. tar's default unpack sanitizes paths.
+    let mut archive = tar::Archive::new(reader);
+    archive.set_preserve_permissions(false);
+    archive
+        .unpack(stage)
+        .context("extracting the decrypted backup")?;
+    // `tar::unpack` STOPS at the tar terminator, so it does NOT read the age stream to EOF — which is
+    // where age authenticates the FINAL STREAM chunk. Drain the reader so a truncated / appended /
+    // tampered ciphertext is REJECTED by age's AEAD tag HERE (inside staging, BEFORE any swap), not
+    // silently accepted as a complete restore (adversarial codex).
+    let mut reader = archive.into_inner();
+    std::io::copy(&mut reader, &mut std::io::sink())
+        .context("authenticating the full backup ciphertext (age integrity check to EOF)")?;
+    Ok(())
+}
+
+/// After a decrypt+untar into `stage`, verify the extracted set matches what the plaintext `manifest`
+/// promised (never silently drop a commitment), then re-harden every entry to owner-only (files 0600,
+/// dirs 0700) and fsync it — mirroring the plaintext restore's hardening.
+fn finalize_decrypted_staging(stage: &Path, manifest: &Manifest) -> Result<()> {
+    let db = stage.join(STATE_DB_FILE);
+    if !is_regular_file(&db) {
+        bail!(
+            "decrypted backup is incomplete/corrupt: missing state DB {} (a restore must reproduce \
+             the operator's commitments exactly)",
+            db.display()
+        );
+    }
+    if manifest.operator_seed && !is_regular_file(&stage.join(SEED_FILE)) {
+        bail!(
+            "decrypted backup is incomplete/corrupt: manifest records {SEED_FILE} but it is missing"
+        );
+    }
+    if manifest.fedimint_config && !is_regular_file(&stage.join(FEDIMINT_CONFIG_FILE)) {
+        bail!("decrypted backup is incomplete/corrupt: manifest records {FEDIMINT_CONFIG_FILE} but it is missing");
+    }
+    if manifest.fedimint_dir {
+        let fed = stage.join(FEDIMINT_DIR);
+        if !fed.is_dir() {
+            bail!("decrypted backup is incomplete/corrupt: manifest records the {FEDIMINT_DIR}/ subtree but it is missing");
+        }
+        for f in &manifest.federations {
+            if !fed.join(f).is_dir() {
+                bail!("decrypted backup is incomplete/corrupt: federation dir {FEDIMINT_DIR}/{f} is missing");
+            }
+        }
+    }
+    harden_and_fsync_tree(stage)
+}
+
+/// Recursively tighten every entry under `root` to owner-only (files 0600, dirs 0700) and fsync it.
+/// A symlink is REFUSED — our own artifacts never contain one (backup refuses them, and the AEAD
+/// authenticates the payload), so a symlink here means a corrupt set, not something to dereference.
+fn harden_and_fsync_tree(root: &Path) -> Result<()> {
+    for entry in fs::read_dir(root).with_context(|| format!("listing {}", root.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            bail!(
+                "refusing symlink {} in the decrypted backup (expected plain files/dirs only)",
+                path.display()
+            );
+        } else if file_type.is_dir() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("setting owner-only perms on {}", path.display()))?;
+            harden_and_fsync_tree(&path)?;
+            fsync_dir(&path)?;
+        } else {
+            harden_file_0600(&path)?;
+            fsync_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
 /// The immediate subdirectory names of `dir`, sorted (the captured federation ids).
 fn list_subdirs(dir: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
@@ -467,8 +919,17 @@ where
     match build(&staging) {
         Ok(()) => Ok(staging),
         Err(e) => {
-            let _ = fs::remove_dir_all(&staging);
-            Err(e)
+            // Surface a cleanup failure: a partially-decrypted seed/ecash must NOT be silently left in
+            // the staging dir (adversarial codex). NotFound is fine — nothing to remove.
+            match fs::remove_dir_all(&staging) {
+                Ok(()) => Err(e),
+                Err(ce) if ce.kind() == std::io::ErrorKind::NotFound => Err(e),
+                Err(ce) => Err(e.context(format!(
+                    "restore failed AND could not remove staging dir {} (possible plaintext secret \
+                     residue — remove it manually): {ce}",
+                    staging.display()
+                ))),
+            }
         }
     }
 }

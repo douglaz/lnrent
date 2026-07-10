@@ -52,8 +52,24 @@ sha2 = "0.10"
 libc = "0.2"
 # Best-effort zeroization of in-memory secret residue (the BIP39 seed copy, the mnemonic string,
 # and the Fedimint root-secret buffer) on drop — the seed/keys are never logged (§13) and this
-# closes the freed-memory residue too (lnrent-7fp.16).
+# closes the freed-memory residue too (lnrent-7fp.16). Also wraps the OPTIONAL backup passphrase
+# (lnrent-y4m.6) so it wipes after the encrypt/decrypt call.
 zeroize = "1"
+# OPTIONAL passphrase-encrypted backup mode (lnrent-y4m.6): the audited Rust `age` crate provides the
+# scrypt passphrase KDF + ChaCha20-Poly1305 AEAD + container format so we NEVER hand-roll crypto.
+# age's `default = []` (verified in age-0.11.3's manifest), so we pull NONE of its opt-in features
+# (no ssh/plugin/cli/armor). CONSCIOUS supply-chain sign-off: even with an empty feature set, age
+# unconditionally pulls a sizable MANDATORY transitive tree — the i18n-embed / i18n-embed-fl /
+# rust-embed localization stack for its error strings, plus x25519-dalek for the recipient (X25519)
+# format we don't use (this passphrase mode exercises only scrypt + ChaCha20-Poly1305). Those deps are
+# NOT feature-gated in age's manifest, so `default-features = false` can't trim them. We accept that
+# footprint deliberately: for a fund-controlling seed, an audited crypto implementation beats a
+# hand-rolled cipher/KDF, which the task forbids anyway.
+age = "0.11"
+# Bundle the sensitive set (sqlite snapshot + seed + fedimint config/dir) into ONE tar stream that is
+# fed through the `age` writer/reader — so the encrypted backup is a single self-contained artifact
+# and we stream (never buffer the whole ecash client.db in memory).
+tar = "0.4"
 # `async fn` in the injected handler/outbound trait objects (object-safe via this macro).
 async-trait = "0.1"
 
