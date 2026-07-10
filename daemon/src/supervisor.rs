@@ -1320,14 +1320,6 @@ async fn check_holdings_floor(
     if expected_msat >= floor {
         return;
     }
-    tracing::warn!(
-        expected_msat = %expected_msat,
-        floor_msat = %floor,
-        "holdings LOW: ledger-expected holdings ({expected_msat} msat) are below the configured books \
-         floor ({floor} msat). This is a BOOKS figure (net ledger receipts − refunds − sweeps), NOT \
-         the wallet balance — directly-seeded ecash is not counted. Liability-independent (fires even \
-         with nothing owed). Run `lnrent reconcile` to compare the books against the live wallet."
-    );
     let detail = format!(
         "ledger-expected holdings {expected_msat} msat are below the configured books floor {floor} \
          msat. This is a books figure (net ledger receipts − refunds − sweeps), NOT the wallet \
@@ -1335,16 +1327,27 @@ async fn check_holdings_floor(
          balance (ADR-0016). Liability-independent: fires even with nothing owed. Use `lnrent \
          reconcile` to check the books against the live wallet."
     );
-    // Best-effort — the dispatcher's cooldown collapses per-tick repeats to one alert per 6h; a
-    // transient enqueue failure is logged and simply retries on the next tick (the condition persists).
-    if let Err(e) = alerts
+    // Log in LOCKSTEP with the DM: this LEVEL condition re-detects every ~5s maintenance tick, but
+    // the dispatcher enqueues (and the WARN fires) at most once per 6h cooldown — never spamming the
+    // logs while the float sits low (codex). A cooldown-suppressed/disabled tick is silent; a
+    // transient enqueue failure logs and retries next tick.
+    match alerts
         .dispatch(Alert::new(AlertKind::HoldingsLow, "holdings", detail))
         .await
     {
-        tracing::warn!(
+        Ok(true) => tracing::warn!(
+            expected_msat = %expected_msat,
+            floor_msat = %floor,
+            "holdings LOW: ledger-expected holdings ({expected_msat} msat) are below the configured \
+             books floor ({floor} msat) — a BOOKS figure (net ledger receipts − refunds − sweeps), \
+             NOT the wallet balance; directly-seeded ecash is not counted. Run `lnrent reconcile` to \
+             compare the books against the live wallet."
+        ),
+        Ok(false) => {} // disabled or within the 6h cooldown — condition persists, do not repeat
+        Err(e) => tracing::warn!(
             error = %format!("{e:#}"),
             "failed to enqueue HoldingsLow alert; will retry next tick"
-        );
+        ),
     }
 }
 
