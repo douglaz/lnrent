@@ -94,14 +94,21 @@ async fn json_money_returns_reply_envelope() {
     assert_eq!(
         keys,
         vec![
+            // gate1-operator-sweep (urw.3): `money` also folds the operator-sweep surplus breakdown
+            // (earned/reserved/paid_out/surplus) + last_sweep — all pure LOCAL ledger reads.
+            "earned_msat",
             "expected_msat",
             "federation_ok",
             "gateway_ok",
             "gross_liability_sat",
+            "last_sweep",
             "liability_count",
+            "paid_out_msat",
             "parked_count",
             "ready",
             "required_msat",
+            "reserved_msat",
+            "surplus_msat",
             "warning",
         ]
     );
@@ -112,6 +119,9 @@ async fn json_money_returns_reply_envelope() {
     assert_eq!(data["liability_count"], 0);
     assert_eq!(data["ready"], serde_json::json!(true));
     assert_eq!(data["warning"], Value::Null);
+    // The sweep surplus breakdown is 0 on a fresh store and no sweep has run yet.
+    assert_eq!(data["surplus_msat"], serde_json::json!(0));
+    assert_eq!(data["last_sweep"], Value::Null);
 
     let _ = fs::remove_dir_all(&data_dir);
 }

@@ -48,6 +48,7 @@ use crate::relay_status::{
 use crate::reconcile::Reconciler;
 use crate::refund::{gen_key, parse_whole_sat, Refunder};
 use crate::refund_resolver::RefundResolver;
+use crate::sweep::Sweeper;
 use crate::reservation::Budget;
 use crate::resume::ResumeDriver;
 use crate::store::{
@@ -134,6 +135,9 @@ pub struct Supervisor {
     provisioner: Arc<Provisioner>,
     resume_driver: Arc<ResumeDriver>,
     refunder: Arc<Refunder>,
+    /// Operator sweep (gate1-operator-sweep, urw.3): pays the operator's own bolt11 from ledger
+    /// surplus. Driven (crash recovery) at boot and each maintenance pass, right after the refunder.
+    sweeper: Arc<Sweeper>,
     reconciler: Arc<Reconciler>,
     /// GATE-1 alert sink, retained for the maintenance loop's relay-blackout check (lnrent-urw.6);
     /// the drivers each hold their own clone.
@@ -214,6 +218,12 @@ impl Supervisor {
             Refunder::with_resolver(store.clone(), payment.clone(), clock.clone(), resolver)
                 .with_alerts(alerts.clone()),
         );
+        // Operator sweep (gate1-operator-sweep, urw.3): same store+payment+clock the money path uses,
+        // plus the shared alert sink so a parked FAILED sweep surfaces a durable operator DM.
+        let sweeper = Arc::new(
+            Sweeper::new(store.clone(), payment.clone(), clock.clone())
+                .with_alerts(alerts.clone()),
+        );
         let reconciler = Arc::new(
             Reconciler::new(store.clone(), payment.clone(), recipe.clone())
                 .with_alerts(alerts.clone()),
@@ -234,6 +244,7 @@ impl Supervisor {
             provisioner,
             resume_driver,
             refunder,
+            sweeper,
             reconciler,
             alerts,
             relays: RelayStatusCell::new(),
@@ -354,11 +365,11 @@ impl Supervisor {
 
     /// Run-once boot recovery, in the order each subsystem's durable recovery requires (lnrent-7fp.21):
     /// op-dispatch interrupted ops, downtime credit, settlement catch-up, provisioning re-drive
-    /// (+ failed cleanups), refunds, a reconcile catch-up tick, then the outbox drain. Each step is
-    /// idempotent; an error in one is logged and does not block the rest (the periodic loops will retry).
+    /// (+ failed cleanups), refunds, sweeps, a reconcile catch-up tick, then the outbox drain. Each step
+    /// is idempotent; an error in one is logged and does not block the rest (the periodic loops retry).
     async fn boot_recovery(&self) -> Result<()> {
         tracing::info!(
-            "boot recovery: op-dispatch -> downtime-credit -> settlement catch-up -> provision -> resume -> refund -> reconcile -> outbox"
+            "boot recovery: op-dispatch -> downtime-credit -> settlement catch-up -> provision -> resume -> refund -> sweep -> reconcile -> outbox"
         );
 
         match self.op_dispatch.recover_interrupted_ops().await {
@@ -409,6 +420,15 @@ impl Supervisor {
             Ok(rep) => tracing::info!(?rep, "boot recovery: refunds driven"),
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "boot recovery: refund recovery failed")
+            }
+        }
+        // Finish any sweep the daemon crashed mid-flight (gate1-operator-sweep, urw.3): re-await a
+        // started key or re-gate an unstarted intent. Idempotent; runs after the refunder so refund
+        // liabilities are settled before a sweep re-gates against the current surplus.
+        match self.sweeper.drive().await {
+            Ok(rep) => tracing::info!(?rep, "boot recovery: sweeps driven"),
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "boot recovery: sweep recovery failed")
             }
         }
         match self.reconciler.reconcile_tick(self.clock.now()).await {
@@ -554,13 +574,14 @@ impl Supervisor {
             )));
         }
 
-        // -- Single serialized maintenance loop (clock sync + periodic settlement catch-up + provision + resume + refund + relay-blackout check + outbox) --
+        // -- Single serialized maintenance loop (clock sync + periodic settlement catch-up + provision + resume + refund + sweep + relay-blackout check + outbox) --
         {
             #[allow(clippy::type_complexity)]
             let (
                 provisioner,
                 resume_driver,
                 refunder,
+                sweeper,
                 payment,
                 engine,
                 store,
@@ -573,6 +594,7 @@ impl Supervisor {
                 self.provisioner.clone(),
                 self.resume_driver.clone(),
                 self.refunder.clone(),
+                self.sweeper.clone(),
                 self.payment.clone(),
                 self.engine.clone(),
                 self.store.clone(),
@@ -592,6 +614,7 @@ impl Supervisor {
                         provisioner,
                         resume_driver,
                         refunder,
+                        sweeper,
                         payment,
                         engine,
                         store,
@@ -604,6 +627,7 @@ impl Supervisor {
                         provisioner.clone(),
                         resume_driver.clone(),
                         refunder.clone(),
+                        sweeper.clone(),
                         payment.clone(),
                         engine.clone(),
                         store.clone(),
@@ -618,6 +642,7 @@ impl Supervisor {
                             provisioner,
                             resume_driver,
                             refunder,
+                            sweeper,
                             payment,
                             store,
                             clock,
@@ -1083,6 +1108,7 @@ async fn run_maintenance_loop(
     provisioner: Arc<Provisioner>,
     resume_driver: Arc<ResumeDriver>,
     refunder: Arc<Refunder>,
+    sweeper: Arc<Sweeper>,
     payment: Arc<dyn PaymentBackend>,
     store: Store,
     clock: Arc<dyn Clock>,
@@ -1110,6 +1136,7 @@ async fn run_maintenance_loop(
             &provisioner,
             &resume_driver,
             &refunder,
+            &sweeper,
             &payment,
             &store,
             &clock,
@@ -1127,15 +1154,16 @@ async fn run_maintenance_loop(
 
 /// One serialized maintenance pass: keep the mock payment clock in step, periodically catch any
 /// missed settlements, drive PROVISIONING subs to ACTIVE/REFUND_DUE (+ finish failed cleanups), drive
-/// RESUMING subs to ACTIVE or a detached renewal refund, pay PENDING refunds, then deliver unsent DMs
-/// (provision.ready, billing.refund, suspend/terminate
-/// notices). Each step is independently idempotent; an error in one is logged and does not block the
-/// others.
+/// RESUMING subs to ACTIVE or a detached renewal refund, pay PENDING refunds, finish any
+/// crash-interrupted operator sweep, then deliver unsent DMs (provision.ready, billing.refund,
+/// suspend/terminate notices). Each step is independently idempotent; an error in one is logged and
+/// does not block the others.
 #[allow(clippy::too_many_arguments)]
 async fn maintenance_pass(
     provisioner: &Provisioner,
     resume_driver: &ResumeDriver,
     refunder: &Refunder,
+    sweeper: &Sweeper,
     payment: &Arc<dyn PaymentBackend>,
     store: &Store,
     clock: &Arc<dyn Clock>,
@@ -1168,6 +1196,11 @@ async fn maintenance_pass(
     }
     if let Err(e) = refunder.drive().await {
         tracing::error!(error = %format!("{e:#}"), "maintenance: refund drive failed");
+    }
+    // Finish any crash-interrupted operator sweep (gate1-operator-sweep, urw.3), right after the
+    // refunder so a sweep re-gates against a surplus that already reflects settled refunds.
+    if let Err(e) = sweeper.drive().await {
+        tracing::error!(error = %format!("{e:#}"), "maintenance: sweep drive failed");
     }
     log_refund_readiness(store, payment).await;
     let relay_rows = engine.relay_status_snapshot().await;

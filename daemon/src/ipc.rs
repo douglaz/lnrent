@@ -48,6 +48,13 @@ pub enum Request {
     /// Re-drive one parked-FAILED refund (lnrent-urw.5): reset it to PENDING so the refunder re-runs
     /// the real resolver + capped-pay path. The only refund actuator — there is no cancel/abandon.
     RefundRetry { id: String },
+    /// DRY-RUN operator sweep quote (gate1-operator-sweep, urw.3): price the outlay + read the ledger
+    /// surplus for `bolt11` and report the ALLOW/REFUSE verdict. No writes, no balance read.
+    SweepQuote { bolt11: String },
+    /// EXECUTE an operator sweep (gate1-operator-sweep, urw.3): gate on ledger surplus, write the
+    /// durable PENDING intent, and pay the operator's own `bolt11` capped at the quote. Ledger-only
+    /// authorization — the federation balance is never read.
+    Sweep { bolt11: String },
     AdminSuspend { id: String },
     AdminResume { id: String },
     DevSettle { subscription_id: String },
@@ -266,7 +273,23 @@ pub async fn dispatch(
             let probe = RefundReadinessProbe::query(payment).await;
             match refund_readiness_report_with_probe(store, payment, &probe).await {
                 Ok(report) => {
-                    Reply::ok(report.to_money_value(probe.gateway_ok(), probe.federation_ok()))
+                    let mut money =
+                        report.to_money_value(probe.gateway_ok(), probe.federation_ok());
+                    // Fold in the operator-sweep view (gate1-operator-sweep, urw.3): the surplus
+                    // breakdown + the last sweep — all pure LOCAL ledger reads, no network.
+                    match crate::sweep::money_sweep_view(store).await {
+                        Ok(sweep_view) => {
+                            if let (Some(obj), Some(extra)) =
+                                (money.as_object_mut(), sweep_view.as_object())
+                            {
+                                for (k, v) in extra {
+                                    obj.insert(k.clone(), v.clone());
+                                }
+                            }
+                            Reply::ok(money)
+                        }
+                        Err(e) => Reply::err("internal", e.to_string()),
+                    }
                 }
                 Err(e) => Reply::err("internal", e.to_string()),
             }
@@ -354,6 +377,46 @@ pub async fn dispatch(
         }
 
         Request::RefundRetry { id } => refund_retry(store, &id, clock.now()).await,
+
+        Request::SweepQuote { bolt11 } => {
+            // §surplus: a DRY-RUN over the ledger — price the outlay + read surplus, no writes and no
+            // balance read. Verdict ALLOW iff surplus covers the outlay.
+            let sweeper =
+                crate::sweep::Sweeper::new(store.clone(), payment.clone(), clock.clone());
+            match sweeper.quote(&bolt11).await {
+                Ok(q) => Reply::ok(json!({
+                    "amount_sat": q.amount_sat,
+                    "outlay_msat": q.outlay_msat,
+                    "earned_msat": q.earned_msat,
+                    "reserved_msat": q.reserved_msat,
+                    "paid_out_msat": q.paid_out_msat,
+                    "surplus_msat": q.surplus_msat,
+                    "verdict": if q.allow { "ALLOW" } else { "REFUSE" },
+                })),
+                Err(e) => Reply::err(e.code(), e.message()),
+            }
+        }
+
+        Request::Sweep { bolt11 } => {
+            // Execute: gate + durable PENDING intent + capped pay. Ledger-only authorization; the
+            // structured refusals (`sweep_invalid`/`sweep_unpriceable`/`sweep_busy`/
+            // `sweep_insufficient`/`sweep_fee_rose`) never move money. No alert sink is wired here
+            // (the operator gets this structured reply live); the supervisor's drive carries alerts.
+            let sweeper =
+                crate::sweep::Sweeper::new(store.clone(), payment.clone(), clock.clone());
+            match sweeper.execute(&bolt11).await {
+                Ok(o) => Reply::ok(json!({
+                    "id": o.id,
+                    "amount_sat": o.amount_sat,
+                    "max_outlay_msat": o.max_outlay_msat,
+                    "status": o.status,
+                    "backend_payment_id": o.backend_payment_id,
+                    "swept": true,
+                    "cached": o.cached,
+                })),
+                Err(e) => Reply::err(e.code(), e.message()),
+            }
+        }
 
         Request::AdminSuspend { id } => {
             admin_transition(
@@ -1499,5 +1562,93 @@ mod tests {
             .unwrap();
         assert!(!bad.ok);
         assert_eq!(bad.error.unwrap().code, "invalid_state");
+    }
+
+    // gate1-operator-sweep (urw.3): SweepQuote -> Sweep end-to-end over the IPC socket on
+    // MockPayment. Asserts the ALLOW verdict, the SENT reply, and the PERSISTED sweep_attempt +
+    // event_log rows (NOT relay delivery).
+    #[tokio::test]
+    async fn sweep_quote_then_execute_persists_rows_over_ipc() {
+        let (store, sock) = serve_temp().await;
+        // s1 is ACTIVE (a final receipt): give it a PAID order invoice so the ledger has surplus.
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO invoice (id, subscription_id, external_id, kind, amount_sat, status, issued_at)
+                     VALUES ('inv-s1', 's1', 'order:s1', 'order', 100000, 'PAID', 0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let bolt11 = crate::refund_resolver::mint_bolt11(40_000 * 1000, "meta", 1_000, 3_600);
+
+        let q = call(&sock, Request::SweepQuote { bolt11: bolt11.clone() })
+            .await
+            .unwrap();
+        assert!(q.ok, "quote: {:?}", q.error);
+        let qd = q.data.unwrap();
+        assert_eq!(qd["verdict"], "ALLOW");
+        assert_eq!(qd["amount_sat"], json!(40_000));
+        assert_eq!(qd["surplus_msat"], json!(100_000_000));
+
+        let s = call(&sock, Request::Sweep { bolt11 }).await.unwrap();
+        assert!(s.ok, "sweep: {:?}", s.error);
+        let sd = s.data.unwrap();
+        assert_eq!(sd["status"], "SENT");
+        assert_eq!(sd["swept"], json!(true));
+
+        let (sent, events): (i64, i64) = store
+            .read(|c| {
+                let sent = c.query_row(
+                    "SELECT count(*) FROM sweep_attempt WHERE status='SENT'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let events =
+                    c.query_row("SELECT count(*) FROM event_log WHERE kind='sweep'", [], |r| r.get(0))?;
+                Ok((sent, events))
+            })
+            .await
+            .unwrap();
+        assert_eq!(sent, 1, "one SENT sweep_attempt row persisted");
+        assert_eq!(events, 2, "intent + sent 'sweep' journal rows persisted");
+    }
+
+    // gate1-operator-sweep: `lnrent money` folds the surplus breakdown + last_sweep (pure ledger).
+    #[tokio::test]
+    async fn money_includes_surplus_breakdown_and_last_sweep() {
+        let store = mem_store();
+        // A final (ACTIVE) receipt of 7 sat plus a SENT sweep that paid out 3_000 msat of it.
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO subscription (id, state, created_at, updated_at) VALUES ('s', 'ACTIVE', 0, 0)",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO invoice (id, subscription_id, external_id, kind, amount_sat, status, issued_at)
+                     VALUES ('inv', 's', 'order:s', 'order', 7, 'PAID', 0)",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO sweep_attempt (id, bolt11, amount_sat, max_outlay_msat, status, attempts, created_at, sent_at)
+                     VALUES ('sweep:h', 'lnbc1', 3, 3000, 'SENT', 1, 10, 20)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
+
+        let data = money_data(&store, &payment).await;
+        assert_eq!(data["earned_msat"], json!(7_000));
+        assert_eq!(data["paid_out_msat"], json!(3_000));
+        assert_eq!(data["surplus_msat"], json!(4_000)); // 7_000 earned − 3_000 swept
+        assert_eq!(data["last_sweep"]["id"], "sweep:h");
+        assert_eq!(data["last_sweep"]["status"], "SENT");
     }
 }
