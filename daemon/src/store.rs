@@ -601,14 +601,20 @@ fn trip_if_fatal_sqlite(degraded: &AtomicBool, e: rusqlite::Error) -> anyhow::Er
     anyhow::Error::new(e)
 }
 
-/// Trip degraded if a fatal `rusqlite::Error` is hiding inside the `anyhow::Error` a write raised
-/// INSIDE the closure (`f(&txn)` yields `anyhow::Result`, so the concrete sqlite error arrives
-/// downcast-able). The original `anyhow` error is returned unchanged so caller context is preserved.
+/// Trip degraded if a fatal `rusqlite::Error` is hiding anywhere in the `anyhow::Error` a write
+/// raised INSIDE the closure (`f(&txn)` yields `anyhow::Result`). Walk the WHOLE source chain, not
+/// just the top: a fatal sqlite error wrapped by `.context(...)` (idiomatic anyhow — the money
+/// closures use it on store ops) or by a typed error that preserves it as `source` would escape a
+/// top-level `downcast_ref` and silently bypass the latch (CodeRabbit). The original `anyhow` error
+/// is returned unchanged so caller context is preserved.
 fn trip_if_fatal_anyhow(degraded: &AtomicBool, e: anyhow::Error) -> anyhow::Error {
-    if let Some(sqlite_err) = e.downcast_ref::<rusqlite::Error>() {
-        if is_fatal_db_error(sqlite_err) {
-            latch_degraded(degraded, &e);
-        }
+    let fatal = e.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(is_fatal_db_error)
+    });
+    if fatal {
+        latch_degraded(degraded, &e);
     }
     e
 }
@@ -2545,6 +2551,32 @@ mod tests {
 
         // Reads/status still serve while degraded, and the refused write applied nothing.
         assert_eq!(count(&s, "SELECT count(*) FROM recipe").await, 1);
+    }
+
+    // A fatal sqlite error wrapped by `.context(...)` (as the money closures do on store ops) is not
+    // downcast-able at the top level, but the classifier walks the whole source chain — so the latch
+    // still trips (CodeRabbit) and the caller's context is preserved on the returned error.
+    #[tokio::test]
+    async fn context_wrapped_fatal_error_still_trips_degraded() {
+        use anyhow::Context;
+        let s = mem_store();
+        assert!(!s.is_degraded());
+
+        let err = s
+            .transaction(|_tx| {
+                Err::<(), _>(sqlite_failure(rusqlite::ffi::SQLITE_FULL))
+                    .context("writing a money row")
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            s.is_degraded(),
+            "a context-wrapped fatal sqlite error latches degraded via the source chain"
+        );
+        assert!(
+            err.to_string().contains("writing a money row"),
+            "caller context preserved on the returned error, got: {err}"
+        );
     }
 
     // A plain business `Err` and a constraint violation both leave the latch clear, so the store
