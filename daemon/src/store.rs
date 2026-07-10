@@ -9,6 +9,8 @@ use anyhow::{anyhow, Result};
 use rusqlite::{Connection, Transaction};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 // `pub(crate)` so the ledger `expected_msat` helper (lnrent-urw.10) reuses the SAME settle-refund
@@ -518,10 +520,97 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 /// in this actor all access still runs on one connection thread — §11), and run
 /// migrations up to the current `SCHEMA_VERSION`.
 pub fn open(path: impl AsRef<Path>) -> Result<Connection> {
+    let path = path.as_ref();
+    if let Ok(meta) = path.metadata() {
+        if meta.is_file() && meta.len() == 0 {
+            return Err(anyhow!(
+                "state DB file exists but is empty for {}; refusing to initialize a new database \
+                 over possible truncation/data loss (remove it only for a deliberate first run, or \
+                 restore from backup)",
+                path.display()
+            ));
+        }
+    }
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    // Integrity gate (lnrent-y4m.3): a corrupt/truncated state DB must fail startup LOUDLY here
+    // rather than surface as a late opaque error on the money path. `quick_check` is the cheap
+    // structural scan (it skips `integrity_check`'s expensive index-vs-table cross-check); it yields
+    // exactly one row `"ok"` on a healthy DB, or one-or-more error-description rows otherwise, so the
+    // first row alone is the verdict.
+    let verdict: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    if verdict != "ok" {
+        return Err(anyhow!(
+            "state DB integrity check failed for {}: {verdict}",
+            path.display()
+        ));
+    }
     migrate(&conn)?;
     Ok(conn)
+}
+
+/// Classify a `rusqlite::Error` as the fatal "can no longer durably write" family — disk-full,
+/// corruption, IO, or a read-only filesystem — the errors that mean the daemon must stop attempting
+/// money writes (lnrent-y4m.3). EVERYTHING else returns false: a `ConstraintViolation`, a
+/// `QueryReturnedNoRows`, a CAS miss, `SQLITE_BUSY`/`SQLITE_LOCKED` (transient contention), or any
+/// non-`SqliteFailure` error is an ordinary business outcome and must NOT latch the store degraded
+/// (that would take a healthy daemon offline).
+///
+/// NOTE: a fatal error raised INSIDE a `transaction()` closure is only classifiable if it reaches
+/// here as a real `rusqlite::Error` — money-write closures MUST propagate store errors with `?`
+/// (which preserves the concrete error via `anyhow`'s `From`), NOT stringify them with
+/// `.map_err(|e| anyhow!("…: {e}"))`, or the `downcast_ref` in `trip_if_fatal_anyhow` cannot see it.
+/// All current money closures use `?`; the commit itself would also fault on the same bad disk.
+///
+/// Variant names verified against libsqlite3-sys 0.28 (rusqlite 0.31): `SQLITE_FULL`→`DiskFull`,
+/// `SQLITE_CORRUPT`→`DatabaseCorrupt`, `SQLITE_NOTADB`→`NotADatabase`, `SQLITE_IOERR`→
+/// `SystemIoFailure` (the whole IOERR family maps to this one primary code), `SQLITE_READONLY`→
+/// `ReadOnly` (a disk remounted read-only after IO errors — a real "cannot write" degradation).
+fn is_fatal_db_error(e: &rusqlite::Error) -> bool {
+    match e {
+        rusqlite::Error::SqliteFailure(ffi_err, _) => matches!(
+            ffi_err.code,
+            rusqlite::ErrorCode::DiskFull
+                | rusqlite::ErrorCode::DatabaseCorrupt
+                | rusqlite::ErrorCode::NotADatabase
+                | rusqlite::ErrorCode::SystemIoFailure
+                | rusqlite::ErrorCode::ReadOnly
+        ),
+        _ => false,
+    }
+}
+
+/// Trip the latching degraded flag and log the transition prominently. The `tracing::error!` IS the
+/// operator's out-of-band signal: a store-backed alert cannot deliver once writes are refused (its
+/// own outbox enqueue is a `transaction()`), so the log line is the honest channel (lnrent-y4m.3).
+fn latch_degraded(degraded: &AtomicBool, err: impl std::fmt::Display) {
+    degraded.store(true, Ordering::Release);
+    tracing::error!(
+        db_error = %err,
+        "FATAL DB error on a money write: store LATCHED to degraded read-only mode. Money writes \
+         are now refused (reads/status still served). Restore the DB from backup and restart to clear."
+    );
+}
+
+/// Trip degraded if a `rusqlite::Error` surfaced by `conn.transaction()` / `txn.commit()` is fatal,
+/// then convert it to `anyhow` (as before). Non-fatal errors pass through untouched.
+fn trip_if_fatal_sqlite(degraded: &AtomicBool, e: rusqlite::Error) -> anyhow::Error {
+    if is_fatal_db_error(&e) {
+        latch_degraded(degraded, &e);
+    }
+    anyhow::Error::new(e)
+}
+
+/// Trip degraded if a fatal `rusqlite::Error` is hiding inside the `anyhow::Error` a write raised
+/// INSIDE the closure (`f(&txn)` yields `anyhow::Result`, so the concrete sqlite error arrives
+/// downcast-able). The original `anyhow` error is returned unchanged so caller context is preserved.
+fn trip_if_fatal_anyhow(degraded: &AtomicBool, e: anyhow::Error) -> anyhow::Error {
+    if let Some(sqlite_err) = e.downcast_ref::<rusqlite::Error>() {
+        if is_fatal_db_error(sqlite_err) {
+            latch_degraded(degraded, &e);
+        }
+    }
+    e
 }
 
 /// A unit of work the store actor runs on its `Connection`. Each job does its sqlite work
@@ -533,6 +622,13 @@ type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 #[derive(Clone)]
 pub struct Store {
     tx: mpsc::Sender<Job>,
+    /// Latching read-only guard (lnrent-y4m.3). Tripped once a fatal DB error (disk-full /
+    /// corruption / IO) is seen on a money commit; from then on `transaction()` refuses writes for
+    /// the process lifetime while `read()`/status keep serving. `#[derive(Clone)]` shares this `Arc`
+    /// across every handle, and the sole-writer actor closure is the only setter. Recovery is the
+    /// operator's restore-then-restart (a restart re-runs `open()`'s `quick_check`) — no auto-clear,
+    /// no background retry, no clear-degraded command, by design.
+    degraded: Arc<AtomicBool>,
 }
 
 impl Store {
@@ -546,12 +642,23 @@ impl Store {
                 job(&mut conn);
             }
         });
-        Store { tx }
+        Store {
+            tx,
+            degraded: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Open the DB (WAL + schema) and spawn the actor in one step.
     pub fn open_spawn(path: impl AsRef<Path>) -> Result<Store> {
         Ok(Store::spawn(open(path)?))
+    }
+
+    /// Whether the store has latched into degraded read-only mode after a fatal DB error
+    /// (disk-full / corruption / IO): money writes are being refused while reads/status still serve
+    /// (lnrent-y4m.3). Surfaced in the operator `Request::Money` readiness report so a status poll —
+    /// not just the daemon log — reveals it (an agent-native operator polls status, not journald).
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Acquire)
     }
 
     /// Run `f` inside ONE transaction: **commit** if it returns `Ok`, **roll back** if it
@@ -561,10 +668,29 @@ impl Store {
         F: FnOnce(&Transaction) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        // Latching read-only guard (lnrent-y4m.3): the store write choke point used by the money
+        // core (and maintenance writes). This closure runs serially on the sole-writer actor — the
+        // authoritative serialization point — so the load/store on `degraded` need no extra lock,
+        // and `read()` uses `run()` directly and stays un-gated so reads/status keep serving
+        // degraded.
+        let degraded = self.degraded.clone();
         self.run(move |conn| {
-            let txn = conn.transaction()?;
-            let out = f(&txn)?;
-            txn.commit()?;
+            // Refuse BEFORE opening a txn so a refused write cannot partially apply.
+            if degraded.load(Ordering::Acquire) {
+                return Err(anyhow!(
+                    "store is in degraded read-only mode after a fatal DB error; money writes are \
+                     refused — restore from backup and restart"
+                ));
+            }
+            // A fatal disk-full/corruption/IO error from ANY of the three sqlite steps trips the
+            // latch so no further money write is attempted against a DB we cannot durably write; a
+            // business `Err` (CAS miss, constraint, no-rows) propagates WITHOUT tripping. On the
+            // fatal path the txn is never committed (aborted here or dropped), so atomicity holds.
+            let txn = conn
+                .transaction()
+                .map_err(|e| trip_if_fatal_sqlite(&degraded, e))?;
+            let out = f(&txn).map_err(|e| trip_if_fatal_anyhow(&degraded, e))?;
+            txn.commit().map_err(|e| trip_if_fatal_sqlite(&degraded, e))?;
             Ok(out)
         })
         .await
@@ -2322,5 +2448,232 @@ mod tests {
         assert_eq!(mode.to_lowercase(), "wal");
         drop(conn);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- lnrent-y4m.3: disk-full / corruption degraded-mode guard ----
+
+    /// Build a synthetic `SqliteFailure` for the given primary result code — no live DB needed, so
+    /// the classifier boundary can be tested against exact `ErrorCode`s (`ffi::Error::new` masks the
+    /// code down to its primary, so extended IOERR codes land on `SystemIoFailure` too).
+    fn sqlite_failure(code: i32) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), Some("synthetic".into()))
+    }
+
+    // The classifier fires ONLY for the disk-full / corruption / IO family — the errors that mean the
+    // DB can no longer be durably written. Business outcomes must never latch the store degraded.
+    #[test]
+    fn is_fatal_db_error_only_for_disk_corruption_io_family() {
+        use rusqlite::ffi;
+        // Fatal family: SQLITE_FULL / SQLITE_CORRUPT / SQLITE_NOTADB / SQLITE_IOERR, plus an extended
+        // IOERR code that masks down to the SQLITE_IOERR primary (-> SystemIoFailure).
+        for code in [
+            ffi::SQLITE_FULL,
+            ffi::SQLITE_CORRUPT,
+            ffi::SQLITE_NOTADB,
+            ffi::SQLITE_IOERR,
+            ffi::SQLITE_IOERR_WRITE,
+            ffi::SQLITE_READONLY,
+        ] {
+            assert!(
+                is_fatal_db_error(&sqlite_failure(code)),
+                "expected fatal for sqlite code {code}"
+            );
+        }
+        // NOT fatal: a constraint violation (UNIQUE/CAS miss) is a business error.
+        assert!(!is_fatal_db_error(&sqlite_failure(ffi::SQLITE_CONSTRAINT)));
+        // NOT fatal: transient contention (BUSY/LOCKED) must not latch a healthy daemon offline.
+        assert!(!is_fatal_db_error(&sqlite_failure(ffi::SQLITE_BUSY)));
+        assert!(!is_fatal_db_error(&sqlite_failure(ffi::SQLITE_LOCKED)));
+        // NOT fatal: non-`SqliteFailure` variants (a no-rows / empty-result outcome).
+        assert!(!is_fatal_db_error(&rusqlite::Error::QueryReturnedNoRows));
+        assert!(!is_fatal_db_error(&rusqlite::Error::ExecuteReturnedResults));
+    }
+
+    // A fatal DB error surfaced from INSIDE the closure trips the latch; the NEXT write is then
+    // refused with the distinctive degraded message WITHOUT running its closure, while reads still
+    // serve and the refused write leaves no partial state.
+    #[tokio::test]
+    async fn fatal_error_trips_degraded_and_refuses_subsequent_writes() {
+        let s = mem_store();
+        assert!(!s.is_degraded(), "healthy store is not degraded");
+
+        // Seed a row so we can prove reads still work while degraded.
+        s.transaction(|tx| {
+            tx.execute("INSERT INTO recipe (id, version) VALUES ('r1', '1')", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // A write whose closure raises a fatal SqliteFailure as an anyhow error — the shape a real
+        // in-closure disk-full write produces (`f(&txn)` yields `anyhow::Result`).
+        let err = s
+            .transaction(|_tx| -> Result<()> {
+                Err(anyhow::Error::new(sqlite_failure(rusqlite::ffi::SQLITE_FULL)))
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<rusqlite::Error>().is_some(),
+            "original concrete error preserved through the classifier"
+        );
+        assert!(
+            s.degraded.load(Ordering::Acquire),
+            "latch tripped by the fatal error"
+        );
+        assert!(s.is_degraded(), "public is_degraded() reflects the tripped latch");
+
+        // A subsequent write is refused with the distinctive message WITHOUT running its closure.
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_probe = ran.clone();
+        let refused = s
+            .transaction(move |tx| {
+                ran_probe.store(true, Ordering::SeqCst);
+                tx.execute("INSERT INTO recipe (id, version) VALUES ('r2', '1')", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("degraded read-only mode"),
+            "distinctive degraded message, got: {refused}"
+        );
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a refused write must not run its closure"
+        );
+
+        // Reads/status still serve while degraded, and the refused write applied nothing.
+        assert_eq!(count(&s, "SELECT count(*) FROM recipe").await, 1);
+    }
+
+    // A plain business `Err` and a constraint violation both leave the latch clear, so the store
+    // stays writable. Tripping degraded on these would take a healthy daemon offline.
+    #[tokio::test]
+    async fn business_error_does_not_trip_degraded() {
+        let s = mem_store();
+
+        // A closure returning a plain business error rolls back and does NOT trip.
+        let res: Result<()> = s
+            .transaction(|tx| {
+                tx.execute("INSERT INTO recipe (id, version) VALUES ('r1', '1')", [])?;
+                Err(anyhow!("business rule violated"))
+            })
+            .await;
+        assert!(res.is_err());
+        assert!(
+            !s.degraded.load(Ordering::Acquire),
+            "a business error must not latch degraded"
+        );
+
+        // A PRIMARY-KEY constraint violation is likewise a business error, not fatal.
+        s.transaction(|tx| {
+            tx.execute("INSERT INTO recipe (id, version) VALUES ('dup', '1')", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let dup: Result<()> = s
+            .transaction(|tx| {
+                tx.execute("INSERT INTO recipe (id, version) VALUES ('dup', '2')", [])?;
+                Ok(())
+            })
+            .await;
+        assert!(dup.is_err(), "duplicate PK must error");
+        assert!(
+            !s.degraded.load(Ordering::Acquire),
+            "a constraint violation must not latch degraded"
+        );
+
+        // The store is still writable: a fresh write commits ('dup' + 'r2' == 2 rows).
+        s.transaction(|tx| {
+            tx.execute("INSERT INTO recipe (id, version) VALUES ('r2', '1')", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(count(&s, "SELECT count(*) FROM recipe").await, 2);
+    }
+
+    // `open()`'s startup gate: a healthy freshly-created file DB passes; an existing zero-byte DB
+    // and a file with a corrupt interior data page both fail startup LOUDLY instead of silently
+    // becoming empty state or surfacing as a late opaque runtime failure.
+    #[tokio::test]
+    async fn open_quick_check_gate() {
+        let dir = std::env::temp_dir();
+        let uniq = std::process::id();
+        let rm_all = |p: &std::path::Path| {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(p.with_extension("sqlite-wal"));
+            let _ = std::fs::remove_file(p.with_extension("sqlite-shm"));
+        };
+
+        // Healthy path: a fresh file DB opens and its quick_check verdict is exactly "ok".
+        let healthy = dir.join(format!("lnrent-qc-ok-{uniq}.sqlite"));
+        rm_all(&healthy);
+        let conn = open(&healthy).unwrap();
+        let verdict: String = conn
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(verdict, "ok");
+        drop(conn);
+        // Reopening the (now populated) healthy WAL DB still passes the gate.
+        assert!(open(&healthy).is_ok());
+        rm_all(&healthy);
+
+        // Existing zero-byte DB path: SQLite would initialize this as a brand-new empty database
+        // before quick_check, so refuse it before `Connection::open` while still allowing the
+        // missing-file first-run path above.
+        let empty = dir.join(format!("lnrent-qc-empty-{uniq}.sqlite"));
+        rm_all(&empty);
+        std::fs::File::create(&empty).unwrap();
+        let err = open(&empty).unwrap_err();
+        assert!(
+            err.to_string().contains("exists but is empty"),
+            "expected empty-file startup refusal, got: {err}"
+        );
+        rm_all(&empty);
+
+        // Corrupt path: build a valid DB with enough rows to span several pages, checkpoint so all
+        // data lives in the main file, then overwrite an interior data page with garbage.
+        let corrupt = dir.join(format!("lnrent-qc-bad-{uniq}.sqlite"));
+        rm_all(&corrupt);
+        let conn = open(&corrupt).unwrap();
+        for i in 0..64 {
+            conn.execute(
+                "INSERT INTO recipe (id, version, manifest_json) VALUES (?1, '1', ?2)",
+                rusqlite::params![format!("id-{i}"), "x".repeat(256)],
+            )
+            .unwrap();
+        }
+        let page_size: i64 = conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        drop(conn);
+        // Drop the WAL/shm sidecars so the reopen reads the (corrupt) main file directly.
+        let _ = std::fs::remove_file(corrupt.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(corrupt.with_extension("sqlite-shm"));
+
+        // Overwrite page 2 (the first data page; page 1 holds header + schema) so the header still
+        // identifies a database (the journal_mode pragma works) but a b-tree page is malformed —
+        // quick_check catches it.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&corrupt)
+                .unwrap();
+            f.seek(SeekFrom::Start(page_size as u64)).unwrap();
+            f.write_all(&vec![0xFF; page_size as usize]).unwrap();
+            f.flush().unwrap();
+        }
+
+        let err = open(&corrupt).unwrap_err();
+        assert!(
+            err.to_string().contains("integrity check failed"),
+            "expected structured integrity error, got: {err}"
+        );
+        rm_all(&corrupt);
     }
 }
