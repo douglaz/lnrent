@@ -307,7 +307,7 @@ impl Sweeper {
     /// No writes. `sweep_invalid` on a zero-amount/unparseable bolt11; `sweep_unpriceable` if the
     /// gateway cannot price the outlay.
     pub async fn quote(&self, bolt11: &str) -> Result<QuoteView, SweepError> {
-        let (_hash, amount_sat) = parse_sweep_invoice(bolt11)?;
+        let (_hash, amount_sat) = parse_sweep_invoice(bolt11, self.clock.now())?;
         let outlay_msat = self.quote_outlay(amount_sat).await?;
         let surplus = self
             .store
@@ -330,10 +330,21 @@ impl Sweeper {
     /// surplus (`sweep_insufficient`), else write the durable PENDING intent (+ journal). Only then
     /// pay, capped at the quoted outlay; success → SENT, a cap refusal (fee rose) → FAILED.
     pub async fn execute(&self, bolt11: &str) -> Result<ExecOutcome, SweepError> {
-        let (payment_hash, amount_sat) = parse_sweep_invoice(bolt11)?;
+        let (payment_hash, amount_sat) = parse_sweep_invoice(bolt11, self.clock.now())?;
         let id = format!("sweep:{payment_hash}");
         let outlay_msat = self.quote_outlay(amount_sat).await?;
         let now = self.clock.now();
+
+        // Refuse a value that cannot round-trip through the i64 ledger columns BEFORE writing intent
+        // (coderabbit): `amount_sat`/`max_outlay_msat` persist as i64, so a clamp (`unwrap_or(MAX)`)
+        // or truncating cast would under-record the committed cap and let later reads subtract too
+        // little. Unreachable for any real invoice (> total BTC supply), but a money value must refuse
+        // an out-of-range conversion, not silently narrow it.
+        if i64::try_from(amount_sat).is_err() || i64::try_from(outlay_msat).is_err() {
+            return Err(SweepError::Invalid(
+                "invoice amount or outlay exceeds the ledger's representable range".to_string(),
+            ));
+        }
 
         match self
             .gate_and_write(&id, bolt11, &payment_hash, amount_sat, outlay_msat, now)
@@ -490,7 +501,12 @@ impl Sweeper {
         outlay_msat: u128,
         now: i64,
     ) -> Result<GateDecision> {
-        let outlay_i64 = i64::try_from(outlay_msat).unwrap_or(i64::MAX);
+        // `execute` already refused an out-of-range value; convert (never clamp) so a future caller
+        // cannot silently under-record the cap.
+        let outlay_i64 = i64::try_from(outlay_msat)
+            .map_err(|_| anyhow::anyhow!("outlay {outlay_msat} msat exceeds the i64 ledger range"))?;
+        let amount_i64 = i64::try_from(amount_sat)
+            .map_err(|_| anyhow::anyhow!("amount {amount_sat} sat exceeds the i64 ledger range"))?;
         let (id_s, bolt11_s, hash_s) = (id.to_string(), bolt11.to_string(), payment_hash.to_string());
         self.store
             .transaction(move |tx| {
@@ -547,7 +563,7 @@ impl Sweeper {
                         max_outlay_msat=excluded.max_outlay_msat, status='PENDING', attempts=0,
                         backend_payment_id=NULL, last_error=NULL, created_at=excluded.created_at,
                         sent_at=NULL",
-                    params![id_s, bolt11_s, amount_sat as i64, outlay_i64, now],
+                    params![id_s, bolt11_s, amount_i64, outlay_i64, now],
                 )?;
                 journal_sweep(
                     tx,
@@ -739,7 +755,7 @@ struct PendingSweep {
 
 /// Parse the operator's sweep invoice: `(payment_hash, amount_sat)`. A parse failure, an amountless
 /// invoice, a sub-sat amount, or an explicit zero amount is `sweep_invalid` — none is payable.
-fn parse_sweep_invoice(bolt11: &str) -> Result<(String, u64), SweepError> {
+fn parse_sweep_invoice(bolt11: &str, now: i64) -> Result<(String, u64), SweepError> {
     let inv = Bolt11Invoice::from_str(bolt11)
         .map_err(|e| SweepError::Invalid(format!("bolt11 parse error: {e}")))?;
     let payment_hash = inv.payment_hash().to_string();
@@ -747,6 +763,15 @@ fn parse_sweep_invoice(bolt11: &str) -> Result<(String, u64), SweepError> {
     if amount_sat == 0 {
         return Err(SweepError::Invalid(
             "zero-amount invoice; a sweep needs an amount".to_string(),
+        ));
+    }
+    // Reject an already-expired invoice UP FRONT (against the daemon clock, not wall time) so it
+    // never passes the surplus gate and writes a doomed PENDING intent — whose cap would block the
+    // one-in-flight slot until it terminalizes, and which a no-validation backend could even record
+    // SENT (codex). Checked here at the single parse point for both quote and execute.
+    if inv.would_expire(std::time::Duration::from_secs(u64::try_from(now).unwrap_or(0))) {
+        return Err(SweepError::Invalid(
+            "invoice has expired; re-issue a fresh one".to_string(),
         ));
     }
     Ok((payment_hash, amount_sat))
@@ -1271,6 +1296,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 0, "a refused sweep writes no sweep_attempt row");
+    }
+
+    #[tokio::test]
+    async fn expired_invoice_is_rejected_up_front_before_intent() {
+        let store = mem_store();
+        let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
+        let s = sweeper(&store, payment); // clock now = 1_000
+
+        // Minted at ts=100, expiry 10s -> expired at 110, well before the daemon clock's now=1_000.
+        let expired = mint_bolt11(50_000 * 1000, META, 100, 10);
+        assert_eq!(
+            s.quote(&expired).await.unwrap_err().code(),
+            "sweep_invalid",
+            "quote refuses an expired invoice"
+        );
+        let err = s.execute(&expired).await.unwrap_err();
+        assert_eq!(err.code(), "sweep_invalid", "execute refuses before writing intent");
+        let n: i64 = store
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM sweep_attempt", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "no doomed PENDING row is written for an expired invoice");
     }
 
     #[tokio::test]
