@@ -32,6 +32,9 @@ pub mod resume;
 pub mod runner;
 pub mod store;
 pub mod supervisor;
+/// Operator sweep (gate1-operator-sweep, urw.3): a daemon-safe payout paying the operator's own
+/// bolt11 from ledger SURPLUS (never a federation balance read), capped so it can never overspend.
+pub mod sweep;
 /// Orphaned-instance teardown dead-letter (lnrent-urw.2): surfaces + retries a failed `destroy` hook
 /// so a droplet that failed to delete stops billing the operator invisibly.
 pub mod teardown;

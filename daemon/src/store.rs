@@ -251,6 +251,19 @@ CREATE TABLE IF NOT EXISTS teardown_failure (  -- orphaned-instance dead-letter 
   resolved_at     INTEGER            -- NULL = still open (provider-side cleanup owed)
 );
 CREATE INDEX IF NOT EXISTS teardown_failure_open_idx ON teardown_failure(resolved_at);
+
+CREATE TABLE IF NOT EXISTS sweep_attempt (  -- durable operator-sweep ledger (gate1-operator-sweep, urw.3)
+  id                 TEXT PRIMARY KEY,   -- sweep:<payment_hash> (== the outbound pay key; unique per invoice)
+  bolt11             TEXT,               -- the operator's own invoice being paid
+  amount_sat         INTEGER,            -- the invoice's own whole-sat amount
+  max_outlay_msat    INTEGER NOT NULL,   -- the QUOTED outlay cap; subtracted from ledger surplus AND expected_msat while PENDING/SENT
+  status             TEXT NOT NULL,      -- PENDING (durable intent; re-drive pay(key) safely on restart) | SENT | FAILED
+  attempts           INTEGER NOT NULL DEFAULT 0,
+  backend_payment_id TEXT,               -- from pay_capped(), once known
+  last_error         TEXT,
+  created_at         INTEGER,
+  sent_at            INTEGER
+);
 "#;
 
 /// Migration 2 (lnrent-7fp.5): the transport-level inbound-DM dedup table. The Nostr engine
@@ -333,6 +346,25 @@ CREATE TABLE IF NOT EXISTS teardown_failure (
 CREATE INDEX IF NOT EXISTS teardown_failure_open_idx ON teardown_failure(resolved_at);
 ";
 
+// gate1-operator-sweep (urw.3): the operator-sweep ledger table. A NEW table, so
+// `CREATE TABLE IF NOT EXISTS` is inherently idempotent — a fresh DB creates it from the §11 SCHEMA
+// above and this migration is a no-op; a legacy DB gets the table here (mirrors M7_TEARDOWN_FAILURE).
+// No duplicate-column dance. Appended — never edit a shipped migration.
+const M8_SWEEP_ATTEMPT: &str = "
+CREATE TABLE IF NOT EXISTS sweep_attempt (
+  id                 TEXT PRIMARY KEY,
+  bolt11             TEXT,
+  amount_sat         INTEGER,
+  max_outlay_msat    INTEGER NOT NULL,
+  status             TEXT NOT NULL,
+  attempts           INTEGER NOT NULL DEFAULT 0,
+  backend_payment_id TEXT,
+  last_error         TEXT,
+  created_at         INTEGER,
+  sent_at            INTEGER
+);
+";
+
 /// Ordered migrations (lnrent-7fp.3): index `i` upgrades the DB from schema version `i` to
 /// `i+1`. Version 1 is the §11 schema; version 2 adds `seen_message` (lnrent-7fp.5); version 3 adds
 /// `subscription.suspend_not_before` (lnrent-7fp.22); version 4 adds the `refund_attempt` resolver
@@ -347,6 +379,7 @@ const MIGRATIONS: &[&str] = &[
     M5_IDEMPOTENCY_CACHE_INDEXES,
     M6_EVENT_LOG_INDEXES,
     M7_TEARDOWN_FAILURE,
+    M8_SWEEP_ATTEMPT,
 ];
 
 /// The target schema version this binary expects (= number of migrations).
@@ -774,8 +807,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // 15 §11 tables + `teardown_failure` (lnrent-urw.2). `seen_message` is migration-only (M2).
-        assert_eq!(n, 16);
+        // 15 §11 tables + `teardown_failure` (lnrent-urw.2) + `sweep_attempt` (gate1-operator-sweep,
+        // urw.3). `seen_message` is migration-only (M2).
+        assert_eq!(n, 17);
     }
 
     #[test]
@@ -794,8 +828,9 @@ mod tests {
             )
             .unwrap();
         // The §11 schema (15 tables) plus `seen_message` (migration 2, lnrent-7fp.5) plus
-        // `teardown_failure` (SCHEMA + migration 7, lnrent-urw.2).
-        assert_eq!(n, 17);
+        // `teardown_failure` (SCHEMA + migration 7, lnrent-urw.2) plus `sweep_attempt` (SCHEMA +
+        // migration 8, gate1-operator-sweep, urw.3).
+        assert_eq!(n, 18);
     }
 
     // M6: the maintenance pass scans event_log every few seconds on the sole-writer connection;

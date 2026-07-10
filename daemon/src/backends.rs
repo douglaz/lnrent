@@ -79,6 +79,23 @@ pub trait PaymentBackend: Send + Sync {
         let _ = gross_sat; // the default backend charges no fee; the cap is the caller's quote
         self.pay(bolt11, amount_sat, idempotency_key).await
     }
+    /// Idempotent OUTLAY-capped pay for the operator sweep (gate1-operator-sweep, urw.3). Like
+    /// [`pay_refund_capped`](Self::pay_refund_capped) it re-awaits an existing `SUCCEEDED`/`PENDING`
+    /// operation for `idempotency_key`, but a NEW operation MUST refuse to start if
+    /// `amount_sat*1000 + fee(amount_sat*1000) > max_outlay_msat` — the just-quoted outlay ceiling, so
+    /// a gateway fee that rose between the quote and the send refuses rather than overspends. Default:
+    /// delegate to `pay` — mock/internal backends charge no fee, so `amount_sat*1000 == max_outlay_msat`
+    /// and the cap always holds.
+    async fn pay_capped(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        max_outlay_msat: u128,
+        idempotency_key: &str,
+    ) -> Result<String> {
+        let _ = max_outlay_msat; // the default backend charges no fee; the caller's quote is the cap
+        self.pay(bolt11, amount_sat, idempotency_key).await
+    }
     /// Status of an outbound payment by its backend id (ADR-0009 refund ledger).
     async fn payment_status(&self, payment_id: &str) -> Result<PayStatus>;
     /// Check an in-flight refund by its idempotency key after a crash (SPEC §6.6). An

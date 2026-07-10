@@ -261,6 +261,9 @@ pub struct FedimintPayment {
     /// can't both mint a gateway invoice (the loser would otherwise be stranded — absent from the
     /// index, never watched). Async so it can be held across the mint `.await` (codex P1).
     create_lock: tokio::sync::Mutex<()>,
+    /// Serializes outbound pay check->start->index so two concurrent same-key callers cannot both see
+    /// an absent pay-index row before either has inserted the PENDING operation.
+    pay_start_lock: tokio::sync::Mutex<()>,
 }
 
 impl FedimintPayment {
@@ -340,6 +343,7 @@ impl FedimintPayment {
             clock,
             gateway,
             create_lock: tokio::sync::Mutex::new(()),
+            pay_start_lock: tokio::sync::Mutex::new(()),
         };
 
         // Backfill any invoice fedimint committed but the daemon never indexed (the crash window
@@ -472,45 +476,65 @@ impl FedimintPayment {
     /// Park a structurally-invalid refund (bad / zero / mismatched bolt11) as a FAILED key row (no
     /// real operation) so `payment_status_by_key` reports Failed and the Refunder parks it rather
     /// than retrying a bad destination forever (codex P2).
-    async fn fail_pay_preflight(&self, key: &str, msg: String) -> Result<String> {
+    async fn fail_pay_preflight<T>(&self, key: &str, msg: String) -> Result<T> {
         pay_idx_upsert(&self.index, key, "(preflight-failed)", "FAILED", "ln")?;
         anyhow::bail!(msg)
     }
 
-    /// The shared refund-pay engine behind [`PaymentBackend::pay`] and
-    /// [`PaymentBackend::pay_refund_capped`]. Idempotent on the key (SUCCEEDED never re-pays; PENDING
-    /// re-awaits the SAME operation; FAILED/absent starts fresh). When `gross_cap` is `Some(received)`
-    /// it enforces the final INV-1 cap against the SAME gateway object used to start the payment, so a
-    /// NEW outbound op whose payout + advertised fee exceeds the received gross is refused before any
-    /// money moves (spec §3.1). `None` (the plain `pay`) skips the cap.
+    /// The shared refund/sweep-pay engine behind [`PaymentBackend::pay`],
+    /// [`PaymentBackend::pay_refund_capped`], and [`PaymentBackend::pay_capped`]. Idempotent on the key
+    /// (SUCCEEDED never re-pays; PENDING re-awaits the SAME operation; FAILED/absent starts fresh).
+    /// `cap` sets the pre-send ceiling enforced against the SAME gateway object used to start the
+    /// payment, so a NEW outbound op whose payout + advertised fee exceeds the ceiling is refused
+    /// before any money moves: [`PayCap::Gross`] is the INV-1 refund cap (payout + fee ≤ received
+    /// gross, spec §3.1); [`PayCap::Outlay`] is the operator-sweep quote cap (payout + fee ≤ the quoted
+    /// `max_outlay_msat`); [`PayCap::None`] (the plain `pay`) skips the cap.
     async fn pay_inner(
         &self,
         dest: &str,
         amount_sat: u64,
         idempotency_key: &str,
-        gross_cap: Option<u64>,
+        cap: PayCap,
     ) -> Result<String> {
-        // Idempotent on the key: a SUCCEEDED key never re-pays; a PENDING key re-awaits the SAME
-        // operation (a crash mid-pay resumes — fedimint persists the op); a FAILED key (the prior LN
-        // attempt was refunded back to us, so no funds left) or an absent key initiates a fresh
-        // attempt. fedimint additionally dedups per invoice payment-hash internally.
-        if let Some((op_hex, status, kind)) = pay_idx_get(&self.index, idempotency_key)? {
-            match status.as_str() {
-                "SUCCEEDED" => return Ok(op_hex),
-                "PENDING" => {
-                    let op = OperationId::from_str(&op_hex)
-                        .map_err(|e| anyhow!("invalid stored pay operation id: {e}"))?;
-                    let pt = if kind == "internal" {
-                        PayType::Internal(op)
-                    } else {
-                        PayType::Lightning(op)
-                    };
-                    return self.await_pay_bounded(pt, idempotency_key).await;
+        let payment_type = {
+            // Idempotent on the key: serialize check->start->index so concurrent same-key callers cannot
+            // both observe "absent" before either inserts the PENDING operation. The guard is released
+            // before awaiting terminal settlement so unrelated pays do not wait behind a long HTLC.
+            let _pay_guard = self.pay_start_lock.lock().await;
+            if let Some((op_hex, status, kind)) = pay_idx_get(&self.index, idempotency_key)? {
+                match status.as_str() {
+                    "SUCCEEDED" => return Ok(op_hex),
+                    "PENDING" => {
+                        let op = OperationId::from_str(&op_hex)
+                            .map_err(|e| anyhow!("invalid stored pay operation id: {e}"))?;
+                        if kind == "internal" {
+                            PayType::Internal(op)
+                        } else {
+                            PayType::Lightning(op)
+                        }
+                    }
+                    _ => {
+                        // FAILED -> re-attempt below (the prior payment refunded; not a double-pay).
+                        self.start_new_pay(dest, amount_sat, idempotency_key, cap)
+                            .await?
+                    }
                 }
-                _ => {} // FAILED -> re-attempt below (the prior payment refunded; not a double-pay)
+            } else {
+                self.start_new_pay(dest, amount_sat, idempotency_key, cap)
+                    .await?
             }
-        }
+        };
 
+        self.await_pay_bounded(payment_type, idempotency_key).await
+    }
+
+    async fn start_new_pay(
+        &self,
+        dest: &str,
+        amount_sat: u64,
+        idempotency_key: &str,
+        cap: PayCap,
+    ) -> Result<PayType> {
         // Structural preflight failures (bad bolt11, no amount, amount mismatch) happen before any
         // operation exists. Park them as a FAILED key row so payment_status_by_key reports Failed and
         // the Refunder parks the refund for an operator rather than retrying a bad dest forever
@@ -562,12 +586,13 @@ impl FedimintPayment {
             .await
             .context("selecting the configured lightning gateway for the refund")?
             .context("the configured (or any) lightning gateway is unavailable")?;
-        // Final INV-1 cap preflight (spec §3.1): quoting and paying are separate awaits, so re-check
-        // the cap here against the SAME gateway object we pass into pay_bolt11_invoice — refuse to
-        // START a new outbound op whose payout + advertised fee would exceed the received gross. The
-        // fee MUST be Fedimint's ACTUAL fee ([`gateway_fee_msat`], mirroring RoutingFees::to_amount),
-        // not the naive floor(x*ppm/1e6) — see that helper. All msat arithmetic is widened to u128.
-        if let Some(gross_sat) = gross_cap {
+        // Final cap preflight (spec §3.1 / gate1-operator-sweep): quoting and paying are separate
+        // awaits, so re-check the cap here against the SAME gateway object we pass into
+        // pay_bolt11_invoice — refuse to START a new outbound op whose payout + advertised fee would
+        // exceed the ceiling (received gross for INV-1 refunds; the quoted outlay for a sweep). The fee
+        // MUST be Fedimint's ACTUAL fee ([`gateway_fee_msat`], mirroring RoutingFees::to_amount), not
+        // the naive floor(x*ppm/1e6) — see that helper. All msat arithmetic is widened to u128.
+        if let Some(ceiling_msat) = cap.ceiling_msat() {
             let fees = gateway.fees;
             let pay_msat_u128 = u128::from(pay_msat);
             let over_cap = match gateway_fee_msat(
@@ -575,18 +600,12 @@ impl FedimintPayment {
                 u64::from(fees.proportional_millionths),
                 pay_msat_u128,
             ) {
-                Some(fee_msat) => pay_msat_u128 + fee_msat > u128::from(gross_sat) * 1000,
-                None => true, // an unpayable (>100%) schedule: never start an over-gross op
+                Some(fee_msat) => pay_msat_u128 + fee_msat > ceiling_msat,
+                None => true, // an unpayable (>100%) schedule: never start an over-cap op
             };
             if over_cap {
                 return self
-                    .fail_pay_preflight(
-                        idempotency_key,
-                        format!(
-                            "refund payout {amount_sat} sat + gateway fee exceeds the {gross_sat} sat \
-                             received (INV-1 cap)"
-                        ),
-                    )
+                    .fail_pay_preflight(idempotency_key, cap.over_cap_message(amount_sat))
                     .await;
             }
         }
@@ -610,8 +629,48 @@ impl FedimintPayment {
         // recover_index_from_oplog) backfills the row from the oplog extra_meta so the next pay(key)
         // re-awaits the OP directly rather than re-parsing the maybe-expired bolt11 (lnrent-4gt).
         pay_idx_upsert(&self.index, idempotency_key, &op_hex, "PENDING", kind)?;
-        self.await_pay_bounded(outgoing.payment_type, idempotency_key)
-            .await
+        Ok(outgoing.payment_type)
+    }
+}
+
+/// The pre-send outlay ceiling [`FedimintPayment::pay_inner`] enforces before starting a NEW
+/// outbound op (quoting and paying are separate awaits, so a fee rise between them must refuse, not
+/// overspend). All three variants share the SAME `payout_msat + gateway_fee_msat > ceiling` check;
+/// only the ceiling and the operator-facing message differ.
+#[derive(Clone, Copy)]
+enum PayCap {
+    /// No cap — the plain `pay` (legacy/internal callers): pay the requested amount.
+    None,
+    /// INV-1 refund cap (spec §3.1): refuse if payout + fee exceeds the received gross (`gross_sat*1000`).
+    Gross(u64),
+    /// Operator-sweep outlay cap (gate1-operator-sweep, urw.3): refuse if payout + fee exceeds the
+    /// just-quoted `max_outlay_msat`.
+    Outlay(u128),
+}
+
+impl PayCap {
+    /// The ceiling in msats, or `None` for the uncapped plain `pay`.
+    fn ceiling_msat(&self) -> Option<u128> {
+        match *self {
+            PayCap::None => None,
+            PayCap::Gross(gross_sat) => Some(u128::from(gross_sat) * 1000),
+            PayCap::Outlay(max_outlay_msat) => Some(max_outlay_msat),
+        }
+    }
+
+    /// The operator-facing preflight-refusal message for an over-cap payout.
+    fn over_cap_message(&self, amount_sat: u64) -> String {
+        match *self {
+            PayCap::None => String::new(),
+            PayCap::Gross(gross_sat) => format!(
+                "refund payout {amount_sat} sat + gateway fee exceeds the {gross_sat} sat \
+                 received (INV-1 cap)"
+            ),
+            PayCap::Outlay(max_outlay_msat) => format!(
+                "sweep payout {amount_sat} sat + gateway fee exceeds the quoted {max_outlay_msat} \
+                 msat outlay cap"
+            ),
+        }
     }
 }
 
@@ -721,9 +780,9 @@ impl PaymentBackend for FedimintPayment {
 
     async fn pay(&self, dest: &str, amount_sat: u64, idempotency_key: &str) -> Result<String> {
         // No gross context here (legacy/internal callers): pay the requested amount with the standard
-        // key idempotency and NO INV-1 cap. The Refunder uses pay_refund_capped when it knows the
-        // gross, so the cap is enforced on the money path (spec §3.1).
-        self.pay_inner(dest, amount_sat, idempotency_key, None)
+        // key idempotency and NO cap. The Refunder uses pay_refund_capped and the Sweeper uses
+        // pay_capped when they know the ceiling, so the cap is enforced on the money path (spec §3.1).
+        self.pay_inner(dest, amount_sat, idempotency_key, PayCap::None)
             .await
     }
 
@@ -793,8 +852,26 @@ impl PaymentBackend for FedimintPayment {
         gross_sat: u64,
         idempotency_key: &str,
     ) -> Result<String> {
-        self.pay_inner(bolt11, amount_sat, idempotency_key, Some(gross_sat))
+        self.pay_inner(bolt11, amount_sat, idempotency_key, PayCap::Gross(gross_sat))
             .await
+    }
+
+    async fn pay_capped(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        max_outlay_msat: u128,
+        idempotency_key: &str,
+    ) -> Result<String> {
+        // The operator sweep passes the just-quoted outlay as the ceiling: a fee that rose since the
+        // quote makes payout+fee exceed it, so the preflight refuses rather than overspends (urw.3).
+        self.pay_inner(
+            bolt11,
+            amount_sat,
+            idempotency_key,
+            PayCap::Outlay(max_outlay_msat),
+        )
+        .await
     }
 
     async fn payment_status(&self, payment_id: &str) -> Result<PayStatus> {

@@ -8,7 +8,7 @@
 //!
 //! Design points that are load-bearing:
 //! - [`AlertKind`] is a CLOSED enum. New kinds are added only by the owning bead (PR-6
-//!   `TeardownFailed`, PR-9c `RelayBlackout`, PR-16 `HoldingsLow`, gate1-operator-sweep
+//!   `TeardownFailed`, PR-9c `RelayBlackout`, PR-16 `HoldingsLow`, gate1-operator-sweep (urw.3)
 //!   `SweepFailed`, PR-21 `PaidServiceDestroyed`). There is deliberately no `BalanceQueryFailed`: the ledger-authoritative
 //!   revision (ADR-0016) retires the automatic balance read, so nothing is left to fail.
 //! - **Edge-triggered** with a per-`(kind, subject)` cooldown ([`ALERT_COOLDOWN_S`]), held in an
@@ -97,6 +97,9 @@ pub enum AlertKind {
     /// A retention `destroy` raced a renewal settlement and tore down a box the buyer just paid for
     /// (wired by PR-21). The subscription stays alive; a refund for the un-provided period follows.
     PaidServiceDestroyed,
+    /// An operator sweep was parked FAILED (a gateway-fee rise refused the capped pay, or a
+    /// crash-recovered intent was superseded by a new liability) — gate1-operator-sweep (urw.3).
+    SweepFailed,
 }
 
 impl AlertKind {
@@ -109,6 +112,7 @@ impl AlertKind {
             AlertKind::RelayBlackout => "relay_blackout",
             AlertKind::HoldingsLow => "holdings_low",
             AlertKind::PaidServiceDestroyed => "paid_service_destroyed",
+            AlertKind::SweepFailed => "sweep_failed",
         }
     }
 }

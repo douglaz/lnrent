@@ -52,6 +52,16 @@ enum Cmd {
     /// resolver + capped-pay path. The only refund actuator — there is no cancel/abandon.
     #[command(name = "refund-retry")]
     RefundRetry { id: String },
+    /// Sweep operator profit to your own bolt11 from ledger SURPLUS (sales − reserves − payouts),
+    /// capped so it can never overspend. Quotes by default (prints the surplus breakdown + verdict);
+    /// pays only with --yes. Authorized from the ledger only — the federation balance is never read.
+    Sweep {
+        /// The operator's own bolt11 invoice to pay (must carry an amount).
+        bolt11: String,
+        /// Execute the sweep (default is a dry-run quote only).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Admin: force-suspend a subscription.
     Suspend { id: String },
     /// Admin: force-resume a suspended subscription.
@@ -74,7 +84,12 @@ enum DevCmd {
 fn exit_for(err_code: &str) -> ExitCode {
     match err_code {
         "not_found" => ExitCode::from(2),
-        "bad_request" | "invalid_state" | "dev_disabled" | "unsupported" => ExitCode::from(3),
+        // Request-level refusals the operator can act on, incl. the structured sweep refusals
+        // (gate1-operator-sweep, urw.3): a bad/zero invoice, an unpriceable quote, another sweep in
+        // flight, an insufficient surplus, a fee rise past the quote, or an in-flight-unconfirmed pay.
+        "bad_request" | "invalid_state" | "dev_disabled" | "unsupported" | "sweep_invalid"
+        | "sweep_unpriceable" | "sweep_busy" | "sweep_insufficient" | "sweep_fee_rose"
+        | "sweep_in_flight" => ExitCode::from(3),
         "internal" => ExitCode::from(5),
         _ => ExitCode::from(1),
     }
@@ -88,11 +103,18 @@ enum HumanRender {
     Teardowns,
     Refunds,
     Relays,
+    Sweep,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    let sock = format!("{}/lnrent.sock", cli.data_dir);
+    // `sweep` is quote-then-confirm: it makes TWO IPC calls (a dry-run quote, then execute on --yes),
+    // so it doesn't fit the single request->reply flow below (gate1-operator-sweep, urw.3).
+    if let Cmd::Sweep { bolt11, yes } = &cli.cmd {
+        return run_sweep(&sock, bolt11.clone(), *yes, cli.json).await;
+    }
     let (req, human_render) = match cli.cmd {
         Cmd::Status => (Request::Status, HumanRender::Generic),
         Cmd::Recipes => (Request::Recipes, HumanRender::Generic),
@@ -109,8 +131,9 @@ async fn main() -> ExitCode {
         Cmd::Dev {
             cmd: DevCmd::Settle { subscription_id },
         } => (Request::DevSettle { subscription_id }, HumanRender::Generic),
+        // Handled by the quote-then-confirm early return above.
+        Cmd::Sweep { .. } => unreachable!("sweep is dispatched before this match"),
     };
-    let sock = format!("{}/lnrent.sock", cli.data_dir);
 
     match ipc::call(&sock, req).await {
         Ok(reply) => render(reply, cli.json, human_render),
@@ -150,6 +173,7 @@ fn render(reply: Reply, as_json: bool, human_render: HumanRender) -> ExitCode {
                 HumanRender::Teardowns => render_teardowns_human(&v),
                 HumanRender::Refunds => render_refunds_human(&v),
                 HumanRender::Relays => render_relays_human(&v),
+                HumanRender::Sweep => render_sweep_human(&v),
             },
         }
     } else if let Some(err) = &reply.error {
@@ -296,6 +320,86 @@ fn render_refunds_human(v: &serde_json::Value) {
             n("attempts").unwrap_or(0),
             n("age_s").unwrap_or(0),
         );
+    }
+}
+
+/// The `lnrent sweep <bolt11> [--yes]` quote-then-confirm flow (gate1-operator-sweep, urw.3): render
+/// the dry-run quote first, then execute ONLY on `--yes`. Money never moves without `--yes`. In JSON
+/// EXECUTION (`--json --yes`) the OK quote is SUPPRESSED so stdout carries EXACTLY ONE authoritative
+/// envelope — the execute result — never a stale `ok:true` quote ahead of a failed execute.
+async fn run_sweep(sock: &str, bolt11: String, yes: bool, as_json: bool) -> ExitCode {
+    // 1. Dry-run quote (surplus breakdown + verdict).
+    let quote = match ipc::call(sock, Request::SweepQuote { bolt11: bolt11.clone() }).await {
+        Ok(r) => r,
+        Err(e) => return ipc_unreachable(sock, e, as_json),
+    };
+    let quote_ok = quote.ok;
+    // A machine caller of `--json --yes` parses stdout as THE command result, so it must see one
+    // envelope. Rendering the OK quote too would leave a stale `ok:true` on stdout even when the
+    // execute below then fails (surplus changed, another sweep raced in, the capped pay refused) — the
+    // caller would read a failed sweep as success. Suppress the advisory quote there; the execute arm
+    // re-validates, re-prices, and re-gates, so its single reply is authoritative. A quote that ITSELF
+    // failed (invalid/unpriceable) IS the one envelope — surface it and stop before executing.
+    let suppress_quote = as_json && yes && quote_ok;
+    if !suppress_quote {
+        let quote_code = render(quote, as_json, HumanRender::Sweep);
+        if !quote_ok {
+            return quote_code;
+        }
+        if !yes {
+            if !as_json {
+                println!("\nDry run only — re-run with --yes to execute the sweep.");
+            }
+            return ExitCode::SUCCESS;
+        }
+    }
+
+    // 2. Execute (only on --yes) — the single authoritative envelope in JSON mode.
+    match ipc::call(sock, Request::Sweep { bolt11 }).await {
+        Ok(reply) => render(reply, as_json, HumanRender::Sweep),
+        Err(e) => ipc_unreachable(sock, e, as_json),
+    }
+}
+
+/// The daemon-unreachable failure (exit 4): a structured, deterministic error to stderr so `--json`
+/// stdout stays clean. Shared by the sweep flow and mirrors `main`'s inline handling.
+fn ipc_unreachable(sock: &str, e: impl std::fmt::Display, as_json: bool) -> ExitCode {
+    if as_json {
+        eprintln!(
+            "{}",
+            serde_json::json!({"ok": false, "error": {"code": "ipc", "message": e.to_string(), "retryable": true}})
+        );
+    } else {
+        eprintln!("lnrent: cannot reach lnrentd at {sock}: {e}");
+    }
+    ExitCode::from(4)
+}
+
+/// Human render for `lnrent sweep` (gate1-operator-sweep): the dry-run quote (surplus breakdown +
+/// ALLOW/REFUSE verdict) OR the execute result (SENT / cached), detected by the reply's fields.
+fn render_sweep_human(v: &serde_json::Value) {
+    let msat = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let amount = v.get("amount_sat").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    if let Some(verdict) = v.get("verdict").and_then(serde_json::Value::as_str) {
+        // Quote breakdown.
+        println!("Sweep quote: {amount} sat (outlay {} msat)", msat("outlay_msat"));
+        println!("  Earned:   {} msat", msat("earned_msat"));
+        println!("  Reserved: {} msat", msat("reserved_msat"));
+        println!("  Paid out: {} msat", msat("paid_out_msat"));
+        println!("  Surplus:  {} msat", msat("surplus_msat"));
+        match verdict {
+            "ALLOW" => println!("Verdict: \x1b[1mALLOW\x1b[0m (surplus covers the sweep)"),
+            other => println!("Verdict: \x1b[1m{other}\x1b[0m (surplus does not cover the sweep)"),
+        }
+    } else {
+        // Execute result.
+        let status = v.get("status").and_then(serde_json::Value::as_str).unwrap_or("?");
+        let cached = v.get("cached").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        if cached {
+            println!("Sweep already completed: {amount} sat (\x1b[1m{status}\x1b[0m).");
+        } else {
+            println!("Sweep \x1b[1m{status}\x1b[0m: {amount} sat.");
+        }
     }
 }
 

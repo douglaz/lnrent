@@ -90,8 +90,10 @@ fn read_ledger_terms(conn: &Connection) -> Result<LedgerReads> {
 }
 
 /// Σ gross of every captured receipt, de-duped by external payment id across BOTH INV-3 provenance
-/// classes and counted ONCE each. Returns msats (`gross_sat * 1000`).
-fn sum_receipts_msat(conn: &Connection) -> Result<u128> {
+/// classes and counted ONCE each. Returns msats (`gross_sat * 1000`). `pub(crate)`: the operator
+/// sweep (gate1-operator-sweep, urw.3) reuses the IDENTICAL receipt base for its surplus `earned`
+/// term, so the sweep can never authorize against a different receipt provenance than `expected_msat`.
+pub(crate) fn sum_receipts_msat(conn: &Connection) -> Result<u128> {
     // Class A — settled invoice rows. `invoice.external_id` is UNIQUE, so no intra-class dup.
     let mut gross_by_ext: HashMap<String, u64> = HashMap::new();
     let mut stmt = conn.prepare(
@@ -195,8 +197,9 @@ fn sum_sweep_caps_msat(conn: &Connection) -> Result<u128> {
 }
 
 /// A whole-sat amount only if strictly positive — a NULL or non-positive receipt/refund contributes
-/// nothing, and skipping it only lowers the bound (conservative).
-fn positive_sat(amount: Option<i64>) -> Option<u64> {
+/// nothing, and skipping it only lowers the bound (conservative). `pub(crate)`: the sweep surplus
+/// (urw.3) filters its reserved/paid-out amounts with the SAME positivity rule.
+pub(crate) fn positive_sat(amount: Option<i64>) -> Option<u64> {
     match amount {
         Some(a) if a > 0 => Some(a as u64),
         _ => None,
@@ -390,9 +393,10 @@ mod tests {
                 [],
             )
             .unwrap();
-            // urw.3 owns this table; a test creates it locally to prove the forward-complete read.
+            // urw.3 now owns this table in the base SCHEMA (bolt11/amount_sat nullable); IF NOT EXISTS
+            // keeps this forward-compat setup a harmless no-op against the real table.
             c.execute_batch(
-                "CREATE TABLE sweep_attempt (
+                "CREATE TABLE IF NOT EXISTS sweep_attempt (
                    id TEXT PRIMARY KEY, status TEXT NOT NULL, max_outlay_msat INTEGER NOT NULL
                  );",
             )
