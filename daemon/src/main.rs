@@ -107,6 +107,13 @@ struct BackupArgs {
     /// dir.
     #[arg(long)]
     dest: PathBuf,
+    /// OPTIONAL: encrypt the sensitive set (seed + ecash + state DB) under the passphrase read from
+    /// this FILE (a single trailing newline is trimmed), producing `dest/backup.age` beside a
+    /// plaintext `MANIFEST.json` instead of the flat plaintext files (lnrent-y4m.6). A path — NOT the
+    /// passphrase itself — so it never lands in the process table (`ps`). Absent → today's plaintext
+    /// backup.
+    #[arg(long)]
+    passphrase_file: Option<PathBuf>,
     /// Emit the machine-readable JSON summary / error instead of human text.
     #[arg(long)]
     json: bool,
@@ -129,6 +136,13 @@ struct RestoreArgs {
     /// Overwrite a non-empty target data dir (default: refuse, to avoid clobbering live state).
     #[arg(long)]
     force: bool,
+    /// The passphrase FILE for an ENCRYPTED backup (`backup --passphrase-file`), read the same way (a
+    /// single trailing newline trimmed) — required when the backup's `MANIFEST.json` says `encrypted`
+    /// (lnrent-y4m.6). A path — NOT the passphrase itself. Absent on an encrypted backup → a clear
+    /// error; supplied for a manifest claiming plaintext → a downgrade-safety error rather than being
+    /// silently ignored.
+    #[arg(long)]
+    passphrase_file: Option<PathBuf>,
     /// Emit the machine-readable JSON summary / error instead of human text.
     #[arg(long)]
     json: bool,
@@ -582,9 +596,34 @@ fn resolve_data_dir_arg(
     ))
 }
 
+/// Read the backup passphrase from `path` into a zeroizing buffer, trimming a SINGLE trailing newline
+/// (`\n`, or a `\r\n` pair). Passing a FILE (not the passphrase) keeps the secret off argv, where `ps`
+/// would expose it; the buffer is a [`Zeroizing<String>`] so it wipes on drop and is never logged. An
+/// empty passphrase (empty file, or a file holding only the newline) is refused — age would accept it
+/// but it offers ZERO protection for the fund-controlling seed the encrypted mode exists to protect,
+/// so it is almost always an operator mistake (lnrent-y4m.6).
+fn read_passphrase_file(path: &std::path::Path) -> Result<Zeroizing<String>> {
+    let raw = Zeroizing::new(
+        std::fs::read_to_string(path)
+            .with_context(|| format!("reading passphrase file {}", path.display()))?,
+    );
+    let trimmed = raw
+        .strip_suffix('\n')
+        .map(|s| s.strip_suffix('\r').unwrap_or(s))
+        .unwrap_or(raw.as_str());
+    if trimmed.trim().is_empty() {
+        anyhow::bail!(
+            "passphrase file {} is empty or whitespace-only; that gives no protection",
+            path.display()
+        );
+    }
+    Ok(Zeroizing::new(trimmed.to_owned()))
+}
+
 /// The headless `lnrentd backup` entrypoint (lnrent-7fp.14): COLD-copy the stopped daemon's durable
-/// state into a fresh dir. Refuses if a daemon's IPC socket is live (cold/offline only). Emits a
-/// structured `{ok, data|error}` summary; deterministic exit (0 success, nonzero on error).
+/// state into a fresh dir. Refuses if a daemon's IPC socket is live (cold/offline only). With
+/// `--passphrase-file` the sensitive set is age-encrypted into `dest/backup.age` (lnrent-y4m.6). Emits
+/// a structured `{ok, data|error}` summary; deterministic exit (0 success, nonzero on error).
 fn run_backup(args: BackupArgs) -> ExitCode {
     let json = args.json;
     let data_dir = match resolve_data_dir_arg(args.data_dir, args.config) {
@@ -592,6 +631,16 @@ fn run_backup(args: BackupArgs) -> ExitCode {
         Err(e) => {
             return emit_op_error(json, "config_error", format!("{} ({})", e.message, e.code))
         }
+    };
+    // The OPTIONAL passphrase — read from a file so it never hits argv. Absent -> plaintext mode.
+    let passphrase = match args
+        .passphrase_file
+        .as_deref()
+        .map(read_passphrase_file)
+        .transpose()
+    {
+        Ok(pw) => pw,
+        Err(e) => return emit_op_error(json, "passphrase_error", format!("{e:#}")),
     };
     // Cold/offline only: a live IPC socket means a daemon is writing this data dir RIGHT NOW, so a
     // copy of the open stores could be torn. Refuse rather than capture an inconsistent backup.
@@ -607,7 +656,7 @@ fn run_backup(args: BackupArgs) -> ExitCode {
             ),
         );
     }
-    match backup::backup(&data_dir, &args.dest) {
+    match backup::backup(&data_dir, &args.dest, passphrase) {
         Ok(m) => {
             if json {
                 println!(
@@ -617,6 +666,7 @@ fn run_backup(args: BackupArgs) -> ExitCode {
                         "data": {
                             "data_dir": data_dir.display().to_string(),
                             "dest": args.dest.display().to_string(),
+                            "encrypted": m.encrypted,
                             "state_db": m.state_db,
                             "fedimint_dir": m.fedimint_dir,
                             "fedimint_config": m.fedimint_config,
@@ -631,6 +681,7 @@ fn run_backup(args: BackupArgs) -> ExitCode {
                     data_dir.display(),
                     args.dest.display()
                 );
+                println!("  encrypted:       {}", yes_no(m.encrypted));
                 println!("  state db:        yes");
                 println!("  fedimint dir:    {}", yes_no(m.fedimint_dir));
                 println!("  fedimint config: {}", yes_no(m.fedimint_config));
@@ -656,6 +707,17 @@ fn run_restore(args: RestoreArgs) -> ExitCode {
             return emit_op_error(json, "config_error", format!("{} ({})", e.message, e.code))
         }
     };
+    // The OPTIONAL passphrase for an ENCRYPTED backup — read from a file (never argv). Absent here and
+    // an encrypted manifest -> `restore` bails with a clear "pass --passphrase-file" error.
+    let passphrase = match args
+        .passphrase_file
+        .as_deref()
+        .map(read_passphrase_file)
+        .transpose()
+    {
+        Ok(pw) => pw,
+        Err(e) => return emit_op_error(json, "passphrase_error", format!("{e:#}")),
+    };
     // A live daemon on the TARGET would race the restore (and then run on half-overwritten state);
     // refuse the same way backup does.
     if backup::daemon_appears_running(&data_dir) {
@@ -670,7 +732,7 @@ fn run_restore(args: RestoreArgs) -> ExitCode {
             ),
         );
     }
-    match backup::restore(&args.from, &data_dir, args.force) {
+    match backup::restore(&args.from, &data_dir, args.force, passphrase) {
         Ok(m) => {
             if json {
                 println!(
@@ -680,6 +742,7 @@ fn run_restore(args: RestoreArgs) -> ExitCode {
                         "data": {
                             "from": args.from.display().to_string(),
                             "data_dir": data_dir.display().to_string(),
+                            "encrypted": m.encrypted,
                             "state_db": m.state_db,
                             "fedimint_dir": m.fedimint_dir,
                             "fedimint_config": m.fedimint_config,
@@ -694,6 +757,7 @@ fn run_restore(args: RestoreArgs) -> ExitCode {
                     args.from.display(),
                     data_dir.display()
                 );
+                println!("  encrypted:       {}", yes_no(m.encrypted));
                 println!("  state db:        yes");
                 println!("  fedimint dir:    {}", yes_no(m.fedimint_dir));
                 println!("  fedimint config: {}", yes_no(m.fedimint_config));

@@ -296,8 +296,9 @@ async fn fedimint_backup_restore_preserves_ecash_live() {
         .expect("create a stub state DB so backup() has one to capture");
     let dest = std::env::temp_dir().join(format!("lnrent-fedimint-bk-dest-{pid}"));
     let restored = std::env::temp_dir().join(format!("lnrent-fedimint-bk-restored-{pid}"));
-    lnrentd::backup::backup(&data_dir, &dest).expect("cold backup of the stopped data dir");
-    lnrentd::backup::restore(&dest, &restored, false).expect("restore into a fresh data dir");
+    lnrentd::backup::backup(&data_dir, &dest, None).expect("cold backup of the stopped data dir");
+    lnrentd::backup::restore(&dest, &restored, false, None)
+        .expect("restore into a fresh data dir");
 
     // --- reopen on the RESTORED dir: prior pay status survives + the ecash is still SPENDABLE -------
     let backend2 =
