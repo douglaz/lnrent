@@ -145,6 +145,9 @@ pub struct Supervisor {
     /// Shared relay-liveness snapshot: the maintenance loop refreshes it each tick from the engine
     /// pool, the IPC `Request::Relays`/`Status` paths read it (lnrent-urw.6).
     relays: RelayStatusCell,
+    /// Draining-holdings warning floor in msats (lnrent-urw.7, spec §D): `0` DISABLES it; below a
+    /// positive floor the maintenance loop dispatches a liability-independent `HoldingsLow` alert.
+    min_holdings_warn_msat: u128,
     sock_path: PathBuf,
     intervals: Intervals,
     /// Optional hook to keep a mock payment backend's internal clock in step with `clock` (M1a only;
@@ -248,6 +251,9 @@ impl Supervisor {
             reconciler,
             alerts,
             relays: RelayStatusCell::new(),
+            // Default: DISABLED (0). `main` opts in via `with_holdings_floor` from the operator config
+            // (lnrent-urw.7); existing `build` callers keep the 10-arg signature unchanged.
+            min_holdings_warn_msat: 0,
             sock_path,
             intervals,
             payment_clock_sync: None,
@@ -260,6 +266,17 @@ impl Supervisor {
     /// each maintenance tick (see [`Supervisor::start`] / [`maintenance_pass`]).
     pub fn with_payment_clock_sync(mut self, sync: impl Fn(i64) + Send + Sync + 'static) -> Self {
         self.payment_clock_sync = Some(Arc::new(sync));
+        self
+    }
+
+    /// Set the draining-holdings warning floor in msats (lnrent-urw.7, spec §D; ADR-0016). `main`
+    /// supplies `operator.config.min_holdings_warn_msat`; `0` (the [`Supervisor::build`] default)
+    /// DISABLES the warning. Below a positive floor, the maintenance loop dispatches one liability-
+    /// independent `HoldingsLow` alert per 6h (the dispatcher cooldown is the edge-trigger). Added as
+    /// a builder — mirroring [`with_payment_clock_sync`](Self::with_payment_clock_sync) — so `build`'s
+    /// signature stays fixed for existing callers.
+    pub fn with_holdings_floor(mut self, min_holdings_warn_msat: u128) -> Self {
+        self.min_holdings_warn_msat = min_holdings_warn_msat;
         self
     }
 
@@ -604,6 +621,9 @@ impl Supervisor {
                 self.alerts.clone(),
                 self.relays.clone(),
             );
+            // Copy (u128 is `Copy`) so it can be moved into both the spawn closure and its per-restart
+            // re-capture below without a clone dance (lnrent-urw.7).
+            let holdings_floor = self.min_holdings_warn_msat;
             let interval = self.intervals.maintenance;
             tasks.push(tokio::spawn(supervise(
                 "maintenance",
@@ -650,6 +670,7 @@ impl Supervisor {
                             sync,
                             alerts,
                             relays,
+                            holdings_floor,
                             interval,
                             nudge2,
                             sd,
@@ -1116,6 +1137,7 @@ async fn run_maintenance_loop(
     sync: Option<Arc<dyn Fn(i64) + Send + Sync>>,
     alerts: Arc<AlertDispatcher>,
     relays: RelayStatusCell,
+    holdings_floor: u128,
     interval: Duration,
     nudge: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
@@ -1146,6 +1168,7 @@ async fn run_maintenance_loop(
             &alerts,
             &relays,
             &mut blackout,
+            holdings_floor,
             run_catch_up,
         )
         .await;
@@ -1173,6 +1196,7 @@ async fn maintenance_pass(
     alerts: &Arc<AlertDispatcher>,
     relays: &RelayStatusCell,
     blackout: &mut RelayBlackoutMonitor,
+    holdings_floor: u128,
     run_catch_up: bool,
 ) {
     // Keep a mock payment backend's clock in step with ours so freshly-issued invoices stamp a live
@@ -1205,6 +1229,10 @@ async fn maintenance_pass(
     log_refund_readiness(store, payment).await;
     let relay_rows = engine.relay_status_snapshot().await;
     refresh_relay_status(relay_rows, relays, blackout, alerts, clock.now()).await;
+    // Liability-INDEPENDENT draining-holdings warning (lnrent-urw.7): fires even when nothing is owed,
+    // unlike `log_refund_readiness` above (which stays silent at zero liabilities). No edge-trigger
+    // state — the dispatcher's per-(kind, subject) 6h cooldown collapses the per-tick re-detection.
+    check_holdings_floor(store, payment, alerts, holdings_floor, clock.now()).await;
     if let Err(e) = outbox.drain_once(engine).await {
         tracing::error!(error = %format!("{e:#}"), "maintenance: outbox drain failed");
     }
@@ -1256,6 +1284,68 @@ async fn refresh_relay_status(
         }
     }
     relays.set(rows);
+}
+
+/// Liability-INDEPENDENT draining-holdings warning (lnrent-urw.7, spec §D; ADR-0016 principle). Warns
+/// the operator whose float is draining toward zero EVEN WHEN NOTHING is currently owed — the case
+/// refund readiness (`log_refund_readiness`) deliberately stays silent on, because it is
+/// liability-gated. The operand is the ledger's conservative lower bound `ledger::expected_msat`, a
+/// PURE LOCAL read (the sqlite ledger + local pay index) that makes NO federation balance call — the
+/// panic-stubs in the tests assert exactly that.
+///
+/// `floor == 0` DISABLES the check (the operator opts in with a floor matching their float). Below a
+/// positive floor, each maintenance tick dispatches ONE `HoldingsLow` alert; the dispatcher's
+/// per-`(kind, subject)` 6h cooldown IS the edge-trigger, so no separate onset monitor is needed
+/// (unlike the relay blackout). Best-effort throughout: a ledger-read or dispatch error is logged and
+/// never fails the maintenance tick. `now` is accepted for call-shape parity with the sibling
+/// maintenance helpers, but the cooldown/edge-trigger clock is owned by the dispatcher, so it is
+/// unused here.
+async fn check_holdings_floor(
+    store: &Store,
+    payment: &Arc<dyn PaymentBackend>,
+    alerts: &Arc<AlertDispatcher>,
+    floor: u128,
+    _now: i64,
+) {
+    if floor == 0 {
+        return; // disabled — the operator has not opted in
+    }
+    let expected_msat = match crate::ledger::expected_msat(store, payment).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "maintenance: holdings-floor check failed");
+            return;
+        }
+    };
+    if expected_msat >= floor {
+        return;
+    }
+    tracing::warn!(
+        expected_msat = %expected_msat,
+        floor_msat = %floor,
+        "holdings LOW: ledger-expected holdings ({expected_msat} msat) are below the configured books \
+         floor ({floor} msat). This is a BOOKS figure (net ledger receipts − refunds − sweeps), NOT \
+         the wallet balance — directly-seeded ecash is not counted. Liability-independent (fires even \
+         with nothing owed). Run `lnrent reconcile` to compare the books against the live wallet."
+    );
+    let detail = format!(
+        "ledger-expected holdings {expected_msat} msat are below the configured books floor {floor} \
+         msat. This is a books figure (net ledger receipts − refunds − sweeps), NOT the wallet \
+         balance — directly-seeded ecash is not counted, and no automatic path reads the federation \
+         balance (ADR-0016). Liability-independent: fires even with nothing owed. Use `lnrent \
+         reconcile` to check the books against the live wallet."
+    );
+    // Best-effort — the dispatcher's cooldown collapses per-tick repeats to one alert per 6h; a
+    // transient enqueue failure is logged and simply retries on the next tick (the condition persists).
+    if let Err(e) = alerts
+        .dispatch(Alert::new(AlertKind::HoldingsLow, "holdings", detail))
+        .await
+    {
+        tracing::warn!(
+            error = %format!("{e:#}"),
+            "failed to enqueue HoldingsLow alert; will retry next tick"
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2366,6 +2456,225 @@ mod tests {
             blackout_rows(&store).await,
             2,
             "the next onset re-alerts (distinct onset subject dodges the per-subject cooldown)"
+        );
+    }
+
+    // ===== lnrent-urw.7: draining-holdings floor (check_holdings_floor) ============================
+
+    /// Count persisted `HoldingsLow` operator.alert outbox rows (the durable evidence the warning
+    /// fired; delivery over Nostr is out of scope for these tests).
+    async fn holdings_low_rows(store: &Store) -> i64 {
+        store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT count(*) FROM outbox WHERE msg_type='operator.alert'
+                       AND payload_json LIKE '%holdings_low%'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// An ENABLED dispatcher on a fixed `TestClock(0)`: two dispatches at the same clock stay inside
+    /// the 6h cooldown, so the second is suppressed — exactly the per-tick collapse the floor relies on.
+    fn enabled_alerts(store: &Store) -> Arc<AlertDispatcher> {
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(0));
+        Arc::new(AlertDispatcher::new(
+            store.clone(),
+            clock,
+            Keys::generate().public_key().to_hex(),
+        ))
+    }
+
+    // floor == 0 DISABLES the check: it never alerts, even at expected_msat == 0. The panic-on-balance
+    // double confirms the disabled path also never reads the wallet (it returns before the ledger read).
+    #[tokio::test]
+    async fn holdings_floor_zero_never_alerts() {
+        let store = mem_store();
+        let payment = readiness_payment(true); // available_balance_msat PANICS
+        let alerts = enabled_alerts(&store);
+
+        check_holdings_floor(&store, &payment, &alerts, 0, 0).await;
+
+        assert_eq!(holdings_low_rows(&store).await, 0, "floor 0 is disabled — no alert");
+    }
+
+    // A positive floor above the ledger-expected holdings fires ONE HoldingsLow — even with ZERO refund
+    // liabilities (the float-independence the readiness path lacks). Re-running within the 6h window is
+    // collapsed by the dispatcher cooldown (the edge-trigger), so exactly one row persists per onset.
+    #[tokio::test]
+    async fn holdings_floor_fires_once_per_onset_at_zero_liability() {
+        let store = mem_store(); // empty ledger: expected_msat == 0, and ZERO refund liabilities
+        let payment = readiness_payment(true);
+        let alerts = enabled_alerts(&store);
+
+        check_holdings_floor(&store, &payment, &alerts, 1_000, 0).await;
+        check_holdings_floor(&store, &payment, &alerts, 1_000, 60).await; // same 6h window
+
+        assert_eq!(
+            holdings_low_rows(&store).await,
+            1,
+            "fires at zero liabilities; the cooldown collapses per-tick repeats to one"
+        );
+    }
+
+    // The floor check reads ONLY the local ledger — never the federation balance. `ReadinessPayment`'s
+    // `available_balance_msat` PANICS, so the check running to completion (and firing) proves it.
+    #[tokio::test]
+    async fn holdings_floor_makes_no_backend_balance_call() {
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "PROVISIONING").await;
+        // A 5-sat receipt ⇒ expected_msat == 5_000, with the floor set above it.
+        seed_invoice(&store, "sub-1", "extA", "order", 5, "PAID", Some(10), Some(10)).await;
+        let payment = readiness_payment(true); // available_balance_msat PANICS
+        let alerts = enabled_alerts(&store);
+
+        check_holdings_floor(&store, &payment, &alerts, 10_000, 0).await;
+
+        assert_eq!(
+            holdings_low_rows(&store).await,
+            1,
+            "fires from the LOCAL ledger without ever reading the federation balance"
+        );
+    }
+
+    // A started-but-PENDING refund commits funds out of the float, pulling expected_msat below the
+    // floor even though the SAME receipts would clear it. This exercises the started-evidence path
+    // (`payment_started_by_key`) that `expected_msat` uses — steered on the double.
+    #[tokio::test]
+    async fn holdings_floor_fires_when_started_pending_refund_drains_below_floor() {
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "PROVISIONING").await;
+        // Receipts 5_000 msat; floor 2_000 sits BELOW them, so without the drain it would NOT fire.
+        seed_invoice(&store, "sub-1", "extA", "order", 5, "PAID", Some(10), Some(10)).await;
+        // A gen-0 PENDING refund of 4 sat with started evidence commits 4_000 out ⇒ expected 1_000.
+        seed_refund_attempt(&store, "sub-1", "extR", 4, "PENDING", None, 0).await;
+        let payment = Arc::new(ReadinessPayment::new(true));
+        payment.set_started(&crate::refund::gen_key("extR", 0)); // "refund:extR" ⇒ committed
+        let payment: Arc<dyn PaymentBackend> = payment;
+        let alerts = enabled_alerts(&store);
+
+        check_holdings_floor(&store, &payment, &alerts, 2_000, 0).await;
+
+        assert_eq!(
+            holdings_low_rows(&store).await,
+            1,
+            "the started refund pulled expected (1_000) below the floor (2_000)"
+        );
+    }
+
+    /// A `MockPayment`-backed double whose `available_balance_msat` PANICS — the e2e proves the real
+    /// Supervisor computes the holdings floor from the LOCAL ledger and never reads the federation
+    /// balance. Every other call delegates to the inner mock so the full money path still runs.
+    struct PanicBalanceMock(Arc<crate::backends::MockPayment>);
+
+    #[async_trait]
+    impl PaymentBackend for PanicBalanceMock {
+        async fn create_invoice(
+            &self,
+            amount_sat: u64,
+            memo: &str,
+            expiry_secs: u32,
+            external_id: &str,
+        ) -> Result<Invoice> {
+            self.0
+                .create_invoice(amount_sat, memo, expiry_secs, external_id)
+                .await
+        }
+        async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
+            self.0.lookup(id).await
+        }
+        async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            self.0.lookup_settlement(id).await
+        }
+        async fn pay(&self, dest: &str, amount_sat: u64, key: &str) -> Result<String> {
+            self.0.pay(dest, amount_sat, key).await
+        }
+        async fn payment_status(&self, id: &str) -> Result<PayStatus> {
+            self.0.payment_status(id).await
+        }
+        async fn payment_status_by_key(&self, key: &str) -> Result<PayStatus> {
+            self.0.payment_status_by_key(key).await
+        }
+        async fn available_balance_msat(&self) -> Result<Option<u64>> {
+            panic!("the holdings floor must be computed from the LOCAL ledger, never a balance read")
+        }
+        async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+            self.0.watch().await
+        }
+    }
+
+    // e2e: drive a REAL Supervisor (build -> with_holdings_floor -> start) over the actual maintenance
+    // loop wiring, with a positive floor above the (empty) ledger, and assert the persisted HoldingsLow
+    // outbox row — NOT relay delivery. The panic-on-balance backend proves no federation balance read.
+    #[tokio::test]
+    async fn holdings_floor_e2e_persists_alert_via_real_supervisor() {
+        let relay = mock_relay().await;
+        let url = relay.url().await.to_string();
+        let store = Store::open_spawn(":memory:").expect("open in-memory store");
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let engine =
+            NostrEngine::connect(Keys::generate(), std::slice::from_ref(&url), store.clone())
+                .await
+                .expect("operator engine connects");
+
+        // Empty ledger ⇒ expected_msat == 0, trivially below the positive floor. (The receipts-minus-
+        // started-refund DRAIN arithmetic is covered by the unit test above; here we exercise the
+        // build -> maintenance-loop -> check_holdings_floor -> dispatcher -> outbox WIRING end to end.)
+        let mock = Arc::new(crate::backends::MockPayment::new());
+        mock.set_now(clock.now());
+        let payment: Arc<dyn PaymentBackend> = Arc::new(PanicBalanceMock(mock));
+
+        let alerts = Arc::new(AlertDispatcher::new(
+            store.clone(),
+            clock.clone(),
+            Keys::generate().public_key().to_hex(),
+        ));
+
+        let recipe = Recipe::load(format!("{}/../recipes/dummy", env!("CARGO_MANIFEST_DIR")))
+            .expect("dummy recipe");
+        let sock = std::env::temp_dir().join(format!(
+            "lnrent-urw7-e2e-{}-{}.sock",
+            std::process::id(),
+            clock.now(),
+        ));
+        let intervals = Intervals {
+            reconcile: Duration::from_secs(3600),
+            maintenance: Duration::from_millis(25),
+        };
+        let sup = Supervisor::build(
+            store.clone(),
+            engine,
+            payment,
+            clock,
+            Arc::new(crate::refund_resolver::PassThroughResolver) as Arc<dyn RefundResolver>,
+            alerts,
+            recipe,
+            sock,
+            intervals,
+            u32::MAX,
+        )
+        .await
+        .expect("build supervisor")
+        .with_holdings_floor(1_000); // above the empty ledger (0) ⇒ the maintenance loop must alert
+
+        let running = sup.start().await.expect("start supervisor");
+
+        let mut fired = false;
+        for _ in 0..200 {
+            if holdings_low_rows(&store).await >= 1 {
+                fired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        running.shutdown().await.expect("graceful shutdown");
+
+        assert!(
+            fired,
+            "the real Supervisor's maintenance loop persisted a HoldingsLow operator.alert row"
         );
     }
 
