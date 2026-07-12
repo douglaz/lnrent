@@ -79,6 +79,43 @@ pub trait PaymentBackend: Send + Sync {
         let _ = gross_sat; // the default backend charges no fee; the cap is the caller's quote
         self.pay(bolt11, amount_sat, idempotency_key).await
     }
+    /// The INV-1 fee-adjusted net cap for `gross_sat` PLUS an advisory hint identifying the gateway that
+    /// priced it (lnrent-y4m.18). With ordered gateway failover (lnrent-y4m.8) the quote and the pay
+    /// each select a gateway independently; a failover between them lets one gateway price a refund the
+    /// other pays, so a resolved invoice minted for the quoted gateway's net can fail the pay-side cap
+    /// preflight against a different gateway. `gateway_hint` lets the caller carry the QUOTE-time
+    /// gateway into [`pay_refund_capped_via`](Self::pay_refund_capped_via) so both use ONE decision.
+    ///
+    /// QUOTE/PAY-CONSISTENCY CONTRACT: `gateway_hint` is an OPAQUE, backend-specific gateway identity,
+    /// valid ONLY within the caller's current attempt (one Refunder drive); it is advisory and MUST
+    /// NEVER be persisted. It MUST NOT weaken the INV-1 cap: whatever gateway actually pays is the
+    /// gateway the cap preflight is enforced against, hint or no hint. Default: no failover concept, so
+    /// the quote is just [`refund_net_sat`](Self::refund_net_sat) with no hint.
+    async fn refund_quote(&self, gross_sat: u64) -> Result<RefundQuote> {
+        Ok(RefundQuote {
+            net_sat: self.refund_net_sat(gross_sat).await?,
+            gateway_hint: None,
+        })
+    }
+    /// Idempotent refund pay exactly like [`pay_refund_capped`](Self::pay_refund_capped), plus a
+    /// best-effort `gateway_hint` (lnrent-y4m.18): the opaque gateway identity a preceding
+    /// [`refund_quote`](Self::refund_quote) selected in the SAME attempt. The backend SHOULD prefer that
+    /// gateway so the quote and the pay use one decision, but MAY ignore it or fall back (e.g. the
+    /// hinted gateway is no longer reachable). The hint is advisory ONLY and MUST NOT weaken the INV-1
+    /// cap: the cap preflight is always enforced against the gateway that ACTUALLY pays. Default: ignore
+    /// the hint and delegate to `pay_refund_capped` (no gateway concept).
+    async fn pay_refund_capped_via(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        gross_sat: u64,
+        idempotency_key: &str,
+        gateway_hint: Option<&str>,
+    ) -> Result<String> {
+        let _ = gateway_hint; // the default backend has no gateway to prefer; ignore it
+        self.pay_refund_capped(bolt11, amount_sat, gross_sat, idempotency_key)
+            .await
+    }
     /// Idempotent OUTLAY-capped pay for the operator sweep (gate1-operator-sweep, urw.3). Like
     /// [`pay_refund_capped`](Self::pay_refund_capped) it re-awaits an existing `SUCCEEDED`/`PENDING`
     /// operation for `idempotency_key`, but a NEW operation MUST refuse to start if
@@ -141,6 +178,17 @@ pub struct Invoice {
     pub bolt11: String,
     pub amount_sat: u64,
     pub expires_at: i64, // bolt11 expiry (unix secs); the order reservation is released at this (§9.3)
+}
+
+/// A refund fee QUOTE (lnrent-y4m.18): the INV-1 fee-adjusted net cap PLUS an advisory hint naming the
+/// gateway that priced it. `gateway_hint` is an OPAQUE, backend-specific gateway identity carried
+/// through to [`PaymentBackend::pay_refund_capped_via`] within ONE attempt so the quote and the pay use
+/// one gateway decision under failover; it is `None` when the backend has no gateway concept and MUST
+/// NEVER be persisted. See [`PaymentBackend::refund_quote`] for the full quote/pay-consistency contract.
+#[derive(Debug, Clone)]
+pub struct RefundQuote {
+    pub net_sat: u64,
+    pub gateway_hint: Option<String>,
 }
 
 /// Status of one of OUR inbound invoices (receiving). SPEC.md §6.1.

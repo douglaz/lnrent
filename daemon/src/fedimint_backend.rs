@@ -26,6 +26,7 @@
 //!    `DerivableSecret` (`new_root`) under `StandardDoubleDerive`, so the position is recoverable.
 
 use std::fs;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -52,11 +53,12 @@ use fedimint_ln_client::{
     LightningOperationMetaVariant, LnPayState, LnReceiveState, PayType,
 };
 use fedimint_ln_common::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
+use fedimint_ln_common::LightningGateway;
 use fedimint_mint_client::MintClientInit;
 use fedimint_rocksdb::RocksDb;
 use fedimint_wallet_client::WalletClientInit;
 
-use crate::backends::{Invoice, PayStatus, PaymentBackend, PaymentStatus, Settlement};
+use crate::backends::{Invoice, PayStatus, PaymentBackend, PaymentStatus, RefundQuote, Settlement};
 use crate::clock::Clock;
 
 /// HKDF salt for wrapping lnrent's (provisional) 32-byte Fedimint root secret (`identity.rs`,
@@ -252,11 +254,18 @@ pub struct FedimintPayment {
     index: Arc<Mutex<Connection>>,
     settle_tx: Mutex<Option<mpsc::Sender<Settlement>>>,
     clock: Arc<dyn Clock>,
-    /// The operator-configured gateway pubkey (`config.fedimint.gateway`), HONORED for BOTH invoice
-    /// creation and refunds rather than a random pick (codex o6p). `None` selects any available gateway
-    /// (tests / unset). `get_gateway(Some(id), false)` fails CLOSED if that gateway is unavailable, so a
-    /// misconfigured/offline gateway errors rather than silently routing money through a different one.
-    gateway: Option<PublicKey>,
+    /// The operator-configured ORDERED gateway list (`[config.fedimint.gateway] ++
+    /// gateway_fallbacks`), HONORED for BOTH invoice creation and refunds rather than a random pick
+    /// (codex o6p). [`select_gateway`](Self::select_gateway) tries them IN ORDER and uses the first
+    /// one the federation still has REGISTERED, so a gateway leaving the federation no longer stops
+    /// receiving + refunds (lnrent-y4m.8 failover). NOTE this failover is registration-based, NOT an
+    /// active liveness probe: a primary that crashes but keeps a live registration is still selected
+    /// until that registration deregisters / its TTL lapses (a lag), at which point the next gateway
+    /// takes over — the fedimint-ln-client API exposes no cheaper per-selection liveness signal. An
+    /// EMPTY list selects any available gateway (tests / unset). When no configured gateway is
+    /// registered it fails CLOSED, so a total outage errors rather than silently routing money through
+    /// an unintended gateway.
+    gateways: Vec<PublicKey>,
     /// Serializes `create_invoice`'s check->mint->insert so two concurrent same-`external_id` callers
     /// can't both mint a gateway invoice (the loser would otherwise be stranded — absent from the
     /// index, never watched). Async so it can be held across the mint `.await` (codex P1).
@@ -267,11 +276,11 @@ pub struct FedimintPayment {
 }
 
 impl FedimintPayment {
-    /// Join (first run) or open (subsequent runs) the federation named by `invite_code`. The
-    /// fedimint client rocksdb + the lnrent index sqlite both live under
-    /// `data_dir/fedimint/<federation_id>/`. `root_secret` is lnrent's deterministic 32-byte seed
-    /// (`identity.rs`), wrapped as a fedimint `DerivableSecret` under `StandardDoubleDerive`. On
-    /// open it backfills the index from the fedimint oplog (crash-window recovery).
+    /// Back-compat single-gateway entry point (kept for the `#[ignore]`d live integration tests that
+    /// pin ONE gateway via `Option<&str>`): a `None` primary maps to an empty ordered list ("pick any
+    /// available gateway"), a `Some` primary to a one-element list. Delegates to
+    /// [`join_or_open_with_gateways`](Self::join_or_open_with_gateways), the ordered-failover
+    /// constructor `main.rs` uses (lnrent-y4m.8).
     pub async fn join_or_open(
         invite_code: &str,
         data_dir: &Path,
@@ -279,15 +288,38 @@ impl FedimintPayment {
         gateway: Option<&str>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
+        let gateways: Vec<String> = gateway.map(str::to_string).into_iter().collect();
+        Self::join_or_open_with_gateways(invite_code, data_dir, root_secret, &gateways, clock).await
+    }
+
+    /// Join (first run) or open (subsequent runs) the federation named by `invite_code`, honoring an
+    /// ORDERED gateway list with automatic failover (lnrent-y4m.8): invoice-create and refund/sweep-pay
+    /// try `gateways` IN ORDER and use the first REACHABLE one. An EMPTY list preserves the "pick any
+    /// available gateway" behavior (tests / unset). The fedimint client rocksdb + the lnrent index
+    /// sqlite both live under `data_dir/fedimint/<federation_id>/`. `root_secret` is lnrent's
+    /// deterministic 32-byte seed (`identity.rs`), wrapped as a fedimint `DerivableSecret` under
+    /// `StandardDoubleDerive`. On open it backfills the index from the fedimint oplog (crash-window
+    /// recovery).
+    pub async fn join_or_open_with_gateways(
+        invite_code: &str,
+        data_dir: &Path,
+        root_secret: &[u8; 32],
+        gateways: &[String],
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
         let invite: InviteCode = invite_code
             .parse()
             .context("parsing federation invite code")?;
-        // Parse the configured gateway pubkey now (fail FAST on a malformed value) — honored for both
-        // receive + refund below; None = any available gateway (tests / unset).
-        let gateway = gateway
-            .map(PublicKey::from_str)
-            .transpose()
-            .context("parsing the configured fedimint gateway pubkey (config.fedimint.gateway)")?;
+        // Parse each configured gateway pubkey now (fail FAST on a malformed value) — honored for both
+        // receive + refund below; an EMPTY list = any available gateway (tests / unset).
+        let gateways = gateways
+            .iter()
+            .map(|g| PublicKey::from_str(g))
+            .collect::<Result<Vec<_>, _>>()
+            .context(
+                "parsing the configured fedimint gateway pubkeys \
+                 (config.fedimint.gateway[_fallbacks])",
+            )?;
         let federation_id = invite.federation_id().to_string();
         let paths = prepare_fedimint_paths(data_dir, &federation_id)
             .context("preparing fedimint data paths")?;
@@ -341,7 +373,7 @@ impl FedimintPayment {
             index: Arc::new(Mutex::new(conn)),
             settle_tx: Mutex::new(None),
             clock,
-            gateway,
+            gateways,
             create_lock: tokio::sync::Mutex::new(()),
             pay_start_lock: tokio::sync::Mutex::new(()),
         };
@@ -396,6 +428,84 @@ impl FedimintPayment {
                 gateway_ok,
                 "fedimint gateway unreachable: cannot create invoices or pay refunds"
             );
+        }
+    }
+
+    /// Select the outbound lightning gateway for invoice-create and refund/sweep-pay, honoring the
+    /// operator's ORDERED gateway list with automatic failover (lnrent-y4m.8). The thin LIVE wrapper
+    /// around the pure [`select_first_reachable`] decision helper: it supplies the real
+    /// `|pk| ln.get_gateway(Some(pk), false)` probe and is the ONLY part touching the fedimint client.
+    /// The configured gateways are tried IN ORDER and the first one the federation still has REGISTERED
+    /// is returned; when the list is EMPTY (tests / unset) this falls back to `get_gateway(None, false)`
+    /// — the federation's "pick any available gateway" behavior. NOTE `get_gateway(Some(pk), false)`
+    /// resolves `pk` against the (refreshed) gateway-registration cache — it is NOT an active liveness
+    /// probe, so failover engages when a gateway deregisters / its registration lapses, not the instant
+    /// a still-registered gateway's process crashes. Fails CLOSED (Err) when no configured gateway is
+    /// registered, so receiving + refunds refuse rather than silently routing money through an
+    /// unintended gateway. This is purely a gateway-SELECTION seam: it never mints or pays, so the
+    /// caller mints/pays ONCE with the single returned gateway — the create-once idempotency and the
+    /// INV-1 caps are untouched.
+    async fn select_gateway(&self) -> Result<LightningGateway> {
+        // All existing callers (invoice-create, the fee quote, the liquidity check, the plain/sweep
+        // pay, readiness) get the unchanged no-preference behavior — the `None` preference reproduces
+        // the pre-y4m.18 ordered-failover selection exactly.
+        self.select_gateway_preferring(None).await
+    }
+
+    /// [`select_gateway`](Self::select_gateway) plus a best-effort `preferred` gateway to try FIRST
+    /// (lnrent-y4m.18): the quote-time gateway a refund's [`PaymentBackend::refund_quote`] selected,
+    /// threaded to its pay so the quote and the pay bind to ONE decision even if a failover would
+    /// otherwise price and pay through different gateways. The pure [`ordered_with_preference`] helper
+    /// builds the probe order (preferred first, then the configured order, deduped; a preferred pk NOT
+    /// in the configured list is still tried first — it was reachable at quote time). If the hinted
+    /// gateway is no longer reachable the ordered probe FALLS BACK to the configured order rather than
+    /// failing the pay: the cap preflight against the ACTUAL paying gateway still protects INV-1, so the
+    /// residual quote-gateway-vanished window is safe (never an over-cap outlay). `preferred: None`
+    /// leaves the pre-y4m.18 behavior byte-for-byte, including the empty-list "any available gateway"
+    /// fallback; a preference WITH an empty configured list tries the preferred pk then falls back to
+    /// `get_gateway(None, ...)` "any". The [`update_gateway_cache`] fail-closed refresh is unchanged.
+    async fn select_gateway_preferring(
+        &self,
+        preferred: Option<PublicKey>,
+    ) -> Result<LightningGateway> {
+        let ln = self
+            .client
+            .get_first_module::<LightningClientModule>()
+            .context("fedimint: no lightning module")?;
+        let ordered = ordered_with_preference(preferred, &self.gateways);
+        if ordered.is_empty() {
+            // No pin AND no preference (tests / unset): preserve the pre-y4m.8 "any available gateway".
+            return ln
+                .get_gateway(None, false)
+                .await
+                .context("selecting an available lightning gateway")?
+                .context("no lightning gateway is available");
+        }
+        // Refresh the federation's gateway-registration cache BEFORE the ordered probe (adversarial
+        // codex): `get_gateway(Some(pk), false)` returns a STALE locally-cached hit WITHOUT refreshing
+        // (it only refreshes on a MISS), so a primary that DEREGISTERED but still sits in our local
+        // cache would be selected forever and failover would never engage. FAIL CLOSED on a refresh
+        // error (CodeRabbit): the refresh is a federation round-trip, so its failure means the
+        // FEDERATION is unreachable — proceeding on stale data could route money through, or report
+        // ready for, a gateway that is actually gone. (A mere gateway DEREGISTRATION — the failover
+        // case — does NOT fail this: the federation is up, so the refresh succeeds and the ordered
+        // probe below then skips the absent primary to a live fallback.)
+        ln.update_gateway_cache()
+            .await
+            .context("refreshing the fedimint gateway registrations before failover selection")?;
+        match select_first_reachable(&ordered, |pk| ln.get_gateway(Some(pk), false)).await {
+            Ok(gw) => Ok(gw),
+            // Empty configured list + a preference whose pk turned out unreachable: fall back to the
+            // federation's "any available gateway" (the empty-list contract), rather than fail-closing
+            // on the advisory hint alone. With a NON-empty configured list this arm is unreachable —
+            // `ordered` already includes every configured gateway, so a failure there is the genuine
+            // total-outage fail-closed and must propagate.
+            Err(_) if self.gateways.is_empty() => ln
+                .get_gateway(None, false)
+                .await
+                .context("selecting an available lightning gateway")?
+                .context("no lightning gateway is available"),
+            Err(e) => Err(e),
         }
     }
 
@@ -495,6 +605,7 @@ impl FedimintPayment {
         amount_sat: u64,
         idempotency_key: &str,
         cap: PayCap,
+        preferred: Option<PublicKey>,
     ) -> Result<String> {
         let payment_type = {
             // Idempotent on the key: serialize check->start->index so concurrent same-key callers cannot
@@ -515,12 +626,12 @@ impl FedimintPayment {
                     }
                     _ => {
                         // FAILED -> re-attempt below (the prior payment refunded; not a double-pay).
-                        self.start_new_pay(dest, amount_sat, idempotency_key, cap)
+                        self.start_new_pay(dest, amount_sat, idempotency_key, cap, preferred)
                             .await?
                     }
                 }
             } else {
-                self.start_new_pay(dest, amount_sat, idempotency_key, cap)
+                self.start_new_pay(dest, amount_sat, idempotency_key, cap, preferred)
                     .await?
             }
         };
@@ -534,6 +645,7 @@ impl FedimintPayment {
         amount_sat: u64,
         idempotency_key: &str,
         cap: PayCap,
+        preferred: Option<PublicKey>,
     ) -> Result<PayType> {
         // Structural preflight failures (bad bolt11, no amount, amount mismatch) happen before any
         // operation exists. Park them as a FAILED key row so payment_status_by_key reports Failed and
@@ -581,11 +693,15 @@ impl FedimintPayment {
             .client
             .get_first_module::<LightningClientModule>()
             .context("fedimint: no lightning module")?;
-        let gateway = ln
-            .get_gateway(self.gateway, false)
+        // Failover selection (lnrent-y4m.8), preferring the quote-time gateway when one was carried
+        // (lnrent-y4m.18): the first reachable gateway, hinted first then in the configured order. The
+        // SAME chosen gateway object is used for the cap preflight AND pay_bolt11_invoice below, so the
+        // fee/route caps are enforced against exactly the gateway the money flows through — the hint
+        // only reorders the probe, it can never weaken the cap.
+        let gateway = self
+            .select_gateway_preferring(preferred)
             .await
-            .context("selecting the configured lightning gateway for the refund")?
-            .context("the configured (or any) lightning gateway is unavailable")?;
+            .context("selecting a reachable lightning gateway for the refund")?;
         // Final cap preflight (spec §3.1 / gate1-operator-sweep): quoting and paying are separate
         // awaits, so re-check the cap here against the SAME gateway object we pass into
         // pay_bolt11_invoice — refuse to START a new outbound op whose payout + advertised fee would
@@ -696,13 +812,18 @@ impl PaymentBackend for FedimintPayment {
             .client
             .get_first_module::<LightningClientModule>()
             .context("fedimint: no lightning module")?;
-        // A gateway is REQUIRED for an externally-payable invoice (codex finding #1). get_gateway
-        // refreshes the cache then picks one; Err if the federation has none registered.
-        let gateway = ln
-            .get_gateway(self.gateway, false)
+        // A gateway is REQUIRED for an externally-payable invoice (codex finding #1). LN-invoice
+        // receive INTRINSICALLY needs A gateway — there is no ecash-native receive path — so the
+        // ordered failover list (lnrent-y4m.8) REDUCES but cannot eliminate the receive-side
+        // single-point-of-failure: if EVERY configured gateway is down, receiving still fails closed.
+        // select_gateway tries the configured gateways in order and returns the first REACHABLE one;
+        // crucially it does NOT mint, so the create-once mint below still happens EXACTLY ONCE per
+        // external_id (select first, then create_bolt11_invoice once — NEVER once per attempted
+        // gateway). The idx_get_by_external check above is the create-once anchor, upstream of this.
+        let gateway = self
+            .select_gateway()
             .await
-            .context("selecting the configured lightning gateway")?
-            .context("the configured (or any) lightning gateway is unavailable")?;
+            .context("selecting a reachable lightning gateway")?;
 
         let desc = Description::new(memo.to_string())
             .map_err(|e| anyhow!("invalid invoice description: {e}"))?;
@@ -782,7 +903,7 @@ impl PaymentBackend for FedimintPayment {
         // No gross context here (legacy/internal callers): pay the requested amount with the standard
         // key idempotency and NO cap. The Refunder uses pay_refund_capped and the Sweeper uses
         // pay_capped when they know the ceiling, so the cap is enforced on the money path (spec §3.1).
-        self.pay_inner(dest, amount_sat, idempotency_key, PayCap::None)
+        self.pay_inner(dest, amount_sat, idempotency_key, PayCap::None, None)
             .await
     }
 
@@ -790,18 +911,14 @@ impl PaymentBackend for FedimintPayment {
     /// plus the configured gateway's advertised fee fits inside `gross_sat`. Read-only — never mints,
     /// pays, or mutates.
     async fn refund_net_sat(&self, gross_sat: u64) -> Result<u64> {
-        let ln = self
-            .client
-            .get_first_module::<LightningClientModule>()
-            .context("fedimint: no lightning module")?;
-        // The SAME configured gateway the refund pay will use — its advertised fee schedule is the
-        // operator's exposure. A gateway that cannot be read is a TRANSIENT quote failure (Err), never
-        // dust/Ok(0), so the Refunder leaves the row PENDING instead of parking it (spec §3.1).
-        let gateway = ln
-            .get_gateway(self.gateway, false)
+        // The SAME reachable gateway the refund pay will use (lnrent-y4m.8 failover) — its advertised
+        // fee schedule is the operator's exposure. A selection failure (no configured gateway
+        // reachable) is a TRANSIENT quote failure (Err), never dust/Ok(0), so the Refunder leaves the
+        // row PENDING instead of parking it (spec §3.1).
+        let gateway = self
+            .select_gateway()
             .await
-            .context("selecting the configured lightning gateway for the refund fee quote")?
-            .context("the configured (or any) lightning gateway is unavailable")?;
+            .context("selecting a reachable lightning gateway for the refund fee quote")?;
         let fees = gateway.fees;
         Ok(net_payout_sat(
             u64::from(fees.base_msat),
@@ -810,20 +927,40 @@ impl PaymentBackend for FedimintPayment {
         ))
     }
 
+    async fn refund_quote(&self, gross_sat: u64) -> Result<RefundQuote> {
+        // ONE gateway decision for the quote (lnrent-y4m.18): select once, derive BOTH the net cap
+        // (same `net_payout_sat` math as `refund_net_sat`) and the hint (that gateway's `gateway_id`
+        // pubkey hex) from it, so the pay of the SAME attempt can prefer this exact gateway and quote
+        // and pay agree on the fee schedule the INV-1 cap is measured against. A selection failure
+        // stays a TRANSIENT quote Err (never dust/Ok(0)), exactly as `refund_net_sat`.
+        let gateway = self
+            .select_gateway()
+            .await
+            .context("selecting a reachable lightning gateway for the refund fee quote")?;
+        let fees = gateway.fees;
+        let net_sat = net_payout_sat(
+            u64::from(fees.base_msat),
+            u64::from(fees.proportional_millionths),
+            gross_sat,
+        );
+        Ok(RefundQuote {
+            net_sat,
+            // The gateway identity `select_gateway_preferring` matches a preference against (the
+            // `LightningGatewayKey` / `get_gateway(Some(pk), _)` key). Advisory + never persisted.
+            gateway_hint: Some(gateway.gateway_id.to_string()),
+        })
+    }
+
     async fn refund_required_outlay_msat(
         &self,
         gross_sat: u64,
         pay_sat: Option<u64>,
     ) -> Result<u128> {
-        let ln = self
-            .client
-            .get_first_module::<LightningClientModule>()
-            .context("fedimint: no lightning module")?;
-        let gateway = ln
-            .get_gateway(self.gateway, false)
+        // The first reachable gateway in the configured order (lnrent-y4m.8 failover).
+        let gateway = self
+            .select_gateway()
             .await
-            .context("selecting the configured lightning gateway for the refund liquidity check")?
-            .context("the configured (or any) lightning gateway is unavailable")?;
+            .context("selecting a reachable lightning gateway for the refund liquidity check")?;
         let fees = gateway.fees;
         let pay_sat = pay_sat.unwrap_or_else(|| {
             net_payout_sat(
@@ -852,8 +989,36 @@ impl PaymentBackend for FedimintPayment {
         gross_sat: u64,
         idempotency_key: &str,
     ) -> Result<String> {
-        self.pay_inner(bolt11, amount_sat, idempotency_key, PayCap::Gross(gross_sat))
-            .await
+        self.pay_inner(
+            bolt11,
+            amount_sat,
+            idempotency_key,
+            PayCap::Gross(gross_sat),
+            None,
+        )
+        .await
+    }
+
+    async fn pay_refund_capped_via(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        gross_sat: u64,
+        idempotency_key: &str,
+        gateway_hint: Option<&str>,
+    ) -> Result<String> {
+        // Parse the advisory quote-time hint (lnrent-y4m.18) into the gateway pubkey the selection seam
+        // prefers. An UNPARSEABLE hint is treated as NO hint (fall through to the ordered probe), NOT an
+        // error: it is advisory, and the INV-1 cap is enforced against whatever gateway actually pays.
+        let preferred = gateway_hint.and_then(|h| PublicKey::from_str(h).ok());
+        self.pay_inner(
+            bolt11,
+            amount_sat,
+            idempotency_key,
+            PayCap::Gross(gross_sat),
+            preferred,
+        )
+        .await
     }
 
     async fn pay_capped(
@@ -870,6 +1035,7 @@ impl PaymentBackend for FedimintPayment {
             amount_sat,
             idempotency_key,
             PayCap::Outlay(max_outlay_msat),
+            None,
         )
         .await
     }
@@ -896,11 +1062,11 @@ impl PaymentBackend for FedimintPayment {
     }
 
     async fn refund_gateway_ready(&self) -> Result<bool> {
-        let ln = self
-            .client
-            .get_first_module::<LightningClientModule>()
-            .context("fedimint: no lightning module")?;
-        Ok(ln.get_gateway(self.gateway, false).await?.is_some())
+        // Failover-aware readiness (lnrent-y4m.8): ready iff at least one configured gateway is
+        // reachable (an empty list falls back to "any available gateway"). select_gateway fails CLOSED
+        // when none is reachable; RefundReadinessProbe + log_readiness treat that Err and an Ok(false)
+        // identically as "not ready", and the Err carries the underlying reason for the diagnostic.
+        self.select_gateway().await.map(|_| true)
     }
 
     async fn backend_ready(&self) -> Result<bool> {
@@ -1427,6 +1593,56 @@ fn net_payout_sat(base_msat: u64, ppm: u64, gross_sat: u64) -> u64 {
     lo
 }
 
+/// PURE, generic ordered-failover selector (lnrent-y4m.8): try each gateway pubkey IN ORDER via
+/// `try_one`, returning the FIRST that resolves to `Ok(Some(gw))` — a REACHABLE gateway. A pubkey
+/// that resolves to `Ok(None)` (unregistered / not found) OR `Err(_)` (a transient probe failure) is
+/// SKIPPED and selection continues to the next, maximizing failover resilience. Only when EVERY
+/// configured gateway is exhausted does it fail CLOSED with a clear error, carrying the last
+/// underlying `Err` as context so a diagnosable transient reason is not swallowed. `gateways` should
+/// be non-empty (the live wrapper handles the empty "pick any available gateway" case before calling
+/// this); an empty slice here simply yields the same fail-closed error without probing. Generic over
+/// the gateway type `G` and free of the live client — following the `net_payout_sat` precedent — so
+/// the DECISION logic is unit-tested without a federation.
+async fn select_first_reachable<G, F, Fut>(gateways: &[PublicKey], try_one: F) -> Result<G>
+where
+    F: Fn(PublicKey) -> Fut,
+    Fut: Future<Output = Result<Option<G>>>,
+{
+    let mut last_err: Option<anyhow::Error> = None;
+    for &pk in gateways {
+        match try_one(pk).await {
+            Ok(Some(gw)) => return Ok(gw),
+            Ok(None) => {}                // registered-but-not-found: try the next in order
+            Err(e) => last_err = Some(e), // transient probe failure: remember why, try the next
+        }
+    }
+    match last_err {
+        Some(e) => Err(e).context("no configured lightning gateway is reachable"),
+        None => anyhow::bail!("no configured lightning gateway is reachable"),
+    }
+}
+
+/// PURE preference-ordering for the quote/pay gateway binding (lnrent-y4m.18): the probe order the live
+/// [`FedimintPayment::select_gateway_preferring`] hands to [`select_first_reachable`]. `preferred` (the
+/// gateway a refund's fee QUOTE selected in this attempt) is tried FIRST, then the configured order,
+/// with the preferred pk DE-DUPED out of the tail so it is never probed twice. A `preferred` NOT in the
+/// configured list is STILL placed first — it was reachable at quote time, so it is the best guess for
+/// the pay even if the operator never listed it. `None` yields the configured order unchanged (the
+/// pre-y4m.18 selection). Free of the live client — following the `net_payout_sat` /
+/// `select_first_reachable` precedent — so the ORDER decision is unit-tested without a federation.
+fn ordered_with_preference(preferred: Option<PublicKey>, gateways: &[PublicKey]) -> Vec<PublicKey> {
+    let mut ordered = Vec::with_capacity(gateways.len() + 1);
+    if let Some(pk) = preferred {
+        ordered.push(pk);
+    }
+    for &pk in gateways {
+        if Some(pk) != preferred {
+            ordered.push(pk);
+        }
+    }
+    ordered
+}
+
 fn fedimint_readiness_warns(gateway_ok: bool) -> bool {
     !gateway_ok
 }
@@ -1740,5 +1956,197 @@ mod net_payout_tests {
         // §F: readiness no longer looks at the balance — only the gateway liveness half remains.
         assert!(!super::fedimint_readiness_warns(true));
         assert!(super::fedimint_readiness_warns(false));
+    }
+}
+
+#[cfg(test)]
+mod select_gateway_tests {
+    //! PURE ordered-failover unit tests (lnrent-y4m.8). The whole module is `#[cfg(feature =
+    //! "fedimint")]` (see lib.rs), so these run under the default-on `cargo test -p lnrentd`.
+    //! `select_first_reachable` is generic and free of the live fedimint client (mirroring the
+    //! `net_payout_sat` precedent), so the SELECTION decision is proven with a fake `try_one` over a
+    //! stand-in gateway type — no federation. The end-to-end failover proof lives in the `#[ignore]`d
+    //! `daemon/tests/fedimint_live.rs`.
+    use super::{ordered_with_preference, select_first_reachable};
+    use anyhow::{anyhow, Result};
+    use fedimint_core::secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Three DISTINCT valid compressed secp256k1 pubkeys standing in for an ordered gateway list.
+    /// Derived from tiny fixed secret keys so they are guaranteed on-curve (no hand-picked-hex
+    /// validity risk); the pure selector never touches the curve, it only compares/returns them.
+    fn pk(seed: u8) -> PublicKey {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[seed; 32]).expect("valid secret key");
+        PublicKey::from_secret_key(&secp, &sk)
+    }
+
+    // The FIRST reachable gateway in the configured order wins — and selection STOPS there (a healthy
+    // primary is never bypassed, and later gateways are not probed).
+    #[tokio::test]
+    async fn first_reachable_wins_in_order() {
+        let gws = [pk(1), pk(2), pk(3)];
+        let tried = Mutex::new(Vec::new());
+        let got = select_first_reachable(&gws, |p| {
+            tried.lock().unwrap().push(p);
+            async move { Ok(Some(p)) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(got, pk(1), "the first gateway is selected");
+        assert_eq!(
+            *tried.lock().unwrap(),
+            vec![pk(1)],
+            "selection stops at the first reachable gateway"
+        );
+    }
+
+    // Back-compat: a single-gateway list behaves exactly like the pre-failover pin-one config.
+    #[tokio::test]
+    async fn single_gateway_list_selects_it() {
+        let got = select_first_reachable(&[pk(1)], |p| async move { Ok(Some(p)) })
+            .await
+            .unwrap();
+        assert_eq!(got, pk(1));
+    }
+
+    // An early Ok(None) (unregistered/not found) AND an early Err (transient) are both SKIPPED, and a
+    // later REACHABLE gateway is used — the whole point of failover.
+    #[tokio::test]
+    async fn early_none_and_err_are_skipped_for_a_later_reachable() {
+        let gws = [pk(1), pk(2), pk(3)];
+        let tried = Mutex::new(Vec::new());
+        let got = select_first_reachable(&gws, |p| {
+            tried.lock().unwrap().push(p);
+            async move {
+                if p == pk(1) {
+                    Ok(None) // unregistered / not found -> skip
+                } else if p == pk(2) {
+                    Err(anyhow!("gateway-2 handshake timeout")) // transient -> skip
+                } else {
+                    Ok(Some(p)) // pk(3) reachable
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(got, pk(3), "failover reaches the third gateway");
+        assert_eq!(
+            *tried.lock().unwrap(),
+            vec![pk(1), pk(2), pk(3)],
+            "gateways are tried strictly in order until one is reachable"
+        );
+    }
+
+    // ALL gateways unreachable -> a clear fail-closed error that CARRIES the last underlying cause
+    // (so a diagnosable transient reason is not swallowed). This is the fail-closed money invariant:
+    // receiving + refunds refuse rather than silently routing through an unintended gateway.
+    #[tokio::test]
+    async fn all_unreachable_is_a_clear_error_carrying_the_last_cause() {
+        let gws = [pk(1), pk(2)];
+        let got: Result<PublicKey> = select_first_reachable(&gws, |p| async move {
+            if p == pk(2) {
+                Err(anyhow!("gateway-2 refused connection"))
+            } else {
+                Ok(None)
+            }
+        })
+        .await;
+        let shown = format!("{:#}", got.unwrap_err());
+        assert!(
+            shown.contains("no configured lightning gateway is reachable"),
+            "clear fail-closed message: {shown}"
+        );
+        assert!(
+            shown.contains("gateway-2 refused connection"),
+            "the last underlying cause is carried as context: {shown}"
+        );
+    }
+
+    // An empty list fails closed WITHOUT probing — the live wrapper handles the empty "pick any
+    // available gateway" case before ever calling the helper, so the helper's empty branch is a
+    // defensive fail-closed, never a silent success.
+    #[tokio::test]
+    async fn empty_list_is_a_clear_error_without_probing() {
+        let calls = AtomicUsize::new(0);
+        let got: Result<PublicKey> = select_first_reachable(&[], |p| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(Some(p)) }
+        })
+        .await;
+        assert!(got.is_err(), "an empty list fails closed");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no gateway is probed for an empty list"
+        );
+    }
+
+    // ---- ordered_with_preference (lnrent-y4m.18): quote/pay gateway binding ------------------------
+    // The PURE preference-ordering rule the live pay path feeds `select_first_reachable`, so quote and
+    // pay probe the SAME gateway first within one attempt. Proven without a federation.
+
+    // The quote-time gateway is tried FIRST, ahead of the configured order.
+    #[test]
+    fn preference_is_tried_first() {
+        let gws = [pk(1), pk(2), pk(3)];
+        assert_eq!(
+            ordered_with_preference(Some(pk(2)), &gws),
+            vec![pk(2), pk(1), pk(3)],
+            "the preferred gateway leads, then the configured order minus it"
+        );
+    }
+
+    // A preferred gateway ALREADY in the configured list is deduped — probed once (first), never twice.
+    #[test]
+    fn preference_in_list_is_deduped() {
+        let gws = [pk(1), pk(2), pk(3)];
+        let ordered = ordered_with_preference(Some(pk(1)), &gws);
+        assert_eq!(
+            ordered,
+            vec![pk(1), pk(2), pk(3)],
+            "an already-first preference leaves the order unchanged, no duplicate"
+        );
+        assert_eq!(
+            ordered.iter().filter(|&&p| p == pk(1)).count(),
+            1,
+            "the preferred pk appears exactly once"
+        );
+    }
+
+    // No preference == the configured order, byte-for-byte (the pre-y4m.18 selection).
+    #[test]
+    fn no_preference_is_the_configured_order() {
+        let gws = [pk(1), pk(2), pk(3)];
+        assert_eq!(
+            ordered_with_preference(None, &gws),
+            vec![pk(1), pk(2), pk(3)]
+        );
+    }
+
+    // A preferred gateway NOT in the configured list is STILL tried first — it was reachable at quote
+    // time, so it is the best guess for the pay even though the operator never listed it.
+    #[test]
+    fn preference_not_in_list_is_still_first() {
+        let gws = [pk(1), pk(2)];
+        assert_eq!(
+            ordered_with_preference(Some(pk(9)), &gws),
+            vec![pk(9), pk(1), pk(2)],
+            "an unlisted preference leads, then the full configured order"
+        );
+    }
+
+    // Empty configured list + a preference: probe the preferred pk alone (the live wrapper then falls
+    // back to "any available gateway" if it is unreachable — see select_gateway_preferring).
+    #[test]
+    fn empty_list_with_preference_probes_the_preferred() {
+        assert_eq!(ordered_with_preference(Some(pk(1)), &[]), vec![pk(1)]);
+    }
+
+    // Empty configured list + NO preference: nothing to probe (the empty-list "any gateway" path).
+    #[test]
+    fn empty_list_without_preference_is_empty() {
+        assert!(ordered_with_preference(None, &[]).is_empty());
     }
 }

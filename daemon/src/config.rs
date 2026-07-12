@@ -82,16 +82,41 @@ impl PaymentMode {
 /// Fedimint receive config — REQUIRED only when `payment_backend = fedimint` (ADR-0012, §4.6). The
 /// federation invite is also part of the backup: the seed alone can't restore the ecash position
 /// (you must know which federation to rejoin), so onboard's backup must include it (§4.6).
+///
+/// `gateway` is the PRIMARY Lightning gateway; `gateway_fallbacks` is an optional ORDERED list of
+/// standby gateways the backend fails over to when the primary is unreachable (lnrent-y4m.8). The
+/// selection list the backend tries in turn is `[gateway] ++ gateway_fallbacks` (see [`gateways`]),
+/// so a single-gateway operator sees no behavior change. `skip_serializing_if` OMITS
+/// `gateway_fallbacks` from the durable `fedimint.json` when it is empty, so a single-gateway config
+/// still writes byte-identical to before (mirrors the y4m.6 flag-omission trick); `serde(default)`
+/// lets an old on-disk config that predates the field parse as an empty list.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FedimintConfig {
     pub invite: String,
     pub gateway: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gateway_fallbacks: Vec<String>,
+}
+
+impl FedimintConfig {
+    /// The ORDERED gateway-selection list the backend tries in turn (lnrent-y4m.8 failover): the
+    /// PRIMARY `gateway` first, then each fallback in order. A single-gateway config yields a
+    /// one-element list, preserving today's pin-one behavior.
+    pub fn gateways(&self) -> Vec<String> {
+        let mut list = Vec::with_capacity(1 + self.gateway_fallbacks.len());
+        list.push(self.gateway.clone());
+        list.extend(self.gateway_fallbacks.iter().cloned());
+        list
+    }
 }
 
 impl Drop for FedimintConfig {
     fn drop(&mut self) {
         self.invite.zeroize();
         self.gateway.zeroize();
+        for fallback in &mut self.gateway_fallbacks {
+            fallback.zeroize();
+        }
     }
 }
 
@@ -100,6 +125,10 @@ impl fmt::Debug for FedimintConfig {
         f.debug_struct("FedimintConfig")
             .field("invite", &"<redacted>")
             .field("gateway", &"<redacted>")
+            .field(
+                "gateway_fallbacks",
+                &format_args!("<redacted; {} fallback(s)>", self.gateway_fallbacks.len()),
+            )
             .finish()
     }
 }
@@ -154,6 +183,11 @@ pub struct RawConfig {
     pub compute_backend: Option<String>,
     pub fedimint_invite: Option<String>,
     pub fedimint_gateway: Option<String>,
+    /// Optional ORDERED list of standby gateways the backend fails over to when the primary
+    /// `fedimint_gateway` is unreachable (lnrent-y4m.8). `Option` + the struct-level `serde(default)`
+    /// means an old config without the key reads as `None`; a config file / stdin JSON supplies it as
+    /// an array. The resolved selection list is `[fedimint_gateway] ++ fedimint_gateway_fallbacks`.
+    pub fedimint_gateway_fallbacks: Option<Vec<String>>,
     /// The BIP39 seed (mnemonic). Optional here because a re-bootstrap reads the persisted seed
     /// from the data dir; a FIRST bootstrap must supply it (else a structured `seed_missing`).
     pub mnemonic: Option<String>,
@@ -179,6 +213,11 @@ impl Zeroize for RawConfig {
         }
         if let Some(gateway) = self.fedimint_gateway.as_mut() {
             gateway.zeroize();
+        }
+        if let Some(fallbacks) = self.fedimint_gateway_fallbacks.as_mut() {
+            for fallback in fallbacks.iter_mut() {
+                fallback.zeroize();
+            }
         }
     }
 }
@@ -475,6 +514,9 @@ impl RawConfig {
             compute_backend: non_empty(self.compute_backend.as_deref()),
             fedimint_invite: sanitize_secret_string(self.fedimint_invite.take()),
             fedimint_gateway: sanitize_secret_string(self.fedimint_gateway.take()),
+            fedimint_gateway_fallbacks: sanitize_secret_string_list(
+                self.fedimint_gateway_fallbacks.take(),
+            ),
             mnemonic,
             // A numeric knob has no blank/whitespace form to strip; carry it through unchanged.
             min_holdings_warn_msat: self.min_holdings_warn_msat,
@@ -489,6 +531,10 @@ impl RawConfig {
             overlay_secret_string(self.fedimint_invite.take(), lower.fedimint_invite.take());
         let fedimint_gateway =
             overlay_secret_string(self.fedimint_gateway.take(), lower.fedimint_gateway.take());
+        let fedimint_gateway_fallbacks = overlay_secret_string_list(
+            self.fedimint_gateway_fallbacks.take(),
+            lower.fedimint_gateway_fallbacks.take(),
+        );
         RawConfig {
             data_dir: self.data_dir.or(lower.data_dir),
             relays: self.relays.or(lower.relays),
@@ -496,6 +542,7 @@ impl RawConfig {
             compute_backend: self.compute_backend.or(lower.compute_backend),
             fedimint_invite,
             fedimint_gateway,
+            fedimint_gateway_fallbacks,
             mnemonic,
             min_holdings_warn_msat: self
                 .min_holdings_warn_msat
@@ -524,6 +571,44 @@ fn overlay_secret_string(high: Option<String>, low: Option<String>) -> Option<St
     }
 }
 
+/// The [`sanitize_secret_string`] analogue for the gateway-fallback list: drop blank/whitespace-only
+/// entries and zeroize the dropped source strings (matching the primary gateway's secret handling).
+/// UNLIKE the scalar sanitizer, an explicit EMPTY list (or an all-blank one) is PRESERVED as
+/// `Some(vec![])`, NOT folded to `None` (codex/CodeRabbit): the resolve/write paths read `None` as
+/// "field omitted → preserve the durable fallbacks" and `Some(vec![])` as "CLEAR the durable
+/// fallbacks", so an operator CAN remove all fallbacks (e.g. decommission a standby gateway) through
+/// the normal config surface. `overlay_secret_string_list` then lets a higher-precedence `Some(vec![])`
+/// win whole, shadowing a lower non-empty list — an explicit clear beats an inherited list.
+fn sanitize_secret_string_list(value: Option<Vec<String>>) -> Option<Vec<String>> {
+    value.map(|mut list| {
+        let cleaned: Vec<String> = list.iter().filter_map(|s| non_empty(Some(s))).collect();
+        for s in list.iter_mut() {
+            s.zeroize();
+        }
+        cleaned
+    })
+}
+
+/// The [`overlay_secret_string`] analogue for the gateway-fallback list: the higher-precedence layer
+/// wins whole (a set list is NOT merged element-wise with a lower one), and a shadowed lower list is
+/// zeroized. Assumes both layers were already [`sanitize_secret_string_list`]-cleaned.
+fn overlay_secret_string_list(
+    high: Option<Vec<String>>,
+    low: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    match high {
+        Some(high) => {
+            if let Some(mut shadowed) = low {
+                for s in shadowed.iter_mut() {
+                    s.zeroize();
+                }
+            }
+            Some(high)
+        }
+        None => low,
+    }
+}
+
 /// Build the `env` source layer from an environment lookup (`get` returns a var's value, or `None`
 /// when unset). Pure given `get`, so tests can inject a fake environment. Blank values are
 /// sanitized away by [`RawConfig::from_sources`].
@@ -541,6 +626,10 @@ fn raw_config_from_env(get: impl Fn(&str) -> Option<String>) -> Result<RawConfig
         compute_backend: get(ENV_COMPUTE_BACKEND),
         fedimint_invite: get(ENV_FEDIMINT_INVITE),
         fedimint_gateway: get(ENV_FEDIMINT_GATEWAY),
+        // No env var for the fallback list (y4m.8: the fallbacks env var is optional). Gateway
+        // failover is configured via the config file / stdin JSON `fedimint_gateway_fallbacks` array
+        // or the durable `fedimint.json`; the single-gateway `LNRENT_FEDIMINT_GATEWAY` still works.
+        fedimint_gateway_fallbacks: None,
         mnemonic: get(ENV_MNEMONIC),
         min_holdings_warn_msat: parse_min_holdings_warn_msat_env(get(ENV_MIN_HOLDINGS_WARN_MSAT))?,
     })
@@ -975,19 +1064,52 @@ fn resolve_durable_fedimint_config(
         return Ok(None);
     }
 
-    if let Some(cfg) = supplied_fedimint_config(raw)? {
-        write_fedimint_config(data_dir, &cfg)?;
+    if let Some(mut cfg) = supplied_fedimint_config(raw)? {
+        write_fedimint_config(
+            data_dir,
+            &mut cfg,
+            raw.fedimint_gateway_fallbacks.is_none(),
+        )?;
         return Ok(Some(cfg));
     }
 
-    Ok(Some(read_fedimint_config(data_dir)?))
+    // Fallbacks-ONLY re-bootstrap (codex): no new invite/gateway supplied — `supplied_fedimint_config`
+    // returned None — but a fallback list WAS supplied. Apply it to the durable config so an operator
+    // can UPDATE or CLEAR failover WITHOUT re-supplying the sensitive invite + primary gateway. The
+    // durable invite/primary are untouched (no federation repoint), only the fungible fallback list is
+    // rewritten. `Some(vec![])` (an explicit empty list, preserved by `sanitize_secret_string_list`)
+    // CLEARS the durable fallbacks; `None` (omitted) reaches here as a plain reload (list unchanged).
+    let mut durable = read_fedimint_config(data_dir)?;
+    if let Some(supplied) = raw.fedimint_gateway_fallbacks.as_ref() {
+        durable.gateway_fallbacks = clean_gateway_fallbacks(Some(supplied));
+        write_fedimint_config(data_dir, &mut durable, false)?;
+    }
+    Ok(Some(durable))
+}
+
+/// Trim + drop blank entries from a gateway-fallback list (a supplied `RawConfig` array or a parsed
+/// durable list), yielding the clean ordered `Vec<String>` the [`FedimintConfig`] carries. An absent
+/// list is an empty one. Distinct from [`sanitize_secret_string_list`] (which zeroizes the dropped
+/// source strings for the layering path and preserves `Some(vec![])` as an explicit-clear signal);
+/// here the empty list is just the natural "no fallbacks".
+fn clean_gateway_fallbacks(list: Option<&[String]>) -> Vec<String> {
+    list.map(|l| l.iter().filter_map(|s| non_empty(Some(s))).collect())
+        .unwrap_or_default()
 }
 
 fn supplied_fedimint_config(raw: &RawConfig) -> Result<Option<FedimintConfig>, IpcError> {
     let invite = non_empty(raw.fedimint_invite.as_deref());
     let gateway = non_empty(raw.fedimint_gateway.as_deref());
+    // Fallbacks are OPTIONAL (y4m.8): the invite+gateway pairing requirement is unchanged; a supplied
+    // list is just carried onto the pinned primary. A list with no primary gateway is meaningless, so
+    // it is only honored when a valid (invite, gateway) pair is present.
+    let gateway_fallbacks = clean_gateway_fallbacks(raw.fedimint_gateway_fallbacks.as_deref());
     match (invite, gateway) {
-        (Some(invite), Some(gateway)) => Ok(Some(FedimintConfig { invite, gateway })),
+        (Some(invite), Some(gateway)) => Ok(Some(FedimintConfig {
+            invite,
+            gateway,
+            gateway_fallbacks,
+        })),
         (None, None) => Ok(None),
         _ => Err(config_err(
             "payment_backend=fedimint requires both `fedimint_invite` and `fedimint_gateway`",
@@ -1032,10 +1154,21 @@ fn read_fedimint_config(data_dir: &Path) -> Result<FedimintConfig, IpcError> {
             path.display()
         ))
     })?;
-    Ok(FedimintConfig { invite, gateway })
+    // Carry the (cleaned) ordered fallback list through — absent in a pre-y4m.8 file (serde default
+    // = empty), present as an array in a multi-gateway one.
+    let gateway_fallbacks = clean_gateway_fallbacks(Some(&cfg.gateway_fallbacks));
+    Ok(FedimintConfig {
+        invite,
+        gateway,
+        gateway_fallbacks,
+    })
 }
 
-fn write_fedimint_config(data_dir: &Path, cfg: &FedimintConfig) -> Result<(), IpcError> {
+fn write_fedimint_config(
+    data_dir: &Path,
+    cfg: &mut FedimintConfig,
+    preserve_omitted_fallbacks: bool,
+) -> Result<(), IpcError> {
     let path = data_dir.join(FEDIMINT_CONFIG_FILE);
     // Reconcile against any stored config. The federation INVITE pins WHERE the ecash lives, so a
     // re-bootstrap that changes it is a `config_conflict` — silently repointing to a new federation
@@ -1048,19 +1181,45 @@ fn write_fedimint_config(data_dir: &Path, cfg: &FedimintConfig) -> Result<(), Ip
                 return Err(config_conflict_err(
                     "operator already bootstrapped with a different Fedimint federation invite; \
                      refusing to repoint to a new federation on re-bootstrap (this could orphan \
-                     the ecash position — clear the data dir to start a fresh federation)",
+                    the ecash position — clear the data dir to start a fresh federation)",
                 ));
             }
-            if existing.gateway.trim() == cfg.gateway.trim() {
-                // Same federation AND gateway: idempotent.
+            // The legacy flag/env bootstrap surfaces can re-supply invite + primary gateway but have
+            // no fallback field. Treat that OMISSION (`preserve_omitted_fallbacks`, i.e. the raw field
+            // was `None`) as "leave the durable fallback list alone"; otherwise an ordinary re-bootstrap
+            // would silently erase failover configuration. A SUPPLIED list replaces the durable one:
+            // `Some(vec![...])` sets it, and an explicit `Some(vec![])` — preserved (NOT folded to
+            // `None`) by `sanitize_secret_string_list` — CLEARS it, so an operator can decommission all
+            // fallbacks through the normal config surface (codex/CodeRabbit).
+            if preserve_omitted_fallbacks {
+                cfg.gateway_fallbacks = clean_gateway_fallbacks(Some(&existing.gateway_fallbacks));
+            }
+            if existing.gateway.trim() == cfg.gateway.trim()
+                && clean_gateway_fallbacks(Some(&existing.gateway_fallbacks))
+                    == clean_gateway_fallbacks(Some(&cfg.gateway_fallbacks))
+            {
+                // Same federation AND full gateway list (primary + fallbacks): idempotent.
                 harden_perms(&path)?;
                 return Ok(());
             }
-            // Same federation, updated (fungible) gateway: fall through to rewrite.
+            // Same federation, updated (fungible) gateway list: fall through to rewrite. The fallback
+            // list is as fungible as the primary — both are just routing endpoints (y4m.8) — so a
+            // re-bootstrap that only edits the fallbacks must persist, not silently no-op.
         } else {
             existing_bytes.zeroize();
+            // An existing-but-UNPARSEABLE durable config fails CLOSED (adversarial codex): silently
+            // overwriting it would bypass the invite-conflict check above, so a corrupt file (e.g. a
+            // hand-edited or truncated `fedimint.json`, or a malformed `gateway_fallbacks`) could hide
+            // a federation-invite mismatch and let a re-bootstrap repoint to a NEW federation —
+            // orphaning the operator's ecash. Refuse; the operator must restore from backup or clear
+            // the data dir deliberately.
+            return Err(config_conflict_err(
+                "a Fedimint config is present but cannot be parsed; refusing to overwrite it on \
+                 re-bootstrap (a corrupt config could hide a federation-invite mismatch, and \
+                 repointing to a new federation would orphan the ecash) — restore it from backup or \
+                 clear the data dir intentionally",
+            ));
         }
-        // An unparseable stored file is replaced by the valid supplied config.
     }
 
     let mut bytes = serde_json::to_vec(cfg)
@@ -1094,12 +1253,26 @@ fn validate_fedimint_config_reconcile(
     };
     let parsed = serde_json::from_slice::<FedimintConfig>(&existing_bytes);
     existing_bytes.zeroize();
-    if let Ok(existing) = parsed {
-        if existing.invite.trim() != cfg.invite.trim() {
+    match parsed {
+        Ok(existing) => {
+            if existing.invite.trim() != cfg.invite.trim() {
+                return Err(config_conflict_err(
+                    "operator already bootstrapped with a different Fedimint federation invite; \
+                     refusing to repoint to a new federation on re-bootstrap (this could orphan \
+                     the ecash position — clear the data dir to start a fresh federation)",
+                ));
+            }
+        }
+        // Fail closed on a present-but-UNPARSEABLE durable config HERE — this runs pre-persist (before
+        // `persist_operator_row`), so bootstrap stays all-or-nothing (codex): the same guard lives in
+        // `write_fedimint_config` as belt-and-suspenders, but rejecting a corrupt config only there
+        // would error AFTER the operator row was written. A corrupt file could hide a federation-invite
+        // mismatch, and repointing to a new federation would orphan the ecash.
+        Err(_) => {
             return Err(config_conflict_err(
-                "operator already bootstrapped with a different Fedimint federation invite; \
-                 refusing to repoint to a new federation on re-bootstrap (this could orphan \
-                 the ecash position — clear the data dir to start a fresh federation)",
+                "a Fedimint config is present but cannot be parsed; refusing to re-bootstrap over it \
+                 (a corrupt config could hide a federation-invite mismatch, and repointing to a new \
+                 federation would orphan the ecash) — restore it from backup or clear the data dir",
             ));
         }
     }
@@ -2187,7 +2360,8 @@ mod tests {
             op.config.fedimint,
             Some(FedimintConfig {
                 invite: "fed11invite".into(),
-                gateway: "03gateway".into()
+                gateway: "03gateway".into(),
+                gateway_fallbacks: vec![],
             })
         );
         let (_c, _m, _o, _b, payment, _r) = read_operator_row(&store).await;
@@ -2396,6 +2570,311 @@ mod tests {
         }
     }
 
+    // y4m.8: a single-gateway config serializes byte-identical to the pre-failover format — the empty
+    // `gateway_fallbacks` is OMITTED (skip_serializing_if), so an existing durable `fedimint.json`
+    // keeps its exact bytes, and an old on-disk document that predates the field parses back as an
+    // empty fallback list (serde default). This is the mandatory back-compat guarantee.
+    #[test]
+    fn single_gateway_fedimint_config_round_trips_byte_identical() {
+        let cfg = FedimintConfig {
+            invite: "fed11invite".into(),
+            gateway: "03gateway".into(),
+            gateway_fallbacks: vec![],
+        };
+        assert_eq!(
+            serde_json::to_string(&cfg).unwrap(),
+            r#"{"invite":"fed11invite","gateway":"03gateway"}"#,
+            "an empty fallback list is omitted (byte-identical to the pre-y4m.8 format)"
+        );
+        let parsed: FedimintConfig =
+            serde_json::from_str(r#"{"invite":"fed11invite","gateway":"03gateway"}"#).unwrap();
+        assert!(
+            parsed.gateway_fallbacks.is_empty(),
+            "a field-less old config reads as empty fallbacks"
+        );
+        assert_eq!(parsed.gateways(), vec!["03gateway".to_string()]);
+    }
+
+    // A present-but-UNPARSEABLE durable fedimint.json must FAIL CLOSED — never silently overwritten,
+    // which would bypass the invite-conflict check and could repoint the federation, orphaning the
+    // ecash (adversarial codex).
+    #[test]
+    fn write_fedimint_config_over_a_corrupt_file_fails_closed() {
+        let dir = temp_data_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FEDIMINT_CONFIG_FILE);
+        fs::write(&path, b"{ corrupt not-json").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut cfg = FedimintConfig {
+            invite: "fed11a-DIFFERENT-federation".into(),
+            gateway: "03gateway".into(),
+            gateway_fallbacks: vec![],
+        };
+        let err = write_fedimint_config(&dir, &mut cfg, false)
+            .expect_err("a corrupt durable config must not be silently overwritten");
+        assert!(
+            err.message.to_lowercase().contains("cannot be parsed"),
+            "expected a fail-closed corrupt-config error, got: {err:?}"
+        );
+        // The corrupt file is left UNTOUCHED — the different invite did NOT overwrite it.
+        assert_eq!(fs::read(&path).unwrap(), b"{ corrupt not-json");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // A multi-gateway config serializes the fallbacks as an array and `gateways()` yields the ordered
+    // selection list: primary first, then each fallback in order.
+    #[test]
+    fn multi_gateway_fedimint_config_serializes_and_orders_fallbacks() {
+        let cfg = FedimintConfig {
+            invite: "fed11invite".into(),
+            gateway: "03primary".into(),
+            gateway_fallbacks: vec!["03standby1".into(), "03standby2".into()],
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"invite":"fed11invite","gateway":"03primary","gateway_fallbacks":["03standby1","03standby2"]}"#
+        );
+        let parsed: FedimintConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.gateways(),
+            vec![
+                "03primary".to_string(),
+                "03standby1".to_string(),
+                "03standby2".to_string()
+            ],
+            "the selection list is primary-first, fallbacks in order"
+        );
+    }
+
+    // The invite+gateway pairing requirement is UNCHANGED by the fallbacks addition: a half config
+    // (a gateway + fallbacks but no invite) is still a structured config error, not a silent accept.
+    #[test]
+    fn supplied_fedimint_half_config_still_errors_with_fallbacks() {
+        let raw = RawConfig {
+            fedimint_gateway: Some("03primary".into()),
+            fedimint_gateway_fallbacks: Some(vec!["03standby".into()]),
+            // invite intentionally omitted -> half config
+            ..Default::default()
+        };
+        let err = supplied_fedimint_config(&raw).unwrap_err();
+        assert_eq!(err.code, "config_invalid");
+    }
+
+    // y4m.8: a multi-gateway config supplied at bootstrap PERSISTS the ordered fallback list to the
+    // durable `fedimint.json`, reloads it on a fresh read, and exposes it primary-first.
+    #[tokio::test]
+    async fn fedimint_bootstrap_persists_and_reloads_gateway_fallbacks() {
+        let dir = temp_data_dir();
+        let store = mem_store();
+        let raw = RawConfig {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            payment_backend: Some("fedimint".into()),
+            fedimint_invite: Some("fed11invite".into()),
+            fedimint_gateway: Some("03primary".into()),
+            fedimint_gateway_fallbacks: Some(vec!["03standby1".into(), "03standby2".into()]),
+            mnemonic: Some(TEST_MNEMONIC.into()),
+            ..Default::default()
+        };
+        let op = bootstrap(raw, &store)
+            .await
+            .expect("multi-gateway fedimint bootstrap");
+        let fedi = op.config.fedimint.clone().expect("fedimint config present");
+        assert_eq!(fedi.gateway, "03primary");
+        assert_eq!(
+            fedi.gateways(),
+            vec![
+                "03primary".to_string(),
+                "03standby1".to_string(),
+                "03standby2".to_string()
+            ]
+        );
+        // Reloaded from the durable data-dir config (fresh read, not the in-memory value).
+        let stored = read_fedimint_config(&dir).expect("durable fedimint config");
+        assert_eq!(
+            stored.gateway_fallbacks,
+            vec!["03standby1".to_string(), "03standby2".to_string()]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // A single-gateway operator's durable `fedimint.json` bytes are byte-identical to the
+    // pre-failover format — the omitted-when-empty `gateway_fallbacks` key is never written.
+    #[tokio::test]
+    async fn single_gateway_bootstrap_writes_no_fallbacks_key() {
+        let dir = temp_data_dir();
+        let store = mem_store();
+        bootstrap(raw_fedimint(&dir), &store)
+            .await
+            .expect("fedimint bootstrap");
+        let text = fs::read_to_string(dir.join(FEDIMINT_CONFIG_FILE)).expect("read fedimint.json");
+        assert!(
+            !text.contains("gateway_fallbacks"),
+            "an empty fallback list is omitted from the durable file: {text}"
+        );
+        assert_eq!(text, "{\"invite\":\"fed11invite\",\"gateway\":\"03gateway\"}\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // A re-bootstrap that EDITS only the (fungible) fallback list — same federation, same primary
+    // gateway — must PERSIST the change, not silently no-op on the idempotency early-return.
+    #[tokio::test]
+    async fn rebootstrap_updating_only_fallbacks_persists() {
+        let dir = temp_data_dir();
+        let store = mem_store();
+        bootstrap(raw_fedimint(&dir), &store)
+            .await
+            .expect("first (single-gateway) bootstrap");
+
+        let raw2 = RawConfig {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            payment_backend: Some("fedimint".into()),
+            fedimint_invite: Some("fed11invite".into()),
+            fedimint_gateway: Some("03gateway".into()),
+            fedimint_gateway_fallbacks: Some(vec!["03standby".into()]),
+            ..Default::default()
+        };
+        let op2 = bootstrap(raw2, &store)
+            .await
+            .expect("re-bootstrap adding a fallback");
+        assert_eq!(
+            op2.config.fedimint.as_ref().unwrap().gateway_fallbacks,
+            vec!["03standby".to_string()]
+        );
+        // Durable: the new fallback is written, not dropped by the same-gateway idempotency path.
+        let stored = read_fedimint_config(&dir).expect("durable fedimint config");
+        assert_eq!(stored.gateway_fallbacks, vec!["03standby".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // A FALLBACKS-ONLY re-bootstrap — NO invite/gateway re-supplied (they are durable) — must still
+    // apply the supplied fallback list (codex): failover config is updatable WITHOUT re-supplying the
+    // sensitive invite + primary gateway.
+    #[tokio::test]
+    async fn rebootstrap_with_only_fallbacks_updates_the_durable_list() {
+        let dir = temp_data_dir();
+        let store = mem_store();
+        bootstrap(raw_fedimint(&dir), &store)
+            .await
+            .expect("first (single-gateway) bootstrap");
+
+        let raw2 = RawConfig {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            payment_backend: Some("fedimint".into()),
+            // NO fedimint_invite / fedimint_gateway — only the fallback list.
+            fedimint_gateway_fallbacks: Some(vec!["03standby".into(), "03third".into()]),
+            ..Default::default()
+        };
+        let op2 = bootstrap(raw2, &store)
+            .await
+            .expect("fallbacks-only re-bootstrap");
+        assert_eq!(
+            op2.config.fedimint.as_ref().unwrap().gateway_fallbacks,
+            vec!["03standby".to_string(), "03third".to_string()]
+        );
+        let stored = read_fedimint_config(&dir).expect("durable fedimint config");
+        assert_eq!(
+            stored.gateway_fallbacks,
+            vec!["03standby".to_string(), "03third".to_string()],
+            "a fallbacks-only re-bootstrap persists the new list without re-supplying invite/gateway"
+        );
+        // The durable invite + primary gateway are untouched.
+        assert_eq!(stored.invite, "fed11invite");
+        assert_eq!(stored.gateway, "03gateway");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // An operator CAN decommission ALL fallbacks via config: a re-bootstrap supplying an EXPLICIT empty
+    // `fedimint_gateway_fallbacks = []` CLEARS the durable list, distinct from omitting the field
+    // (codex/CodeRabbit). (The sanitize-level preservation of `Some(vec![])` is pinned separately in
+    // `empty_fallbacks_preserved_as_explicit_clear_distinct_from_omitted`.)
+    #[tokio::test]
+    async fn rebootstrap_with_explicit_empty_fallbacks_clears_the_durable_list() {
+        let dir = temp_data_dir();
+        let store = mem_store();
+        // First bootstrap (single-gateway, carries the mnemonic), then add a fallback.
+        bootstrap(raw_fedimint(&dir), &store)
+            .await
+            .expect("first single-gateway bootstrap");
+        let add = RawConfig {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            payment_backend: Some("fedimint".into()),
+            fedimint_invite: Some("fed11invite".into()),
+            fedimint_gateway: Some("03gateway".into()),
+            fedimint_gateway_fallbacks: Some(vec!["03standby".into()]),
+            ..Default::default()
+        };
+        bootstrap(add, &store).await.expect("add a fallback");
+        assert_eq!(
+            read_fedimint_config(&dir).unwrap().gateway_fallbacks,
+            vec!["03standby".to_string()]
+        );
+
+        let clear = RawConfig {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            payment_backend: Some("fedimint".into()),
+            fedimint_invite: Some("fed11invite".into()),
+            fedimint_gateway: Some("03gateway".into()),
+            fedimint_gateway_fallbacks: Some(vec![]), // explicit clear
+            ..Default::default()
+        };
+        let op = bootstrap(clear, &store)
+            .await
+            .expect("clear-fallbacks re-bootstrap");
+        assert!(op.config.fedimint.as_ref().unwrap().gateway_fallbacks.is_empty());
+        let stored = read_fedimint_config(&dir).expect("durable fedimint config");
+        assert!(
+            stored.gateway_fallbacks.is_empty(),
+            "an explicit empty fallbacks list clears the durable failover list"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Re-supplying the legacy invite + primary-gateway pair without the optional fallback field must
+    // not erase a durable failover list. This is the normal flag/env re-bootstrap shape because those
+    // legacy surfaces only carry the primary gateway.
+    #[tokio::test]
+    async fn rebootstrap_omitting_fallbacks_preserves_durable_list() {
+        let dir = temp_data_dir();
+        let store = mem_store();
+        let first = RawConfig {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            payment_backend: Some("fedimint".into()),
+            fedimint_invite: Some("fed11invite".into()),
+            fedimint_gateway: Some("03primary".into()),
+            fedimint_gateway_fallbacks: Some(vec!["03standby".into()]),
+            mnemonic: Some(TEST_MNEMONIC.into()),
+            ..Default::default()
+        };
+        bootstrap(first, &store)
+            .await
+            .expect("first multi-gateway bootstrap");
+
+        let second = RawConfig {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            payment_backend: Some("fedimint".into()),
+            fedimint_invite: Some("fed11invite".into()),
+            fedimint_gateway: Some("03primary".into()),
+            // The legacy flag/env surface has no fallback field.
+            fedimint_gateway_fallbacks: None,
+            ..Default::default()
+        };
+        let op = bootstrap(second, &store)
+            .await
+            .expect("legacy-shape re-bootstrap");
+        assert_eq!(
+            op.config.fedimint.unwrap().gateway_fallbacks,
+            vec!["03standby".to_string()]
+        );
+        assert_eq!(
+            read_fedimint_config(&dir)
+                .expect("durable fedimint config")
+                .gateway_fallbacks,
+            vec!["03standby".to_string()]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // Review P2: a re-bootstrap that OMITS the payment backend must inherit the stored `fedimint`
     // backend and reload the durable Fedimint join config from the data dir — never downgrade to
     // `mock`, and never require flags/env/stdin for values we already durably stored.
@@ -2420,7 +2899,8 @@ mod tests {
             op2.config.fedimint,
             Some(FedimintConfig {
                 invite: "fed11invite".into(),
-                gateway: "03gateway".into()
+                gateway: "03gateway".into(),
+                gateway_fallbacks: vec![],
             })
         );
 
@@ -2664,7 +3144,8 @@ mod tests {
             op2.config.fedimint,
             Some(FedimintConfig {
                 invite: "fed11invite".into(),
-                gateway: "03gateway".into()
+                gateway: "03gateway".into(),
+                gateway_fallbacks: vec![],
             })
         );
         let (count, ..) = read_operator_row(&store).await;
@@ -2721,7 +3202,8 @@ mod tests {
             op2.config.fedimint,
             Some(FedimintConfig {
                 invite: "fed11invite".into(),
-                gateway: "03NEWGATEWAY".into()
+                gateway: "03NEWGATEWAY".into(),
+                gateway_fallbacks: vec![],
             })
         );
         let stored = read_fedimint_config(&dir).expect("durable config");
@@ -3239,7 +3721,8 @@ mod tests {
             cfg.fedimint,
             Some(FedimintConfig {
                 invite: "fed11x".into(),
-                gateway: "03y".into()
+                gateway: "03y".into(),
+                gateway_fallbacks: vec![],
             })
         );
     }
@@ -3273,6 +3756,7 @@ mod tests {
             fedimint: Some(FedimintConfig {
                 invite: "fed11SECRET".into(),
                 gateway: "03SECRETGATEWAY".into(),
+                gateway_fallbacks: vec![],
             }),
             min_holdings_warn_msat: 0,
         };
@@ -3426,6 +3910,49 @@ mod tests {
         assert_eq!(merged.data_dir.as_deref(), Some("/env/dir"));
     }
 
+    // y4m.8 review (codex/CodeRabbit): an EXPLICIT empty (or all-blank) `fedimint_gateway_fallbacks`
+    // is PRESERVED as `Some(vec![])` — distinct from an OMITTED field (`None`) — so it reads as "CLEAR
+    // the durable fallbacks", not "preserve them". This is what lets an operator decommission a standby
+    // gateway through the normal config surface (see `write_fedimint_config`'s `preserve_omitted_fallbacks`).
+    #[test]
+    fn empty_fallbacks_preserved_as_explicit_clear_distinct_from_omitted() {
+        assert_eq!(sanitize_secret_string_list(Some(vec![])), Some(vec![]));
+        assert_eq!(
+            sanitize_secret_string_list(Some(vec!["   ".into(), "\t".into()])),
+            Some(vec![]),
+            "an all-blank list is an explicit (empty) clear, not omitted"
+        );
+        assert_eq!(sanitize_secret_string_list(None), None, "an omitted field stays None (preserve)");
+        // A non-empty list keeps only its non-blank entries (blank ones must not shadow a lower layer).
+        assert_eq!(
+            sanitize_secret_string_list(Some(vec!["03a".into(), "  ".into(), "03b".into()])),
+            Some(vec!["03a".to_string(), "03b".to_string()])
+        );
+
+        // End to end through source-merging: an explicit empty higher-precedence fallbacks list WINS
+        // (shadows a lower list) and stays `Some(vec![])`, so `resolve_durable_fedimint_config` treats
+        // it as an explicit CLEAR — an operator's `[]` beats a durable/inherited list.
+        let flags = RawConfig {
+            fedimint_gateway_fallbacks: Some(vec![]),
+            ..Default::default()
+        };
+        let lower = RawConfig {
+            fedimint_gateway_fallbacks: Some(vec!["03inherited".into()]),
+            ..Default::default()
+        };
+        let merged = RawConfig::from_sources(
+            flags,
+            RawConfig::default(),
+            lower,
+            RawConfig::default(),
+        );
+        assert_eq!(
+            merged.fedimint_gateway_fallbacks,
+            Some(vec![]),
+            "an explicit empty fallbacks list clears (shadows the lower list), distinct from omitted"
+        );
+    }
+
     // The `env` layer reads the documented vars (relays comma-split) via an injected lookup.
     #[test]
     fn raw_config_from_env_reads_documented_vars() {
@@ -3536,7 +4063,8 @@ mod tests {
             op.config.fedimint,
             Some(FedimintConfig {
                 invite: "fed11fromfile".into(),
-                gateway: "03fromfile".into()
+                gateway: "03fromfile".into(),
+                gateway_fallbacks: vec![],
             })
         );
         assert_eq!(
