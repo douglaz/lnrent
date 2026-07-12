@@ -129,10 +129,16 @@ enum PlanOutcome {
     /// `refund:<external_id>`; gen>=1 = `refund:<external_id>:g<gen>`). `pay_sat` is the exact
     /// fee-adjusted payout (INV-1): `net_cap` for a freshly resolved invoice, or the persisted/direct
     /// invoice's own whole-sat amount on a re-await or bolt11 pass-through. It is NOT the gross.
+    /// `gateway_hint` (lnrent-y4m.18) carries the QUOTE-time gateway to the pay of the SAME drive so
+    /// both bind to one gateway decision — `Some` only on the arms that just quoted a fresh net cap
+    /// (gen-0 new payment, gen-1 first resolution, Failed re-resolve); `None` on the NO-quote re-await
+    /// arms, whose persisted invoice was already bound to an earlier attempt's gateway. Advisory and
+    /// NEVER persisted; the backend's INV-1 cap is enforced against whatever gateway actually pays.
     Pay {
         bolt11: String,
         gen: i64,
         pay_sat: u64,
+        gateway_hint: Option<String>,
     },
     /// The CURRENT generation already settled — record SENT without paying. `pay_sat` is the amount
     /// that generation actually paid (the persisted/direct invoice's own whole-sat figure), so the
@@ -329,7 +335,7 @@ impl Refunder {
 
         // Decide the bolt11 + generation + fee-adjusted pay amount (resolving/quoting + persisting if
         // needed), BEFORE pay(). `received` is the GROSS liability; `pay_sat` is the INV-1 payout.
-        let (bolt11, gen, pay_sat) = match self
+        let (bolt11, gen, pay_sat, gateway_hint) = match self
             .plan_payment(&row, &external_id, dest, received, now)
             .await
         {
@@ -337,7 +343,8 @@ impl Refunder {
                 bolt11,
                 gen,
                 pay_sat,
-            }) => (bolt11, gen, pay_sat),
+                gateway_hint,
+            }) => (bolt11, gen, pay_sat, gateway_hint),
             Ok(PlanOutcome::AlreadySent { pay_sat }) => {
                 return self.finish_sent(&row, None, pay_sat, now).await
             }
@@ -375,9 +382,12 @@ impl Refunder {
         // received amount (`received`); only the payout — and the buyer-facing "sent" DM (review P2) —
         // is reduced by the gateway fee.
         tracing::debug!(refund = %row.id, gross = received, net_pay = pay_sat, gen, "paying capped refund");
+        // Carry the quote-time gateway hint (lnrent-y4m.18) so this pay prefers the SAME gateway the
+        // net cap was priced on; `None` on the re-await arms leaves the ordered probe unchanged. The
+        // hint is advisory — the backend's INV-1 cap is still enforced against the ACTUAL paying gateway.
         match self
             .payment
-            .pay_refund_capped(&bolt11, pay_sat, received, &key)
+            .pay_refund_capped_via(&bolt11, pay_sat, received, &key, gateway_hint.as_deref())
             .await
         {
             Ok(backend_payment_id) => {
@@ -462,18 +472,24 @@ impl Refunder {
                 PayStatus::Succeeded => Ok(PlanOutcome::AlreadySent {
                     pay_sat: bolt11_sat,
                 }),
+                // Re-await an in-flight gen-0 with NO re-quote: its op was already bound to a gateway,
+                // so there is no quote-time gateway to carry (lnrent-y4m.18).
                 PayStatus::Pending => Ok(PlanOutcome::Pay {
                     bolt11: dest.to_string(),
                     gen: 0,
                     pay_sat: bolt11_sat,
+                    gateway_hint: None,
                 }),
                 _ if started_unknown => Ok(PlanOutcome::Pay {
                     bolt11: dest.to_string(),
                     gen: 0,
                     pay_sat: bolt11_sat,
+                    gateway_hint: None,
                 }),
+                // NEW gen-0 payment: the quote just priced the cap on a specific gateway; carry that
+                // gateway to the pay so the cap preflight is checked against the same fee schedule.
                 PayStatus::Unknown | PayStatus::Failed => {
-                    let net_cap = self.quote_net_cap(received).await?;
+                    let (net_cap, gateway_hint) = self.quote_net_cap(received).await?;
                     if bolt11_sat > net_cap {
                         return Err(PlanError::Structural(format!(
                             "buyer's fixed bolt11 ({bolt11_sat} sat) exceeds the fee-adjusted refund cap ({net_cap} sat)"
@@ -483,6 +499,7 @@ impl Refunder {
                         bolt11: dest.to_string(),
                         gen: 0,
                         pay_sat: bolt11_sat,
+                        gateway_hint,
                     })
                 }
             };
@@ -492,7 +509,7 @@ impl Refunder {
             // Never resolved -> generation 1, a NEW payment: quote the INV-1 cap, resolve a bolt11 for
             // EXACTLY that net cap, PERSIST (committed), then pay g1 for the net amount.
             None => {
-                let net_cap = self.quote_net_cap(received).await?;
+                let (net_cap, gateway_hint) = self.quote_net_cap(received).await?;
                 let owed_msat = net_cap.checked_mul(1000).ok_or_else(|| {
                     PlanError::Structural(format!(
                         "refund net amount {net_cap} sat overflows u64 msats"
@@ -502,10 +519,13 @@ impl Refunder {
                 if !self.persist_resolution(&row.id, &resolved, 1, now).await? {
                     return Ok(PlanOutcome::Skip);
                 }
+                // Fresh gen-1 invoice minted for EXACTLY this quote's net cap; the pay prefers the
+                // quote-time gateway so its INV-1 preflight sees the same fee (lnrent-y4m.18).
                 Ok(PlanOutcome::Pay {
                     bolt11: resolved.bolt11,
                     gen: 1,
                     pay_sat: net_cap,
+                    gateway_hint,
                 })
             }
             // Already resolved -> branch on the CURRENT generation's status. The quote is touched ONLY
@@ -550,7 +570,7 @@ impl Refunder {
                     // re-await the persisted invoice below with NO re-quote, so a gateway outage can never
                     // strand an in-flight payment.
                     PayStatus::Failed => {
-                        let net_cap = self.quote_net_cap(received).await?; // Err (gateway down) => Transient
+                        let (net_cap, gateway_hint) = self.quote_net_cap(received).await?; // Err (gateway down) => Transient
                         let persisted_sat = parse_whole_sat(bolt11).unwrap_or(received);
                         if expired || persisted_sat > net_cap {
                             let owed_msat = net_cap.checked_mul(1000).ok_or_else(|| {
@@ -566,16 +586,31 @@ impl Refunder {
                             {
                                 return Ok(PlanOutcome::Skip);
                             }
+                            // RE-RESOLVE mints a fresh invoice for this quote's net cap; carry the
+                            // quote-time gateway to the pay (lnrent-y4m.18).
                             Ok(PlanOutcome::Pay {
                                 bolt11: resolved.bolt11,
                                 gen: next_gen,
                                 pay_sat: net_cap,
+                                gateway_hint,
                             })
                         } else {
+                            // Plain retry REUSES the persisted invoice (minted under an EARLIER
+                            // attempt for `persisted_sat`, which we just re-checked still fits this
+                            // quote's cap) instead of minting a fresh one sized to THIS quote's
+                            // net_cap. A bolt11 invoice is not bound to any outbound gateway — this
+                            // FAILED gen starts a NEW pay op — but the pay amount here is NOT sized to
+                            // the quote's gateway, so we carry NO hint and let start_new_pay pick a
+                            // gateway via its own ordered probe. That probe converges with the quote's
+                            // selection under stable reachability, and its cap preflight runs against
+                            // the ACTUAL paying gateway, so INV-1 holds regardless of any quote/pay
+                            // gateway reorder (a rare reorder only risks a preflight rejection that
+                            // re-drives, never an overpay).
                             Ok(PlanOutcome::Pay {
                                 bolt11: bolt11.to_string(),
                                 gen,
                                 pay_sat: persisted_sat,
+                                gateway_hint: None,
                             })
                         }
                     }
@@ -586,10 +621,13 @@ impl Refunder {
                     // final cap preflight still bounds — so it can never overpay.
                     PayStatus::Pending | PayStatus::Unknown => {
                         let pay_sat = parse_whole_sat(bolt11).unwrap_or(received);
+                        // Re-await the persisted invoice with NO re-quote (lnrent-y4m.18): its op is
+                        // bound to an earlier attempt's gateway, so there is no quote-time hint.
                         Ok(PlanOutcome::Pay {
                             bolt11: bolt11.to_string(),
                             gen,
                             pay_sat,
+                            gateway_hint: None,
                         })
                     }
                 }
@@ -598,17 +636,19 @@ impl Refunder {
     }
 
     /// Quote the INV-1 net cap for a NEW refund payment (spec §3.1): the largest fee-adjusted whole-sat
-    /// payout for `received`. `Ok(0)` (true dust — no positive whole-sat payout plus fee fits inside the
+    /// payout for `received`, PLUS the advisory gateway hint that priced it (lnrent-y4m.18) so the pay
+    /// of the SAME drive can prefer the quote-time gateway. `Ok(net, hint)` — a `Some(net>0)` net.
+    /// `Ok(0)` from the backend (true dust — no positive whole-sat payout plus fee fits inside the
     /// gross) is a STRUCTURAL park (FAILED, never retried). An `Err` (gateway unreadable / quote
     /// failure) is TRANSIENT (row stays PENDING, retried next drive) — NOT dust, so a gateway outage
     /// never parks a real liability as if it were unrefundable.
-    async fn quote_net_cap(&self, received: u64) -> Result<u64, PlanError> {
-        match self.payment.refund_net_sat(received).await {
-            Ok(0) => Err(PlanError::Structural(
+    async fn quote_net_cap(&self, received: u64) -> Result<(u64, Option<String>), PlanError> {
+        match self.payment.refund_quote(received).await {
+            Ok(q) if q.net_sat == 0 => Err(PlanError::Structural(
                 "received amount below the network fee; cannot auto-refund without operator loss"
                     .to_string(),
             )),
-            Ok(net) => Ok(net),
+            Ok(q) => Ok((q.net_sat, q.gateway_hint)),
             Err(e) => Err(PlanError::Transient(format!(
                 "refund fee quote failed: {e}"
             ))),
@@ -3291,6 +3331,205 @@ mod tests {
             offenders.is_empty(),
             "unexpected production `INTO refund_attempt` writer(s): {offenders:?}; only \
              capture.rs::refund_intent and provision.rs::RefundDueWrite may create refund rows (INV-3)"
+        );
+    }
+
+    // ---- y4m.18: the quote-time gateway hint is bound to the pay within one drive ------------------
+
+    /// A fee-aware backend for the y4m.18 quote/pay-gateway-binding tests: it overrides `refund_quote`
+    /// (returning a configurable net cap + gateway hint, counting the quote calls) and
+    /// `pay_refund_capped_via` (recording the hint each pay received, keyed by idempotency key). So a
+    /// test can assert that a fresh resolution's pay bound to the SAME gateway its quote picked, and
+    /// that a NO-quote re-await pays with `None` (and never quoted). `payment_status_by_key` returns a
+    /// per-key override (default `Unknown`) so the re-await arm can be driven.
+    #[derive(Default)]
+    struct HintPayment {
+        inner: Mutex<HintPayState>,
+    }
+    #[derive(Default)]
+    struct HintPayState {
+        net_sat: u64,
+        hint: Option<String>,
+        quote_calls: usize,
+        /// idempotency_key -> the gateway hint its `pay_refund_capped_via` received.
+        pay_hints: HashMap<String, Option<String>>,
+        /// per-key `payment_status_by_key` override (default `Unknown`).
+        key_status: HashMap<String, PayStatus>,
+        seq: u64,
+    }
+    impl HintPayment {
+        fn new(net_sat: u64, hint: Option<&str>) -> Self {
+            Self {
+                inner: Mutex::new(HintPayState {
+                    net_sat,
+                    hint: hint.map(str::to_string),
+                    ..Default::default()
+                }),
+            }
+        }
+        fn quote_calls(&self) -> usize {
+            self.inner.lock().unwrap().quote_calls
+        }
+        /// `Some(hint)` if a pay under `key` was recorded (`hint` itself may be `None`); `None` if no
+        /// pay ran on that key. So `Some(None)` (paid, no hint) is distinguishable from never-paid.
+        fn pay_hint(&self, key: &str) -> Option<Option<String>> {
+            self.inner.lock().unwrap().pay_hints.get(key).cloned()
+        }
+        fn set_key_status(&self, key: &str, status: PayStatus) {
+            self.inner
+                .lock()
+                .unwrap()
+                .key_status
+                .insert(key.to_string(), status);
+        }
+    }
+    #[async_trait]
+    impl PaymentBackend for HintPayment {
+        async fn refund_quote(&self, _gross_sat: u64) -> Result<crate::backends::RefundQuote> {
+            let mut st = self.inner.lock().unwrap();
+            st.quote_calls += 1;
+            Ok(crate::backends::RefundQuote {
+                net_sat: st.net_sat,
+                gateway_hint: st.hint.clone(),
+            })
+        }
+        async fn pay_refund_capped_via(
+            &self,
+            _bolt11: &str,
+            _amount_sat: u64,
+            _gross_sat: u64,
+            idempotency_key: &str,
+            gateway_hint: Option<&str>,
+        ) -> Result<String> {
+            let mut st = self.inner.lock().unwrap();
+            let recorded = gateway_hint.map(str::to_string);
+            st.pay_hints.insert(idempotency_key.to_string(), recorded);
+            let n = st.seq;
+            st.seq += 1;
+            Ok(format!("hint-pay-{n}"))
+        }
+        async fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus> {
+            Ok(self
+                .inner
+                .lock()
+                .unwrap()
+                .key_status
+                .get(idempotency_key)
+                .copied()
+                .unwrap_or(PayStatus::Unknown))
+        }
+        async fn pay(&self, _: &str, _: u64, _: &str) -> Result<String> {
+            unimplemented!("HintPayment pays only via pay_refund_capped_via")
+        }
+        async fn create_invoice(&self, _: u64, _: &str, _: u32, _: &str) -> Result<Invoice> {
+            unimplemented!("refunder never receives")
+        }
+        async fn lookup(&self, _: &str) -> Result<PaymentStatus> {
+            unimplemented!("refunder never looks up invoices")
+        }
+        async fn lookup_settlement(&self, _: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            unimplemented!("refunder never looks up invoices")
+        }
+        async fn payment_status(&self, _: &str) -> Result<PayStatus> {
+            unimplemented!("refunder checks by key, not id")
+        }
+        async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+            unimplemented!("refunder never watches")
+        }
+    }
+
+    // (a) A FRESH resolution's pay receives EXACTLY the gateway hint its quote produced — quote and pay
+    //     bind to one gateway decision within the drive (the y4m.18 correctness goal).
+    #[tokio::test]
+    async fn fresh_resolution_pay_uses_the_quote_gateway_hint() {
+        let store = mem_store();
+        let payment = Arc::new(HintPayment::new(500, Some("gw-A")));
+        let clock = TestClock::new(1_000);
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        seed_refund(&store, "sub-1", Some(LN_ADDR), Some(500)).await;
+
+        let report = Refunder::new(store.clone(), payment.clone(), Arc::new(clock.clone()))
+            .drive()
+            .await
+            .unwrap();
+
+        assert_eq!(report.sent, 1);
+        assert_eq!(
+            payment.quote_calls(),
+            1,
+            "one quote priced the fresh gen-1 resolution"
+        );
+        assert_eq!(
+            payment.pay_hint("refund:order:sub-1:g1"),
+            Some(Some("gw-A".to_string())),
+            "the pay received EXACTLY the gateway hint its quote produced"
+        );
+    }
+
+    // (b) A Pending re-await pays with `None` and NEVER quotes — its persisted invoice is already bound
+    //     to an earlier attempt's gateway, so there is no quote-time gateway to carry.
+    #[tokio::test]
+    async fn reawait_pay_uses_no_hint_and_does_not_quote() {
+        let store = mem_store();
+        let payment = Arc::new(HintPayment::new(500, Some("gw-A")));
+        payment.set_key_status("refund:order:sub-1:g1", PayStatus::Pending);
+        let clock = TestClock::new(1_000);
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        // A resolved gen-1 row with a FUTURE expiry: a Pending status re-awaits it with no re-quote.
+        seed_refund_resolved(&store, "sub-1", LN_ADDR, 500, "persisted-bolt11", 10_000, 1).await;
+
+        let report = Refunder::new(store.clone(), payment.clone(), Arc::new(clock.clone()))
+            .drive()
+            .await
+            .unwrap();
+
+        assert_eq!(report.sent, 1);
+        assert_eq!(
+            payment.quote_calls(),
+            0,
+            "a Pending re-await must not re-quote (no fresh gateway decision)"
+        );
+        assert_eq!(
+            payment.pay_hint("refund:order:sub-1:g1"),
+            Some(None),
+            "the re-await pay carries no gateway hint"
+        );
+    }
+
+    // (c) DEFAULT trait impls: a backend overriding ONLY the OLD methods (refund_net_sat + pay) still
+    //     works unchanged — the default `refund_quote` mirrors `refund_net_sat` with no hint, and the
+    //     default `pay_refund_capped_via` delegates through `pay_refund_capped` -> `pay`.
+    #[tokio::test]
+    async fn default_trait_impls_keep_old_mocks_working() {
+        let payment = Arc::new(TestPayment::new());
+        payment.set_net_cap(400);
+        let q = payment.refund_quote(500).await.unwrap();
+        assert_eq!(
+            q.net_sat,
+            payment.refund_net_sat(500).await.unwrap(),
+            "the default refund_quote returns refund_net_sat verbatim"
+        );
+        assert_eq!(q.net_sat, 400);
+        assert_eq!(
+            q.gateway_hint, None,
+            "a backend with no gateway concept produces no hint"
+        );
+
+        // And the full drive still runs through the default-implemented pay_refund_capped_via.
+        let store = mem_store();
+        let clock = TestClock::new(1_000);
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        seed_refund(&store, "sub-1", Some(LN_ADDR), Some(500)).await;
+
+        let report = refunder(&store, &payment, &clock).drive().await.unwrap();
+
+        assert_eq!(
+            report.sent, 1,
+            "the default pay_refund_capped_via delegates through to pay"
+        );
+        assert!(
+            payment.was_paid("refund:order:sub-1:g1"),
+            "the fresh gen-1 refund paid for the default-quoted net cap"
         );
     }
 }

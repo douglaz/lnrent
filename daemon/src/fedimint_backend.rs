@@ -58,7 +58,7 @@ use fedimint_mint_client::MintClientInit;
 use fedimint_rocksdb::RocksDb;
 use fedimint_wallet_client::WalletClientInit;
 
-use crate::backends::{Invoice, PayStatus, PaymentBackend, PaymentStatus, Settlement};
+use crate::backends::{Invoice, PayStatus, PaymentBackend, PaymentStatus, RefundQuote, Settlement};
 use crate::clock::Clock;
 
 /// HKDF salt for wrapping lnrent's (provisional) 32-byte Fedimint root secret (`identity.rs`,
@@ -446,12 +446,35 @@ impl FedimintPayment {
     /// caller mints/pays ONCE with the single returned gateway — the create-once idempotency and the
     /// INV-1 caps are untouched.
     async fn select_gateway(&self) -> Result<LightningGateway> {
+        // All existing callers (invoice-create, the fee quote, the liquidity check, the plain/sweep
+        // pay, readiness) get the unchanged no-preference behavior — the `None` preference reproduces
+        // the pre-y4m.18 ordered-failover selection exactly.
+        self.select_gateway_preferring(None).await
+    }
+
+    /// [`select_gateway`](Self::select_gateway) plus a best-effort `preferred` gateway to try FIRST
+    /// (lnrent-y4m.18): the quote-time gateway a refund's [`PaymentBackend::refund_quote`] selected,
+    /// threaded to its pay so the quote and the pay bind to ONE decision even if a failover would
+    /// otherwise price and pay through different gateways. The pure [`ordered_with_preference`] helper
+    /// builds the probe order (preferred first, then the configured order, deduped; a preferred pk NOT
+    /// in the configured list is still tried first — it was reachable at quote time). If the hinted
+    /// gateway is no longer reachable the ordered probe FALLS BACK to the configured order rather than
+    /// failing the pay: the cap preflight against the ACTUAL paying gateway still protects INV-1, so the
+    /// residual quote-gateway-vanished window is safe (never an over-cap outlay). `preferred: None`
+    /// leaves the pre-y4m.18 behavior byte-for-byte, including the empty-list "any available gateway"
+    /// fallback; a preference WITH an empty configured list tries the preferred pk then falls back to
+    /// `get_gateway(None, ...)` "any". The [`update_gateway_cache`] fail-closed refresh is unchanged.
+    async fn select_gateway_preferring(
+        &self,
+        preferred: Option<PublicKey>,
+    ) -> Result<LightningGateway> {
         let ln = self
             .client
             .get_first_module::<LightningClientModule>()
             .context("fedimint: no lightning module")?;
-        if self.gateways.is_empty() {
-            // No pin (tests / unset): preserve the pre-y4m.8 "any available gateway" behavior.
+        let ordered = ordered_with_preference(preferred, &self.gateways);
+        if ordered.is_empty() {
+            // No pin AND no preference (tests / unset): preserve the pre-y4m.8 "any available gateway".
             return ln
                 .get_gateway(None, false)
                 .await
@@ -470,7 +493,20 @@ impl FedimintPayment {
         ln.update_gateway_cache()
             .await
             .context("refreshing the fedimint gateway registrations before failover selection")?;
-        select_first_reachable(&self.gateways, |pk| ln.get_gateway(Some(pk), false)).await
+        match select_first_reachable(&ordered, |pk| ln.get_gateway(Some(pk), false)).await {
+            Ok(gw) => Ok(gw),
+            // Empty configured list + a preference whose pk turned out unreachable: fall back to the
+            // federation's "any available gateway" (the empty-list contract), rather than fail-closing
+            // on the advisory hint alone. With a NON-empty configured list this arm is unreachable —
+            // `ordered` already includes every configured gateway, so a failure there is the genuine
+            // total-outage fail-closed and must propagate.
+            Err(_) if self.gateways.is_empty() => ln
+                .get_gateway(None, false)
+                .await
+                .context("selecting an available lightning gateway")?
+                .context("no lightning gateway is available"),
+            Err(e) => Err(e),
+        }
     }
 
     /// Await a refund payment to a terminal state, recording the outcome in the pay index and
@@ -569,6 +605,7 @@ impl FedimintPayment {
         amount_sat: u64,
         idempotency_key: &str,
         cap: PayCap,
+        preferred: Option<PublicKey>,
     ) -> Result<String> {
         let payment_type = {
             // Idempotent on the key: serialize check->start->index so concurrent same-key callers cannot
@@ -589,12 +626,12 @@ impl FedimintPayment {
                     }
                     _ => {
                         // FAILED -> re-attempt below (the prior payment refunded; not a double-pay).
-                        self.start_new_pay(dest, amount_sat, idempotency_key, cap)
+                        self.start_new_pay(dest, amount_sat, idempotency_key, cap, preferred)
                             .await?
                     }
                 }
             } else {
-                self.start_new_pay(dest, amount_sat, idempotency_key, cap)
+                self.start_new_pay(dest, amount_sat, idempotency_key, cap, preferred)
                     .await?
             }
         };
@@ -608,6 +645,7 @@ impl FedimintPayment {
         amount_sat: u64,
         idempotency_key: &str,
         cap: PayCap,
+        preferred: Option<PublicKey>,
     ) -> Result<PayType> {
         // Structural preflight failures (bad bolt11, no amount, amount mismatch) happen before any
         // operation exists. Park them as a FAILED key row so payment_status_by_key reports Failed and
@@ -655,11 +693,13 @@ impl FedimintPayment {
             .client
             .get_first_module::<LightningClientModule>()
             .context("fedimint: no lightning module")?;
-        // Failover selection (lnrent-y4m.8): the first reachable gateway in the configured order. The
-        // SAME chosen gateway object is used for the cap preflight AND pay_bolt11_invoice below, so
-        // the fee/route caps are enforced against exactly the gateway the money flows through.
+        // Failover selection (lnrent-y4m.8), preferring the quote-time gateway when one was carried
+        // (lnrent-y4m.18): the first reachable gateway, hinted first then in the configured order. The
+        // SAME chosen gateway object is used for the cap preflight AND pay_bolt11_invoice below, so the
+        // fee/route caps are enforced against exactly the gateway the money flows through — the hint
+        // only reorders the probe, it can never weaken the cap.
         let gateway = self
-            .select_gateway()
+            .select_gateway_preferring(preferred)
             .await
             .context("selecting a reachable lightning gateway for the refund")?;
         // Final cap preflight (spec §3.1 / gate1-operator-sweep): quoting and paying are separate
@@ -863,7 +903,7 @@ impl PaymentBackend for FedimintPayment {
         // No gross context here (legacy/internal callers): pay the requested amount with the standard
         // key idempotency and NO cap. The Refunder uses pay_refund_capped and the Sweeper uses
         // pay_capped when they know the ceiling, so the cap is enforced on the money path (spec §3.1).
-        self.pay_inner(dest, amount_sat, idempotency_key, PayCap::None)
+        self.pay_inner(dest, amount_sat, idempotency_key, PayCap::None, None)
             .await
     }
 
@@ -885,6 +925,30 @@ impl PaymentBackend for FedimintPayment {
             u64::from(fees.proportional_millionths),
             gross_sat,
         ))
+    }
+
+    async fn refund_quote(&self, gross_sat: u64) -> Result<RefundQuote> {
+        // ONE gateway decision for the quote (lnrent-y4m.18): select once, derive BOTH the net cap
+        // (same `net_payout_sat` math as `refund_net_sat`) and the hint (that gateway's `gateway_id`
+        // pubkey hex) from it, so the pay of the SAME attempt can prefer this exact gateway and quote
+        // and pay agree on the fee schedule the INV-1 cap is measured against. A selection failure
+        // stays a TRANSIENT quote Err (never dust/Ok(0)), exactly as `refund_net_sat`.
+        let gateway = self
+            .select_gateway()
+            .await
+            .context("selecting a reachable lightning gateway for the refund fee quote")?;
+        let fees = gateway.fees;
+        let net_sat = net_payout_sat(
+            u64::from(fees.base_msat),
+            u64::from(fees.proportional_millionths),
+            gross_sat,
+        );
+        Ok(RefundQuote {
+            net_sat,
+            // The gateway identity `select_gateway_preferring` matches a preference against (the
+            // `LightningGatewayKey` / `get_gateway(Some(pk), _)` key). Advisory + never persisted.
+            gateway_hint: Some(gateway.gateway_id.to_string()),
+        })
     }
 
     async fn refund_required_outlay_msat(
@@ -925,8 +989,36 @@ impl PaymentBackend for FedimintPayment {
         gross_sat: u64,
         idempotency_key: &str,
     ) -> Result<String> {
-        self.pay_inner(bolt11, amount_sat, idempotency_key, PayCap::Gross(gross_sat))
-            .await
+        self.pay_inner(
+            bolt11,
+            amount_sat,
+            idempotency_key,
+            PayCap::Gross(gross_sat),
+            None,
+        )
+        .await
+    }
+
+    async fn pay_refund_capped_via(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        gross_sat: u64,
+        idempotency_key: &str,
+        gateway_hint: Option<&str>,
+    ) -> Result<String> {
+        // Parse the advisory quote-time hint (lnrent-y4m.18) into the gateway pubkey the selection seam
+        // prefers. An UNPARSEABLE hint is treated as NO hint (fall through to the ordered probe), NOT an
+        // error: it is advisory, and the INV-1 cap is enforced against whatever gateway actually pays.
+        let preferred = gateway_hint.and_then(|h| PublicKey::from_str(h).ok());
+        self.pay_inner(
+            bolt11,
+            amount_sat,
+            idempotency_key,
+            PayCap::Gross(gross_sat),
+            preferred,
+        )
+        .await
     }
 
     async fn pay_capped(
@@ -943,6 +1035,7 @@ impl PaymentBackend for FedimintPayment {
             amount_sat,
             idempotency_key,
             PayCap::Outlay(max_outlay_msat),
+            None,
         )
         .await
     }
@@ -1529,6 +1622,27 @@ where
     }
 }
 
+/// PURE preference-ordering for the quote/pay gateway binding (lnrent-y4m.18): the probe order the live
+/// [`FedimintPayment::select_gateway_preferring`] hands to [`select_first_reachable`]. `preferred` (the
+/// gateway a refund's fee QUOTE selected in this attempt) is tried FIRST, then the configured order,
+/// with the preferred pk DE-DUPED out of the tail so it is never probed twice. A `preferred` NOT in the
+/// configured list is STILL placed first — it was reachable at quote time, so it is the best guess for
+/// the pay even if the operator never listed it. `None` yields the configured order unchanged (the
+/// pre-y4m.18 selection). Free of the live client — following the `net_payout_sat` /
+/// `select_first_reachable` precedent — so the ORDER decision is unit-tested without a federation.
+fn ordered_with_preference(preferred: Option<PublicKey>, gateways: &[PublicKey]) -> Vec<PublicKey> {
+    let mut ordered = Vec::with_capacity(gateways.len() + 1);
+    if let Some(pk) = preferred {
+        ordered.push(pk);
+    }
+    for &pk in gateways {
+        if Some(pk) != preferred {
+            ordered.push(pk);
+        }
+    }
+    ordered
+}
+
 fn fedimint_readiness_warns(gateway_ok: bool) -> bool {
     !gateway_ok
 }
@@ -1853,7 +1967,7 @@ mod select_gateway_tests {
     //! `net_payout_sat` precedent), so the SELECTION decision is proven with a fake `try_one` over a
     //! stand-in gateway type — no federation. The end-to-end failover proof lives in the `#[ignore]`d
     //! `daemon/tests/fedimint_live.rs`.
-    use super::select_first_reachable;
+    use super::{ordered_with_preference, select_first_reachable};
     use anyhow::{anyhow, Result};
     use fedimint_core::secp256k1::{PublicKey, Secp256k1, SecretKey};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1967,5 +2081,72 @@ mod select_gateway_tests {
             0,
             "no gateway is probed for an empty list"
         );
+    }
+
+    // ---- ordered_with_preference (lnrent-y4m.18): quote/pay gateway binding ------------------------
+    // The PURE preference-ordering rule the live pay path feeds `select_first_reachable`, so quote and
+    // pay probe the SAME gateway first within one attempt. Proven without a federation.
+
+    // The quote-time gateway is tried FIRST, ahead of the configured order.
+    #[test]
+    fn preference_is_tried_first() {
+        let gws = [pk(1), pk(2), pk(3)];
+        assert_eq!(
+            ordered_with_preference(Some(pk(2)), &gws),
+            vec![pk(2), pk(1), pk(3)],
+            "the preferred gateway leads, then the configured order minus it"
+        );
+    }
+
+    // A preferred gateway ALREADY in the configured list is deduped — probed once (first), never twice.
+    #[test]
+    fn preference_in_list_is_deduped() {
+        let gws = [pk(1), pk(2), pk(3)];
+        let ordered = ordered_with_preference(Some(pk(1)), &gws);
+        assert_eq!(
+            ordered,
+            vec![pk(1), pk(2), pk(3)],
+            "an already-first preference leaves the order unchanged, no duplicate"
+        );
+        assert_eq!(
+            ordered.iter().filter(|&&p| p == pk(1)).count(),
+            1,
+            "the preferred pk appears exactly once"
+        );
+    }
+
+    // No preference == the configured order, byte-for-byte (the pre-y4m.18 selection).
+    #[test]
+    fn no_preference_is_the_configured_order() {
+        let gws = [pk(1), pk(2), pk(3)];
+        assert_eq!(
+            ordered_with_preference(None, &gws),
+            vec![pk(1), pk(2), pk(3)]
+        );
+    }
+
+    // A preferred gateway NOT in the configured list is STILL tried first — it was reachable at quote
+    // time, so it is the best guess for the pay even though the operator never listed it.
+    #[test]
+    fn preference_not_in_list_is_still_first() {
+        let gws = [pk(1), pk(2)];
+        assert_eq!(
+            ordered_with_preference(Some(pk(9)), &gws),
+            vec![pk(9), pk(1), pk(2)],
+            "an unlisted preference leads, then the full configured order"
+        );
+    }
+
+    // Empty configured list + a preference: probe the preferred pk alone (the live wrapper then falls
+    // back to "any available gateway" if it is unreachable — see select_gateway_preferring).
+    #[test]
+    fn empty_list_with_preference_probes_the_preferred() {
+        assert_eq!(ordered_with_preference(Some(pk(1)), &[]), vec![pk(1)]);
+    }
+
+    // Empty configured list + NO preference: nothing to probe (the empty-list "any gateway" path).
+    #[test]
+    fn empty_list_without_preference_is_empty() {
+        assert!(ordered_with_preference(None, &[]).is_empty());
     }
 }
