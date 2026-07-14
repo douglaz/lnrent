@@ -1382,9 +1382,20 @@ async fn recover_pay_from_oplog(
     // the true total) so one pathological key cannot balloon memory to O(oplog). BTreeMap so the
     // fail-closed diagnostic below is byte-deterministic across restarts.
     const MAX_LISTED: usize = 8;
-    /// (was this key's arm a Backfill, up to [`MAX_LISTED`] listed `(op_hex, kind)` candidates,
-    /// TRUE total seen) for one key.
-    type KeyCandidates = (bool, Vec<(String, &'static str)>, usize);
+    #[derive(Default)]
+    struct KeyCandidates {
+        /// This key's arm: an absent-row backfill (`true`) or a stale-FAILED replace (`false`).
+        /// Cannot change mid-scan — nothing is upserted in-scan.
+        is_backfill: bool,
+        /// Up to [`MAX_LISTED`] possibly-LIVE `(op_hex, kind)` candidates for the PENDING slot.
+        listed: Vec<(String, &'static str)>,
+        /// TRUE total of possibly-live candidates (may exceed `listed.len()`).
+        total_live: usize,
+        /// Absent-row arm only: the smallest ledger-DEAD candidate (deterministic pick). Never a
+        /// live candidate; used for a truthful FAILED bookkeeping backfill when NO live candidate
+        /// exists, and what lets the ambiguity runbook unbrick an absent-row refusal.
+        dead_min: Option<(String, &'static str)>,
+    }
     let mut pending_writes: std::collections::BTreeMap<String, KeyCandidates> =
         std::collections::BTreeMap::new();
     let mut last = None;
@@ -1428,9 +1439,14 @@ async fn recover_pay_from_oplog(
             // that cache (the wrapper caches the last emitted update on an EOF-without-terminal).
             // The ledger is a local instant lookup with none of those dependencies.
             let candidate_dead = match existing_ref {
+                // Both arms that might WRITE consult the ledger: the FAILED arm so a dead
+                // candidate never resurrects, and the ABSENT arm so a dead candidate never counts
+                // as live toward the ambiguity refusal (codex PR-32 P1: otherwise the operator's
+                // runbook insert could never unbrick an absent-row refusal).
                 Some((row_op, "FAILED")) if row_op != op_hex => {
                     pay_idx_is_dead(index, &op_hex)?
                 }
+                None => pay_idx_is_dead(index, &op_hex)?,
                 _ => false,
             };
             let kind = if pay.is_internal_payment {
@@ -1441,18 +1457,28 @@ async fn recover_pay_from_oplog(
             // COLLECT rather than write in-scan — for BOTH arms — so every competing candidate
             // for a key is seen before one is chosen (the row state stays constant during the
             // scan, so later same-key candidates are never masked by an earlier write).
-            let is_backfill = match pay_recovery_action(existing_ref, &op_hex, candidate_dead) {
-                PayRecoveryAction::Skip => continue,
-                PayRecoveryAction::Backfill => true,
-                PayRecoveryAction::ReplaceStaleFailed => false,
-            };
-            let (_, listed, total) = pending_writes
-                .entry(idk.to_owned())
-                .or_insert((is_backfill, Vec::new(), 0));
-            if listed.len() < MAX_LISTED {
-                listed.push((op_hex.clone(), kind));
+            match pay_recovery_action(existing_ref, &op_hex, candidate_dead) {
+                PayRecoveryAction::Skip => {}
+                PayRecoveryAction::BackfillDead => {
+                    let entry = pending_writes.entry(idk.to_owned()).or_default();
+                    entry.is_backfill = true;
+                    if entry
+                        .dead_min
+                        .as_ref()
+                        .is_none_or(|(existing_min, _)| op_hex < *existing_min)
+                    {
+                        entry.dead_min = Some((op_hex.clone(), kind));
+                    }
+                }
+                action @ (PayRecoveryAction::Backfill | PayRecoveryAction::ReplaceStaleFailed) => {
+                    let entry = pending_writes.entry(idk.to_owned()).or_default();
+                    entry.is_backfill = action == PayRecoveryAction::Backfill;
+                    if entry.listed.len() < MAX_LISTED {
+                        entry.listed.push((op_hex.clone(), kind));
+                    }
+                    entry.total_live += 1;
+                }
             }
-            *total += 1;
         }
         last = page.last().map(|(k, _)| *k);
         if count < 100 {
@@ -1472,11 +1498,14 @@ async fn recover_pay_from_oplog(
     // + sorted op ids keep the refusal text deterministic across restarts.
     let ambiguous: Vec<String> = pending_writes
         .iter()
-        .filter(|(_, (_, _, total))| *total > 1)
-        .map(|(idk, (_, listed, total))| {
-            let mut ops: Vec<&str> = listed.iter().map(|(op, _)| op.as_str()).collect();
+        .filter(|(_, entry)| entry.total_live > 1)
+        .map(|(idk, entry)| {
+            let mut ops: Vec<&str> = entry.listed.iter().map(|(op, _)| op.as_str()).collect();
             ops.sort_unstable();
-            format!("key {idk}: {total} competing unrecorded ops (listing up to {MAX_LISTED}): {ops:?}")
+            format!(
+                "key {idk}: {} competing unrecorded ops (listing up to {MAX_LISTED}): {ops:?}",
+                entry.total_live
+            )
         })
         .collect();
     if !ambiguous.is_empty() {
@@ -1490,10 +1519,20 @@ async fn recover_pay_from_oplog(
             ambiguous.join("; ")
         );
     }
-    for (idk, (is_backfill, candidates, _)) in pending_writes {
-        let (op_hex, kind) = &candidates[0];
-        pay_idx_upsert(index, &idk, op_hex, "PENDING", kind)?;
-        if is_backfill {
+    for (idk, entry) in pending_writes {
+        if let Some((op_hex, kind)) = entry.listed.first() {
+            // Exactly one possibly-live candidate: it takes the PENDING slot (re-awaited by the
+            // drivers; the y4m.16 machinery lands its real outcome).
+            pay_idx_upsert(index, &idk, op_hex, "PENDING", kind)?;
+        } else if let Some((op_hex, kind)) = &entry.dead_min {
+            // Absent row whose every candidate is ledger-dead (e.g. the operator just recorded
+            // them per the ambiguity runbook): backfill the TRUTH — FAILED — so the key stops
+            // reading Unknown and the drivers may retry normally (funds provably back).
+            pay_idx_upsert(index, &idk, op_hex, "FAILED", kind)?;
+        } else {
+            continue;
+        }
+        if entry.is_backfill {
             backfilled += 1;
         } else {
             replaced_stale_failed += 1;
@@ -1940,13 +1979,20 @@ fn classify_internal_pay_state(state: &InternalPayState) -> PayStateClass {
 /// decision) is unit-tested without a federation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PayRecoveryAction {
-    /// No row for this key — the daemon crashed before the FIRST `pay_idx_upsert` (lnrent-4gt).
-    /// Upsert the oplog op as PENDING (the original backfill).
+    /// No row for this key and the op is NOT ledger-dead — the daemon crashed before the FIRST
+    /// `pay_idx_upsert` (lnrent-4gt). Upsert the oplog op as PENDING (the original backfill).
     Backfill,
+    /// No row for this key but the op IS in the dead-op ledger (it definitively failed under our
+    /// eyes; only the row write was lost, or the operator just recorded it per the ambiguity
+    /// runbook). It must NOT count as a live candidate — that would keep the ambiguity refusal
+    /// firing after the operator resolves it, bricking startup (codex PR-32 P1) — and its
+    /// bookkeeping backfill is FAILED, not PENDING (truthful: funds provably back, drivers may
+    /// retry normally).
+    BackfillDead,
     /// The row says FAILED but points at a DIFFERENT operation than this oplog entry (including the
-    /// `"(preflight-failed)"` placeholder), and the entry is not a dead (cached-definitive-failure)
-    /// candidate. Upsert the oplog op as PENDING so the drivers re-await it instead of retrying
-    /// behind its back (the lnrent-kum double-pay window).
+    /// `"(preflight-failed)"` placeholder), and the entry is not a ledger-dead candidate. Upsert
+    /// the oplog op as PENDING so the drivers re-await it instead of retrying behind its back (the
+    /// lnrent-kum double-pay window).
     ReplaceStaleFailed,
     /// The row already reflects this key faithfully — leave it untouched.
     Skip,
@@ -1967,9 +2013,12 @@ enum PayRecoveryAction {
 /// caching wrapper can write a NON-terminal last update as the outcome on an EOF-without-terminal,
 /// permanently blinding later re-awaits).
 ///
-/// - `None` row -> `Backfill`: no row at all (crash before the FIRST upsert; the lnrent-4gt
-///   behavior, unconditional — a dead backfilled op settles to its real status on the first
-///   re-await).
+/// - `None` row + NOT ledger-dead -> `Backfill`: no row at all (crash before the FIRST upsert;
+///   the lnrent-4gt behavior). `None` row + LEDGER-DEAD -> `BackfillDead`: record the truth
+///   (FAILED) without ever counting as a live candidate — this is what lets the ambiguity
+///   runbook actually unbrick an absent-row refusal (codex PR-32 P1: without it, the operator's
+///   `fedimint_pay_dead_op` insert would not reduce the live-candidate count and the daemon
+///   would refuse to start forever).
 /// - FAILED under a DIFFERENT op than the oplog entry:
 ///   - `candidate_dead` -> `Skip`: this exact op already definitively failed (funds provably
 ///     back). Resurrecting it would burn a refund attempt on a replayed failure — and with TWO
@@ -2012,6 +2061,7 @@ fn pay_recovery_action(
     candidate_dead: bool,
 ) -> PayRecoveryAction {
     match existing {
+        None if candidate_dead => PayRecoveryAction::BackfillDead,
         None => PayRecoveryAction::Backfill,
         Some((row_op, "FAILED")) if row_op != oplog_op_hex => {
             if candidate_dead {
@@ -2736,18 +2786,26 @@ mod pay_recovery_action_tests {
     use rusqlite::Connection;
     use std::sync::Mutex;
 
-    // No row at all: the daemon crashed before the FIRST upsert. Backfill — the lnrent-4gt
-    // behavior, unchanged and unconditional (even a ledger-dead op is recorded; its first re-await
-    // lands the real status).
+    // No row at all + NOT ledger-dead: the daemon crashed before the FIRST upsert. Backfill — the
+    // lnrent-4gt behavior.
     #[test]
     fn absent_row_is_backfilled() {
         assert_eq!(
             pay_recovery_action(None, "op-A", false),
             PayRecoveryAction::Backfill
         );
+    }
+
+    // RUNBOOK-UNBRICK (codex PR-32 P1): an absent-row candidate that IS ledger-dead must NOT count
+    // as a live candidate — otherwise the operator's `fedimint_pay_dead_op` insert (the documented
+    // ambiguity runbook) could never reduce the live count for an absent-row refusal and the
+    // daemon would refuse to start forever. It backfills as FAILED bookkeeping instead (funds
+    // provably back; drivers may retry normally).
+    #[test]
+    fn absent_row_dead_candidate_is_a_dead_backfill_not_a_live_one() {
         assert_eq!(
             pay_recovery_action(None, "op-A", true),
-            PayRecoveryAction::Backfill
+            PayRecoveryAction::BackfillDead
         );
     }
 
