@@ -153,6 +153,19 @@ fn create_staging_dir(parent: &Path) -> Result<PathBuf> {
 /// Returns the listener plus the socket file's owner uid — the daemon's effective uid, captured
 /// while the inode was still private, for the per-connection peer-cred gate (no libc call).
 fn bind_owner_only(path: &Path) -> Result<(UnixListener, u32)> {
+    // Validate the FINAL path against the sockaddr_un limit up front (codex PR-34): the staged
+    // path (`/.iXXXXXX/s`) is one byte SHORTER than `/lnrent.sock`, so for a data dir exactly one
+    // byte over the limit the staged bind would succeed and the rename would publish a live
+    // socket at a pathname clients cannot even encode — the daemon would run while every operator
+    // IPC call fails. Fail startup loudly instead, exactly as the old direct bind did.
+    if path.as_os_str().len() > MAX_SUN_PATH_BYTES {
+        anyhow::bail!(
+            "ipc socket path {} is {} bytes — longer than the {MAX_SUN_PATH_BYTES}-byte unix \
+             socket limit; use a shorter data dir",
+            path.display(),
+            path.as_os_str().len()
+        );
+    }
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -163,6 +176,9 @@ fn bind_owner_only(path: &Path) -> Result<(UnixListener, u32)> {
     let _ = std::fs::remove_dir_all(&staging);
     bound
 }
+
+/// Max usable `sun_path` bytes on Linux (108 including the terminating NUL).
+const MAX_SUN_PATH_BYTES: usize = 107;
 
 /// The inside of [`bind_owner_only`], split out so the caller removes the staging dir on both
 /// the success and every error path.
@@ -1218,6 +1234,43 @@ mod tests {
         drop(listener);
         std::fs::remove_file(&sock).unwrap();
         std::fs::remove_dir(&parent).unwrap();
+    }
+
+    // codex PR-34: a final path ONE byte over the sun_path limit must FAIL STARTUP with a clear
+    // diagnostic — the staged path is one byte shorter, so without the up-front guard the bind
+    // would succeed and the rename would publish a live socket at a pathname clients cannot even
+    // encode (the daemon runs, every operator IPC call fails).
+    #[tokio::test]
+    async fn over_limit_final_path_fails_loudly_instead_of_publishing_dead() {
+        use std::os::unix::ffi::OsStrExt;
+
+        const SOCKET_NAME: &str = "lnrent.sock";
+        let base = std::env::temp_dir();
+        // Build a parent dir so <parent>/lnrent.sock is EXACTLY one byte over the limit.
+        let target_parent_len = MAX_SUN_PATH_BYTES + 1 - 1 - SOCKET_NAME.len();
+        let seed = format!(
+            "{}/lnrent-ipc-overlimit-{}-",
+            base.as_os_str().to_str().unwrap(),
+            std::process::id()
+        );
+        let pad = target_parent_len
+            .checked_sub(seed.len())
+            .expect("temp dir short enough for this test");
+        let parent = std::path::PathBuf::from(format!("{seed}{}", "x".repeat(pad)));
+        std::fs::create_dir_all(&parent).unwrap();
+        let sock = parent.join(SOCKET_NAME);
+        assert_eq!(sock.as_os_str().as_bytes().len(), MAX_SUN_PATH_BYTES + 1);
+
+        let err = bind_owner_only(&sock).expect_err("must refuse an over-limit final path");
+        assert!(
+            err.to_string().contains("unix socket limit"),
+            "clear diagnostic: {err:#}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&sock).is_err(),
+            "nothing was published at the dead path"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     const LOOSE_UMASK_HELPER_ENV: &str = "LNRENT_TEST_LOOSE_UMASK_BIND";
