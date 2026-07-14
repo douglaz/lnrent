@@ -2,7 +2,8 @@
 //! SPEC §4.2/§4.7/§10). The daemon owns the socket; the `lnrent` CLI and Claude skills act
 //! ONLY through it — they never touch sqlite directly, so the daemon stays the sole writer.
 //! This is the OPERATOR's agent surface: every reply is structured JSON (so an operator agent
-//! drives it), and it is never network-reachable (a UDS with owner-only perms, no HTTP/MCP).
+//! drives it), and it is never network-reachable (a UDS with owner-only perms + a peer-uid
+//! gate on accept, no HTTP/MCP).
 
 use crate::backends::{PaymentBackend, DEV_SETTLE_UNSUPPORTED};
 use crate::clock::Clock;
@@ -16,8 +17,8 @@ use crate::teardown;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -107,8 +108,140 @@ impl Reply {
 /// not be able to memory-DoS the daemon, codex #9). Requests are tiny JSON.
 const MAX_REQUEST_BYTES: u64 = 1 << 18; // 256 KiB
 
+/// Peer-cred authorization for one accepted IPC connection (lnrent-y4m.10, defense-in-depth
+/// behind the 0600 socket perms): only the daemon's own uid — the operator account — or root
+/// (who could bypass any uid check anyway) may issue operator commands. Pure, so the decision
+/// is unit-testable without a foreign-uid peer (which would need root to construct).
+fn peer_allowed(peer_uid: u32, daemon_uid: u32) -> bool {
+    peer_uid == daemon_uid || peer_uid == 0
+}
+
+/// Atomically create a fresh private staging directory whose socket path suffix
+/// (`/.iXXXXXX/s`) is shorter than `/lnrent.sock`, preserving every final path that fits in
+/// `sockaddr_un.sun_path`. Existing names are skipped rather than removed: another daemon may
+/// still be using one, and crash leftovers are harmless unreachable directories.
+fn create_staging_dir(parent: &Path) -> Result<PathBuf> {
+    const NAME_SPACE: u64 = 1 << 24;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    for _ in 0..NAME_SPACE {
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % NAME_SPACE;
+        let staging = parent.join(format!(".i{n:06x}"));
+        match std::fs::DirBuilder::new().mode(0o700).create(&staging) {
+            Ok(()) => return Ok(staging),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("creating ipc staging dir {}", staging.display()))
+            }
+        }
+    }
+    anyhow::bail!(
+        "all private ipc staging names are occupied in {}",
+        parent.display()
+    )
+}
+
+/// Bind the IPC listener with NO perms window and NO missing-path window (lnrent-y4m.10).
+/// The socket inode is created inside a fresh 0700 staging directory next to the final path —
+/// unreachable by other users regardless of the process umask — chmod'd to 0600 while still
+/// unreachable, then atomically `rename(2)`d onto `path`. The rename also REPLACES a stale
+/// socket in the same syscall, closing the old remove-then-bind gap where a client could
+/// observe the path missing. The listener serves the inode regardless of the path move.
+/// A staged bind (not `umask(2)`) because umask is PROCESS-GLOBAL: flipping it here would race
+/// concurrently-spawned hook processes' file creation.
+/// Returns the listener plus the socket file's owner uid — the daemon's effective uid, captured
+/// while the inode was still private, for the per-connection peer-cred gate (no libc call).
+fn bind_owner_only(path: &Path) -> Result<(UnixListener, u32)> {
+    // Validate the FINAL path against the sockaddr_un limit up front (codex PR-34): the staged
+    // path (`/.iXXXXXX/s`) is one byte SHORTER than `/lnrent.sock`, so for a data dir exactly one
+    // byte over the limit the staged bind would succeed and the rename would publish a live
+    // socket at a pathname clients cannot even encode — the daemon would run while every operator
+    // IPC call fails. Fail startup loudly instead, exactly as the old direct bind did.
+    if path.as_os_str().len() > MAX_SUN_PATH_BYTES {
+        anyhow::bail!(
+            "ipc socket path {} is {} bytes — longer than the {MAX_SUN_PATH_BYTES}-byte unix \
+             socket limit; use a shorter data dir",
+            path.display(),
+            path.as_os_str().len()
+        );
+    }
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let staging = create_staging_dir(parent)?;
+    let bound = bind_staged(&staging, path);
+    // Success or error, the staging dir must not linger next to the socket.
+    let _ = std::fs::remove_dir_all(&staging);
+    bound
+}
+
+/// Max usable `sun_path` bytes on Linux (108 including the terminating NUL).
+const MAX_SUN_PATH_BYTES: usize = 107;
+
+/// The inside of [`bind_owner_only`], split out so the caller removes the staging dir on both
+/// the success and every error path.
+fn bind_staged(staging: &Path, path: &Path) -> Result<(UnixListener, u32)> {
+    // mkdir's mode is still masked by the umask — it can only STRIP bits from 0700, never widen,
+    // so the dir is private regardless — but an aggressive umask could strip owner bits and break
+    // the bind below. Pin 0700 explicitly.
+    std::fs::set_permissions(staging, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("perms on {}", staging.display()))?;
+    // One-char temp name (the rename target defines the final name): keeps the staged path from
+    // exceeding sun_path where the final path itself still fits.
+    let tmp = staging.join("s");
+    let listener =
+        UnixListener::bind(&tmp).with_context(|| format!("binding {}", tmp.display()))?;
+    // Belt-and-suspenders: owner-only on the socket itself while it is still unreachable.
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("perms on {}", tmp.display()))?;
+    // The just-created socket's owner IS the daemon's effective uid.
+    let daemon_uid = std::fs::metadata(&tmp)
+        .with_context(|| format!("stat {}", tmp.display()))?
+        .uid();
+    evict_unsafe_final_path(path, daemon_uid)?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("publishing {} -> {}", tmp.display(), path.display()))?;
+    Ok((listener, daemon_uid))
+}
+
+/// Remove an UNSAFE pre-existing entry at the final socket path just before publishing
+/// (adversarial y4m.10 review): until the rename lands, whatever sits at `path` keeps serving
+/// startup-racing clients — a loose or foreign-owned socket, a plain file, or a symlink (which
+/// clients would follow) could impersonate the daemon for that window. Planting one requires
+/// write access to the data dir (with which an attacker could as well swap the socket at ANY
+/// later moment), so this is defense-in-depth, not a trust boundary. ONLY an owner-only (0600,
+/// our-euid) real socket — the legit remnant of a previous run — is left in place, preserving the
+/// no-missing-path-window atomic replacement for the normal restart; anything else is unlinked (a
+/// brief missing-path window beats serving an impostor endpoint). `symlink_metadata` so a symlink
+/// is judged (and removed) as itself, never followed.
+fn evict_unsafe_final_path(path: &Path, daemon_uid: u32) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("inspecting stale {}", path.display())),
+    };
+    let safe_stale_socket = meta.file_type().is_socket()
+        && meta.mode() & 0o777 == 0o600
+        && meta.uid() == daemon_uid;
+    if !safe_stale_socket {
+        tracing::warn!(
+            path = %path.display(),
+            "removing an unsafe pre-existing entry at the ipc socket path (not an owner-only \
+             socket) before publishing the real one"
+        );
+        std::fs::remove_file(path)
+            .with_context(|| format!("removing unsafe stale {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Serve IPC on `path` until the listener errors. Each connection is one request -> one reply.
-/// The socket is created owner-only and is removed-then-rebound to clear a stale socket. This is
+/// The socket is published owner-only via an atomic staged bind ([`bind_owner_only`] — never
+/// observable looser than 0600, and a stale socket is replaced with no missing-path window), and
+/// every accepted peer is uid-gated ([`peer_allowed`]) before any request byte is read. This is
 /// the never-shutdown form; the daemon supervisor (lnrent-7fp.21) uses [`serve_with_shutdown`].
 pub async fn serve(
     store: Store,
@@ -140,12 +273,8 @@ pub async fn serve_with_shutdown(
     if *shutdown.borrow() {
         return Ok(()); // already shutting down — never bind
     }
-    let _ = std::fs::remove_file(path);
-    let listener =
-        UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("perms on {}", path.display()))?;
-    tracing::info!(socket = %path.display(), "ipc serving");
+    let (listener, daemon_uid) = bind_owner_only(path)?;
+    tracing::info!(socket = %path.display(), "ipc serving (staged 0600 bind, atomic publish)");
     // Track the spawned per-connection handlers so a graceful shutdown can AWAIT the ones still
     // in flight — committing an admin txn and writing its reply — instead of dropping them when the
     // accept loop stops (the handlers were previously detached, so a shutdown could lose an in-flight
@@ -155,6 +284,20 @@ pub async fn serve_with_shutdown(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _addr) = accepted?;
+                // Peer-cred gate (lnrent-y4m.10): a foreign-uid peer is dropped BEFORE any
+                // request byte is read — no reply, no protocol surface. Unreadable creds on a
+                // platform that has SO_PEERCRED are a refusal, never a pass.
+                match stream.peer_cred() {
+                    Ok(cred) if peer_allowed(cred.uid(), daemon_uid) => {}
+                    Ok(cred) => {
+                        tracing::warn!(peer_uid = cred.uid(), "ipc: refused connection from foreign uid");
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ipc: refused connection (peer credentials unreadable)");
+                        continue;
+                    }
+                }
                 let (store, recipes, clock, payment, relays) = (
                     store.clone(),
                     recipes.clone(),
@@ -1015,11 +1158,7 @@ mod tests {
         let store = Store::spawn(conn);
         let dir = format!("{}/../recipes", env!("CARGO_MANIFEST_DIR"));
         let recipes = Arc::new(Recipe::load_all(&dir).unwrap());
-        // Unique per test (all tests share one PID), so concurrent tests don't clobber the socket.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let sock = std::env::temp_dir().join(format!("lnrent-ipc-{}-{n}.sock", std::process::id()));
+        let sock = temp_sock("serve");
         let (s2, sock2) = (store.clone(), sock.clone());
         let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
         let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
@@ -1034,6 +1173,288 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         (store, sock)
+    }
+
+    /// A unique temp socket path (all tests share one PID, so add a per-binary sequence).
+    fn temp_sock(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("lnrent-ipc-{tag}-{}-{n}.sock", std::process::id()))
+    }
+
+    // y4m.10: the pure peer-cred decision — the daemon's own uid and root are the ONLY
+    // authorized peers. A disallowed-uid CONNECTION isn't constructible without root, so the
+    // decision is tested pure and wired at the accept site.
+    #[test]
+    fn peer_allowed_only_daemon_uid_and_root() {
+        assert!(peer_allowed(1000, 1000), "same uid commands its own daemon");
+        assert!(peer_allowed(0, 1000), "root is always allowed");
+        assert!(!peer_allowed(1001, 1000), "foreign uid refused");
+        assert!(
+            !peer_allowed(1000, 0),
+            "non-root peer refused by a root daemon"
+        );
+        assert!(peer_allowed(0, 0));
+    }
+
+    // y4m.10 review: staging must not make a valid final `lnrent.sock` path fail merely because
+    // the detour is longer. Linux accepts 107 pathname bytes in sockaddr_un (108 including NUL).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn staged_bind_preserves_the_final_socket_path_limit() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        const MAX_PATH_BYTES: usize = 107;
+        const SOCKET_NAME: &str = "lnrent.sock";
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+
+        let base = std::env::temp_dir();
+        let parent_len = MAX_PATH_BYTES - 1 - SOCKET_NAME.len();
+        let prefix = format!(
+            "lnrent-ipc-path-limit-{}-{}-",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        );
+        let component_len = parent_len - base.as_os_str().as_bytes().len() - 1;
+        assert!(
+            prefix.len() <= component_len,
+            "temporary directory path is too long"
+        );
+        let parent = base.join(format!(
+            "{prefix}{}",
+            "x".repeat(component_len - prefix.len())
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let sock = parent.join(SOCKET_NAME);
+        assert_eq!(sock.as_os_str().as_bytes().len(), MAX_PATH_BYTES);
+
+        let (listener, _) = bind_owner_only(&sock).unwrap();
+        drop(listener);
+        std::fs::remove_file(&sock).unwrap();
+        std::fs::remove_dir(&parent).unwrap();
+    }
+
+    // codex PR-34: a final path ONE byte over the sun_path limit must FAIL STARTUP with a clear
+    // diagnostic — the staged path is one byte shorter, so without the up-front guard the bind
+    // would succeed and the rename would publish a live socket at a pathname clients cannot even
+    // encode (the daemon runs, every operator IPC call fails).
+    #[tokio::test]
+    async fn over_limit_final_path_fails_loudly_instead_of_publishing_dead() {
+        use std::os::unix::ffi::OsStrExt;
+
+        const SOCKET_NAME: &str = "lnrent.sock";
+        let base = std::env::temp_dir();
+        // Build a parent dir so <parent>/lnrent.sock is EXACTLY one byte over the limit.
+        let target_parent_len = MAX_SUN_PATH_BYTES + 1 - 1 - SOCKET_NAME.len();
+        let seed = format!(
+            "{}/lnrent-ipc-overlimit-{}-",
+            base.as_os_str().to_str().unwrap(),
+            std::process::id()
+        );
+        let pad = target_parent_len
+            .checked_sub(seed.len())
+            .expect("temp dir short enough for this test");
+        let parent = std::path::PathBuf::from(format!("{seed}{}", "x".repeat(pad)));
+        std::fs::create_dir_all(&parent).unwrap();
+        let sock = parent.join(SOCKET_NAME);
+        assert_eq!(sock.as_os_str().as_bytes().len(), MAX_SUN_PATH_BYTES + 1);
+
+        let err = bind_owner_only(&sock).expect_err("must refuse an over-limit final path");
+        assert!(
+            err.to_string().contains("unix socket limit"),
+            "clear diagnostic: {err:#}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&sock).is_err(),
+            "nothing was published at the dead path"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    const LOOSE_UMASK_HELPER_ENV: &str = "LNRENT_TEST_LOOSE_UMASK_BIND";
+
+    // y4m.10: the socket is NEVER observable looser than 0600 even under a deliberately loose
+    // umask — the inode is chmod'd inside the 0700 staging dir BEFORE the atomic publish. Run the
+    // mutation in a subprocess because umask(2) is process-global and Rust tests run in parallel.
+    #[test]
+    fn bind_is_owner_only_even_under_loose_umask() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ipc::tests::loose_umask_bind_helper",
+                "--nocapture",
+            ])
+            .env(LOOSE_UMASK_HELPER_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("running 1 test"),
+            "loose-umask helper failed or did not run\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loose_umask_bind_helper() {
+        if std::env::var_os(LOOSE_UMASK_HELPER_ENV).is_none() {
+            return;
+        }
+        use std::os::unix::fs::MetadataExt;
+        let sock = temp_sock("umask");
+        let old = unsafe { libc::umask(0) };
+        let bound = bind_owner_only(&sock);
+        unsafe { libc::umask(old) };
+        let (_listener, daemon_uid) = bound.unwrap();
+        let meta = std::fs::metadata(&sock).unwrap();
+        assert_eq!(
+            meta.permissions().mode() & 0o7777,
+            0o600,
+            "no umask leak onto the published socket"
+        );
+        assert_eq!(
+            daemon_uid,
+            meta.uid(),
+            "captured uid is the socket owner (daemon euid)"
+        );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // y4m.10: binding over a PRE-EXISTING stale socket is an ATOMIC replace. A poller hammers
+    // the path across the whole swap window: the path must NEVER be missing (the old
+    // remove-then-bind gap), any NEW inode must already be 0600, and a connect must never see
+    // NotFound or PermissionDenied — only the stale socket's refusal or a live accept. The
+    // round trip at the end proves the listener serves the RENAMED inode.
+    #[tokio::test]
+    async fn rebind_over_stale_socket_is_atomic_and_owner_only() {
+        use std::os::unix::fs::MetadataExt;
+
+        let sock = temp_sock("swap");
+        // What a crashed daemon leaves behind: a bound-then-dropped (dead) socket file, at the
+        // 0600 owner-only mode every real bind publishes — the one stale shape
+        // `evict_unsafe_final_path` deliberately KEEPS so the replace stays atomic (an unsafe
+        // stale is evicted instead; see evicts_unsafe_preexisting_entries_before_publish).
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let stale_ino = std::fs::metadata(&sock).unwrap().ino();
+
+        let poller = {
+            let sock = sock.clone();
+            std::thread::spawn(move || {
+                let (mut missing, mut loose, mut denied) = (0u32, 0u32, 0u32);
+                // Bounded (~10s) so a broken bind fails the test instead of hanging it.
+                for _ in 0..20_000 {
+                    match std::fs::metadata(&sock) {
+                        Err(_) => missing += 1,
+                        Ok(m) if m.ino() != stale_ino => {
+                            if m.permissions().mode() & 0o7777 != 0o600 {
+                                loose += 1;
+                            }
+                        }
+                        Ok(_) => {} // still the stale inode
+                    }
+                    match std::os::unix::net::UnixStream::connect(&sock) {
+                        Ok(_) => return (missing, loose, denied, true),
+                        Err(e) => match e.kind() {
+                            std::io::ErrorKind::NotFound => missing += 1,
+                            std::io::ErrorKind::PermissionDenied => denied += 1,
+                            _ => {} // the stale socket: connection refused
+                        },
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(500));
+                }
+                (missing, loose, denied, false)
+            })
+        };
+
+        // Start the daemon side while the poller is watching the path.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let store = Store::spawn(conn);
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
+        let sock2 = sock.clone();
+        tokio::spawn(async move {
+            let _ = serve(
+                store,
+                recipes,
+                clock,
+                payment,
+                RelayStatusCell::new(),
+                &sock2,
+            )
+            .await;
+        });
+
+        let (missing, loose, denied, connected) =
+            tokio::task::spawn_blocking(move || poller.join().unwrap())
+                .await
+                .unwrap();
+        assert!(connected, "a client eventually reaches the NEW socket");
+        assert_eq!(missing, 0, "the path is NEVER missing across the swap");
+        assert_eq!(
+            loose, 0,
+            "the new socket is 0600 from its first observable instant"
+        );
+        assert_eq!(denied, 0, "no filesystem-permissions error around the swap");
+
+        // The listener serves the inode bound at the staging path, now at the final path.
+        let st = call(&sock, Request::Status).await.unwrap();
+        assert!(st.ok, "round trip over the renamed inode: {:?}", st.error);
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // y4m.10 (adversarial review): an UNSAFE pre-existing entry at the final path — a
+    // loose-perms socket, a plain file, or a symlink — must be EVICTED before publish rather
+    // than keep serving startup-racing clients until the rename lands. Only the owner-only 0600
+    // socket a real previous run leaves behind is kept (the atomic-replace case above). The
+    // symlink is judged as itself (never followed): its TARGET must survive.
+    #[tokio::test]
+    async fn evicts_unsafe_preexisting_entries_before_publish() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        // A loose-perms stale socket (what a pre-y4m.10 daemon could leave under a loose umask).
+        let sock = temp_sock("evict-loose");
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let (_l, uid) = bind_owner_only(&sock).unwrap();
+        let meta = std::fs::metadata(&sock).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(meta.uid(), uid);
+        let _ = std::fs::remove_file(&sock);
+
+        // A plain file squatting on the path.
+        let sock = temp_sock("evict-file");
+        std::fs::write(&sock, b"impostor").unwrap();
+        let (_l, _) = bind_owner_only(&sock).unwrap();
+        let meta = std::fs::metadata(&sock).unwrap();
+        assert!(
+            meta.file_type().is_socket(),
+            "the squatting file is replaced by the real socket"
+        );
+        let _ = std::fs::remove_file(&sock);
+
+        // A symlink at the path: removed AS a symlink; its target is untouched.
+        let sock = temp_sock("evict-link");
+        let target = temp_sock("evict-link-target");
+        std::fs::write(&target, b"decoy target").unwrap();
+        std::os::unix::fs::symlink(&target, &sock).unwrap();
+        let (_l, _) = bind_owner_only(&sock).unwrap();
+        let meta = std::fs::symlink_metadata(&sock).unwrap();
+        assert!(
+            meta.file_type().is_socket() && !meta.file_type().is_symlink(),
+            "the symlink itself is evicted and replaced by the real socket"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"decoy target",
+            "the symlink TARGET is never followed or touched"
+        );
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&target);
     }
 
     #[tokio::test]
