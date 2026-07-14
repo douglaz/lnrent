@@ -510,9 +510,13 @@ impl FedimintPayment {
     }
 
     /// Await a refund payment to a terminal state, recording the outcome in the pay index and
-    /// returning the backend payment id (the operation-id hex) on success, or an error on a
-    /// definitive failure. Outbound, so there is no settled_at/over-credit concern — `into_stream()`
-    /// (which replays a cached terminal outcome as a single item) is sufficient, unlike `watch()`.
+    /// returning the backend payment id (the operation-id hex) on success. A DEFINITIVE failure
+    /// (funds provably back or never sent) marks the row FAILED and Errs; an AMBIGUOUS terminal state
+    /// (cannot prove the recipient was unpaid) writes NO mark — the row stays PENDING — and Errs, so
+    /// `payment_status_by_key` reports Pending and the driver re-awaits the SAME operation on the next
+    /// drive instead of ever starting a second payment (lnrent-y4m.16). Outbound, so there is no
+    /// settled_at/over-credit concern — `into_stream()` (which replays a cached terminal outcome as a
+    /// single item) is sufficient, unlike `watch()`.
     async fn await_pay(&self, payment_type: PayType, key: &str) -> Result<String> {
         let op_hex = payment_type.operation_id().fmt_full().to_string();
         let ln = self
@@ -526,21 +530,75 @@ impl FedimintPayment {
                     .await
                     .context("subscribing to refund payment")?
                     .into_stream();
+                // fedimint-ln-client emits `AwaitingChange` ONLY after the payment preimage is
+                // already in hand (the recipient is provably paid; only the operator's own change
+                // output is still settling). Track that transition so a subsequent
+                // `UnexpectedError` — which fedimint also emits for a change-output failure AFTER a
+                // successful payment — upgrades to SUCCEEDED instead of parking a provably-paid
+                // refund as ambiguous (adversarial y4m.16 review; both independent reviewers traced
+                // this to the same fedimint 0.11.1 source). Live awaits see the full state sequence;
+                // a post-crash re-subscribe may replay only the cached terminal state, in which case
+                // the flag stays false and the conservative Ambiguous handling below applies.
+                let mut preimage_obtained = false;
                 while let Some(state) = updates.next().await {
-                    match state {
-                        LnPayState::Success { .. } => {
-                            pay_idx_mark(&self.index, key, "SUCCEEDED")?;
+                    if matches!(state, LnPayState::AwaitingChange) {
+                        preimage_obtained = true;
+                    }
+                    // The single money choke point: classify (pure helper) then act on the CLASS, so
+                    // the FAILED-vs-leave-PENDING decision is proven variant-by-variant without a
+                    // federation (lnrent-y4m.16).
+                    match classify_ln_pay_state(&state) {
+                        PayStateClass::Success => {
+                            pay_idx_mark(&self.index, key, &op_hex, "SUCCEEDED")?;
                             return Ok(op_hex);
                         }
                         // Created / Funded / AwaitingChange / WaitingForRefund -> keep waiting.
-                        LnPayState::Created
-                        | LnPayState::Funded { .. }
-                        | LnPayState::AwaitingChange
-                        | LnPayState::WaitingForRefund { .. } => {}
-                        // Refunded / Canceled / UnexpectedError -> definitive failure.
-                        other => {
-                            pay_idx_mark(&self.index, key, "FAILED")?;
-                            anyhow::bail!("refund payment failed: {other:?}");
+                        PayStateClass::InFlight => {}
+                        // Refunded / Canceled -> funds provably back / never sent. The FAILED mark
+                        // lets a later drive start a fresh payment WITHOUT a double-pay.
+                        //
+                        // Documented residual (adversarial y4m.16 review): `Refunded` proves the
+                        // OPERATOR's funds are back, not that the Lightning RECIPIENT went unpaid — a
+                        // gateway that paid the invoice but lost its contract claim leaves the
+                        // recipient paid at the GATEWAY's expense while we refund + retry. The
+                        // operator's own outlay stays single (this attempt cost nothing), so INV-1
+                        // holds; classifying `Refunded` as ambiguous instead would strand EVERY
+                        // routine route-failure refund (it is fedimint's normal failure terminal).
+                        PayStateClass::DefinitiveFailure => {
+                            pay_idx_mark(&self.index, key, &op_hex, "FAILED")?;
+                            anyhow::bail!("refund payment failed: {state:?}");
+                        }
+                        // UnexpectedError -> AMBIGUOUS: NOT proof the recipient was unpaid. Write NO
+                        // index mark so the key row STAYS PENDING and bail; `payment_status_by_key`
+                        // then reports Pending, so the driver re-awaits THIS SAME operation next drive
+                        // (never starts a new pay). A terminally-UnexpectedError op replays the same
+                        // state on every re-subscribe, so the row stays PENDING indefinitely — the
+                        // INTENDED fail-safe: money ambiguity needs an operator/fedimint resolution,
+                        // never an automatic second send. (One known upstream lossy case: the client
+                        // stream can collapse a definitive `FundingRejected` into `UnexpectedError`,
+                        // which parks a provably-unfunded pay here — indistinguishable at this layer;
+                        // the RefundStuck operator alert surfaces it.)
+                        PayStateClass::Ambiguous => {
+                            if preimage_obtained {
+                                // The stream already proved the recipient was paid (AwaitingChange);
+                                // this terminal error concerns only the operator's change output.
+                                // SUCCEEDED is the money-correct outcome for the refund; the change
+                                // loss is operator-internal, so surface it loudly.
+                                tracing::warn!(
+                                    %key,
+                                    op = %op_hex,
+                                    ?state,
+                                    "refund payment succeeded (preimage obtained) but the change \
+                                     output errored; marking SUCCEEDED — the operator's change may \
+                                     need fedimint-side recovery"
+                                );
+                                pay_idx_mark(&self.index, key, &op_hex, "SUCCEEDED")?;
+                                return Ok(op_hex);
+                            }
+                            anyhow::bail!(
+                                "refund payment reached an ambiguous terminal state: {state:?}; \
+                                 leaving PENDING — will re-await this operation, never re-pay"
+                            );
                         }
                     }
                 }
@@ -553,15 +611,30 @@ impl FedimintPayment {
                     .context("subscribing to internal refund payment")?
                     .into_stream();
                 while let Some(state) = updates.next().await {
-                    match state {
-                        InternalPayState::Preimage(_) => {
-                            pay_idx_mark(&self.index, key, "SUCCEEDED")?;
+                    // Same class-based choke point as the lightning branch (lnrent-y4m.16).
+                    match classify_internal_pay_state(&state) {
+                        PayStateClass::Success => {
+                            pay_idx_mark(&self.index, key, &op_hex, "SUCCEEDED")?;
                             return Ok(op_hex);
                         }
-                        InternalPayState::Funding => {}
-                        other => {
-                            pay_idx_mark(&self.index, key, "FAILED")?;
-                            anyhow::bail!("internal refund payment failed: {other:?}");
+                        // Funding -> keep waiting.
+                        PayStateClass::InFlight => {}
+                        // FundingFailed / RefundSuccess -> funds never left / provably back. FAILED
+                        // is safe: a later drive may start a fresh payment.
+                        PayStateClass::DefinitiveFailure => {
+                            pay_idx_mark(&self.index, key, &op_hex, "FAILED")?;
+                            anyhow::bail!("internal refund payment failed: {state:?}");
+                        }
+                        // RefundError / UnexpectedError -> AMBIGUOUS (a refund was attempted and
+                        // errored, or an unclassified local error): the funds' whereabouts are
+                        // unknown. Write NO mark so the row STAYS PENDING and re-awaits this SAME
+                        // operation — never a second send. See the lightning branch for the full
+                        // rationale.
+                        PayStateClass::Ambiguous => {
+                            anyhow::bail!(
+                                "internal refund payment reached an ambiguous terminal state: \
+                                 {state:?}; leaving PENDING — will re-await this operation, never re-pay"
+                            );
                         }
                     }
                 }
@@ -625,7 +698,13 @@ impl FedimintPayment {
                         }
                     }
                     _ => {
-                        // FAILED -> re-attempt below (the prior payment refunded; not a double-pay).
+                        // FAILED -> re-attempt below. Not a double-pay: `await_pay` now writes FAILED
+                        // ONLY for DEFINITIVE outcomes (Refunded/Canceled/FundingFailed/RefundSuccess
+                        // — funds provably back or never sent) plus structural preflight parks (no
+                        // operation was ever started). An AMBIGUOUS outcome (UnexpectedError /
+                        // RefundError) instead leaves the row PENDING, so it takes the "PENDING" arm
+                        // above and re-awaits the SAME operation — it can never reach this re-pay
+                        // (lnrent-y4m.16).
                         self.start_new_pay(dest, amount_sat, idempotency_key, cap, preferred)
                             .await?
                     }
@@ -1513,11 +1592,18 @@ fn pay_idx_upsert(
     Ok(())
 }
 
-fn pay_idx_mark(index: &Mutex<Connection>, key: &str, status: &str) -> Result<()> {
+/// Mark a pay row's terminal status, guarded by the OPERATION the waiter actually awaited (a CAS,
+/// adversarial y4m.16 review): `pay_start_lock` is released before settlement is awaited, so two
+/// callers can await the SAME key concurrently. Without the operation guard a DELAYED waiter that
+/// observed operation A's definitive failure could clobber the row AFTER a fresh operation B was
+/// started and upserted PENDING under the same key — a later drive would then see FAILED and start a
+/// THIRD operation while B is still in flight (a double-pay). Guarding on `operation_id` makes a
+/// stale waiter's mark a harmless no-op (0 rows), while the live waiter's op always matches.
+fn pay_idx_mark(index: &Mutex<Connection>, key: &str, op_hex: &str, status: &str) -> Result<()> {
     let conn = index.lock().unwrap();
     conn.execute(
-        "UPDATE fedimint_pay SET status = ?2 WHERE idempotency_key = ?1",
-        params![key, status],
+        "UPDATE fedimint_pay SET status = ?2 WHERE idempotency_key = ?1 AND operation_id = ?3",
+        params![key, status, op_hex],
     )?;
     Ok(())
 }
@@ -1643,13 +1729,89 @@ fn ordered_with_preference(preferred: Option<PublicKey>, gateways: &[PublicKey])
     ordered
 }
 
+/// PURE money-safety class of a fedimint pay state (lnrent-y4m.16). Splits a terminal pay outcome
+/// into "definitively failed" (funds provably returned or never left — safe to mark FAILED and let
+/// a later drive start a FRESH payment) versus "ambiguous" (cannot prove the recipient was unpaid —
+/// must NEVER be retried, or the daemon could send the money a SECOND time). Free of the live client
+/// — following the `net_payout_sat` / `select_first_reachable` / `ordered_with_preference` precedent
+/// — so the CLASSIFICATION is unit-tested variant-by-variant without a federation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayStateClass {
+    /// Preimage in hand — the recipient is provably paid. `await_pay` marks the row SUCCEEDED.
+    Success,
+    /// Not terminal yet — keep awaiting the stream. No money decision to make.
+    InFlight,
+    /// Funds provably returned or never left the wallet, so THIS attempt sent nothing. `await_pay`
+    /// marks the row FAILED; a later drive may safely start a fresh payment.
+    DefinitiveFailure,
+    /// Terminal, but the recipient's paid/unpaid status is UNKNOWN (a post-funding local error, or a
+    /// refund that was itself attempted and errored). `await_pay` writes NO mark — the row stays
+    /// PENDING — and re-awaits the SAME operation forever. That is the INTENDED fail-safe: a
+    /// terminally-ambiguous op replays the same state on every re-subscribe, so it needs an
+    /// operator/fedimint resolution, never an automatic second send. Marking FAILED here would let a
+    /// later drive start a SECOND payment against a possibly-already-paid invoice (a double-pay).
+    Ambiguous,
+}
+
+/// Classify an [`LnPayState`] into its [`PayStateClass`] (lnrent-y4m.16). EXHAUSTIVE (no `_` arm) on
+/// purpose: a future new fedimint variant is a COMPILE ERROR here, forcing a deliberate money-safety
+/// classification rather than silently defaulting to FAILED (and thus a retry).
+fn classify_ln_pay_state(state: &LnPayState) -> PayStateClass {
+    match state {
+        // Preimage in hand — the recipient is provably paid.
+        LnPayState::Success { .. } => PayStateClass::Success,
+        // The outgoing contract is being created / funded / settled, or a refund is pending — not
+        // terminal, keep awaiting (behavior unchanged).
+        LnPayState::Created
+        | LnPayState::Funded { .. }
+        | LnPayState::AwaitingChange
+        | LnPayState::WaitingForRefund { .. } => PayStateClass::InFlight,
+        // The federation REFUNDED the outgoing contract — the funds are provably back in the wallet,
+        // so this attempt sent nothing. DEFINITIVE failure: a fresh pay is safe.
+        LnPayState::Refunded { .. } => PayStateClass::DefinitiveFailure,
+        // The outgoing contract was CANCELED before it was funded — no money ever left. DEFINITIVE
+        // failure: a fresh pay is safe.
+        LnPayState::Canceled => PayStateClass::DefinitiveFailure,
+        // A local error AFTER the state machine may already have acted on the payment. This is NOT
+        // proof the recipient was unpaid — it can be a post-payment bookkeeping failure — so it is
+        // AMBIGUOUS: never retry (that risks a double-send); leave the row PENDING.
+        LnPayState::UnexpectedError { .. } => PayStateClass::Ambiguous,
+    }
+}
+
+/// Classify an [`InternalPayState`] (a federation-internal, gateway-less pay) into its
+/// [`PayStateClass`] (lnrent-y4m.16). EXHAUSTIVE, same discipline as [`classify_ln_pay_state`].
+fn classify_internal_pay_state(state: &InternalPayState) -> PayStateClass {
+    match state {
+        // Preimage decrypted — the recipient is provably paid.
+        InternalPayState::Preimage(_) => PayStateClass::Success,
+        // Still funding the incoming contract — not terminal, keep awaiting (behavior unchanged).
+        InternalPayState::Funding => PayStateClass::InFlight,
+        // The contract funding failed outright — no money ever left. DEFINITIVE failure: safe to
+        // start a fresh pay.
+        InternalPayState::FundingFailed { .. } => PayStateClass::DefinitiveFailure,
+        // The internal payment was refunded successfully — funds are provably back. DEFINITIVE
+        // failure: safe to start a fresh pay.
+        InternalPayState::RefundSuccess { .. } => PayStateClass::DefinitiveFailure,
+        // A refund was ATTEMPTED and itself errored — the funds' whereabouts are UNKNOWN (paid,
+        // refunded, or stuck). AMBIGUOUS: never retry; leave the row PENDING.
+        InternalPayState::RefundError { .. } => PayStateClass::Ambiguous,
+        // An unclassified local error — not proof the recipient was unpaid. AMBIGUOUS: never retry;
+        // leave the row PENDING.
+        InternalPayState::UnexpectedError(_) => PayStateClass::Ambiguous,
+    }
+}
+
 fn fedimint_readiness_warns(gateway_ok: bool) -> bool {
     !gateway_ok
 }
 
 #[cfg(test)]
 mod index_tests {
-    use super::{idx_list_open, idx_mark_canceled, idx_mark_paid, INDEX_SCHEMA};
+    use super::{
+        idx_list_open, idx_mark_canceled, idx_mark_paid, pay_idx_get, pay_idx_mark,
+        pay_idx_upsert, INDEX_SCHEMA,
+    };
     use rusqlite::{params, Connection};
     use std::sync::Mutex;
 
@@ -1694,6 +1856,34 @@ mod index_tests {
             )
             .unwrap();
         assert_eq!(status, "PAID");
+    }
+
+    // ---- pay-index terminal-mark CAS (adversarial y4m.16 review) --------------------------------
+    // `pay_start_lock` is released before settlement is awaited, so two callers can await the SAME
+    // key. A DELAYED waiter that saw operation A's outcome must never clobber the row after a fresh
+    // operation B was upserted under the same key — otherwise a later drive sees FAILED and starts a
+    // THIRD operation while B is in flight (a double-pay).
+
+    #[test]
+    fn stale_waiter_mark_cannot_clobber_a_newer_operation() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(INDEX_SCHEMA).unwrap();
+        let index = Mutex::new(conn);
+
+        // Operation A runs and definitively fails.
+        pay_idx_upsert(&index, "key", "op-A", "PENDING", "ln").unwrap();
+        pay_idx_mark(&index, "key", "op-A", "FAILED").unwrap();
+        // The driver retries: operation B is upserted PENDING under the same key.
+        pay_idx_upsert(&index, "key", "op-B", "PENDING", "ln").unwrap();
+        // A delayed second waiter on A replays A's failure — its mark must be a no-op now.
+        pay_idx_mark(&index, "key", "op-A", "FAILED").unwrap();
+        let (op, status, _) = pay_idx_get(&index, "key").unwrap().unwrap();
+        assert_eq!((op.as_str(), status.as_str()), ("op-B", "PENDING"),
+            "a stale waiter's terminal mark for a superseded operation must not clobber the live row");
+        // The live waiter on B still lands its own terminal mark.
+        pay_idx_mark(&index, "key", "op-B", "SUCCEEDED").unwrap();
+        let (op, status, _) = pay_idx_get(&index, "key").unwrap().unwrap();
+        assert_eq!((op.as_str(), status.as_str()), ("op-B", "SUCCEEDED"));
     }
 }
 
@@ -2148,5 +2338,163 @@ mod select_gateway_tests {
     #[test]
     fn empty_list_without_preference_is_empty() {
         assert!(ordered_with_preference(None, &[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pay_state_class_tests {
+    //! PURE terminal-classification unit tests (lnrent-y4m.16). The whole module is `#[cfg(feature =
+    //! "fedimint")]` (see lib.rs), so these run under the default-on `cargo test -p lnrentd`. The
+    //! classifiers are free of the live client (the `net_payout_sat` / `select_first_reachable`
+    //! precedent), so the money-safety class of EVERY pay-state variant is proven variant-by-variant
+    //! without a federation. The choke point — `await_pay` marking FAILED only for `DefinitiveFailure`
+    //! and leaving `Ambiguous` PENDING — is a single match on these classes; an end-to-end index
+    //! proof would need a live client, so it lives in the `#[ignore]`d `daemon/tests/fedimint_live.rs`.
+    use super::{
+        classify_internal_pay_state, classify_ln_pay_state, InternalPayState, LnPayState,
+        PayStateClass,
+    };
+    use fedimint_ln_client::incoming::IncomingSmError;
+    use fedimint_ln_client::pay::GatewayPayError;
+    use fedimint_ln_common::contracts::Preimage;
+
+    // A plain constructible `IncomingSmError` for the internal-pay variants that carry one. The class
+    // never inspects WHICH error, only the variant, so any concrete error stands in.
+    fn sm_err() -> IncomingSmError {
+        IncomingSmError::FailedToFundContract {
+            error_message: "test".to_string(),
+        }
+    }
+
+    // ---- LnPayState ----------------------------------------------------------------------------
+
+    // Success carries a preimage -> the recipient is provably paid.
+    #[test]
+    fn ln_success_is_success() {
+        assert_eq!(
+            classify_ln_pay_state(&LnPayState::Success {
+                preimage: "00".to_string()
+            }),
+            PayStateClass::Success
+        );
+    }
+
+    // Every non-terminal state keeps awaiting (unchanged from the pre-y4m.16 behavior).
+    #[test]
+    fn ln_interim_states_are_in_flight() {
+        for s in [
+            LnPayState::Created,
+            LnPayState::Funded { block_height: 0 },
+            LnPayState::AwaitingChange,
+            LnPayState::WaitingForRefund {
+                error_reason: "pending refund".to_string(),
+            },
+        ] {
+            assert_eq!(
+                classify_ln_pay_state(&s),
+                PayStateClass::InFlight,
+                "{s:?} must keep awaiting, never terminate"
+            );
+        }
+    }
+
+    // MONEY-CRITICAL: the federation refunded the outgoing contract -> funds provably back, so this
+    // attempt sent nothing. DEFINITIVE failure -> FAILED -> a fresh pay is safe.
+    #[test]
+    fn ln_refunded_is_definitive_failure() {
+        assert_eq!(
+            classify_ln_pay_state(&LnPayState::Refunded {
+                gateway_error: GatewayPayError::OutgoingContractError,
+            }),
+            PayStateClass::DefinitiveFailure
+        );
+    }
+
+    // MONEY-CRITICAL: canceled before funding -> no money ever left. DEFINITIVE failure -> FAILED.
+    #[test]
+    fn ln_canceled_is_definitive_failure() {
+        assert_eq!(
+            classify_ln_pay_state(&LnPayState::Canceled),
+            PayStateClass::DefinitiveFailure
+        );
+    }
+
+    // MONEY-CRITICAL (the whole point of y4m.16): UnexpectedError is NOT proof the recipient was
+    // unpaid — it can be a post-payment local failure — so it is AMBIGUOUS and must NEVER be retried
+    // (that risks a double-send). `await_pay` leaves such a row PENDING.
+    #[test]
+    fn ln_unexpected_error_is_ambiguous() {
+        assert_eq!(
+            classify_ln_pay_state(&LnPayState::UnexpectedError {
+                error_message: "post-pay bookkeeping blew up".to_string(),
+            }),
+            PayStateClass::Ambiguous
+        );
+    }
+
+    // ---- InternalPayState ----------------------------------------------------------------------
+
+    // A decrypted preimage -> the recipient is provably paid.
+    #[test]
+    fn internal_preimage_is_success() {
+        assert_eq!(
+            classify_internal_pay_state(&InternalPayState::Preimage(Preimage([0u8; 32]))),
+            PayStateClass::Success
+        );
+    }
+
+    // The one non-terminal internal state keeps awaiting.
+    #[test]
+    fn internal_funding_is_in_flight() {
+        assert_eq!(
+            classify_internal_pay_state(&InternalPayState::Funding),
+            PayStateClass::InFlight
+        );
+    }
+
+    // MONEY-CRITICAL: the contract funding failed outright -> no money ever left. DEFINITIVE failure.
+    #[test]
+    fn internal_funding_failed_is_definitive_failure() {
+        assert_eq!(
+            classify_internal_pay_state(&InternalPayState::FundingFailed { error: sm_err() }),
+            PayStateClass::DefinitiveFailure
+        );
+    }
+
+    // MONEY-CRITICAL: the internal payment was refunded successfully -> funds provably back.
+    // DEFINITIVE failure -> a fresh pay is safe.
+    #[test]
+    fn internal_refund_success_is_definitive_failure() {
+        assert_eq!(
+            classify_internal_pay_state(&InternalPayState::RefundSuccess {
+                out_points: vec![],
+                error: sm_err(),
+            }),
+            PayStateClass::DefinitiveFailure
+        );
+    }
+
+    // MONEY-CRITICAL: a refund was ATTEMPTED and itself errored -> the funds' whereabouts are UNKNOWN,
+    // so AMBIGUOUS; `await_pay` leaves the row PENDING rather than risk a second send.
+    #[test]
+    fn internal_refund_error_is_ambiguous() {
+        assert_eq!(
+            classify_internal_pay_state(&InternalPayState::RefundError {
+                error_message: "refund attempt failed".to_string(),
+                error: sm_err(),
+            }),
+            PayStateClass::Ambiguous
+        );
+    }
+
+    // MONEY-CRITICAL: an unclassified local error -> not proof of non-payment -> AMBIGUOUS.
+    #[test]
+    fn internal_unexpected_error_is_ambiguous() {
+        assert_eq!(
+            classify_internal_pay_state(&InternalPayState::UnexpectedError(
+                "internal state machine blew up".to_string()
+            )),
+            PayStateClass::Ambiguous
+        );
     }
 }
