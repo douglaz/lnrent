@@ -61,9 +61,42 @@ pub struct HookOutput {
     pub stdout_json: Value,
 }
 
+/// Failure/cancellation backstop for a hook process group. Tokio's `kill_on_drop` kills only the
+/// immediate child; this guard group-kills every descendant too whenever `run_hook` leaves without
+/// having explicitly reaped the group — a DROPPED future (a caller cancelled on shutdown, leader
+/// still alive) or a clean-exit-but-FAILURE bail (non-zero exit / non-JSON stdout, where a hook
+/// that backgrounded a detached child would otherwise orphan it). It is disarmed only where the
+/// group is already handled: after `reap` (which group-kills BEFORE it waits) on the timeout/cap/
+/// no-exit paths, and on the SUCCESS path. See the `child.wait()` site for the one documented
+/// residual (a reaped-leader `killpg` relies on a surviving descendant keeping the pgid reserved).
+struct HookProcessGroup {
+    pgid: Option<i32>,
+}
+
+impl HookProcessGroup {
+    fn new(child: &tokio::process::Child) -> Self {
+        Self {
+            pgid: child.id().map(|pid| pid as i32),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.pgid = None;
+    }
+}
+
+impl Drop for HookProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid {
+            kill_hook_process_group(pgid);
+        }
+    }
+}
+
 /// Run `hook` (an absolute path) with `input` on stdin, bounded by `timeout` and `OUTPUT_CAP`.
 /// A timeout, a cap breach on EITHER pipe, a non-zero exit, or non-JSON stdout is a failure —
-/// and the child is explicitly killed + reaped (not left to best-effort drop cleanup).
+/// failure cleanup group-kills any still-running hook processes and makes a bounded reap attempt
+/// for the immediate child (not left only to Tokio's child-drop cleanup).
 ///
 /// `env_passthrough` is the recipe's `provisioning.env` allowlist; the hook receives ONLY the base
 /// env + those vars (lnrent-y4m.7). Callers pass `&recipe.provisioning.env`.
@@ -74,6 +107,7 @@ pub async fn run_hook(
     env_passthrough: &[String],
 ) -> Result<HookOutput> {
     let mut child = spawn_hook(hook, env_passthrough).await?;
+    let mut process_group = HookProcessGroup::new(&child);
 
     let si = child.stdin.take();
     let input_bytes = serde_json::to_vec(input)?;
@@ -99,11 +133,13 @@ pub async fn run_hook(
     let (out_buf, err_buf) = match tokio::time::timeout(timeout, read).await {
         Err(_) => {
             reap(&mut child).await;
+            process_group.disarm();
             bail!("hook {} timed out after {timeout:?}", hook.display());
         }
         Ok(Err(e)) => {
             // cap breach or read error -> kill the (possibly still-writing) child and fail
             reap(&mut child).await;
+            process_group.disarm();
             return Err(anyhow!("hook {}: {e}", hook.display()));
         }
         Ok(Ok(bufs)) => bufs,
@@ -111,11 +147,27 @@ pub async fn run_hook(
     // Reads are done; the stdin feed (normally already finished) is no longer needed.
     feed.abort();
 
-    // Both pipes hit EOF -> the child has closed its outputs; wait for exit (bounded).
+    // Both pipes hit EOF -> the child has closed its outputs; wait for exit (bounded). NOTE the
+    // guard stays ARMED through the status/JSON checks below ON PURPOSE: a hook that backgrounds a
+    // detached child (one that redirected the inherited stdout/stderr, so the pipes could reach
+    // EOF while it runs) and then exits non-zero or emits non-JSON would otherwise orphan that
+    // child — the same billed-resource leak this bead closes for the timeout path. On those bail
+    // paths the guard's `Drop` group-kills it. A `wait()` ERROR likewise keeps the guard armed
+    // (the `?` returns before any disarm) — correct, because the leader may still be alive.
+    //
+    // The one documented residual (adversarial y4m.12 review P3): on a clean-exit bail the leader
+    // has just been reaped, so the guard's `Drop` `killpg(pgid)` relies on a SURVIVING descendant
+    // to keep the pgid reserved (the exact orphan case it targets). If instead the last descendant
+    // also exited in the intervening window, the `killpg` gets a harmless `ESRCH` — unless the
+    // pgid were recycled onto an unrelated group in that same window. That window is a few
+    // straight-line instructions with NO `.await` (so no scheduler yield) and pid recycling is not
+    // immediate on Linux, making it effectively unreachable; it is inherent to reaping-the-leader-
+    // then-signaling and not worth trading for the real clean-exit orphan gap above.
     let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
         Ok(s) => s.context("waiting on hook")?,
         Err(_) => {
             reap(&mut child).await;
+            process_group.disarm();
             bail!(
                 "hook {} did not exit after closing its output",
                 hook.display()
@@ -133,6 +185,7 @@ pub async fn run_hook(
 
     let stdout_json: Value = serde_json::from_slice(&out_buf)
         .map_err(|e| anyhow!("hook {} stdout is not JSON: {e}", hook.display()))?;
+    process_group.disarm();
     Ok(HookOutput { stdout_json })
 }
 
@@ -152,6 +205,13 @@ async fn spawn_hook(hook: &Path, env_passthrough: &[String]) -> Result<tokio::pr
             // never reaches the hook.
             .env_clear()
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            // Put the hook in its OWN process group (pgid == the child's pid — a NEW group led by
+            // the child, so the DAEMON is never a member). On a timeout `reap` group-kills that
+            // pgid, reaping not just the hook shell but every descendant it forked — e.g. an
+            // in-flight `curl` mid droplet-create that would otherwise survive the shell's SIGKILL,
+            // finish provisioning AFTER the daemon declared failure + refunded, and leave an
+            // orphaned, still-billing droplet no teardown ever recorded (lnrent-y4m.12).
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -172,11 +232,32 @@ async fn spawn_hook(hook: &Path, env_passthrough: &[String]) -> Result<tokio::pr
     }
 }
 
-/// Explicitly kill the child and reap it (bounded), so a timed-out/over-producing hook leaves
-/// no zombie — `kill_on_drop` is only a backstop.
+/// Explicitly kill the timed-out/over-producing hook — the WHOLE process group, not just the
+/// immediate child — and reap it (bounded), so no zombie AND no orphaned descendant survives.
+/// `spawn_hook` made the hook its own group leader (pgid == pid), so a group-kill reaps any
+/// grandchild it forked (e.g. an in-flight `curl` still creating a billed droplet) that would
+/// outlive a SIGKILL of just the shell (lnrent-y4m.12). `kill_on_drop` is only a backstop.
 async fn reap(child: &mut tokio::process::Child) {
-    let _ = child.start_kill();
+    // Capture the pid FIRST: once `child.wait()` reaps the process, `id()` returns None, so we must
+    // read it before any wait. `None` here means it was already reaped — nothing to signal.
+    if let Some(pid) = child.id() {
+        kill_hook_process_group(pid as i32);
+    }
+    // Preserve the bounded 5s reap-wait; the group-kill above covers the child, so no separate
+    // `start_kill` is needed. `kill_on_drop` remains the last-resort backstop.
     let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+}
+
+fn kill_hook_process_group(pgid: i32) {
+    // SAFETY: `pgid` comes only from our own just-spawned child, which `process_group(0)` made the
+    // leader of a new group. It therefore names exactly that hook's group, never the daemon's.
+    let rc = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    if rc == -1 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            tracing::debug!(pgid, error = %err, "killpg on hook group failed (best-effort)");
+        }
+    }
 }
 
 /// Read `r` to EOF, retaining the bytes, but return an error the moment the total would exceed
@@ -209,14 +290,62 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
-    // Write an executable script into a unique temp dir and return its path.
+    /// Whether a group-killed descendant is DEAD — reaped (`kill(pid, 0)` -> `ESRCH`) OR a
+    /// ZOMBIE. The zombie case matters (codex PR-36 review): the grandchild is our hook shell's
+    /// child, so when the group-kill also kills the shell the grandchild is reparented to init;
+    /// in a minimal container whose PID 1 does not promptly reap, it lingers as a zombie, and
+    /// `kill(zombie, 0)` returns SUCCESS — so an ESRCH-only probe would wrongly report the killed
+    /// process as "survived". A zombie has been killed; the SIGKILL landed. We check
+    /// `/proc/<pid>/stat` for state `Z` (Linux; the daemon is Linux). `kill(pid, 0)` sends NO
+    /// signal (existence probe only) and we only ever probe a pid our own hook recorded.
+    fn descendant_gone(pid: i32) -> bool {
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return true; // fully reaped
+        }
+        // Present in the table — reaped-but-zombie counts as dead. /proc/<pid>/stat is
+        // `pid (comm) STATE ...`; the state char follows the last ')' (comm may contain spaces).
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.trim_start().chars().next())
+                == Some('Z'),
+            Err(_) => true, // vanished between the kill probe and the stat read -> gone
+        }
+    }
+
+    /// Poll [`descendant_gone`] up to ~500ms (absorbing init's reaping latency), returning whether
+    /// the descendant died.
+    async fn poll_descendant_gone(pid: i32) -> bool {
+        for _ in 0..50 {
+            if descendant_gone(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    // Write an executable script into a fresh, unique temp dir and return its path. The dir name
+    // mixes the pid, a high-resolution timestamp, a process-local monotonic seq, and the hook name
+    // so two runs can never collide on the same path — even if the OS reuses this pid across
+    // separate test-process runs (PID namespaces recycle small pids). Freshness matters beyond
+    // avoiding a `create_dir` `AlreadyExists` panic: the group-kill tests read a `gc.pid` file from
+    // this dir, and a stale pid left by an earlier run would let those tests pass VACUOUSLY.
+    // `create_dir` (not `_all`) then asserts the dir really is brand-new.
     fn write_hook(name: &str, body: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir =
-            std::env::temp_dir().join(format!("lnrent-runner-{}-{seq}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lnrent-runner-{}-{nanos}-{seq}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
         let path = dir.join(name);
         std::fs::write(&path, body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -237,12 +366,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonzero_exit_is_failure() {
-        let hook = write_hook("fail", "#!/usr/bin/env bash\necho '{}' ; exit 1\n");
-        let err = run_hook(&hook, &json!({}), DEFAULT_TIMEOUT, &[])
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("failed (exit"), "got: {err}");
+    async fn failed_clean_exit_group_kills_forked_descendant() {
+        for (name, exit, expected) in [
+            ("nonzero", "echo '{}'; exit 1", "failed (exit"),
+            ("non-json", "echo nope", "stdout is not JSON"),
+        ] {
+            // Redirect the background process's stdio so the runner sees EOF and reaps the shell
+            // while the descendant is still alive. Both failure decisions happen after that wait.
+            let hook = write_hook(
+                name,
+                &format!(
+                    "#!/usr/bin/env bash\n\
+                     gcdir=\"$(dirname \"$0\")\"\n\
+                     sleep 30 >/dev/null 2>&1 &\n\
+                     echo \"$!\" > \"$gcdir/gc.pid\"\n\
+                     {exit}\n"
+                ),
+            );
+            let pidfile = hook.parent().unwrap().join("gc.pid");
+
+            let err = run_hook(&hook, &json!({}), DEFAULT_TIMEOUT, &[])
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(expected), "got: {err}");
+
+            let gc_pid = std::fs::read_to_string(pidfile)
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .unwrap();
+            assert!(
+                poll_descendant_gone(gc_pid).await,
+                "descendant pid {gc_pid} survived the {name} hook failure"
+            );
+        }
     }
 
     #[tokio::test]
@@ -252,6 +409,108 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out"));
+    }
+
+    // lnrent-y4m.12: a timed-out hook that forked a LONG-LIVED grandchild must leave NO surviving
+    // descendant after `reap` — the group-kill takes the whole process group, not just the immediate
+    // shell. A SIGKILL of only the child would orphan that grandchild: the invisible-billed-droplet
+    // failure (an in-flight `curl` completing the provision AFTER the daemon declared failure and
+    // refunded) that this change exists to prevent. We prove the grandchild is GONE by a BOUNDED
+    // `kill(pid, 0)` -> ESRCH poll (signal 0 delivers nothing — it only probes existence), NOT by
+    // letting it self-exit; a regression fails the assertion instead of hanging the test.
+    #[tokio::test]
+    async fn timeout_group_kills_forked_descendant() {
+        // A subshell backgrounds `sleep`, so the sleep is this hook's GRANDCHILD (mirroring a curl
+        // spawned by a provisioning subshell). It stays in the hook's process group — no setsid/new
+        // group, which would escape the group-kill. Record its pid next to the script (via $0's
+        // dir, no env mutation), then hang so run_hook times out and `reap` group-kills.
+        let hook = write_hook(
+            "fork-grandchild",
+            "#!/usr/bin/env bash\n\
+             gcdir=\"$(dirname \"$0\")\"\n\
+             ( sleep 30 & echo \"$!\" > \"$gcdir/gc.pid\" )\n\
+             sleep 30\n",
+        );
+        let pidfile = hook.parent().unwrap().join("gc.pid");
+
+        let err = run_hook(&hook, &json!({}), Duration::from_millis(300), &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "got: {err}");
+
+        // The grandchild pid was written at hook start; by the time run_hook returned (timeout +
+        // reap) the file exists. Poll briefly to be robust against the write race, then parse it.
+        let mut gc_pid = None;
+        for _ in 0..50 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                if let Ok(p) = s.trim().parse::<i32>() {
+                    gc_pid = Some(p);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let gc_pid = gc_pid.expect("hook recorded the grandchild pid");
+
+        // Assert the grandchild is GONE (reaped or zombie). `reap` group-killed before returning,
+        // so it is already dead or being reaped by init; the bounded poll only absorbs that
+        // reaping latency.
+        assert!(
+            poll_descendant_gone(gc_pid).await,
+            "grandchild pid {gc_pid} survived reap — the hook's process group was not killed"
+        );
+    }
+
+    // Dropping an in-flight run_hook future (as supervisor shutdown does after its bounded drain)
+    // must kill the hook's process group too. `kill_on_drop` covers only the immediate shell, so
+    // without the process-group drop guard this leaves the long-lived grandchild running.
+    #[tokio::test]
+    async fn cancelled_hook_group_kills_forked_descendant() {
+        let hook = write_hook(
+            "cancel-fork-grandchild",
+            "#!/usr/bin/env bash\n\
+             gcdir=\"$(dirname \"$0\")\"\n\
+             ( sleep 30 & echo \"$!\" > \"$gcdir/gc.pid\" )\n\
+             sleep 30\n",
+        );
+        let pidfile = hook.parent().unwrap().join("gc.pid");
+        let task =
+            tokio::spawn(async move { run_hook(&hook, &json!({}), DEFAULT_TIMEOUT, &[]).await });
+
+        let mut gc_pid = None;
+        for _ in 0..50 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                if let Ok(p) = s.trim().parse::<i32>() {
+                    gc_pid = Some(p);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let gc_pid = match gc_pid {
+            Some(pid) => pid,
+            None => {
+                task.abort();
+                let _ = task.await;
+                panic!("hook did not record the grandchild pid before cancellation");
+            }
+        };
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let gone = poll_descendant_gone(gc_pid).await;
+        if !gone {
+            // Regression cleanup: signal only the pid this test hook recorded, so a failing test
+            // does not itself leave the long-lived descendant behind.
+            unsafe {
+                libc::kill(gc_pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            gone,
+            "grandchild pid {gc_pid} survived cancellation of run_hook"
+        );
     }
 
     // A hook that never drains stdin + a payload larger than the pipe buffer must still hit the
@@ -366,10 +625,16 @@ mod tests {
         let env = hook_env_from(daemon_env, &["DO_TOKEN".to_string()]);
         let has = |k: &str| env.iter().any(|(name, _)| name == k);
 
-        assert!(has("PATH") && has("HOME"), "base allowlist forwarded when present");
+        assert!(
+            has("PATH") && has("HOME"),
+            "base allowlist forwarded when present"
+        );
         assert!(has("DO_TOKEN"), "a recipe-declared var passes through");
         assert!(!has("LNRENT_MNEMONIC"), "the seed is NEVER forwarded");
-        assert!(!has("UNDECLARED_X"), "an undeclared daemon var is not forwarded");
+        assert!(
+            !has("UNDECLARED_X"),
+            "an undeclared daemon var is not forwarded"
+        );
         // Unset base vars are simply skipped (not forwarded empty).
         assert!(!has("LANG"), "an unset base var is skipped");
     }
@@ -424,9 +689,21 @@ mod tests {
             None => std::env::remove_var("Y4M7_TEST_UNDECLARED"),
         }
 
-        assert_eq!(j["seed"], json!(false), "the LNRENT_MNEMONIC seed NEVER reaches a hook");
-        assert_eq!(j["undeclared"], json!(false), "an undeclared daemon var does not reach a hook");
-        assert_eq!(j["token"], json!(true), "a recipe-declared var passes through");
+        assert_eq!(
+            j["seed"],
+            json!(false),
+            "the LNRENT_MNEMONIC seed NEVER reaches a hook"
+        );
+        assert_eq!(
+            j["undeclared"],
+            json!(false),
+            "an undeclared daemon var does not reach a hook"
+        );
+        assert_eq!(
+            j["token"],
+            json!(true),
+            "a recipe-declared var passes through"
+        );
         assert_eq!(j["path"], json!(true), "the base PATH is present");
     }
 }
