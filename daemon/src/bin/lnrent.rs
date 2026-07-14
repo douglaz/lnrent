@@ -36,6 +36,12 @@ enum Cmd {
     /// wallet balance): reports wallet vs expected holdings + an OK/DRIFT/UNKNOWN verdict (UNKNOWN =
     /// a backend with no observable balance, e.g. the mock). Report-only.
     Reconcile,
+    /// Preflight the three EXTERNAL go-live dependencies — refund gateway, federation guardians,
+    /// provider API token (DO_TOKEN) — with per-check pass/fail + diagnostics. Exits nonzero when
+    /// any check fails, so an operator agent can gate subsequent launch promotion on it. The daemon
+    /// publishes before IPC starts, so this is not a publication interlock. Alias: `doctor`.
+    #[command(alias = "doctor")]
+    Preflight,
     /// List subscriptions.
     Subs,
     /// Inspect one subscription.
@@ -79,7 +85,8 @@ enum DevCmd {
     Settle { subscription_id: String },
 }
 
-/// Exit-code taxonomy (agent-grade, ADR-0014): 0 ok; 2 not_found; 3 bad_request/invalid_state;
+/// Exit-code taxonomy (agent-grade, ADR-0014): 0 ok; 1 preflight check(s) failed (lnrent-y4m.9) or
+/// an unrecognized daemon error code; 2 not_found; 3 bad_request/invalid_state;
 /// 4 ipc/connection failure; 5 internal.
 fn exit_for(err_code: &str) -> ExitCode {
     match err_code {
@@ -100,6 +107,7 @@ enum HumanRender {
     Generic,
     Money,
     Reconcile,
+    Preflight,
     Teardowns,
     Refunds,
     Relays,
@@ -115,11 +123,19 @@ async fn main() -> ExitCode {
     if let Cmd::Sweep { bolt11, yes } = &cli.cmd {
         return run_sweep(&sock, bolt11.clone(), *yes, cli.json).await;
     }
+    // `preflight` is one request->reply, but its exit code is gated on the AGGREGATE verdict
+    // INSIDE the data (lnrent-y4m.9): a healthy IPC round-trip carrying a failed check must still
+    // exit nonzero so an agent can gate subsequent launch promotion on it.
+    if let Cmd::Preflight = &cli.cmd {
+        return run_preflight(&sock, cli.json).await;
+    }
     let (req, human_render) = match cli.cmd {
         Cmd::Status => (Request::Status, HumanRender::Generic),
         Cmd::Recipes => (Request::Recipes, HumanRender::Generic),
         Cmd::Money => (Request::Money, HumanRender::Money),
         Cmd::Reconcile => (Request::Reconcile, HumanRender::Reconcile),
+        // Handled by the aggregate-gated early return above.
+        Cmd::Preflight => unreachable!("preflight is dispatched before this match"),
         Cmd::Subs => (Request::Subs, HumanRender::Generic),
         Cmd::Sub { id } => (Request::Sub { id }, HumanRender::Generic),
         Cmd::Teardowns => (Request::Teardowns, HumanRender::Teardowns),
@@ -170,6 +186,7 @@ fn render(reply: Reply, as_json: bool, human_render: HumanRender) -> ExitCode {
                 HumanRender::Generic => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
                 HumanRender::Money => render_money_human(&v),
                 HumanRender::Reconcile => render_reconcile_human(&v),
+                HumanRender::Preflight => render_preflight_human(&v),
                 HumanRender::Teardowns => render_teardowns_human(&v),
                 HumanRender::Refunds => render_refunds_human(&v),
                 HumanRender::Relays => render_relays_human(&v),
@@ -266,6 +283,91 @@ fn render_reconcile_human(v: &serde_json::Value) {
             "Verdict: \x1b[1mDRIFT\x1b[0m (wallet holds less than the books — investigate)"
         ),
         other => println!("Verdict: \x1b[1m{other}\x1b[0m (no observable wallet balance for this backend)"),
+    }
+}
+
+/// `lnrent preflight` (alias `doctor`, lnrent-y4m.9): one IPC round-trip, then the exit code comes
+/// from the AGGREGATE check verdict in the data — not just the IPC envelope — so `preflight` in a
+/// go-live script fails the pipeline when any external dependency is broken.
+async fn run_preflight(sock: &str, as_json: bool) -> ExitCode {
+    match ipc::call(sock, Request::Preflight).await {
+        Ok(reply) => {
+            let failed = preflight_checks_failed(&reply);
+            let code = render(reply, as_json, HumanRender::Preflight);
+            if failed {
+                ExitCode::from(1)
+            } else {
+                code
+            }
+        }
+        Err(e) => ipc_unreachable(sock, e, as_json),
+    }
+}
+
+/// The check names a healthy daemon's preflight report MUST contain (adversarial y4m.9 review):
+/// exit-0 is an AGENT GATE, so the CLI validates the report STRUCTURALLY instead of trusting the
+/// aggregate bit — a version-skewed or buggy daemon replying `ok:true` with missing or
+/// contradictory checks must exit 1, never silently pass. Future daemon-side checks are accepted
+/// (forward-compatible) but must each pass.
+const PREFLIGHT_REQUIRED_CHECKS: [&str; 3] = ["gateway", "federation", "provider_token"];
+
+/// PURE aggregate→exit mapping for `preflight`: exit 1 (distinct from the taxonomy codes 2..5)
+/// unless the reply is a WELL-FORMED passing report — aggregate `ok: true`, a checks array in
+/// which EVERY check has `ok: true` (a contradiction with the aggregate fails closed), and every
+/// [`PREFLIGHT_REQUIRED_CHECKS`] name present. A malformed/absent/incomplete report counts as
+/// failed — never silently a pass. An IPC-LEVEL error is not this path's job: `render`'s taxonomy
+/// exit already covers it (hence `false` here).
+fn preflight_checks_failed(reply: &Reply) -> bool {
+    if !reply.ok {
+        // A WELL-FORMED error reply keeps `render`'s taxonomy exit (2..5). But a deserializable
+        // yet inconsistent envelope — ok:false with NO error object — would fall through render
+        // at exit 0 (adversarial y4m.9 review): fail it here; exit 0 stays reserved for a
+        // structurally passing report.
+        return reply.error.is_none();
+    }
+    let Some(data) = reply.data.as_ref() else {
+        return true;
+    };
+    if data.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return true;
+    }
+    let Some(checks) = data.get("checks").and_then(serde_json::Value::as_array) else {
+        return true;
+    };
+    let every_check_passes = checks.iter().all(|c| {
+        c.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+            && c.get("name").and_then(serde_json::Value::as_str).is_some()
+    });
+    let all_required_present = PREFLIGHT_REQUIRED_CHECKS.iter().all(|required| {
+        checks
+            .iter()
+            .any(|c| c.get("name").and_then(serde_json::Value::as_str) == Some(required))
+    });
+    !(every_check_passes && all_required_present)
+}
+
+/// Human render for `lnrent preflight` (lnrent-y4m.9): the per-check verdicts + the aggregate.
+fn render_preflight_human(v: &serde_json::Value) {
+    let checks = v
+        .get("checks")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for c in &checks {
+        let s = |k: &str| c.get(k).and_then(serde_json::Value::as_str).unwrap_or("?");
+        let mark = if c.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+            "\u{2022}"
+        } else {
+            "\u{00d7}"
+        };
+        println!("  {} {} \u{b7} {}", mark, s("name"), s("detail"));
+    }
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        println!("Preflight: \x1b[1mPASS\x1b[0m");
+    } else {
+        println!(
+            "Preflight: \x1b[1mFAIL\x1b[0m \u{2014} fix the failing check(s) before promoting"
+        );
     }
 }
 
@@ -449,5 +551,69 @@ fn render_relays_human(v: &serde_json::Value) {
             .map(|t| format!("last connected @{t}"))
             .unwrap_or_else(|| "never connected".to_string());
         println!("  {} {} \u{b7} {} \u{b7} {}", mark, s("url"), s("status"), last);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // lnrent-y4m.9: the aggregate→exit mapping is pure and STRUCTURAL (adversarial review) —
+    // exit 0 only for a well-formed passing report with every required check present and passing;
+    // malformed, incomplete, or self-contradictory reports exit nonzero; an IPC-level error is
+    // left to `render`'s taxonomy exit.
+    #[test]
+    fn preflight_checks_failed_maps_the_aggregate() {
+        let full_pass = |names: &[&str]| {
+            Reply::ok(json!({
+                "ok": true,
+                "checks": names
+                    .iter()
+                    .map(|n| json!({"name": n, "ok": true, "detail": "ok"}))
+                    .collect::<Vec<_>>(),
+            }))
+        };
+        assert!(!preflight_checks_failed(&full_pass(&[
+            "gateway", "federation", "provider_token",
+        ])));
+        // Forward-compatible: an EXTRA (unknown) passing check is accepted.
+        assert!(!preflight_checks_failed(&full_pass(&[
+            "gateway", "federation", "provider_token", "future_check",
+        ])));
+
+        let fail = Reply::ok(json!({
+            "ok": false,
+            "checks": [{"name": "gateway", "ok": false, "detail": "down"}],
+        }));
+        assert!(preflight_checks_failed(&fail));
+
+        // STRUCTURAL fail-closed (adversarial review): a daemon replying ok:true with an EMPTY or
+        // INCOMPLETE checks array, a contradictory per-check verdict, a non-bool aggregate, or no
+        // data at all must exit nonzero — the exit code is an agent gate.
+        assert!(preflight_checks_failed(&Reply::ok(json!({"ok": true, "checks": []}))));
+        assert!(preflight_checks_failed(&Reply::ok(
+            json!({"ok": true, "checks": [{"name": "gateway", "ok": true, "detail": "ok"}]})
+        )));
+        assert!(preflight_checks_failed(&Reply::ok(json!({
+            "ok": true,
+            "checks": [
+                {"name": "gateway", "ok": true, "detail": "ok"},
+                {"name": "federation", "ok": false, "detail": "down"},
+                {"name": "provider_token", "ok": true, "detail": "ok"},
+            ],
+        }))));
+        assert!(preflight_checks_failed(&Reply::ok(json!({"checks": []}))));
+        assert!(preflight_checks_failed(&Reply::ok(json!({"ok": "yes"}))));
+
+        // An IPC-level error keeps render's taxonomy exit; this mapping stays out of it.
+        assert!(!preflight_checks_failed(&Reply::err("internal", "boom")));
+
+        // But an INCONSISTENT envelope — ok:false with NO error object — is malformed, not a
+        // taxonomy error: render would exit 0 on it, so this gate must fail it (adversarial
+        // y4m.9 review).
+        let ok_false_no_error: Reply =
+            serde_json::from_value(json!({"ok": false})).expect("deserializable envelope");
+        assert!(preflight_checks_failed(&ok_false_no_error));
     }
 }

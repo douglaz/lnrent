@@ -21,6 +21,9 @@ pub mod ledger;
 pub mod nostr_engine;
 pub mod op_dispatch;
 pub mod order_intake;
+/// `lnrent preflight`/`doctor` (lnrent-y4m.9): probe the three EXTERNAL go-live dependencies
+/// (gateway, federation, provider token) via the existing readiness seams — per-check pass/fail.
+pub mod preflight;
 pub mod provision;
 pub mod recipe;
 pub mod reconcile;
