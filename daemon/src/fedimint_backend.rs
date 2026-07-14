@@ -245,6 +245,9 @@ CREATE TABLE IF NOT EXISTS fedimint_pay (
     status           TEXT NOT NULL DEFAULT 'PENDING',
     pay_kind         TEXT NOT NULL DEFAULT 'ln'
 );
+CREATE TABLE IF NOT EXISTS fedimint_pay_dead_op (
+    operation_id  TEXT PRIMARY KEY
+);
 ";
 
 /// Real Fedimint backend: the joined fedimint client, the lnrent-owned idempotency index, the
@@ -393,13 +396,15 @@ impl FedimintPayment {
 
         // Symmetric backfill for OUTBOUND pays (lnrent-4gt): a crash in pay()'s window (op committed,
         // fedimint_pay row not yet upserted) would otherwise leave a refund key Unknown, so pay(key)
-        // would re-parse the maybe-expired bolt11 and fail instead of re-awaiting the op. FAIL-CLOSED.
-        let recovered_pay = recover_pay_from_oplog(&me.client, &me.index)
+        // would re-parse the maybe-expired bolt11 and fail instead of re-awaiting the op. Also
+        // un-hides a retry op left behind a stale FAILED row (lnrent-kum). FAIL-CLOSED.
+        let (recovered_pay, unhidden_pay) = recover_pay_from_oplog(&me.client, &me.index)
             .await
             .context("fedimint: oplog pay recovery failed; refusing to start")?;
-        if recovered_pay > 0 {
+        if recovered_pay > 0 || unhidden_pay > 0 {
             tracing::info!(
                 backfilled = recovered_pay,
+                replaced_stale_failed = unhidden_pay,
                 "fedimint: recovered pay index rows from oplog"
             );
         }
@@ -565,6 +570,10 @@ impl FedimintPayment {
                         // holds; classifying `Refunded` as ambiguous instead would strand EVERY
                         // routine route-failure refund (it is fedimint's normal failure terminal).
                         PayStateClass::DefinitiveFailure => {
+                            // Op-level fact, recorded regardless of the row CAS below: this exact
+                            // operation terminally failed with funds provably back, so crash
+                            // recovery must never resurrect it (lnrent-kum dead-op ledger).
+                            pay_idx_record_dead(&self.index, &op_hex)?;
                             pay_idx_mark(&self.index, key, &op_hex, "FAILED")?;
                             anyhow::bail!("refund payment failed: {state:?}");
                         }
@@ -622,6 +631,8 @@ impl FedimintPayment {
                         // FundingFailed / RefundSuccess -> funds never left / provably back. FAILED
                         // is safe: a later drive may start a fresh payment.
                         PayStateClass::DefinitiveFailure => {
+                            // Same op-level dead-ledger record as the lightning branch (lnrent-kum).
+                            pay_idx_record_dead(&self.index, &op_hex)?;
                             pay_idx_mark(&self.index, key, &op_hex, "FAILED")?;
                             anyhow::bail!("internal refund payment failed: {state:?}");
                         }
@@ -1342,15 +1353,40 @@ async fn recover_index_from_oplog(
 /// original bolt11 (which may have EXPIRED in the meantime) and fail before discovering the in-flight
 /// op. Backfilling the row (the op id + ln/internal kind) from the oplog `extra_meta` on open lets
 /// `pay(key)` take its early path and re-await the OPERATION directly. Backfilled as `PENDING`; the
-/// next `pay(key)` reconstructs the `PayType` from (op, kind) and resolves it to terminal. IDEMPOTENT
-/// (skips keys already indexed); an undecodable oplog entry is logged + skipped (matching the receive
-/// side); `join_or_open` is fail-closed on a pass-level error (refuses to start).
+/// next `pay(key)` reconstructs the `PayType` from (op, kind) and resolves it to terminal.
+///
+/// ALSO un-hides an unrecorded LIVE operation behind a stale FAILED row (lnrent-kum): a crash after
+/// a same-key retry's `pay_bolt11_invoice` committed but before its upsert replaced the prior
+/// attempt's FAILED row would otherwise leave the new op invisible, so a later drive retries AGAIN
+/// while it is still in flight — both can settle, an operator double-pay. Per-entry decisions are
+/// [`pay_recovery_action`] (pure; see its order-independence + dead-op-ledger arguments —
+/// fedimint's oplog is wall-clock-ordered, so the decision must not rely on scan order); PENDING,
+/// SUCCEEDED, correctly FAILED, and ledger-dead candidates never mutate anything. Returns
+/// `(backfilled, replaced_stale_failed)`. IDEMPOTENT (a re-run changes nothing: replaced rows are
+/// PENDING and ledger-dead candidates keep skipping); an undecodable oplog entry is logged +
+/// skipped (matching the receive side); `join_or_open` is fail-closed on a pass-level error
+/// (refuses to start).
 async fn recover_pay_from_oplog(
     client: &ClientHandleArc,
     index: &Arc<Mutex<Connection>>,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
     let log = client.operation_log();
     let mut backfilled = 0usize;
+    let mut replaced_stale_failed = 0usize;
+    // key -> the candidates that could take its row (a BACKFILL for an absent row, or a REPLACE
+    // for a stale FAILED row — a key's arm cannot change mid-scan because NOTHING is upserted
+    // in-scan), collected across the WHOLE scan before ANY row is written. Both arms accumulate
+    // for the same reason: two unindexed/unrecorded ops under one key are the SAME
+    // cannot-represent-in-one-row ambiguity whichever row state they hide behind (adversarial
+    // lnrent-kum review, round 6). Bounded per key (the Vec caps at MAX_LISTED; the count keeps
+    // the true total) so one pathological key cannot balloon memory to O(oplog). BTreeMap so the
+    // fail-closed diagnostic below is byte-deterministic across restarts.
+    const MAX_LISTED: usize = 8;
+    /// (was this key's arm a Backfill, up to [`MAX_LISTED`] listed `(op_hex, kind)` candidates,
+    /// TRUE total seen) for one key.
+    type KeyCandidates = (bool, Vec<(String, &'static str)>, usize);
+    let mut pending_writes: std::collections::BTreeMap<String, KeyCandidates> =
+        std::collections::BTreeMap::new();
     let mut last = None;
     loop {
         let page = log.paginate_operations_rev(100, last).await;
@@ -1379,24 +1415,91 @@ async fn recover_pay_from_oplog(
             else {
                 continue;
             };
-            if pay_idx_status_by_key(index, idk)?.is_some() {
-                continue;
-            }
             let op_hex = key.operation_id.fmt_full().to_string();
+            let existing = pay_idx_get(index, idk)?;
+            let existing_ref = existing
+                .as_ref()
+                .map(|(op, status, _)| (op.as_str(), status.as_str()));
+            // Dead-candidate test = OUR OWN dead-op ledger (`fedimint_pay_dead_op`), written by
+            // `await_pay` the moment it observes a definitive failure. Deliberately NOT any
+            // fedimint-side signal — three adversarial review rounds refuted those in turn: the
+            // oplog is wall-clock-ordered (not causal), the outcome cache is only written on an
+            // EOF-drain `await_pay` never performs, and PROBING via subscribe can itself poison
+            // that cache (the wrapper caches the last emitted update on an EOF-without-terminal).
+            // The ledger is a local instant lookup with none of those dependencies.
+            let candidate_dead = match existing_ref {
+                Some((row_op, "FAILED")) if row_op != op_hex => {
+                    pay_idx_is_dead(index, &op_hex)?
+                }
+                _ => false,
+            };
             let kind = if pay.is_internal_payment {
                 "internal"
             } else {
                 "ln"
             };
-            pay_idx_upsert(index, idk, &op_hex, "PENDING", kind)?;
-            backfilled += 1;
+            // COLLECT rather than write in-scan — for BOTH arms — so every competing candidate
+            // for a key is seen before one is chosen (the row state stays constant during the
+            // scan, so later same-key candidates are never masked by an earlier write).
+            let is_backfill = match pay_recovery_action(existing_ref, &op_hex, candidate_dead) {
+                PayRecoveryAction::Skip => continue,
+                PayRecoveryAction::Backfill => true,
+                PayRecoveryAction::ReplaceStaleFailed => false,
+            };
+            let (_, listed, total) = pending_writes
+                .entry(idk.to_owned())
+                .or_insert((is_backfill, Vec::new(), 0));
+            if listed.len() < MAX_LISTED {
+                listed.push((op_hex.clone(), kind));
+            }
+            *total += 1;
         }
         last = page.last().map(|(k, _)| *k);
         if count < 100 {
             break;
         }
     }
-    Ok(backfilled)
+    // FAIL CLOSED on ambiguity BEFORE writing anything (all-or-nothing — NOTHING was upserted
+    // in-scan, so a bail here leaves the index byte-identical, matching the bootstrap
+    // discipline): in the post-ledger steady state at most ONE unrecorded candidate can exist per
+    // key (a second same-key op only ever starts after the first resolved and — for failures —
+    // was ledgered), so a competing set means pre-ledger orphans and/or clock-pathology crash
+    // artifacts racing a possibly-live op. The single-op row cannot represent that: whichever op
+    // it re-awaits, an unchosen candidate could still settle while a later FAILED-driven retry
+    // starts a fresh payment — the double-pay this bead exists to close. No automatic choice is
+    // money-safe, so REFUSE TO START and hand the operator the exact op ids (adversarial
+    // lnrent-kum review, rounds 4-6; full per-key enumeration is lnrent-7so). BTreeMap iteration
+    // + sorted op ids keep the refusal text deterministic across restarts.
+    let ambiguous: Vec<String> = pending_writes
+        .iter()
+        .filter(|(_, (_, _, total))| *total > 1)
+        .map(|(idk, (_, listed, total))| {
+            let mut ops: Vec<&str> = listed.iter().map(|(op, _)| op.as_str()).collect();
+            ops.sort_unstable();
+            format!("key {idk}: {total} competing unrecorded ops (listing up to {MAX_LISTED}): {ops:?}")
+        })
+        .collect();
+    if !ambiguous.is_empty() {
+        anyhow::bail!(
+            "fedimint pay recovery: MULTIPLE unrecorded operations compete for the same \
+             idempotency key (pre-ledger history or a crash under clock pathology) — no automatic \
+             choice is money-safe, refusing to start. Verify each op's true state (fedimint oplog \
+             / gateway logs), record the genuinely dead ones with: INSERT INTO \
+             fedimint_pay_dead_op (operation_id) VALUES ('<op>'); in the pay index DB, then \
+             restart. Details: {}",
+            ambiguous.join("; ")
+        );
+    }
+    for (idk, (is_backfill, candidates, _)) in pending_writes {
+        let (op_hex, kind) = &candidates[0];
+        pay_idx_upsert(index, &idk, op_hex, "PENDING", kind)?;
+        if is_backfill {
+            backfilled += 1;
+        } else {
+            replaced_stale_failed += 1;
+        }
+    }
+    Ok((backfilled, replaced_stale_failed))
 }
 
 // ---- the lnrent-owned sqlite index (sync; guards never cross an await) ---------------------------
@@ -1608,6 +1711,34 @@ fn pay_idx_mark(index: &Mutex<Connection>, key: &str, op_hex: &str, status: &str
     Ok(())
 }
 
+/// Append an operation to the DEAD-OP LEDGER (`fedimint_pay_dead_op`, lnrent-kum): `await_pay`
+/// records every op it observes reaching a DEFINITIVE failure (funds provably back), the moment it
+/// observes it and regardless of the row CAS outcome — dead-ness is a property of the OPERATION,
+/// not the row. Crash recovery consults this ledger so a dead op is never resurrected behind a
+/// stale FAILED row (no burned attempts, no restart oscillation). Append-only, idempotent.
+fn pay_idx_record_dead(index: &Mutex<Connection>, op_hex: &str) -> Result<()> {
+    let conn = index.lock().unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO fedimint_pay_dead_op (operation_id) VALUES (?1)",
+        params![op_hex],
+    )?;
+    Ok(())
+}
+
+/// Whether an operation is in the dead-op ledger (see [`pay_idx_record_dead`]).
+fn pay_idx_is_dead(index: &Mutex<Connection>, op_hex: &str) -> Result<bool> {
+    let conn = index.lock().unwrap();
+    let dead = conn
+        .query_row(
+            "SELECT 1 FROM fedimint_pay_dead_op WHERE operation_id = ?1",
+            params![op_hex],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(dead)
+}
+
 fn map_pay_status(s: Option<String>) -> PayStatus {
     match s.as_deref() {
         Some("SUCCEEDED") => PayStatus::Succeeded,
@@ -1799,6 +1930,97 @@ fn classify_internal_pay_state(state: &InternalPayState) -> PayStateClass {
         // An unclassified local error — not proof the recipient was unpaid. AMBIGUOUS: never retry;
         // leave the row PENDING.
         InternalPayState::UnexpectedError(_) => PayStateClass::Ambiguous,
+    }
+}
+
+/// PURE per-entry decision for [`recover_pay_from_oplog`] (lnrent-kum): what recovery does with an
+/// oplog pay operation given the key's existing `fedimint_pay` row. Free of the live client —
+/// following the `net_payout_sat` / `select_first_reachable` / `ordered_with_preference` /
+/// `classify_ln_pay_state` precedent — so which OPERATION a recovered row points at (the double-pay
+/// decision) is unit-tested without a federation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayRecoveryAction {
+    /// No row for this key — the daemon crashed before the FIRST `pay_idx_upsert` (lnrent-4gt).
+    /// Upsert the oplog op as PENDING (the original backfill).
+    Backfill,
+    /// The row says FAILED but points at a DIFFERENT operation than this oplog entry (including the
+    /// `"(preflight-failed)"` placeholder), and the entry is not a dead (cached-definitive-failure)
+    /// candidate. Upsert the oplog op as PENDING so the drivers re-await it instead of retrying
+    /// behind its back (the lnrent-kum double-pay window).
+    ReplaceStaleFailed,
+    /// The row already reflects this key faithfully — leave it untouched.
+    Skip,
+}
+
+/// Decide the [`PayRecoveryAction`] for one oplog pay entry (lnrent-kum). The crash window this
+/// closes: operation A fails definitively (row FAILED), a same-key retry starts operation B, and the
+/// daemon crashes after `pay_bolt11_invoice` commits B but before `pay_idx_upsert` replaces A's row
+/// — a later drive then sees FAILED and (if the persisted invoice EXPIRED) re-resolves a fresh
+/// payment hash and starts operation C while B is still hidden in flight; B and C can BOTH settle
+/// (each is INV-1-capped individually, not jointly), so the OPERATOR pays twice.
+///
+/// `candidate_dead` is the dead-op ledger verdict for THIS oplog entry's operation
+/// (`fedimint_pay_dead_op`, written by `await_pay` the moment it observes a definitive failure).
+/// The ledger is deliberately the ONLY dead signal — three adversarial review rounds refuted every
+/// fedimint-side alternative: scan order (the oplog is wall-clock-ordered, not causal), the outcome
+/// cache (only written on an EOF-drain `await_pay` never performs), and subscription probing (the
+/// caching wrapper can write a NON-terminal last update as the outcome on an EOF-without-terminal,
+/// permanently blinding later re-awaits).
+///
+/// - `None` row -> `Backfill`: no row at all (crash before the FIRST upsert; the lnrent-4gt
+///   behavior, unconditional — a dead backfilled op settles to its real status on the first
+///   re-await).
+/// - FAILED under a DIFFERENT op than the oplog entry:
+///   - `candidate_dead` -> `Skip`: this exact op already definitively failed (funds provably
+///     back). Resurrecting it would burn a refund attempt on a replayed failure — and with TWO
+///     dead ops under one key, each restart would re-point the row at the OTHER dead op forever,
+///     an oscillation that parks the refund at its attempt cap (adversarial lnrent-kum review).
+///     This also keeps a NEWER `"(preflight-failed)"` placeholder from being clobbered by a
+///     historical dead op.
+///   - otherwise -> `ReplaceStaleFailed`: un-hide the possibly-live unrecorded op as PENDING. The
+///     drivers re-await it and the y4m.16 machinery lands its REAL outcome (Success -> SUCCEEDED;
+///     DefinitiveFailure -> FAILED + a dead-ledger record, so it can never be resurrected again;
+///     Ambiguous stays PENDING).
+/// - FAILED under the SAME op -> `Skip`: a genuinely failed operation — the FAILED mark is correct
+///   and must survive recovery.
+/// - PENDING / SUCCEEDED (or any other status) -> `Skip`: NEVER touch a live or completed row.
+///
+/// Ordering argument (adversarial lnrent-kum review): fedimint's oplog is ordered by WALL-CLOCK
+/// time, not causally, so "newest-first" cannot be trusted across a clock rollback. This decision
+/// is therefore ORDER-INDEPENDENT: a ledger-dead candidate never replaces anything (no
+/// oscillation, at any scan position); a possibly-live candidate replaces a stale FAILED row at
+/// ANY scan position; and once replaced the row is PENDING, so every other entry for the key
+/// skips.
+///
+/// Documented residuals (not fixable from a single-op row + this scan):
+/// - a SINGLE pre-ledger orphan (an op that failed before the dead-op ledger existed) is not in
+///   the ledger -> classified possibly-live -> replaced once -> its re-await lands FAILED and
+///   RECORDS it. Converges with at most one burned refund attempt; no restart oscillation;
+/// - MULTIPLE competing candidates for one key — whether its row is a stale FAILED or entirely
+///   ABSENT — cannot be represented by the single-op row, and NO automatic choice is money-safe:
+///   the recovery loop collects BOTH arms without writing in-scan, detects the competition, and
+///   FAILS THE PASS (the daemon refuses to start) with every competing op id and a
+///   manual-reconciliation runbook. Post-ledger, competition is impossible in normal operation: a
+///   second same-key op only ever starts after the first resolved and was ledgered. Full per-key
+///   enumeration is lnrent-7so;
+/// - an op stamped far enough in the FUTURE of the recovering clock is excluded from
+///   `paginate_operations_rev` entirely (upstream starts at now+30s) — it stays hidden until a
+///   later restart when the clock catches up; until then the pre-kum window applies to that key.
+fn pay_recovery_action(
+    existing: Option<(&str, &str)>,
+    oplog_op_hex: &str,
+    candidate_dead: bool,
+) -> PayRecoveryAction {
+    match existing {
+        None => PayRecoveryAction::Backfill,
+        Some((row_op, "FAILED")) if row_op != oplog_op_hex => {
+            if candidate_dead {
+                PayRecoveryAction::Skip
+            } else {
+                PayRecoveryAction::ReplaceStaleFailed
+            }
+        }
+        Some(_) => PayRecoveryAction::Skip,
     }
 }
 
@@ -2496,5 +2718,137 @@ mod pay_state_class_tests {
             )),
             PayStateClass::Ambiguous
         );
+    }
+}
+
+#[cfg(test)]
+mod pay_recovery_action_tests {
+    //! PURE recovery-decision unit tests (lnrent-kum). The whole module is `#[cfg(feature =
+    //! "fedimint")]` (see lib.rs), so these run under the default-on `cargo test -p lnrentd`.
+    //! `pay_recovery_action` is free of the live client (the `net_payout_sat` /
+    //! `classify_ln_pay_state` precedent), so which OPERATION a recovered row points at — the
+    //! double-pay decision — is proven without a federation. The decision is ORDER-INDEPENDENT
+    //! (fedimint's oplog is wall-clock-ordered, untrustworthy across a clock rollback) and its
+    //! only dead signal is OUR OWN dead-op ledger, so no test here depends on scan position or on
+    //! any fedimint-side cache/replay behavior.
+    use super::{pay_idx_is_dead, pay_idx_record_dead, pay_recovery_action, PayRecoveryAction};
+    use super::INDEX_SCHEMA;
+    use rusqlite::Connection;
+    use std::sync::Mutex;
+
+    // No row at all: the daemon crashed before the FIRST upsert. Backfill — the lnrent-4gt
+    // behavior, unchanged and unconditional (even a ledger-dead op is recorded; its first re-await
+    // lands the real status).
+    #[test]
+    fn absent_row_is_backfilled() {
+        assert_eq!(
+            pay_recovery_action(None, "op-A", false),
+            PayRecoveryAction::Backfill
+        );
+        assert_eq!(
+            pay_recovery_action(None, "op-A", true),
+            PayRecoveryAction::Backfill
+        );
+    }
+
+    // MONEY-CRITICAL (the whole point of lnrent-kum): operation A failed (row FAILED), a same-key
+    // retry started operation B, and the daemon crashed before the upsert replaced A's row — B sits
+    // in the oplog invisible behind the stale FAILED row, and B is NOT in the dead-op ledger (it
+    // never definitively failed under our eyes: it may still be live). A later drive would see
+    // FAILED and (if the invoice expired) start operation C while B is still in flight; B and C can
+    // BOTH settle (each INV-1-capped individually, not jointly), so the OPERATOR pays twice.
+    // Recovery must re-point the row at B as PENDING so the drivers re-await it.
+    #[test]
+    fn stale_failed_row_is_replaced_by_the_unrecorded_live_op() {
+        assert_eq!(
+            pay_recovery_action(Some(("op-A", "FAILED")), "op-B", false),
+            PayRecoveryAction::ReplaceStaleFailed
+        );
+    }
+
+    // ADVERSARIAL-REVIEW GUARD (order-independence): a candidate in OUR dead-op ledger already
+    // definitively failed — funds provably back. It must never replace a FAILED row: the
+    // resurrected op would replay its failure and burn a refund attempt, and with TWO dead ops
+    // under one key each restart would re-point the row at the OTHER one forever — an oscillation
+    // that parks the refund at its attempt cap. This ledger rule (not scan order, which fedimint's
+    // wall-clock oplog cannot guarantee; not the outcome cache, which our await never writes; not
+    // probing, which can poison that cache) is what keeps a genuinely-failed history closed.
+    #[test]
+    fn ledger_dead_candidate_never_resurrects() {
+        assert_eq!(
+            pay_recovery_action(Some(("op-A", "FAILED")), "op-B", true),
+            PayRecoveryAction::Skip
+        );
+    }
+
+    // The codex PR-review case: a NEWER `"(preflight-failed)"` placeholder (a cap refusal that
+    // never started an op) must NOT be clobbered by a historical ledger-dead op — that would waste
+    // the refund's attempt budget on a replayed dead failure and could park it at the cap. A
+    // placeholder is only replaced by a possibly-LIVE unrecorded op (the true crash window; and a
+    // same-key op after a placeholder reuses the SAME invoice/payment-hash, so even a mistaken
+    // replace can never double-pay).
+    #[test]
+    fn placeholder_row_ignores_dead_ops_but_yields_to_live_ones() {
+        assert_eq!(
+            pay_recovery_action(Some(("(preflight-failed)", "FAILED")), "op-A", true),
+            PayRecoveryAction::Skip
+        );
+        assert_eq!(
+            pay_recovery_action(Some(("(preflight-failed)", "FAILED")), "op-B", false),
+            PayRecoveryAction::ReplaceStaleFailed
+        );
+    }
+
+    // A FAILED row pointing at the SAME op the oplog entry holds is a genuinely failed operation —
+    // the FAILED mark is correct and must survive recovery (otherwise every restart would reopen
+    // every historical definitive failure). Ledger-independent.
+    #[test]
+    fn genuinely_failed_op_stays_failed() {
+        assert_eq!(
+            pay_recovery_action(Some(("op-A", "FAILED")), "op-A", false),
+            PayRecoveryAction::Skip
+        );
+        assert_eq!(
+            pay_recovery_action(Some(("op-A", "FAILED")), "op-A", true),
+            PayRecoveryAction::Skip
+        );
+    }
+
+    // A PENDING row is never touched: after a replace installs the live unrecorded op as PENDING,
+    // every other oplog entry for the key — at ANY scan position, ledger-dead or live — must leave
+    // it alone. This is the convergence half of the order-independence argument.
+    #[test]
+    fn pending_row_is_never_touched() {
+        assert_eq!(
+            pay_recovery_action(Some(("op-B", "PENDING")), "op-A", false),
+            PayRecoveryAction::Skip
+        );
+    }
+
+    // A completed pay is never reopened, whatever operation an oplog entry names.
+    #[test]
+    fn succeeded_row_is_never_touched() {
+        assert_eq!(
+            pay_recovery_action(Some(("op-A", "SUCCEEDED")), "op-B", false),
+            PayRecoveryAction::Skip
+        );
+    }
+
+    // The dead-op LEDGER itself: append-only, idempotent, and an op is dead only after it was
+    // recorded. `await_pay` records at its DefinitiveFailure choke points, regardless of the row
+    // CAS outcome — dead-ness is a property of the OPERATION, not the row.
+    #[test]
+    fn dead_op_ledger_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(INDEX_SCHEMA).unwrap();
+        let index = Mutex::new(conn);
+
+        assert!(!pay_idx_is_dead(&index, "op-A").unwrap());
+        pay_idx_record_dead(&index, "op-A").unwrap();
+        assert!(pay_idx_is_dead(&index, "op-A").unwrap());
+        // Idempotent: a duplicate record is a no-op, not an error.
+        pay_idx_record_dead(&index, "op-A").unwrap();
+        assert!(pay_idx_is_dead(&index, "op-A").unwrap());
+        assert!(!pay_idx_is_dead(&index, "op-B").unwrap());
     }
 }
