@@ -108,6 +108,45 @@ impl Reply {
 /// not be able to memory-DoS the daemon, codex #9). Requests are tiny JSON.
 const MAX_REQUEST_BYTES: u64 = 1 << 18; // 256 KiB
 
+/// Deadline for reading the ONE request frame off an accepted connection (lnrent-y4m.13). A
+/// legitimate client writes its single JSON line immediately after connecting, so seconds is
+/// generous. The bound exists for the graceful drain: `serve_with_shutdown` AWAITS in-flight
+/// handlers at shutdown (so an admin txn + reply isn't lost), so without it one idle peer
+/// (connect, send nothing) pins the drain until the supervisor's SHUTDOWN_DRAIN (3s) abort
+/// kills the whole task set — which can kill a CONCURRENT handler after its txn committed but
+/// before its reply was written. The idle-path budget — this deadline plus
+/// [`TIMED_OUT_REPLY_WRITE_BOUND`] — stays UNDER that 3s window, so even an idle connection
+/// accepted the instant before shutdown self-completes inside the graceful drain.
+/// (A `cfg!` expression, not attribute-split consts: this file's convention — which the
+/// one-call-site invariant test relies on — is that the first cfg-test ATTRIBUTE in the text
+/// marks the tests module. Test-tuned to milliseconds: the tests hold real idle sockets
+/// against this deadline.)
+const REQUEST_READ_DEADLINE: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(500)
+} else {
+    REQUEST_READ_DEADLINE_PROD
+};
+
+/// The PRODUCTION read deadline, named so the compile-time budget guard below checks the real
+/// value even in test builds (where [`REQUEST_READ_DEADLINE`] is test-tuned to milliseconds).
+const REQUEST_READ_DEADLINE_PROD: std::time::Duration = std::time::Duration::from_secs(2);
+
+// Compile-time budget guard (adversarial y4m.13 review): the idle-connection path — the
+// PRODUCTION read deadline plus the bounded timeout reply — must complete inside the
+// supervisor's SHUTDOWN_DRAIN window, or one idle peer accepted just before shutdown would again
+// force the abort that can kill a concurrent committed-but-unreplied handler. A future bump of
+// either constant that silently reintroduces that window becomes a compile error here.
+const _: () = assert!(
+    REQUEST_READ_DEADLINE_PROD.as_millis() + TIMED_OUT_REPLY_WRITE_BOUND.as_millis()
+        < crate::supervisor::SHUTDOWN_DRAIN.as_millis(),
+    "idle IPC connection budget must stay under the supervisor drain window"
+);
+
+/// Bound on the best-effort `bad_request` reply after a read timeout: the tiny reply fits the
+/// connection's empty send buffer (so this never blocks in practice), but a peer that somehow
+/// wedges the write must not wedge the handler — the prompt close, not the reply, is the point.
+const TIMED_OUT_REPLY_WRITE_BOUND: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Peer-cred authorization for one accepted IPC connection (lnrent-y4m.10, defense-in-depth
 /// behind the 0600 socket perms): only the daemon's own uid — the operator account — or root
 /// (who could bypass any uid check anyway) may issue operator commands. Pure, so the decision
@@ -337,10 +376,34 @@ async fn handle_conn(
     relays: RelayStatusCell,
 ) -> Result<()> {
     let (rd, mut wr) = stream.into_split();
-    // Bounded read: cap the request frame so an over-long line can't exhaust memory.
+    // Bounded read: cap the request frame so an over-long line can't exhaust memory, and put a
+    // deadline on it (lnrent-y4m.13) so an idle peer can't hold this handler open — the graceful
+    // shutdown drain awaits it. A read within the deadline behaves byte-for-byte as before.
     let mut rd = BufReader::new(rd.take(MAX_REQUEST_BYTES));
     let mut line = String::new();
-    rd.read_line(&mut line).await?;
+    match tokio::time::timeout(REQUEST_READ_DEADLINE, rd.read_line(&mut line)).await {
+        Err(_elapsed) => {
+            // Read deadline hit: reply best-effort — mirroring the over-long/unterminated-frame
+            // path — and close promptly. The write is bounded and its result ignored: an
+            // unresponsive peer must not wedge the close either (one that stopped reading just
+            // sees the close). Logged so a wedged/crashed same-uid client is diagnosable — the
+            // foreign-uid refusal path warns, this should too (review P3).
+            tracing::warn!(
+                deadline = ?REQUEST_READ_DEADLINE,
+                "ipc connection sent no request within the read deadline; closing"
+            );
+            let mut out =
+                serde_json::to_vec(&Reply::err("bad_request", "request read timed out"))?;
+            out.push(b'\n');
+            let _ = tokio::time::timeout(TIMED_OUT_REPLY_WRITE_BOUND, async {
+                let _ = wr.write_all(&out).await;
+                let _ = wr.flush().await;
+            })
+            .await;
+            return Ok(());
+        }
+        Ok(read) => read?,
+    };
     let reply = if !line.ends_with('\n') {
         // hit the byte cap without a line terminator -> over-long / malformed frame
         Reply::err("bad_request", "request too large or unterminated")
@@ -1455,6 +1518,161 @@ mod tests {
         );
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&target);
+    }
+
+    // y4m.13: an idle client (connect, send nothing) is cut at the read deadline with the
+    // structured `bad_request` reply — its handler self-completes instead of pinning forever.
+    #[tokio::test]
+    async fn idle_client_is_timed_out_with_a_bad_request_reply() {
+        let (_store, sock) = serve_temp().await;
+        let connected_at = std::time::Instant::now();
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        // Keep the write half ALIVE (named binding): dropping it would half-close and hand the
+        // server an EOF — the unterminated-frame path, not the timeout under test.
+        let (rd, _wr) = stream.into_split();
+        let mut rd = BufReader::new(rd);
+        let mut line = String::new();
+        tokio::time::timeout(REQUEST_READ_DEADLINE * 4, rd.read_line(&mut line))
+            .await
+            .expect("the timed-out reply arrives ~at the deadline, the handler never hangs")
+            .unwrap();
+        let elapsed = connected_at.elapsed();
+        let reply: Reply = serde_json::from_str(line.trim()).unwrap();
+        assert!(!reply.ok);
+        let err = reply.error.unwrap();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("timed out"), "message: {}", err.message);
+        assert!(
+            elapsed < REQUEST_READ_DEADLINE * 3,
+            "cut at ~the deadline, not some later fallback: {elapsed:?}"
+        );
+    }
+
+    // y4m.13: a slow-but-legitimate client that sends its line just UNDER the deadline still
+    // gets a normal reply — the deadline only cuts peers that never complete a frame.
+    #[tokio::test]
+    async fn slow_client_under_the_deadline_gets_a_normal_reply() {
+        let (_store, sock) = serve_temp().await;
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        // A QUARTER of the deadline (not half — review P3): the server's clock starts at accept,
+        // so under a parallel suite half the deadline left too little slack against scheduling
+        // jitter and the test could flake.
+        tokio::time::sleep(REQUEST_READ_DEADLINE / 4).await;
+        let mut buf = serde_json::to_vec(&Request::Status).unwrap();
+        buf.push(b'\n');
+        stream.write_all(&buf).await.unwrap();
+        stream.flush().await.unwrap();
+        let (rd, _wr) = stream.into_split();
+        let mut rd = BufReader::new(rd);
+        let mut line = String::new();
+        rd.read_line(&mut line).await.unwrap();
+        let reply: Reply = serde_json::from_str(line.trim()).unwrap();
+        assert!(reply.ok, "slow-but-legit request succeeds: {:?}", reply.error);
+        assert_eq!(reply.data.unwrap()["subscriptions"], json!(1));
+    }
+
+    // y4m.13 — THE bead scenario: at shutdown `serve_with_shutdown` AWAITS in-flight handlers.
+    // Before the read deadline, one idle client pinned that drain until the supervisor's abort
+    // fallback killed the whole task set — able to kill a concurrent handler between its txn
+    // commit and its reply (a committed-but-unacknowledged admin action). Now the idle handler
+    // self-completes at the deadline, the drain returns promptly (never reaching an abort), and
+    // a well-behaved connection accepted BEFORE shutdown still commits its admin txn AND gets
+    // its reply.
+    #[tokio::test]
+    async fn shutdown_drain_is_not_wedged_by_an_idle_client() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO subscription (id, recipe_id, state, created_at) VALUES ('s1','dummy','ACTIVE',1)",
+            [],
+        )
+        .unwrap();
+        let store = Store::spawn(conn);
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
+        let sock = temp_sock("drain");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(serve_with_shutdown(
+            store.clone(),
+            recipes,
+            clock,
+            payment,
+            RelayStatusCell::new(),
+            sock.clone(),
+            shutdown_rx,
+        ));
+        for _ in 0..50 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The idle client: accepted, then never sends a byte (write half kept alive).
+        let idle = UnixStream::connect(&sock).await.unwrap();
+        let (idle_rd, _idle_wr) = idle.into_split();
+        // The well-behaved client: its connection also arrives before shutdown.
+        let mut legit = UnixStream::connect(&sock).await.unwrap();
+        // A probe round-trip AFTER both connects: the accept loop dequeues in order, so its
+        // reply proves both handlers above are already spawned (in flight at shutdown time),
+        // not parked in the listen backlog where dropping the listener would just kill them.
+        let probe = call(&sock, Request::Status).await.unwrap();
+        assert!(probe.ok, "probe: {:?}", probe.error);
+
+        shutdown_tx.send(true).unwrap();
+        let shutdown_at = std::time::Instant::now();
+
+        // The in-flight well-behaved handler still commits its admin txn and replies.
+        let mut buf = serde_json::to_vec(&Request::AdminSuspend { id: "s1".into() }).unwrap();
+        buf.push(b'\n');
+        legit.write_all(&buf).await.unwrap();
+        legit.flush().await.unwrap();
+        let (legit_rd, _legit_wr) = legit.into_split();
+        let mut legit_rd = BufReader::new(legit_rd);
+        let mut line = String::new();
+        legit_rd.read_line(&mut line).await.unwrap();
+        let reply: Reply = serde_json::from_str(line.trim()).unwrap();
+        assert!(
+            reply.ok,
+            "the in-flight admin action gets its reply through the drain: {:?}",
+            reply.error
+        );
+        assert_eq!(reply.data.unwrap()["state"], "SUSPENDED");
+
+        // The idle client (still reading) gets the structured timed-out reply.
+        let mut idle_rd = BufReader::new(idle_rd);
+        let mut idle_line = String::new();
+        tokio::time::timeout(REQUEST_READ_DEADLINE * 4, idle_rd.read_line(&mut idle_line))
+            .await
+            .expect("the idle handler self-completes at the deadline")
+            .unwrap();
+        let idle_reply: Reply = serde_json::from_str(idle_line.trim()).unwrap();
+        assert_eq!(idle_reply.error.unwrap().code, "bad_request");
+
+        // THE assertion: the graceful drain completes promptly — bounded by the read deadline,
+        // never hanging toward an abort fallback that could kill committed-but-unreplied work.
+        let drained = tokio::time::timeout(REQUEST_READ_DEADLINE * 4, server)
+            .await
+            .expect("graceful drain must not hang on the idle handler")
+            .unwrap();
+        assert!(drained.is_ok(), "serve_with_shutdown returns Ok: {drained:?}");
+        assert!(
+            shutdown_at.elapsed() < REQUEST_READ_DEADLINE * 3,
+            "drain bounded by the read deadline, not an abort window: {:?}",
+            shutdown_at.elapsed()
+        );
+
+        // Committed AND acknowledged: the admin txn survived the shutdown.
+        let state: String = store
+            .read(|c| {
+                Ok(c.query_row("SELECT state FROM subscription WHERE id='s1'", [], |r| {
+                    r.get(0)
+                })?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "SUSPENDED");
     }
 
     #[tokio::test]

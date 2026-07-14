@@ -95,7 +95,9 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Per-loop window [`supervise`] gives a child to finish its in-flight work on shutdown before it is
 /// aborted. Every long-lived loop observes the shutdown signal and returns promptly (the IPC loop
 /// drains its in-flight handlers first), so this is only a backstop for a loop that ignores it.
-const SHUTDOWN_DRAIN: Duration = Duration::from_secs(3);
+/// `pub(crate)` so ipc.rs can compile-time-assert its idle-connection budget stays under this
+/// window (lnrent-y4m.13).
+pub(crate) const SHUTDOWN_DRAIN: Duration = Duration::from_secs(3);
 
 /// M1a fallback host budget, used ONLY when no `box` capacity row exists yet (onboard, a later bead,
 /// writes the real one). Deliberately SMALL and BOUNDED — never an unlimited budget — and LOGGED on
