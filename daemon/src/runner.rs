@@ -290,6 +290,42 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
+    /// Whether a group-killed descendant is DEAD — reaped (`kill(pid, 0)` -> `ESRCH`) OR a
+    /// ZOMBIE. The zombie case matters (codex PR-36 review): the grandchild is our hook shell's
+    /// child, so when the group-kill also kills the shell the grandchild is reparented to init;
+    /// in a minimal container whose PID 1 does not promptly reap, it lingers as a zombie, and
+    /// `kill(zombie, 0)` returns SUCCESS — so an ESRCH-only probe would wrongly report the killed
+    /// process as "survived". A zombie has been killed; the SIGKILL landed. We check
+    /// `/proc/<pid>/stat` for state `Z` (Linux; the daemon is Linux). `kill(pid, 0)` sends NO
+    /// signal (existence probe only) and we only ever probe a pid our own hook recorded.
+    fn descendant_gone(pid: i32) -> bool {
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return true; // fully reaped
+        }
+        // Present in the table — reaped-but-zombie counts as dead. /proc/<pid>/stat is
+        // `pid (comm) STATE ...`; the state char follows the last ')' (comm may contain spaces).
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.trim_start().chars().next())
+                == Some('Z'),
+            Err(_) => true, // vanished between the kill probe and the stat read -> gone
+        }
+    }
+
+    /// Poll [`descendant_gone`] up to ~500ms (absorbing init's reaping latency), returning whether
+    /// the descendant died.
+    async fn poll_descendant_gone(pid: i32) -> bool {
+        for _ in 0..50 {
+            if descendant_gone(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
     // Write an executable script into a fresh, unique temp dir and return its path. The dir name
     // mixes the pid, a high-resolution timestamp, a process-local monotonic seq, and the hook name
     // so two runs can never collide on the same path — even if the OS reuses this pid across
@@ -359,17 +395,8 @@ mod tests {
                 .trim()
                 .parse::<i32>()
                 .unwrap();
-            let mut gone = false;
-            for _ in 0..50 {
-                let rc = unsafe { libc::kill(gc_pid, 0) };
-                if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                    gone = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
             assert!(
-                gone,
+                poll_descendant_gone(gc_pid).await,
                 "descendant pid {gc_pid} survived the {name} hook failure"
             );
         }
@@ -425,21 +452,11 @@ mod tests {
         }
         let gc_pid = gc_pid.expect("hook recorded the grandchild pid");
 
-        // Assert the grandchild is GONE. `reap` group-killed before returning, so it is already
-        // dead or being reaped by init; the bounded poll only absorbs that reaping latency.
-        // `kill(pid, 0)` sends NO signal (existence probe only) — safe, and we only ever probe a
-        // pid our own hook spawned.
-        let mut gone = false;
-        for _ in 0..50 {
-            let rc = unsafe { libc::kill(gc_pid, 0) };
-            if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                gone = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // Assert the grandchild is GONE (reaped or zombie). `reap` group-killed before returning,
+        // so it is already dead or being reaped by init; the bounded poll only absorbs that
+        // reaping latency.
         assert!(
-            gone,
+            poll_descendant_gone(gc_pid).await,
             "grandchild pid {gc_pid} survived reap — the hook's process group was not killed"
         );
     }
@@ -482,15 +499,7 @@ mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
 
-        let mut gone = false;
-        for _ in 0..50 {
-            let rc = unsafe { libc::kill(gc_pid, 0) };
-            if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                gone = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let gone = poll_descendant_gone(gc_pid).await;
         if !gone {
             // Regression cleanup: signal only the pid this test hook recorded, so a failing test
             // does not itself leave the long-lived descendant behind.
