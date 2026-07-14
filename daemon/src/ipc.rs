@@ -33,6 +33,10 @@ pub enum Request {
     /// is read. Report-only — compares `available_balance_msat()` against the ledger `expected_msat`
     /// and returns `{wallet_msat, expected_msat, verdict}`; never mutates state or gates a payment.
     Reconcile,
+    /// Go-live preflight (lnrent-y4m.9): probe the three EXTERNAL dependencies — refund gateway,
+    /// federation guardians, provider API token — and report per-check `{name, ok, detail}` plus an
+    /// aggregate `ok`. Read-only; the only network I/O is the three probes themselves.
+    Preflight,
     Subs,
     Sub { id: String },
     /// Open teardown dead-letters (lnrent-urw.2): failed retention `destroy` hooks + the
@@ -335,6 +339,16 @@ pub async fn dispatch(
                     Err(e) => Reply::err("internal", format!("wallet balance query failed: {e:#}")),
                 },
             }
+        }
+
+        Request::Preflight => {
+            // The provider token resolves from the daemon env exactly as `runner::hook_env`
+            // forwards it to a declaring recipe's hooks; the probe is the real DigitalOcean
+            // client. Tests inject stubs at the `preflight` module seam instead — no test hits
+            // the real API.
+            let token = crate::preflight::read_token_env();
+            let probe = crate::preflight::DoTokenProbe::new();
+            Reply::ok(crate::preflight::preflight_report(payment, recipes, token, &probe).await)
         }
 
         Request::Subs => match store.read(query_subs).await {

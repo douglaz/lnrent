@@ -86,7 +86,7 @@ backend; unset ⇒ the daemon self-DMs the operator key (still durable in the ou
 to import the operator key into a DM client to read it). `LNRENT_ALERTS_ENABLED=false` turns the
 sink off.
 
-## 4. Preflight — verify readiness BEFORE you announce it
+## 4. Preflight — verify post-start readiness BEFORE you promote it
 
 Run the daemon (the config is now persisted; run only needs the data dir, the recipes dir, and `DO_TOKEN`
 for provisioning):
@@ -104,7 +104,12 @@ technically possible from the moment the daemon started):
   `published … listing` · `ipc serving`. No `refund readiness warning:` / `refund readiness ALARM:`
   lines (the daemon's actual not-ready markers).
 - `LNRENT_DATA_DIR=/srv/lnrent/data ./target/release/lnrent money` → `Gateway: ok` and `READY`.
-- DO token is valid: `curl -fsS -H "Authorization: Bearer $DO_TOKEN" https://api.digitalocean.com/v2/account`.
+- `LNRENT_DATA_DIR=/srv/lnrent/data ./target/release/lnrent preflight` (alias `doctor`) → all three
+  external checks pass: the refund gateway, the federation guardians, and the DO token (the daemon
+  probes `GET /v2/account` itself — the old hand-run curl). Exits nonzero on any failure, `--json`
+  for machine output, so an agent can gate subsequent launch promotion on it. This is a post-start
+  health gate, not a publication interlock: as noted above, starting the daemon already published
+  the listing.
 - ONE real end-to-end order at a SMALL price first: a buyer discovers the listing → orders → pays →
   gets a droplet → SSHes in → cancels. Drive it manually with the buyer CLI (`lnrent-buyer`) against
   your live listing — no script covers the full product flow (`scripts/live-fed-e2e.sh` proves only
