@@ -141,7 +141,10 @@ enum DeliveryCmd {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => return handle_parse_error(e, std::env::args().skip(1)),
+    };
     let json = cli.json;
     match run(cli).await {
         Ok(data) => {
@@ -150,6 +153,50 @@ async fn main() -> ExitCode {
         }
         Err(err) => render_err(&err, json),
     }
+}
+
+/// Whether the raw argv requested `--json`. The clap parse FAILED, so we can't read `cli.json` —
+/// scan the tokens directly (a bare bool flag; `--` before it makes `--json` positional, which a
+/// parse-error argv would not sanely contain, so a literal token match is the pragmatic contract).
+fn argv_has_json(args: impl Iterator<Item = String>) -> bool {
+    args.take_while(|a| a != "--").any(|a| a == "--json")
+}
+
+/// Keep the `--json` machine contract on a clap ARGV PARSE FAILURE (lnrent-y4m.14): the buyer CLI
+/// is agent-driven, so a bad-flags failure must not escape as clap's plaintext exit **2** — which
+/// both breaks the `{ok:false,error:{…}}` envelope AND collides with the taxonomy's exit 2 =
+/// `not_found`. When `--json` is present, emit a `bad_request` envelope (matching
+/// `BuyerError::BadRequest`'s exit **3**) to stderr; otherwise fall through to clap's human
+/// usage/exit. `--help`/`--version` are NOT errors — always render clap's normal output (exit 0),
+/// even under `--json`, since an agent asking for help wants the help text.
+fn handle_parse_error(e: clap::Error, args: impl Iterator<Item = String>) -> ExitCode {
+    use clap::error::ErrorKind;
+    if matches!(
+        e.kind(),
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    ) {
+        e.exit(); // prints help/version to stdout, exits 0 — diverges
+    }
+    if argv_has_json(args) {
+        // The specific failure is clap's first rendered line ("error: unexpected argument …"); the
+        // trailing usage block is dropped so the machine message stays a single actionable line.
+        let rendered = e.to_string();
+        let message = rendered
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("argv parse error")
+            .trim_start_matches("error:")
+            .trim();
+        eprintln!(
+            "{}",
+            json!({ "ok": false, "error": { "code": "bad_request", "message": message, "retryable": false } })
+        );
+        return ExitCode::from(3);
+    }
+    e.exit(); // clap's human usage to stderr, its default exit 2 — diverges
 }
 
 async fn run(cli: Cli) -> Result<Value, BuyerError> {
@@ -441,4 +488,20 @@ fn render_err(err: &BuyerError, as_json: bool) -> ExitCode {
         eprintln!("lnrent-buyer: {} ({})", env.message, env.code);
     }
     ExitCode::from(err.exit_code())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::argv_has_json;
+
+    #[test]
+    fn argv_has_json_detects_the_flag_before_a_terminator() {
+        let has = |v: &[&str]| argv_has_json(v.iter().map(|s| s.to_string()));
+        assert!(has(&["listings", "--json"]));
+        assert!(has(&["--json", "listings"]));
+        assert!(!has(&["listings"]));
+        // `--` ends option parsing, so a `--json` AFTER it is positional, not the flag.
+        assert!(!has(&["listings", "--", "--json"]));
+        assert!(has(&["--json", "--", "positional"]));
+    }
 }
