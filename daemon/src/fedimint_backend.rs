@@ -230,6 +230,23 @@ const PAY_AWAIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Mirrors store.rs's `TERMINAL_ROW_RETENTION_SECS` (30 days).
 const FEDIMINT_INDEX_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 
+/// Retention floor for reapable definitively `FAILED` `fedimint_pay` rows before the best-effort GC
+/// ([`gc_fedimint_pay_index`], lnrent-y4m.19) may delete them. Set MUCH longer than the 30-day invoice
+/// retention (180 days) and DELIBERATELY not a config knob (single-const discipline, matching
+/// store.rs and y4m.15), because a failed pay row participates in the lnrent-kum recovery guard: it
+/// identifies the operation whose definitive failure was recorded while startup recovery reconciles
+/// any other permanent oplog entries for the same key. Its dead-op marker survives the reap, so a
+/// later oplog backfill still records FAILED rather than resurrecting that operation as live.
+///
+/// `SUCCEEDED` rows are intentionally NOT reapable. [`PaymentBackend::pay`] promises that calling the
+/// same key twice never pays twice, [`FedimintPayment::pay_inner`] starts a new operation for an absent
+/// key, and the separate store intentionally retains `refund_attempt`/`sweep_attempt` rows. Therefore
+/// age alone cannot prove a successful key will never be driven again: deleting it could turn delayed
+/// store bookkeeping into a second payment. A permanent tombstone or cross-DB terminal proof would add
+/// mechanism for a table bounded by real refund/sweep activity, not a free-flood vector, so the
+/// smallest correct y4m.19 scope is long-retention FAILED-row GC while keeping SUCCEEDED idempotency.
+const FEDIMINT_PAY_RETENTION_SECS: i64 = 180 * 24 * 60 * 60;
+
 /// Minimum spacing between two flood-path index GC sweeps (lnrent-y4m.15): a burst of
 /// `create_invoice`s triggers at most one GC per hour ([`FedimintPayment::gc_index_if_due`]). The
 /// throttle is TIME-based via the injected `self.clock`, so tests drive it deterministically with a
@@ -260,7 +277,15 @@ CREATE TABLE IF NOT EXISTS fedimint_pay (
     operation_id     TEXT NOT NULL,
     backend_pay_id   TEXT NOT NULL,
     status           TEXT NOT NULL DEFAULT 'PENDING',
-    pay_kind         TEXT NOT NULL DEFAULT 'ln'
+    pay_kind         TEXT NOT NULL DEFAULT 'ln',
+    -- lnrent-y4m.19: clock time this lifecycle row was (re-)created, refreshed when its current op is
+    -- terminally observed, so a FAILED row gets a full retention window. SUCCEEDED rows are never
+    -- reaped. NULLABLE: a fresh DB gets it here, a legacy DB gets it via the guarded ALTER in
+    -- `ensure_fedimint_pay_gc_schema` (SQLite has no ADD COLUMN IF NOT EXISTS), and any NULL (legacy)
+    -- row is NEVER reaped (see gc_fedimint_pay_index). The `fedimint_pay_gc_idx` covering index over
+    -- (status, created_at) is created in that same helper, AFTER the ALTER — placing it in this batch
+    -- would error on a legacy DB whose column does not yet exist.
+    created_at       INTEGER
 );
 CREATE TABLE IF NOT EXISTS fedimint_pay_dead_op (
     operation_id  TEXT PRIMARY KEY
@@ -392,6 +417,11 @@ impl FedimintPayment {
         let conn = Connection::open(paths.index_db).context("opening lnrent index db")?;
         conn.execute_batch(INDEX_SCHEMA)
             .context("initialising lnrent index schema")?;
+        // lnrent-y4m.19: dup-tolerantly bring a legacy pay index up to the terminal-`fedimint_pay` GC
+        // schema (add `created_at` if missing, then its covering index). Must run AFTER the schema
+        // batch, since the covering index references `created_at`.
+        ensure_fedimint_pay_gc_schema(&conn)
+            .context("applying the fedimint_pay GC schema migration (lnrent-y4m.19)")?;
 
         let me = Self {
             client,
@@ -421,9 +451,10 @@ impl FedimintPayment {
         // fedimint_pay row not yet upserted) would otherwise leave a refund key Unknown, so pay(key)
         // would re-parse the maybe-expired bolt11 and fail instead of re-awaiting the op. Also
         // un-hides a retry op left behind a stale FAILED row (lnrent-kum). FAIL-CLOSED.
-        let (recovered_pay, unhidden_pay) = recover_pay_from_oplog(&me.client, &me.index)
-            .await
-            .context("fedimint: oplog pay recovery failed; refusing to start")?;
+        let (recovered_pay, unhidden_pay) =
+            recover_pay_from_oplog(&me.client, &me.index, me.clock.now())
+                .await
+                .context("fedimint: oplog pay recovery failed; refusing to start")?;
         if recovered_pay > 0 || unhidden_pay > 0 {
             tracing::info!(
                 backfilled = recovered_pay,
@@ -577,7 +608,7 @@ impl FedimintPayment {
                     // federation (lnrent-y4m.16).
                     match classify_ln_pay_state(&state) {
                         PayStateClass::Success => {
-                            pay_idx_mark(&self.index, key, &op_hex, "SUCCEEDED")?;
+                            pay_idx_mark(&self.index, key, &op_hex, "SUCCEEDED", self.clock.now())?;
                             return Ok(op_hex);
                         }
                         // Created / Funded / AwaitingChange / WaitingForRefund -> keep waiting.
@@ -597,7 +628,7 @@ impl FedimintPayment {
                             // operation terminally failed with funds provably back, so crash
                             // recovery must never resurrect it (lnrent-kum dead-op ledger).
                             pay_idx_record_dead(&self.index, &op_hex)?;
-                            pay_idx_mark(&self.index, key, &op_hex, "FAILED")?;
+                            pay_idx_mark(&self.index, key, &op_hex, "FAILED", self.clock.now())?;
                             anyhow::bail!("refund payment failed: {state:?}");
                         }
                         // UnexpectedError -> AMBIGUOUS: NOT proof the recipient was unpaid. Write NO
@@ -624,7 +655,13 @@ impl FedimintPayment {
                                      output errored; marking SUCCEEDED — the operator's change may \
                                      need fedimint-side recovery"
                                 );
-                                pay_idx_mark(&self.index, key, &op_hex, "SUCCEEDED")?;
+                                pay_idx_mark(
+                                    &self.index,
+                                    key,
+                                    &op_hex,
+                                    "SUCCEEDED",
+                                    self.clock.now(),
+                                )?;
                                 return Ok(op_hex);
                             }
                             anyhow::bail!(
@@ -646,7 +683,7 @@ impl FedimintPayment {
                     // Same class-based choke point as the lightning branch (lnrent-y4m.16).
                     match classify_internal_pay_state(&state) {
                         PayStateClass::Success => {
-                            pay_idx_mark(&self.index, key, &op_hex, "SUCCEEDED")?;
+                            pay_idx_mark(&self.index, key, &op_hex, "SUCCEEDED", self.clock.now())?;
                             return Ok(op_hex);
                         }
                         // Funding -> keep waiting.
@@ -656,7 +693,7 @@ impl FedimintPayment {
                         PayStateClass::DefinitiveFailure => {
                             // Same op-level dead-ledger record as the lightning branch (lnrent-kum).
                             pay_idx_record_dead(&self.index, &op_hex)?;
-                            pay_idx_mark(&self.index, key, &op_hex, "FAILED")?;
+                            pay_idx_mark(&self.index, key, &op_hex, "FAILED", self.clock.now())?;
                             anyhow::bail!("internal refund payment failed: {state:?}");
                         }
                         // RefundError / UnexpectedError -> AMBIGUOUS (a refund was attempted and
@@ -694,7 +731,14 @@ impl FedimintPayment {
     /// real operation) so `payment_status_by_key` reports Failed and the Refunder parks it rather
     /// than retrying a bad destination forever (codex P2).
     async fn fail_pay_preflight<T>(&self, key: &str, msg: String) -> Result<T> {
-        pay_idx_upsert(&self.index, key, "(preflight-failed)", "FAILED", "ln")?;
+        pay_idx_upsert(
+            &self.index,
+            key,
+            "(preflight-failed)",
+            "FAILED",
+            "ln",
+            self.clock.now(),
+        )?;
         anyhow::bail!(msg)
     }
 
@@ -857,25 +901,35 @@ impl FedimintPayment {
         // row -> payment_status_by_key=Unknown. recover_pay_from_oplog (on open, symmetric to
         // recover_index_from_oplog) backfills the row from the oplog extra_meta so the next pay(key)
         // re-awaits the OP directly rather than re-parsing the maybe-expired bolt11 (lnrent-4gt).
-        pay_idx_upsert(&self.index, idempotency_key, &op_hex, "PENDING", kind)?;
+        pay_idx_upsert(
+            &self.index,
+            idempotency_key,
+            &op_hex,
+            "PENDING",
+            kind,
+            self.clock.now(),
+        )?;
         Ok(outgoing.payment_type)
     }
 
-    /// Throttled, best-effort driver for the terminal `fedimint_invoice` index GC (lnrent-y4m.15),
-    /// called at the END of a successful `create_invoice` after the mint committed and OUTSIDE
-    /// `create_lock`. [`index_gc_due_and_stamp`] gates it to at most one reap per
-    /// [`INDEX_GC_INTERVAL_SECS`] over `last_index_gc_at`, timed by the injected `self.clock`
-    /// (deterministic under a `TestClock`). The SQLite work runs on Tokio's blocking pool so it does
-    /// not hold up the successful create response. BEST-EFFORT: a reap error is logged and swallowed,
-    /// so GC never changes the result of the already-committed mint.
+    /// Throttled, best-effort driver for the terminal index GC, called at the END of a successful
+    /// `create_invoice` after the mint committed and OUTSIDE `create_lock`. [`index_gc_due_and_stamp`]
+    /// gates it to at most one reap per [`INDEX_GC_INTERVAL_SECS`] over `last_index_gc_at`, timed by
+    /// the injected `self.clock` (deterministic under a `TestClock`). The SQLite work runs on Tokio's
+    /// blocking pool so it does not hold up the successful create response. BEST-EFFORT: a reap error
+    /// is logged and swallowed, so GC never changes the result of the already-committed mint.
+    ///
+    /// A SINGLE throttle covers BOTH indices (lnrent-y4m.19): the same `spawn_blocking` closure reaps
+    /// the `fedimint_invoice` flood (y4m.15) AND the definitively failed `fedimint_pay` rows — no second
+    /// timer, no second create-path hook. Each non-zero reap is logged independently.
     fn gc_index_if_due(&self) {
         let now = self.clock.now();
         if !index_gc_due_and_stamp(&self.last_index_gc_at, now, INDEX_GC_INTERVAL_SECS) {
             return;
         }
         let index = self.index.clone();
-        drop(tokio::task::spawn_blocking(
-            move || match gc_fedimint_invoice_index(&index, now, FEDIMINT_INDEX_RETENTION_SECS) {
+        drop(tokio::task::spawn_blocking(move || {
+            match gc_fedimint_invoice_index(&index, now, FEDIMINT_INDEX_RETENTION_SECS) {
                 Ok(0) => {}
                 Ok(reaped) => tracing::info!(
                     reaped,
@@ -885,8 +939,39 @@ impl FedimintPayment {
                     error = %e,
                     "fedimint: best-effort invoice index GC failed; ignoring"
                 ),
-            },
-        ));
+            }
+            // lnrent-y4m.19: reap definitively failed fedimint_pay rows under the SAME throttle, still
+            // OUTSIDE create_lock, still best-effort (pay-GC can never affect the committed mint).
+            match gc_fedimint_pay_index(&index, now, FEDIMINT_PAY_RETENTION_SECS) {
+                Ok(0) => {}
+                Ok(reaped) => tracing::info!(
+                    reaped,
+                    "fedimint: reaped definitively failed pay index rows past retention"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "fedimint: best-effort pay index GC failed; ignoring"
+                ),
+            }
+            // The dead-op ledger (fedimint_pay_dead_op) is DELIBERATELY left un-GC'd (lnrent-y4m.19
+            // fallback, §5). The bead offered to also reap orphaned markers whose owning fedimint_pay
+            // row is gone (`operation_id NOT IN (SELECT operation_id FROM fedimint_pay)`); we DECLINE,
+            // because that reap is all cost and no benefit:
+            //  1. It is NOT a flood vector. The ledger holds one row per DEFINITIVELY-FAILED pay op, so
+            //     it is bounded by real refund/sweep failure volume — not the distinct-external_id
+            //     unpaid-order flood y4m.15 exists to bound — so leaving it never defeats this bead's
+            //     flood goal.
+            //  2. Reaping it would REINTRODUCE a startup brick. Take a key whose refund failed twice:
+            //     ops A then A' both reach the dead ledger and the row ends FAILED under A'. Recovery
+            //     runs on EVERY startup BEFORE any create-path reap, and today it SKIPs both (A is
+            //     dead-under-a-different-op, A' is FAILED-under-the-same-op) — clean forever. If the
+            //     180-day reap deleted the row AND both now-orphaned markers, a later restart's
+            //     recover_pay_from_oplog would see the two permanent oplog entries under an ABSENT row
+            //     with NO dead marker, classify BOTH as live candidates, and FAIL THE PASS on ambiguity
+            //     — the daemon would refuse to start. Keeping the markers also makes each normally
+            //     reaped FAILED op backfill as FAILED rather than as a live candidate. A trustworthy,
+            //     oplog-aware dead-op GC is a narrower follow-up, not bolted on here.
+        }));
     }
 }
 
@@ -1472,6 +1557,7 @@ fn receive_backfill_needed(outcome: Option<&LnReceiveState>, expires_at: i64, no
 async fn recover_pay_from_oplog(
     client: &ClientHandleArc,
     index: &Arc<Mutex<Connection>>,
+    now: i64,
 ) -> Result<(usize, usize)> {
     let log = client.operation_log();
     let mut backfilled = 0usize;
@@ -1625,13 +1711,14 @@ async fn recover_pay_from_oplog(
     for (idk, entry) in pending_writes {
         if let Some((op_hex, kind)) = entry.listed.first() {
             // Exactly one possibly-live candidate: it takes the PENDING slot (re-awaited by the
-            // drivers; the y4m.16 machinery lands its real outcome).
-            pay_idx_upsert(index, &idk, op_hex, "PENDING", kind)?;
+            // drivers; the y4m.16 machinery lands its real outcome). Stamped with the recovery `now`
+            // (lnrent-y4m.19) so a recovered row is reapable once terminal, never stranded NULL.
+            pay_idx_upsert(index, &idk, op_hex, "PENDING", kind, now)?;
         } else if let Some((op_hex, kind)) = &entry.dead_min {
             // Absent row whose every candidate is ledger-dead (e.g. the operator just recorded
             // them per the ambiguity runbook): backfill the TRUTH — FAILED — so the key stops
             // reading Unknown and the drivers may retry normally (funds provably back).
-            pay_idx_upsert(index, &idk, op_hex, "FAILED", kind)?;
+            pay_idx_upsert(index, &idk, op_hex, "FAILED", kind, now)?;
         } else {
             continue;
         }
@@ -1773,6 +1860,45 @@ fn idx_mark_canceled(index: &Mutex<Connection>, op_hex: &str) -> Result<()> {
     Ok(())
 }
 
+/// Dup-tolerant `fedimint_pay` GC schema migration (lnrent-y4m.19): add the `created_at` column if a
+/// legacy DB lacks it, then create the covering index that backs the pay reap predicate. `created_at`
+/// is in the `fedimint_pay` CREATE TABLE (INDEX_SCHEMA), so a FRESH DB already has it and the ALTER is
+/// skipped; a DB created before y4m.19 has the table WITHOUT it, and SQLite has no `ADD COLUMN IF NOT
+/// EXISTS` (and `execute_batch` won't add a column to an existing table), so the column is added here,
+/// guarded by a PRAGMA-table_info check (mirrors store.rs's `ensure_refund_resolution_columns`). The
+/// covering index is created HERE, not in INDEX_SCHEMA, because it references `created_at`: on a legacy
+/// DB that column does not exist until this ALTER runs, so a `CREATE INDEX ... (status, created_at)`
+/// inside the INDEX_SCHEMA batch would abort before the column is added. Idempotent across re-runs
+/// (both the column check and the `IF NOT EXISTS` index guard): a fresh DB, a legacy DB, and a re-run
+/// all open cleanly.
+fn ensure_fedimint_pay_gc_schema(conn: &Connection) -> Result<()> {
+    if !index_has_column(conn, "fedimint_pay", "created_at")? {
+        conn.execute_batch("ALTER TABLE fedimint_pay ADD COLUMN created_at INTEGER")?;
+    }
+    // Covering index for the y4m.19 reap DELETE predicate (status='FAILED' AND created_at < cutoff) so
+    // it does not full-scan `fedimint_pay` while holding the sole money-path `index` mutex — the same
+    // reasoning as y4m.15's `fedimint_invoice_gc_idx`. Created after the ALTER so `created_at` exists.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS fedimint_pay_gc_idx ON fedimint_pay (status, created_at)",
+    )?;
+    Ok(())
+}
+
+/// Whether `table` has a column named `column` (PRAGMA table_info). A local equivalent of
+/// store.rs's non-`pub` `has_column`, backing the dup-tolerant migration above. Returns `false` for a
+/// non-existent table (empty PRAGMA result), which is fine: the only caller runs it after the schema
+/// batch has created the table.
+fn index_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for name in rows {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Reap past-retention CANCELED `fedimint_invoice` rows, returning the number deleted. A
 /// distinct-`external_id` unpaid-order flood inserts one CANCELED row per expired request and
 /// previously retained it forever — this is the flood fix.
@@ -1823,6 +1949,81 @@ fn gc_fedimint_invoice_index(
                       WHERE status = 'CANCELED'
                         AND expires_at > 0
                         AND expires_at < MIN(unixepoch(), ?1) - ?2
+                      LIMIT ?3)",
+                params![now, retention_secs, BATCH],
+            )?
+        }; // lock released here — other index callers can run before the next batch
+        total += deleted;
+        if deleted < BATCH {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// Reap definitively `FAILED` `fedimint_pay` rows past a LONG, crash-redrive-safe retention
+/// ([`FEDIMINT_PAY_RETENTION_SECS`]), returning the number deleted (lnrent-y4m.19). Mirrors
+/// [`gc_fedimint_invoice_index`] EXACTLY in shape: CHUNKED (BATCH=512) with the `index` mutex RELEASED
+/// between batches so the money path interleaves, cutoff clock-capped as store.rs does
+/// (`< MIN(unixepoch(), ?now) - ?retention`, so a clock running ahead cannot reap a fresh row), backed
+/// by the `fedimint_pay_gc_idx` covering index.
+///
+/// Three invariants keep this from dropping LIVE idempotency state:
+///  - PENDING rows are NEVER reaped (`status = 'FAILED'` only): a PENDING row is still
+///    in-flight / re-drivable, and deleting it would let a later `pay(key)` start a SECOND op instead
+///    of re-awaiting the one already in flight.
+///  - SUCCEEDED rows are NEVER reaped. They are the durable implementation of
+///    [`PaymentBackend::pay`]'s same-key-never-pays-twice contract, and age cannot prove the separate
+///    store has no still-PENDING refund/sweep driver. An absent key makes
+///    [`FedimintPayment::pay_inner`] start a new operation; retaining the row is therefore the smallest
+///    correct answer to the round-3 P1, not optional hardening.
+///  - Rows with a NULL `created_at` are NEVER reaped (`created_at IS NOT NULL`): a legacy pre-y4m.19
+///    row (or any row whose age we cannot prove) is treated as "not yet old enough" — the conservative
+///    floor, exactly as y4m.15 leaves `expires_at = 0` invoice rows.
+///
+/// A reaped FAILED operation remains in Fedimint's permanent oplog. Its deliberately retained dead-op
+/// marker makes absent-row recovery classify it as `BackfillDead`, so it cannot become a live
+/// resurrection candidate; on the next open `recover_pay_from_oplog` re-writes the row as FAILED with a
+/// fresh `created_at`. That re-backfill fires on EVERY restart, so this reap is intra-run tidiness, not
+/// durable pruning: a real-op FAILED row only reaches reap age after ~180d of UNBROKEN uptime and, once
+/// reaped, returns (retention clock reset) the moment the daemon restarts. The lone exception is a
+/// `fail_pay_preflight` row (synthetic op `"(preflight-failed)"`, no oplog entry): recovery cannot
+/// re-backfill it, so a reaped one stays absent (Unknown) until a driver re-attempts — a deterministic
+/// re-fail that pays nothing, since a preflight park means no operation was ever started.
+///
+/// One accepted, restart-recoverable liveness edge follows, and it is NOT a double-pay — reaping only
+/// FAILED (never SUCCEEDED) keeps money-safety. A reaped row reads Unknown, and for a RESOLVED
+/// (LN-address/LNURL) refund `refund::plan_payment` treats Unknown as "re-await the persisted invoice,
+/// never re-resolve" (its crash-window contract, so an in-flight HTLC is never double-paid). An operator
+/// `refund-retry` of a refund that had parked FAILED with an EXPIRED resolved invoice therefore reuses
+/// the dead invoice against a reaped row — until the next restart re-backfills FAILED and the retry
+/// re-resolves normally. Making that impossible would require coupling the reap to the SEPARATE store's
+/// refund state (an explicit NON-GOAL); a definitive FAILED means funds are provably back, so the worst
+/// case is this recoverable delay, never a lost or duplicated payment.
+///
+/// The dead-op ledger (`fedimint_pay_dead_op`) is deliberately LEFT UN-GC'd — see [`gc_index_if_due`]
+/// for the reasoned deferral (it is not a flood vector, and reaping it would reintroduce a startup
+/// ambiguity brick for a double-failed refund key).
+fn gc_fedimint_pay_index(
+    index: &Mutex<Connection>,
+    now: i64,
+    retention_secs: i64,
+) -> Result<usize> {
+    // CHUNKED for the same reason as the invoice reaper: this DELETE holds the sole `index` mutex that
+    // pay/lookup/settlement take SYNCHRONOUSLY on async worker threads, so it must not run unbounded.
+    // `fedimint_pay` is bounded by refund/sweep volume (not a free flood), so the backlog is small in
+    // practice, but the chunked shape is kept identical for safety and to match y4m.15.
+    const BATCH: usize = 512;
+    let mut total = 0usize;
+    loop {
+        let deleted = {
+            let conn = index.lock().unwrap();
+            conn.execute(
+                "DELETE FROM fedimint_pay WHERE rowid IN (
+                     SELECT rowid FROM fedimint_pay
+                      WHERE status = 'FAILED'
+                        AND created_at IS NOT NULL
+                        AND created_at < MIN(unixepoch(), ?1) - ?2
                       LIMIT ?3)",
                 params![now, retention_secs, BATCH],
             )?
@@ -1896,20 +2097,28 @@ fn pay_idx_status_by_key(index: &Mutex<Connection>, key: &str) -> Result<Option<
 }
 
 /// Insert (or, on a FAILED-then-retry, replace) the pay row for a key as PENDING under a new op.
+/// `now` (the caller's `self.clock`/recovery clock) stamps `created_at` so the y4m.19 pay GC can reap
+/// this row if it later becomes FAILED and ages past retention; [`pay_idx_mark`] refreshes it again
+/// when the op terminalizes so even a long-PENDING attempt gets the full FAILED-row retention. On the
+/// ON CONFLICT (retry) branch `created_at` is REFRESHED to `now`: a retry is a fresh lifecycle, so its
+/// retention clock must restart — a retried key must never be reaped on the original attempt's age.
 fn pay_idx_upsert(
     index: &Mutex<Connection>,
     key: &str,
     op_hex: &str,
     status: &str,
     kind: &str,
+    now: i64,
 ) -> Result<()> {
     let conn = index.lock().unwrap();
     conn.execute(
-        "INSERT INTO fedimint_pay (idempotency_key, operation_id, backend_pay_id, status, pay_kind)
-         VALUES (?1, ?2, ?2, ?3, ?4)
+        "INSERT INTO fedimint_pay
+             (idempotency_key, operation_id, backend_pay_id, status, pay_kind, created_at)
+         VALUES (?1, ?2, ?2, ?3, ?4, ?5)
          ON CONFLICT(idempotency_key)
-           DO UPDATE SET operation_id = ?2, backend_pay_id = ?2, status = ?3, pay_kind = ?4",
-        params![key, op_hex, status, kind],
+           DO UPDATE SET operation_id = ?2, backend_pay_id = ?2, status = ?3, pay_kind = ?4,
+                         created_at = ?5",
+        params![key, op_hex, status, kind, now],
     )?;
     Ok(())
 }
@@ -1921,11 +2130,25 @@ fn pay_idx_upsert(
 /// started and upserted PENDING under the same key — a later drive would then see FAILED and start a
 /// THIRD operation while B is still in flight (a double-pay). Guarding on `operation_id` makes a
 /// stale waiter's mark a harmless no-op (0 rows), while the live waiter's op always matches.
-fn pay_idx_mark(index: &Mutex<Connection>, key: &str, op_hex: &str, status: &str) -> Result<()> {
+///
+/// The same guarded update refreshes `created_at` to the terminal-observation `now` for either terminal
+/// status (GC consults it only for FAILED). A pay can remain PENDING longer than
+/// [`FEDIMINT_PAY_RETENTION_SECS`]; retaining its original start time would make a newly-FAILED row
+/// immediately reapable instead of preserving its recovery state for the documented 180-day window.
+/// Refreshing inside this operation-guarded CAS starts that full window at terminalization without
+/// letting a stale waiter extend or mutate a newer operation's row.
+fn pay_idx_mark(
+    index: &Mutex<Connection>,
+    key: &str,
+    op_hex: &str,
+    status: &str,
+    now: i64,
+) -> Result<()> {
     let conn = index.lock().unwrap();
     conn.execute(
-        "UPDATE fedimint_pay SET status = ?2 WHERE idempotency_key = ?1 AND operation_id = ?3",
-        params![key, status, op_hex],
+        "UPDATE fedimint_pay SET status = ?2, created_at = ?4
+          WHERE idempotency_key = ?1 AND operation_id = ?3",
+        params![key, status, op_hex, now],
     )?;
     Ok(())
 }
@@ -2323,17 +2546,30 @@ mod index_tests {
         let index = Mutex::new(conn);
 
         // Operation A runs and definitively fails.
-        pay_idx_upsert(&index, "key", "op-A", "PENDING", "ln").unwrap();
-        pay_idx_mark(&index, "key", "op-A", "FAILED").unwrap();
+        pay_idx_upsert(&index, "key", "op-A", "PENDING", "ln", 1_000).unwrap();
+        pay_idx_mark(&index, "key", "op-A", "FAILED", 2_000).unwrap();
         // The driver retries: operation B is upserted PENDING under the same key.
-        pay_idx_upsert(&index, "key", "op-B", "PENDING", "ln").unwrap();
+        pay_idx_upsert(&index, "key", "op-B", "PENDING", "ln", 1_000).unwrap();
         // A delayed second waiter on A replays A's failure — its mark must be a no-op now.
-        pay_idx_mark(&index, "key", "op-A", "FAILED").unwrap();
+        pay_idx_mark(&index, "key", "op-A", "FAILED", 3_000).unwrap();
         let (op, status, _) = pay_idx_get(&index, "key").unwrap().unwrap();
         assert_eq!((op.as_str(), status.as_str()), ("op-B", "PENDING"),
             "a stale waiter's terminal mark for a superseded operation must not clobber the live row");
+        let created_at: i64 = index
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT created_at FROM fedimint_pay WHERE idempotency_key = 'key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            created_at, 1_000,
+            "the operation guard also prevents a stale waiter from refreshing the newer row's age"
+        );
         // The live waiter on B still lands its own terminal mark.
-        pay_idx_mark(&index, "key", "op-B", "SUCCEEDED").unwrap();
+        pay_idx_mark(&index, "key", "op-B", "SUCCEEDED", 4_000).unwrap();
         let (op, status, _) = pay_idx_get(&index, "key").unwrap().unwrap();
         assert_eq!((op.as_str(), status.as_str()), ("op-B", "SUCCEEDED"));
     }
@@ -2341,11 +2577,14 @@ mod index_tests {
 
 #[cfg(test)]
 mod index_gc_tests {
-    //! Terminal `fedimint_invoice` index GC unit tests (lnrent-y4m.15). These are feature-gated with
-    //! the backend and exercise standalone seams without a live federation.
+    //! Terminal `fedimint_invoice` (lnrent-y4m.15) and `fedimint_pay` (lnrent-y4m.19) index GC unit
+    //! tests. These are feature-gated with the backend and exercise standalone seams without a live
+    //! federation.
     use super::{
-        gc_fedimint_invoice_index, index_gc_due_and_stamp, receive_backfill_needed,
-        FEDIMINT_INDEX_RETENTION_SECS, INDEX_GC_INTERVAL_SECS, INDEX_SCHEMA,
+        ensure_fedimint_pay_gc_schema, gc_fedimint_invoice_index, gc_fedimint_pay_index,
+        index_gc_due_and_stamp, index_has_column, pay_idx_mark, pay_idx_record_dead,
+        pay_idx_upsert, receive_backfill_needed, FEDIMINT_INDEX_RETENTION_SECS,
+        FEDIMINT_PAY_RETENTION_SECS, INDEX_GC_INTERVAL_SECS, INDEX_SCHEMA,
     };
     use crate::clock::{Clock, SystemClock, TestClock};
     use fedimint_ln_client::receive::LightningReceiveError;
@@ -2576,6 +2815,299 @@ mod index_gc_tests {
             corrected + INDEX_GC_INTERVAL_SECS - 1,
             INDEX_GC_INTERVAL_SECS
         ));
+    }
+
+    // ---- terminal `fedimint_pay` GC (lnrent-y4m.19) ---------------------------------------------
+
+    /// A fresh in-memory pay index with the full schema + y4m.19 migration applied (so `created_at`
+    /// and its covering index exist), wrapped for the reaper's `&Mutex<Connection>` API.
+    fn open_pay_index() -> Mutex<Connection> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(INDEX_SCHEMA).unwrap();
+        ensure_fedimint_pay_gc_schema(&conn).unwrap();
+        Mutex::new(conn)
+    }
+
+    /// Seed one pay row with an explicit status and `created_at` (NULL when `created_at` is `None`).
+    fn seed_pay(index: &Mutex<Connection>, key: &str, status: &str, created_at: Option<i64>) {
+        index
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO fedimint_pay
+                   (idempotency_key, operation_id, backend_pay_id, status, pay_kind, created_at)
+                 VALUES (?1, ?2, ?2, ?3, 'ln', ?4)",
+                params![key, format!("op-{key}"), status, created_at],
+            )
+            .unwrap();
+    }
+
+    fn pay_exists(index: &Mutex<Connection>, key: &str) -> bool {
+        let n: i64 = index
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM fedimint_pay WHERE idempotency_key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        n > 0
+    }
+
+    fn pay_count(index: &Mutex<Connection>) -> i64 {
+        index
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM fedimint_pay", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    // The pay reap deletes ONLY definitively FAILED rows past retention. SUCCEEDED rows remain the
+    // permanent same-key idempotency record; PENDING rows are still in-flight / re-drivable. Neither
+    // is ever reaped at any age, and a NULL-created_at (legacy) row is never reaped either — an unknown
+    // age is treated as "not yet old enough" (the conservative floor).
+    #[test]
+    fn reaps_only_failed_pay_rows_past_retention() {
+        // Synthetic clock well below real unixepoch(), so MIN(unixepoch(), now) == now: cutoff = now -
+        // RETENTION. Rows strictly before the cutoff are reapable (if terminal + non-NULL age).
+        let now = 2 * FEDIMINT_PAY_RETENTION_SECS;
+        let cutoff = FEDIMINT_PAY_RETENTION_SECS; // now - RETENTION
+        let old = cutoff - 1; // strictly past the window -> reapable (if terminal)
+        let boundary = cutoff; // EXACTLY at the cutoff -> kept (strict `<`)
+        let recent = now; // within retention -> kept
+
+        let index = open_pay_index();
+        // REAPED: a past-retention FAILED row.
+        seed_pay(&index, "succeeded-old", "SUCCEEDED", Some(old));
+        seed_pay(&index, "failed-old", "FAILED", Some(old));
+        // SURVIVES: SUCCEEDED is the permanent idempotency record; strict `<` keeps the FAILED
+        // boundary; a recent FAILED row is within retention.
+        seed_pay(&index, "failed-boundary", "FAILED", Some(boundary));
+        seed_pay(&index, "failed-recent", "FAILED", Some(recent));
+        // SURVIVES: a PENDING row is in-flight — never reaped, even ancient.
+        seed_pay(&index, "pending-ancient", "PENDING", Some(old));
+        // SURVIVES: a NULL-age (legacy) terminal row is never reaped.
+        seed_pay(&index, "succeeded-null-age", "SUCCEEDED", None);
+
+        let reaped = gc_fedimint_pay_index(&index, now, FEDIMINT_PAY_RETENTION_SECS).unwrap();
+        assert_eq!(reaped, 1, "only the past-retention FAILED row is reaped");
+        assert!(
+            pay_exists(&index, "succeeded-old"),
+            "SUCCEEDED remains a permanent same-key idempotency record"
+        );
+        assert!(!pay_exists(&index, "failed-old"));
+        assert!(pay_exists(&index, "failed-boundary"));
+        assert!(pay_exists(&index, "failed-recent"));
+        assert!(
+            pay_exists(&index, "pending-ancient"),
+            "PENDING is never reaped"
+        );
+        assert!(
+            pay_exists(&index, "succeeded-null-age"),
+            "a NULL-created_at row is never reaped"
+        );
+        assert_eq!(pay_count(&index), 5);
+
+        // Idempotent: a second sweep at the same clock removes nothing more.
+        assert_eq!(
+            gc_fedimint_pay_index(&index, now, FEDIMINT_PAY_RETENTION_SECS).unwrap(),
+            0
+        );
+    }
+
+    // A NULL `created_at` (legacy) row is NEVER reaped, no matter how far in the future `now` runs.
+    #[test]
+    fn pay_reap_never_touches_a_null_created_at_row() {
+        let index = open_pay_index();
+        seed_pay(&index, "legacy", "FAILED", None);
+        // An absurdly large `now` (cutoff way past any real timestamp) still cannot reap a NULL age.
+        let huge_now = 100 * FEDIMINT_PAY_RETENTION_SECS;
+        assert_eq!(
+            gc_fedimint_pay_index(&index, huge_now, FEDIMINT_PAY_RETENTION_SECS).unwrap(),
+            0
+        );
+        assert!(pay_exists(&index, "legacy"));
+    }
+
+    // The clock-cap (MIN(unixepoch(), now)): a wall clock jumped far into the FUTURE cannot reap a row
+    // whose real `created_at` is recent — the cutoff pins to the REAL unixepoch(). Mirrors the invoice
+    // reaper's `future_now_cannot_reap_a_fresh_row`.
+    #[test]
+    fn future_now_cannot_reap_a_fresh_pay_row() {
+        let index = open_pay_index();
+        let real_now = SystemClock.now();
+        seed_pay(&index, "fresh-failed", "FAILED", Some(real_now));
+
+        let huge_now = real_now + 10 * FEDIMINT_PAY_RETENTION_SECS; // a badly-fast wall clock
+        let reaped = gc_fedimint_pay_index(&index, huge_now, FEDIMINT_PAY_RETENTION_SECS).unwrap();
+        assert_eq!(
+            reaped, 0,
+            "a future `now` cannot reap a row fresh by the real clock"
+        );
+        assert!(pay_exists(&index, "fresh-failed"));
+    }
+
+    // The reap is CHUNKED (bounded mutex hold): a backlog larger than one 512-row batch is fully
+    // drained across batches. Mirrors the invoice reaper's chunk test.
+    #[test]
+    fn pay_reap_is_chunked() {
+        let now = 2 * FEDIMINT_PAY_RETENTION_SECS;
+        let old = FEDIMINT_PAY_RETENTION_SECS - 1; // strictly past the window
+
+        let index = open_pay_index();
+        let reapable = 512 * 2 + 37;
+        for i in 0..reapable {
+            seed_pay(&index, &format!("flood-{i}"), "FAILED", Some(old));
+        }
+        let reaped = gc_fedimint_pay_index(&index, now, FEDIMINT_PAY_RETENTION_SECS).unwrap();
+        assert_eq!(
+            reaped, reapable,
+            "the whole backlog is drained across batches"
+        );
+        assert_eq!(pay_count(&index), 0);
+    }
+
+    // The dup-tolerant migration: opening a DB whose `fedimint_pay` LACKS `created_at` (a pre-y4m.19
+    // legacy DB) adds the column and its covering index without error; re-running is idempotent; and a
+    // fresh DB (column already present from the CREATE TABLE) is a no-op ALTER.
+    #[test]
+    fn pay_gc_schema_migration_is_dup_tolerant() {
+        let has_gc_index = |conn: &Connection| -> bool {
+            conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master
+                      WHERE type = 'index'
+                        AND name = 'fedimint_pay_gc_idx'
+                        AND tbl_name = 'fedimint_pay'
+                 )",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap()
+        };
+
+        // A legacy DB: the `fedimint_pay` table WITHOUT `created_at` (the pre-y4m.19 shape).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE fedimint_pay (
+                 idempotency_key TEXT PRIMARY KEY,
+                 operation_id    TEXT NOT NULL,
+                 backend_pay_id  TEXT NOT NULL,
+                 status          TEXT NOT NULL DEFAULT 'PENDING',
+                 pay_kind        TEXT NOT NULL DEFAULT 'ln'
+             );",
+        )
+        .unwrap();
+        assert!(!index_has_column(&conn, "fedimint_pay", "created_at").unwrap());
+        assert!(!has_gc_index(&conn));
+        // The migration adds the column + covering index without error.
+        ensure_fedimint_pay_gc_schema(&conn).unwrap();
+        assert!(index_has_column(&conn, "fedimint_pay", "created_at").unwrap());
+        assert!(has_gc_index(&conn));
+        // Re-running is idempotent (no duplicate-column / duplicate-index error).
+        ensure_fedimint_pay_gc_schema(&conn).unwrap();
+        assert!(index_has_column(&conn, "fedimint_pay", "created_at").unwrap());
+        assert!(has_gc_index(&conn));
+
+        // A fresh DB already has the column from INDEX_SCHEMA's CREATE TABLE, so the ALTER is skipped;
+        // the helper still creates the index after proving the column exists.
+        let fresh = Connection::open_in_memory().unwrap();
+        fresh.execute_batch(INDEX_SCHEMA).unwrap();
+        assert!(index_has_column(&fresh, "fedimint_pay", "created_at").unwrap());
+        assert!(!has_gc_index(&fresh));
+        ensure_fedimint_pay_gc_schema(&fresh).unwrap();
+        assert!(index_has_column(&fresh, "fedimint_pay", "created_at").unwrap());
+        assert!(has_gc_index(&fresh));
+    }
+
+    // `pay_idx_upsert` stamps `created_at` on INSERT and REFRESHES it on the ON CONFLICT (retry)
+    // branch — a retry is a fresh terminal-lifecycle, so its retention clock restarts (never reaped on
+    // the original attempt's age).
+    #[test]
+    fn pay_upsert_stamps_and_refreshes_created_at() {
+        let index = open_pay_index();
+        let created_at = |key: &str| -> Option<i64> {
+            index
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT created_at FROM fedimint_pay WHERE idempotency_key = ?1",
+                    params![key],
+                    |r| r.get::<_, Option<i64>>(0),
+                )
+                .unwrap()
+        };
+
+        pay_idx_upsert(&index, "key", "op-A", "PENDING", "ln", 1_000).unwrap();
+        assert_eq!(created_at("key"), Some(1_000), "INSERT stamps created_at");
+
+        // The retry (ON CONFLICT) branch refreshes created_at to the new `now`.
+        pay_idx_upsert(&index, "key", "op-B", "PENDING", "ln", 9_000).unwrap();
+        assert_eq!(
+            created_at("key"),
+            Some(9_000),
+            "the retry branch restarts the retention clock"
+        );
+    }
+
+    // A pay may stay PENDING longer than the 180-day retention before it finally terminalizes. The
+    // terminal CAS must restart the retention clock; otherwise the next GC could immediately delete
+    // the newly-FAILED recovery guard before a later startup has converged its permanent oplog entry.
+    #[test]
+    fn terminal_mark_restarts_pay_retention_window() {
+        let index = open_pay_index();
+        let terminal_at = 2 * FEDIMINT_PAY_RETENTION_SECS;
+        pay_idx_upsert(&index, "slow-pay", "op-slow", "PENDING", "ln", 1).unwrap();
+
+        pay_idx_mark(&index, "slow-pay", "op-slow", "FAILED", terminal_at).unwrap();
+
+        let created_at: Option<i64> = index
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT created_at FROM fedimint_pay WHERE idempotency_key = 'slow-pay'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(created_at, Some(terminal_at));
+        assert_eq!(
+            gc_fedimint_pay_index(&index, terminal_at, FEDIMINT_PAY_RETENTION_SECS).unwrap(),
+            0,
+            "a newly-failed row is retained for the full failed-row retention window"
+        );
+    }
+
+    // Fallback documentation (lnrent-y4m.19 §5): the dead-op ledger (`fedimint_pay_dead_op`) is
+    // INTENTIONALLY left un-GC'd — the pay reap deleting a row's op does NOT touch the ledger marker.
+    // See gc_index_if_due for the reasoned deferral (not a flood vector; reaping it would reintroduce a
+    // startup ambiguity brick for a double-failed refund key).
+    #[test]
+    fn dead_op_ledger_is_left_ungced_by_the_pay_reap() {
+        let now = 2 * FEDIMINT_PAY_RETENTION_SECS;
+        let old = FEDIMINT_PAY_RETENTION_SECS - 1;
+
+        let index = open_pay_index();
+        // A terminal FAILED row for op-`dead` past retention, plus its dead-op ledger marker.
+        seed_pay(&index, "dead", "FAILED", Some(old));
+        pay_idx_record_dead(&index, "op-dead").unwrap();
+
+        let reaped = gc_fedimint_pay_index(&index, now, FEDIMINT_PAY_RETENTION_SECS).unwrap();
+        assert_eq!(reaped, 1, "the definitively failed pay row is reaped");
+        assert!(!pay_exists(&index, "dead"));
+        // The dead-op marker SURVIVES — the reap never touches fedimint_pay_dead_op.
+        let dead_rows: i64 = index
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM fedimint_pay_dead_op", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            dead_rows, 1,
+            "the dead-op ledger is intentionally left un-GC'd"
+        );
     }
 }
 
