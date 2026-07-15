@@ -87,18 +87,30 @@ enum DevCmd {
 
 /// Exit-code taxonomy (agent-grade, ADR-0014): 0 ok; 1 preflight check(s) failed (lnrent-y4m.9) or
 /// an unrecognized daemon error code; 2 not_found; 3 bad_request/invalid_state;
-/// 4 ipc/connection failure; 5 internal.
+/// 4 ipc/connection failure OR a graceful-shutdown restart race (lnrent-j3c); 5 internal.
 fn exit_for(err_code: &str) -> ExitCode {
+    ExitCode::from(exit_code_for(err_code))
+}
+
+/// The raw error-code → exit-number mapping, split out from [`exit_for`] so it is unit-testable
+/// (`std::process::ExitCode` is neither `PartialEq` nor introspectable).
+fn exit_code_for(err_code: &str) -> u8 {
     match err_code {
-        "not_found" => ExitCode::from(2),
+        "not_found" => 2,
         // Request-level refusals the operator can act on, incl. the structured sweep refusals
         // (gate1-operator-sweep, urw.3): a bad/zero invoice, an unpriceable quote, another sweep in
         // flight, an insufficient surplus, a fee rise past the quote, or an in-flight-unconfirmed pay.
         "bad_request" | "invalid_state" | "dev_disabled" | "unsupported" | "sweep_invalid"
         | "sweep_unpriceable" | "sweep_busy" | "sweep_insufficient" | "sweep_fee_rose"
-        | "sweep_in_flight" => ExitCode::from(3),
-        "internal" => ExitCode::from(5),
-        _ => ExitCode::from(1),
+        | "sweep_in_flight" => 3,
+        // A read-only request cancelled because the daemon is gracefully shutting down (lnrent-j3c):
+        // a TRANSIENT restart race (the reply carries retryable:true), not a hard failure. Map it to
+        // the same transient IPC/connection exit as an unreachable daemon (`ipc_unreachable`) so shell
+        // automation retries against the replacement daemon instead of classifying a restart as a
+        // failed gate (which the default exit 1 would).
+        "shutting_down" => 4,
+        "internal" => 5,
+        _ => 1,
     }
 }
 
@@ -563,6 +575,22 @@ mod tests {
     // exit 0 only for a well-formed passing report with every required check present and passing;
     // malformed, incomplete, or self-contradictory reports exit nonzero; an IPC-level error is
     // left to `render`'s taxonomy exit.
+    // The error-code → exit taxonomy (ADR-0014). lnrent-j3c: `shutting_down` (a read-only request
+    // cancelled by a graceful shutdown) must map to the TRANSIENT ipc/connection exit 4 — the same
+    // bucket as an unreachable daemon — so an agent retries a restart race instead of reading the
+    // default exit 1 as a hard failure.
+    #[test]
+    fn exit_code_for_maps_the_error_taxonomy() {
+        assert_eq!(exit_code_for("not_found"), 2);
+        assert_eq!(exit_code_for("bad_request"), 3);
+        assert_eq!(exit_code_for("sweep_in_flight"), 3);
+        // lnrent-j3c: the graceful-shutdown restart race is transient/retryable, NOT exit 1.
+        assert_eq!(exit_code_for("shutting_down"), 4);
+        assert_eq!(exit_code_for("internal"), 5);
+        // An unrecognized daemon error code falls through to the generic failure exit.
+        assert_eq!(exit_code_for("some_unknown_code"), 1);
+    }
+
     #[test]
     fn preflight_checks_failed_maps_the_aggregate() {
         let full_pass = |names: &[&str]| {

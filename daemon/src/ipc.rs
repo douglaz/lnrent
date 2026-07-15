@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio_util::sync::CancellationToken;
 
 /// A request from the CLI to the daemon. One JSON object per line.
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,6 +64,58 @@ pub enum Request {
     AdminSuspend { id: String },
     AdminResume { id: String },
     DevSettle { subscription_id: String },
+}
+
+impl Request {
+    /// Whether this request writes durable state and/or gates a payment. The graceful shutdown
+    /// drain (`serve_with_shutdown`) branches on this to decide who it MUST await: a MUTATING op in
+    /// flight is run to completion so its committed txn + reply is never lost; a READ-ONLY op is
+    /// drain-EXEMPT — it commits nothing, so a graceful shutdown may cancel it mid-flight and reply
+    /// "shutting down" promptly instead of pinning the drain.
+    ///
+    /// WHY the split (lnrent-j3c): read-only requests include the slow `Preflight` (network probes
+    /// bounded at 10s/15s in `preflight.rs`, well above the 3s `SHUTDOWN_DRAIN`) and the
+    /// network-touching `Reconcile`/`Money`. One of those in flight at shutdown would pin the drain
+    /// past the supervisor's grace, forcing the abort (supervisor.rs `timeout(SHUTDOWN_DRAIN, ..)`
+    /// → `AbortOnDrop`) that kills a CONCURRENT committed-but-unreplied handler — the exact window
+    /// y4m.13 closed for idle peers, otherwise reopened by a slow dispatch. Cancelling a read-only
+    /// op loses nothing durable (a dropped store read / network probe commits nothing). MUTATING
+    /// ops (`RefundRetry`/`Sweep`/`AdminSuspend`/`AdminResume`/`DevSettle`) write a durable txn
+    /// and/or gate a payment, so the drain MUST let them finish — never cancelled. Most are a fast
+    /// local sqlite txn + reply that comfortably fits `SHUTDOWN_DRAIN` (`RefundRetry` only CASes a
+    /// row to PENDING; the admin transitions and `DevSettle` are single txns). The ONE exception is
+    /// `Request::Sweep`, whose dispatch awaits a real Lightning/fedimint pay bounded at
+    /// `fedimint_backend::PAY_AWAIT_TIMEOUT` (120s) — far above `SHUTDOWN_DRAIN`. We STILL do not
+    /// cancel it: dropping an in-flight capped pay mid-settle would risk paying out without recording
+    /// SENT, so money safety wins over drain promptness. A slow `Sweep` in flight at shutdown can
+    /// therefore still overrun the drain and force the supervisor abort — but that is a PRE-EXISTING
+    /// hazard j3c neither introduces nor widens (all ops were awaited before), and the sweep's
+    /// durable PENDING intent makes an aborted pay idempotently recoverable on restart. j3c closes
+    /// only the READ-ONLY slow-dispatch reopening of the window, not the sweep case. `SweepQuote` is
+    /// a DRY-RUN (no writes) → read-only.
+    ///
+    /// EXHAUSTIVE by design (no `_` wildcard): a future variant must fail to compile here until it
+    /// is classified, so nothing silently defaults into the drain-exempt (cancel-me) bucket.
+    fn is_mutating(&self) -> bool {
+        match self {
+            Request::RefundRetry { .. }
+            | Request::Sweep { .. }
+            | Request::AdminSuspend { .. }
+            | Request::AdminResume { .. }
+            | Request::DevSettle { .. } => true,
+            Request::Status
+            | Request::Recipes
+            | Request::Money
+            | Request::Reconcile
+            | Request::Preflight
+            | Request::Subs
+            | Request::Sub { .. }
+            | Request::Teardowns
+            | Request::Relays
+            | Request::Refunds
+            | Request::SweepQuote { .. } => false,
+        }
+    }
 }
 
 /// A structured error a caller (human or agent) can branch on (mirrors §5.1 error shape).
@@ -319,6 +372,15 @@ pub async fn serve_with_shutdown(
     // accept loop stops (the handlers were previously detached, so a shutdown could lose an in-flight
     // admin txn+reply, violating the graceful-shutdown AC).
     let mut conns = tokio::task::JoinSet::new();
+    // Cooperative shutdown signal for READ-ONLY handlers (lnrent-j3c). The drain below AWAITS
+    // in-flight handlers so a MUTATING op lands its commit + reply — but a read-only op commits
+    // nothing, and the slow ones (`Preflight`'s 10s/15s probes, `Reconcile`/`Money`'s network
+    // touches) would pin that await past `SHUTDOWN_DRAIN` and force the supervisor abort that can
+    // kill a concurrent committed-but-unreplied MUTATING handler. So on shutdown we cancel this
+    // token; a read-only handler observing it drops its in-flight dispatch (safe — nothing durable)
+    // and returns a prompt "shutting_down" reply. MUTATING handlers ignore the token and always run
+    // to completion. In the never-shutdown [`serve`] wrapper this token is simply never cancelled.
+    let shutdown_token = CancellationToken::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -344,8 +406,10 @@ pub async fn serve_with_shutdown(
                     payment.clone(),
                     relays.clone(),
                 );
+                let token = shutdown_token.clone();
                 conns.spawn(async move {
-                    if let Err(e) = handle_conn(stream, store, recipes, clock, payment, relays).await
+                    if let Err(e) =
+                        handle_conn(stream, store, recipes, clock, payment, relays, token).await
                     {
                         tracing::warn!(error = %e, "ipc connection error");
                     }
@@ -357,8 +421,21 @@ pub async fn serve_with_shutdown(
                 if *shutdown.borrow() {
                     tracing::info!(socket = %path.display(), "ipc serve: shutdown signaled; draining in-flight handlers");
                     let _ = std::fs::remove_file(path);
-                    // Let in-flight handlers finish their txn + reply. Bounded by the supervisor's
-                    // shutdown grace, which aborts this whole task if the drain overruns.
+                    // Wake read-only handlers FIRST (lnrent-j3c): a slow read-only op (e.g.
+                    // `Preflight`'s 10s/15s probes) observes this cancel and returns its prompt
+                    // "shutting_down" reply instead of pinning the await-drain below past
+                    // SHUTDOWN_DRAIN. Must fire BEFORE the drain loop so those handlers are already
+                    // winding down as it awaits them.
+                    shutdown_token.cancel();
+                    // Let in-flight handlers finish: MUTATING handlers ignore the token and run
+                    // their txn + reply to completion; read-only handlers self-complete promptly on
+                    // the cancel above. Most mutating ops are a fast local txn, so with read-only
+                    // ops now exempt a slow READ-ONLY dispatch no longer forces the supervisor abort.
+                    // Still ultimately bounded by the supervisor's shutdown grace, which aborts this
+                    // whole task if the drain overruns — the one residual overrun is an in-flight
+                    // `Sweep`, whose fedimint pay (`PAY_AWAIT_TIMEOUT`, 120s) we deliberately never
+                    // cancel for money safety; that pre-existing gap is unchanged by j3c and its
+                    // durable PENDING intent makes an aborted pay recoverable on restart.
                     while conns.join_next().await.is_some() {}
                     return Ok(());
                 }
@@ -374,6 +451,7 @@ async fn handle_conn(
     clock: Arc<dyn Clock>,
     payment: Arc<dyn PaymentBackend>,
     relays: RelayStatusCell,
+    shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (rd, mut wr) = stream.into_split();
     // Bounded read: cap the request frame so an over-long line can't exhaust memory, and put a
@@ -409,7 +487,37 @@ async fn handle_conn(
         Reply::err("bad_request", "request too large or unterminated")
     } else {
         match serde_json::from_str::<Request>(line.trim()) {
-            Ok(req) => dispatch(req, &store, &recipes, &clock, &payment, &relays).await,
+            Ok(req) if req.is_mutating() => {
+                // A MUTATING op must land its durable commit + reply within the drain and is NEVER
+                // cancelled (lnrent-j3c) — dropping it mid-flight could lose a committed txn or a
+                // paid-but-unrecorded settle. Most are a fast local sqlite txn + reply the drain
+                // easily fits; the exception is `Sweep`, whose fedimint pay can run to
+                // `PAY_AWAIT_TIMEOUT` (120s) and which we still don't cancel for money safety (see
+                // `Request::is_mutating` for the residual-gap reasoning).
+                dispatch(req, &store, &recipes, &clock, &payment, &relays).await
+            }
+            Ok(req) => {
+                // A READ-ONLY op is drain-EXEMPT (lnrent-j3c): if a graceful shutdown fires while it
+                // runs, cancel it and reply promptly rather than pin the drain (the slow `Preflight`
+                // probes run 10s/15s, past SHUTDOWN_DRAIN). On cancel the `dispatch` future is
+                // DROPPED — safe for a read-only op, which commits nothing durable (a dropped store
+                // read / network probe loses nothing). The tiny error reply then goes out the
+                // unchanged write path below, exactly like any other `Reply`.
+                tokio::select! {
+                    r = dispatch(req, &store, &recipes, &clock, &payment, &relays) => r,
+                    _ = shutdown_token.cancelled() => Reply {
+                        ok: false,
+                        data: None,
+                        error: Some(IpcError {
+                            code: "shutting_down".into(),
+                            message: "daemon is shutting down; read-only request aborted, retry after restart".into(),
+                            // A restart race is transient; machine callers may safely retry the
+                            // read-only request against the replacement daemon.
+                            retryable: true,
+                        }),
+                    },
+                }
+            }
             Err(e) => Reply::err("bad_request", format!("invalid request: {e}")),
         }
     };
@@ -1087,6 +1195,47 @@ mod tests {
         }
     }
 
+    /// A test-only backend whose `available_balance_msat` SIGNALS that it was entered and then
+    /// BLOCKS for `delay` (lnrent-j3c) — used to hold a read-only `Reconcile` handler in flight
+    /// across a shutdown. Every other method bails: the reconcile path over an EMPTY store touches
+    /// only the balance read (`ledger::expected_msat` makes no payment call with no refunds).
+    struct SlowBalancePayment {
+        entered: mpsc::UnboundedSender<()>,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait]
+    impl PaymentBackend for SlowBalancePayment {
+        async fn create_invoice(&self, _: u64, _: &str, _: u32, _: &str) -> Result<Invoice> {
+            anyhow::bail!("SlowBalancePayment: only available_balance_msat is exercised")
+        }
+        async fn lookup(&self, _: &str) -> Result<PaymentStatus> {
+            anyhow::bail!("SlowBalancePayment: only available_balance_msat is exercised")
+        }
+        async fn lookup_settlement(&self, _: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            anyhow::bail!("SlowBalancePayment: only available_balance_msat is exercised")
+        }
+        async fn pay(&self, _: &str, _: u64, _: &str) -> Result<String> {
+            anyhow::bail!("SlowBalancePayment: only available_balance_msat is exercised")
+        }
+        async fn payment_status(&self, _: &str) -> Result<PayStatus> {
+            anyhow::bail!("SlowBalancePayment: only available_balance_msat is exercised")
+        }
+        async fn payment_status_by_key(&self, _: &str) -> Result<PayStatus> {
+            anyhow::bail!("SlowBalancePayment: only available_balance_msat is exercised")
+        }
+        async fn available_balance_msat(&self) -> Result<Option<u64>> {
+            // Announce we're now inside the slow read-only call, then block. A cooperative shutdown
+            // must DROP this future (via the read-only select!) rather than await the full `delay`.
+            let _ = self.entered.send(());
+            tokio::time::sleep(self.delay).await;
+            Ok(Some(1))
+        }
+        async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+            anyhow::bail!("SlowBalancePayment: only available_balance_msat is exercised")
+        }
+    }
+
     fn mem_store() -> Store {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
@@ -1669,6 +1818,234 @@ mod tests {
                 Ok(c.query_row("SELECT state FROM subscription WHERE id='s1'", [], |r| {
                     r.get(0)
                 })?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "SUSPENDED");
+    }
+
+    // lnrent-j3c: `is_mutating` is the compile-time-forced (exhaustive-match, no `_`) classifier the
+    // shutdown drain branches on. This pins the RUNTIME truth table: MUTATING ⇒ drain awaits it;
+    // read-only ⇒ drain-exempt (cancellable). A new variant makes `is_mutating` fail to compile, and
+    // if it is misclassified this test is where the wrong bucket shows up.
+    #[test]
+    fn is_mutating_classifies_every_request_variant() {
+        // MUTATING: writes a durable txn and/or gates a payment → the drain MUST let it finish.
+        assert!(Request::RefundRetry { id: "x".into() }.is_mutating());
+        assert!(Request::Sweep { bolt11: "x".into() }.is_mutating());
+        assert!(Request::AdminSuspend { id: "x".into() }.is_mutating());
+        assert!(Request::AdminResume { id: "x".into() }.is_mutating());
+        assert!(Request::DevSettle {
+            subscription_id: "x".into()
+        }
+        .is_mutating());
+        // READ-ONLY: commits nothing → drain-exempt (cancelled promptly at shutdown). Includes the
+        // slow `Preflight` and the network-touching `Reconcile`/`Money`, plus the `SweepQuote`
+        // dry-run.
+        assert!(!Request::Status.is_mutating());
+        assert!(!Request::Recipes.is_mutating());
+        assert!(!Request::Money.is_mutating());
+        assert!(!Request::Reconcile.is_mutating());
+        assert!(!Request::Preflight.is_mutating());
+        assert!(!Request::Subs.is_mutating());
+        assert!(!Request::Sub { id: "x".into() }.is_mutating());
+        assert!(!Request::Teardowns.is_mutating());
+        assert!(!Request::Relays.is_mutating());
+        assert!(!Request::Refunds.is_mutating());
+        assert!(!Request::SweepQuote { bolt11: "x".into() }.is_mutating());
+    }
+
+    // lnrent-j3c — THE bead scenario: a SLOW read-only op in flight must NOT pin the graceful drain.
+    // A `Reconcile` handler is parked inside a ~10s balance read; when shutdown flips, the read-only
+    // exemption cancels it, so `serve_with_shutdown` returns WELL under that 10s sleep (proving the
+    // handler was cancelled, not awaited) and the client sees the structured `shutting_down` reply.
+    // Before the fix the drain would await the full sleep and force the supervisor's overrun-abort —
+    // the committed-but-unreplied kill window y4m.13 closed for idle peers, reopened by slow dispatch.
+    #[tokio::test]
+    async fn slow_read_only_op_does_not_pin_the_shutdown_drain() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let store = Store::spawn(conn);
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let payment: Arc<dyn PaymentBackend> = Arc::new(SlowBalancePayment {
+            entered: entered_tx,
+            delay: std::time::Duration::from_secs(10),
+        });
+        let sock = temp_sock("slow-readonly");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(serve_with_shutdown(
+            store,
+            recipes,
+            clock,
+            payment,
+            RelayStatusCell::new(),
+            sock.clone(),
+            shutdown_rx,
+        ));
+        for _ in 0..50 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // A read-only Reconcile that will block ~10s inside `available_balance_msat`.
+        let mut client = UnixStream::connect(&sock).await.unwrap();
+        let mut buf = serde_json::to_vec(&Request::Reconcile).unwrap();
+        buf.push(b'\n');
+        client.write_all(&buf).await.unwrap();
+        client.flush().await.unwrap();
+
+        // Confirm the handler is genuinely IN FLIGHT in the slow read-only call before shutting down
+        // (not still parked in the read or the listen backlog).
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the reconcile handler reaches the slow balance read")
+            .expect("entered signal");
+
+        // Flip shutdown and time the drain: it must cancel the read-only op, NOT await the 10s sleep.
+        let shutdown_at = std::time::Instant::now();
+        shutdown_tx.send(true).unwrap();
+
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(3), server)
+            .await
+            .expect("graceful drain must not await the 10s read-only sleep")
+            .unwrap();
+        assert!(
+            drained.is_ok(),
+            "serve_with_shutdown returns Ok: {drained:?}"
+        );
+        assert!(
+            shutdown_at.elapsed() < std::time::Duration::from_secs(2),
+            "drain cancelled the read-only op instead of awaiting its 10s sleep: {:?}",
+            shutdown_at.elapsed()
+        );
+
+        // The client gets the structured, retryable `shutting_down` reply: this is a transient
+        // restart race, not a permanent request failure.
+        let (rd, _wr) = client.into_split();
+        let mut rd = BufReader::new(rd);
+        let mut line = String::new();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), rd.read_line(&mut line))
+            .await
+            .expect("a prompt reply, never the 10s sleep")
+            .unwrap();
+        assert!(n > 0, "shutdown cancellation returns a structured reply");
+        let reply: Reply = serde_json::from_str(line.trim()).unwrap();
+        assert!(!reply.ok, "read-only op aborted at shutdown: {reply:?}");
+        let error = reply.error.unwrap();
+        assert_eq!(error.code, "shutting_down");
+        assert!(error.retryable, "a restart race is transient");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // lnrent-j3c: a concurrent MUTATING op still lands its reply through the SAME drain that
+    // cancels a slow read-only op. The `AdminSuspend` handler commits its txn and replies (the token
+    // must NOT abort it), while the parked ~10s `Reconcile` is cancelled — so the drain both honors
+    // the mutating commit AND completes promptly.
+    #[tokio::test]
+    async fn mutating_op_completes_through_drain_despite_a_slow_readonly_op() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO subscription (id, recipe_id, state, created_at) VALUES ('s1','dummy','ACTIVE',1)",
+            [],
+        )
+        .unwrap();
+        let store = Store::spawn(conn);
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let payment: Arc<dyn PaymentBackend> = Arc::new(SlowBalancePayment {
+            entered: entered_tx,
+            delay: std::time::Duration::from_secs(10),
+        });
+        let sock = temp_sock("drain-mut");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(serve_with_shutdown(
+            store.clone(),
+            recipes,
+            clock,
+            payment,
+            RelayStatusCell::new(),
+            sock.clone(),
+            shutdown_rx,
+        ));
+        for _ in 0..50 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The slow read-only op: send Reconcile, wait until it's inside the 10s balance read.
+        let mut slow = UnixStream::connect(&sock).await.unwrap();
+        let mut buf = serde_json::to_vec(&Request::Reconcile).unwrap();
+        buf.push(b'\n');
+        slow.write_all(&buf).await.unwrap();
+        slow.flush().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the reconcile handler reaches the slow balance read")
+            .expect("entered signal");
+
+        // The well-behaved MUTATING client connects and sends its AdminSuspend BEFORE shutdown, so its
+        // handler reads the request the moment it is spawned — the request bytes never race the
+        // (test-tuned, 500ms) read deadline that starts at accept (adversarial j3c review P3). A probe
+        // round-trip AFTER both clients connect proves both handlers are already spawned (in flight at
+        // shutdown), not parked in the listen backlog. The admin txn is mutating, so the shutdown token
+        // never cancels it; whether it commits just before or during the drain, its reply must land and
+        // the drain must still finish promptly.
+        let mut legit = UnixStream::connect(&sock).await.unwrap();
+        let mut buf = serde_json::to_vec(&Request::AdminSuspend { id: "s1".into() }).unwrap();
+        buf.push(b'\n');
+        legit.write_all(&buf).await.unwrap();
+        legit.flush().await.unwrap();
+        let probe = call(&sock, Request::Status).await.unwrap();
+        assert!(probe.ok, "probe: {:?}", probe.error);
+
+        shutdown_tx.send(true).unwrap();
+        let shutdown_at = std::time::Instant::now();
+
+        // The in-flight mutating handler still commits its admin txn and replies — never aborted by
+        // the token (its request was sent above, before shutdown).
+        let (legit_rd, _legit_wr) = legit.into_split();
+        let mut legit_rd = BufReader::new(legit_rd);
+        let mut line = String::new();
+        legit_rd.read_line(&mut line).await.unwrap();
+        let reply: Reply = serde_json::from_str(line.trim()).unwrap();
+        assert!(
+            reply.ok,
+            "the in-flight admin action gets its reply through the drain: {:?}",
+            reply.error
+        );
+        assert_eq!(reply.data.unwrap()["state"], "SUSPENDED");
+
+        // The drain still completes promptly — the slow read-only op was cancelled, not awaited.
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(3), server)
+            .await
+            .expect("graceful drain must not await the 10s read-only sleep")
+            .unwrap();
+        assert!(
+            drained.is_ok(),
+            "serve_with_shutdown returns Ok: {drained:?}"
+        );
+        assert!(
+            shutdown_at.elapsed() < std::time::Duration::from_secs(2),
+            "drain bounded by cancellation of the read-only op, not the 10s sleep: {:?}",
+            shutdown_at.elapsed()
+        );
+
+        // Committed AND acknowledged: the admin txn survived the shutdown.
+        let state: String = store
+            .read(|c| {
+                Ok(
+                    c.query_row("SELECT state FROM subscription WHERE id='s1'", [], |r| {
+                        r.get(0)
+                    })?,
+                )
             })
             .await
             .unwrap();
