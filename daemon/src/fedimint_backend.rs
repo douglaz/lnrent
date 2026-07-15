@@ -595,9 +595,26 @@ impl FedimintPayment {
                 // `UnexpectedError` — which fedimint also emits for a change-output failure AFTER a
                 // successful payment — upgrades to SUCCEEDED instead of parking a provably-paid
                 // refund as ambiguous (adversarial y4m.16 review; both independent reviewers traced
-                // this to the same fedimint 0.11.1 source). Live awaits see the full state sequence;
-                // a post-crash re-subscribe may replay only the cached terminal state, in which case
-                // the flag stays false and the conservative Ambiguous handling below applies.
+                // this to the same fedimint 0.11.1 source).
+                //
+                // This in-memory flag is safe to re-derive on EVERY (re-)await — an interrupted,
+                // timed-out (PAY_AWAIT_TIMEOUT), or post-crash re-subscribe loses nothing and the
+                // upgrade STILL lands (lnrent-mc8, verified against fedimint v0.11.1 @ 2620789):
+                //  - The pay state machine's persisted terminal for this case is `Success(preimage)`
+                //    (pay.rs), NOT an error state. `AwaitingChange` and the change-output
+                //    `UnexpectedError` are BOTH re-derived LIVE from durable op-meta on each subscribe
+                //    (`subscribe_ln_pay` yields `AwaitingChange` then awaits the change output,
+                //    lib.rs:1619-1631) — the error is never persisted as the terminal.
+                //  - fedimint caches an operation outcome ONLY when a subscriber drains the update
+                //    stream to EOF (`caching_operation_update_stream` writes the last update AFTER its
+                //    `while let Some` loop, oplog.rs:376). This loop BAILS on the terminal state and
+                //    never polls to `None`, so it never arms that cache; nothing else drains this op.
+                // So a re-subscribe always replays `Created→Funded→Success` and re-yields
+                // `AwaitingChange` (re-setting this flag) BEFORE any re-`UnexpectedError` — mc8's
+                // "parks PENDING forever" is unreachable, hence a doc-only close. (One PRE-EXISTING
+                // fedimint fragility, NOT this mechanism: the notifier orders replayed states by
+                // wall-clock `created_at` with a non-monotonicity FIXME — a severe backward clock step
+                // could desync the positional replay, but that hits FIRST-time subscribes equally.)
                 let mut preimage_obtained = false;
                 while let Some(state) = updates.next().await {
                     if matches!(state, LnPayState::AwaitingChange) {
