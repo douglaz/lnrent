@@ -36,12 +36,16 @@ use lightning_invoice::Bolt11Invoice;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{json, Value};
 
-use crate::alerts::{AlertDispatcher, AlertKind, AlertRow};
+use crate::alerts::{Alert, AlertDispatcher, AlertKind, AlertRow};
 use crate::backends::{PayStatus, PaymentBackend};
 use crate::clock::Clock;
 use crate::ledger::{positive_sat, sum_receipts_msat};
 use crate::refund::parse_whole_sat;
 use crate::store::{Store, SETTLE_REFUND_KINDS_SQL};
+
+/// How long an operator sweep may remain PENDING before it raises a recurring stuck alert.
+/// Mirrors `refund.rs`'s `RESOLUTION_STUCK_ALERT_S`.
+const SWEEP_STUCK_ALERT_S: i64 = 6 * 3600;
 
 /// The three §surplus terms, in msats, from ONE consistent ledger snapshot. `u128` saturating so the
 /// derived surplus is never negative and never over-authorizes.
@@ -280,9 +284,9 @@ pub struct Sweeper {
     store: Store,
     payment: Arc<dyn PaymentBackend>,
     clock: Arc<dyn Clock>,
-    /// Optional GATE-1 alert sink: surfaces a parked FAILED sweep as a durable operator DM. `None`
-    /// for the IPC execute path (a WARN log suffices — the operator gets the structured reply live)
-    /// and focused tests; the supervisor injects the real one via [`Sweeper::with_alerts`].
+    /// Optional GATE-1 alert sink: surfaces parked FAILED and aged PENDING sweeps as durable operator
+    /// DMs. `None` for the IPC execute path (the operator gets the structured reply live) and focused
+    /// tests; the supervisor injects the real one via [`Sweeper::with_alerts`].
     alerts: Option<Arc<AlertDispatcher>>,
 }
 
@@ -296,11 +300,42 @@ impl Sweeper {
         }
     }
 
-    /// Inject the GATE-1 alert sink (the supervisor wires it) so a parked FAILED sweep additionally
-    /// enqueues a durable `SweepFailed` operator DM inside the FAILED transaction.
+    /// Inject the GATE-1 alert sink (the supervisor wires it) so parked/stuck sweeps additionally
+    /// surface as durable operator DMs.
     pub fn with_alerts(mut self, alerts: Arc<AlertDispatcher>) -> Self {
         self.alerts = Some(alerts);
         self
+    }
+
+    /// Fire a recurring alert best-effort, outside the sweep state transaction.
+    async fn alert(&self, alert: Alert) {
+        if let Some(alerts) = &self.alerts {
+            if let Err(e) = alerts.dispatch(alert).await {
+                tracing::warn!(error = %format!("{e:#}"), "failed to enqueue operator alert");
+            }
+        }
+    }
+
+    /// Alert when a sweep row remains PENDING past the stuck threshold — `reason` names the cause
+    /// so the operator DM is accurate on both livelock arms (an ambiguous in-flight pay, or a
+    /// bolt11-less row needing manual handling).
+    async fn maybe_alert_stuck(&self, row: &PendingSweep, now: i64, reason: &str) {
+        let age = now - row.created_at;
+        if age < SWEEP_STUCK_ALERT_S {
+            return;
+        }
+        tracing::error!(
+            sweep = %row.id,
+            age_s = age,
+            %reason,
+            "operator sweep stuck PENDING past the alert threshold; operator attention needed"
+        );
+        self.alert(Alert::new(
+            AlertKind::SweepStuck,
+            row.id.clone(),
+            format!("operator sweep {} stuck PENDING {age}s without progress ({reason})", row.id),
+        ))
+        .await;
     }
 
     /// Dry-run quote: parse the invoice, price the outlay, read the surplus, and report the verdict.
@@ -402,6 +437,12 @@ impl Sweeper {
             let Some(bolt11) = row.bolt11.clone() else {
                 tracing::warn!(sweep = %row.id, "PENDING sweep has no bolt11; leaving for manual handling");
                 report.pending += 1;
+                // A bolt11-less PENDING row is the MOST stuck kind — it can never self-resolve and
+                // needs manual handling — and it livelocks the one-at-a-time sweep gate just like an
+                // ambiguous pay, so it must surface the SweepStuck alert too (defensive: gate_and_write
+                // always writes a non-NULL bolt11, so this is unreachable for daemon-created rows).
+                self.maybe_alert_stuck(&row, self.clock.now(), "no bolt11; needs manual handling")
+                    .await;
                 continue;
             };
             let payment_hash = payment_hash_of(&row.id);
@@ -488,7 +529,11 @@ impl Sweeper {
             match outcome {
                 PayOutcome::Sent(_) => report.sent += 1,
                 PayOutcome::Failed(_) => report.failed += 1,
-                PayOutcome::Pending => report.pending += 1,
+                PayOutcome::Pending => {
+                    report.pending += 1;
+                    self.maybe_alert_stuck(&row, self.clock.now(), "ambiguous pay not progressing")
+                        .await;
+                }
             }
         }
         Ok(report)
@@ -759,7 +804,7 @@ impl Sweeper {
         self.store
             .read(|c| {
                 let mut stmt = c.prepare(
-                    "SELECT id, bolt11, COALESCE(amount_sat, 0), max_outlay_msat
+                    "SELECT id, bolt11, COALESCE(amount_sat, 0), max_outlay_msat, created_at
                        FROM sweep_attempt
                       WHERE status='PENDING'
                       ORDER BY created_at, id",
@@ -771,6 +816,7 @@ impl Sweeper {
                             bolt11: r.get(1)?,
                             amount_sat: r.get::<_, i64>(2)?.max(0) as u64,
                             max_outlay_msat: u128::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
+                            created_at: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
                         })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -786,6 +832,8 @@ struct PendingSweep {
     bolt11: Option<String>,
     amount_sat: u64,
     max_outlay_msat: u128,
+    /// Intent creation time; a missing legacy value is treated as ancient.
+    created_at: i64,
 }
 
 /// Parse the operator's sweep invoice: `(payment_hash, amount_sat)`. A parse failure, an amountless
@@ -1079,6 +1127,7 @@ mod tests {
         paid: HashSet<String>,     // keys with a recorded send
         started: HashSet<String>,  // keys payment_started_by_key reports as an in-flight op
         failed: HashSet<String>,   // keys whose pay refused (status_by_key -> Failed)
+        pending: HashSet<String>,  // keys whose pay remains ambiguously in flight
         sends: usize,              // NEW sends (not idempotent re-awaits)
         quote_fee_msat: u128,
         pay_fee_msat: u128,
@@ -1105,6 +1154,11 @@ mod tests {
         fn seed_started_failed(&self, key: &str) {
             let mut st = self.inner.lock().unwrap();
             st.failed.insert(key.to_string());
+            st.started.insert(key.to_string());
+        }
+        fn seed_started_pending(&self, key: &str) {
+            let mut st = self.inner.lock().unwrap();
+            st.pending.insert(key.to_string());
             st.started.insert(key.to_string());
         }
         fn sends(&self) -> usize {
@@ -1143,6 +1197,9 @@ mod tests {
             key: &str,
         ) -> Result<String> {
             let mut st = self.inner.lock().unwrap();
+            if st.pending.contains(key) {
+                anyhow::bail!("sweep pay is in-flight but unconfirmed");
+            }
             if st.paid.contains(key) {
                 return Ok(format!("sweep-pay-{key}")); // idempotent re-await, no new send
             }
@@ -1168,6 +1225,8 @@ mod tests {
                 PayStatus::Succeeded
             } else if st.failed.contains(key) {
                 PayStatus::Failed
+            } else if st.pending.contains(key) {
+                PayStatus::Pending
             } else {
                 PayStatus::Unknown
             })
@@ -1243,6 +1302,36 @@ mod tests {
             .read(|c| Ok(c.query_row("SELECT status FROM sweep_attempt", [], |r| r.get(0))?))
             .await
             .unwrap()
+    }
+
+    async fn operator_alert_kinds(store: &Store) -> Vec<String> {
+        let payloads: Vec<String> = store
+            .read(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT payload_json FROM outbox WHERE msg_type='operator.alert' ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        payloads
+            .into_iter()
+            .map(|p| match serde_json::from_str::<lnrent_wire::Msg>(&p).unwrap() {
+                lnrent_wire::Msg::OperatorAlert(a) => a.kind,
+                other => panic!("expected OperatorAlert, got {other:?}"),
+            })
+            .collect()
+    }
+
+    async fn alert_count(store: &Store, kind: &str) -> usize {
+        operator_alert_kinds(store)
+            .await
+            .into_iter()
+            .filter(|k| k == kind)
+            .count()
     }
 
     fn sweeper(store: &Store, payment: Arc<dyn PaymentBackend>) -> Sweeper {
@@ -1608,5 +1697,75 @@ mod tests {
         s.execute(&bolt11).await.unwrap();
         s.drive().await.unwrap(); // no PENDING rows left, but the read path still must not panic
         // Reaching here means available_balance_msat was never called.
+    }
+
+    async fn seed_pending_sweep(store: &Store, id: &str, created_at: i64) {
+        let id = id.to_string();
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO sweep_attempt (id, bolt11, amount_sat, max_outlay_msat, status, attempts, created_at)
+                     VALUES (?1, 'lnbc1', 40000, 40000000, 'PENDING', 0, ?2)",
+                    params![id, created_at],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stuck_pending_sweep_fires_one_sweep_stuck_alert_past_threshold() {
+        let store = mem_store();
+        let clock = Arc::new(TestClock::new(1_000));
+        seed_pending_sweep(&store, "sweep:stuck", 0).await;
+
+        let payment = Arc::new(SweepPayment::new());
+        payment.seed_started_pending("sweep:stuck");
+        let alerts = Arc::new(AlertDispatcher::new(store.clone(), clock.clone(), "operator".into()));
+        let s = Sweeper::new(store.clone(), payment, clock.clone()).with_alerts(alerts);
+
+        let report = s.drive().await.unwrap();
+        assert_eq!(report.pending, 1, "the ambiguous pay leaves the row PENDING");
+        assert_eq!(alert_count(&store, "sweep_stuck").await, 0, "a fresh PENDING sweep alerts nothing");
+
+        clock.set(SWEEP_STUCK_ALERT_S + 1);
+        let report = s.drive().await.unwrap();
+        assert_eq!(report.pending, 1, "still PENDING (never re-paid, never terminalized)");
+        assert_eq!(alert_count(&store, "sweep_stuck").await, 1, "past the threshold, one SweepStuck fires");
+
+        clock.set(SWEEP_STUCK_ALERT_S + 2);
+        s.drive().await.unwrap();
+        assert_eq!(
+            alert_count(&store, "sweep_stuck").await,
+            1,
+            "the dispatcher cooldown collapses repeats to a single DM"
+        );
+
+        assert_eq!(single_sweep_status(&store).await, "PENDING");
+    }
+
+    #[tokio::test]
+    async fn terminal_drive_fires_no_sweep_stuck_alert() {
+        let store = mem_store();
+        let clock = Arc::new(TestClock::new(SWEEP_STUCK_ALERT_S * 2));
+        seed_pending_sweep(&store, "sweep:done", 0).await;
+        seed_pending_sweep(&store, "sweep:bad", 0).await;
+
+        let payment = Arc::new(SweepPayment::new());
+        payment.seed_started_paid("sweep:done");
+        payment.seed_started_failed("sweep:bad");
+        let alerts = Arc::new(AlertDispatcher::new(store.clone(), clock.clone(), "operator".into()));
+        let s = Sweeper::new(store.clone(), payment.clone(), clock).with_alerts(alerts);
+
+        let report = s.drive().await.unwrap();
+        assert_eq!((report.sent, report.failed, report.pending), (1, 1, 0));
+        assert_eq!(payment.sends(), 0, "the paid key is re-awaited, not re-sent");
+        assert_eq!(alert_count(&store, "sweep_stuck").await, 0, "no SweepStuck on a terminal drive");
+        assert_eq!(
+            alert_count(&store, "sweep_failed").await,
+            1,
+            "the FAILED park still fires the existing SweepFailed"
+        );
     }
 }
