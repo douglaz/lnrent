@@ -43,6 +43,18 @@ fn bad_argv_without_json_keeps_clap_default_exit_2() {
     );
 }
 
+// A MISSING required subcommand under --json is a genuine parse failure, NOT a help display
+// (codex PR-41 review): `order` requires a nested subcommand, so `--json order` must exit 3 with
+// the bad_request envelope, not clap's help/plaintext.
+#[test]
+fn missing_subcommand_under_json_is_bad_request_exit_3() {
+    let (code, _stdout, stderr) = run(&["--json", "order"]);
+    assert_eq!(code, 3, "a missing required subcommand under --json must exit 3; stderr:\n{stderr}");
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).unwrap_or_else(|e| panic!("stderr not JSON ({e}):\n{stderr}"));
+    assert_eq!(v["error"]["code"], serde_json::json!("bad_request"));
+}
+
 // --help is NOT an error even under --json: clap renders help and exits 0.
 #[test]
 fn help_is_not_an_error_under_json() {

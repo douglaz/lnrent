@@ -167,16 +167,15 @@ fn argv_has_json(args: impl Iterator<Item = String>) -> bool {
 /// both breaks the `{ok:false,error:{…}}` envelope AND collides with the taxonomy's exit 2 =
 /// `not_found`. When `--json` is present, emit a `bad_request` envelope (matching
 /// `BuyerError::BadRequest`'s exit **3**) to stderr; otherwise fall through to clap's human
-/// usage/exit. `--help`/`--version` are NOT errors — always render clap's normal output (exit 0),
-/// even under `--json`, since an agent asking for help wants the help text.
+/// usage/exit. Only an EXPLICIT `--help`/`--version` bypasses JSON — those are not errors, so
+/// render clap's normal output (exit 0) even under `--json`, since an agent asking for help wants
+/// the help text. Notably NOT `DisplayHelpOnMissingArgumentOrSubcommand` (codex PR-41 review): a
+/// MISSING required subcommand (e.g. `lnrent-buyer --json order`) is a genuine parse failure an
+/// agent must receive as the `bad_request` envelope, not clap's help/plaintext — so it falls
+/// through to the `--json` check below.
 fn handle_parse_error(e: clap::Error, args: impl Iterator<Item = String>) -> ExitCode {
     use clap::error::ErrorKind;
-    if matches!(
-        e.kind(),
-        ErrorKind::DisplayHelp
-            | ErrorKind::DisplayVersion
-            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-    ) {
+    if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
         e.exit(); // prints help/version to stdout, exits 0 — diverges
     }
     if argv_has_json(args) {
