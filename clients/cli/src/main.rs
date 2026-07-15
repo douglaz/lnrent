@@ -143,7 +143,7 @@ enum DeliveryCmd {
 async fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(e) => return handle_parse_error(e, std::env::args().skip(1)),
+        Err(e) => return handle_parse_error(e, std::env::args_os().skip(1)),
     };
     let json = cli.json;
     match run(cli).await {
@@ -158,8 +158,12 @@ async fn main() -> ExitCode {
 /// Whether the raw argv requested `--json`. The clap parse FAILED, so we can't read `cli.json` —
 /// scan the tokens directly (a bare bool flag; `--` before it makes `--json` positional, which a
 /// parse-error argv would not sanely contain, so a literal token match is the pragmatic contract).
-fn argv_has_json(args: impl Iterator<Item = String>) -> bool {
-    args.take_while(|a| a != "--").any(|a| a == "--json")
+/// Scans `OsString`s via `to_str()` (codex PR-41 review): a non-UTF-8 argv token would panic
+/// `std::env::args()`, breaking the machine contract on exactly the bad input this path exists for
+/// — `to_str()` yields `None` for such a token, which never matches the ASCII `--`/`--json`.
+fn argv_has_json(args: impl Iterator<Item = std::ffi::OsString>) -> bool {
+    args.take_while(|a| a.to_str() != Some("--"))
+        .any(|a| a.to_str() == Some("--json"))
 }
 
 /// Keep the `--json` machine contract on a clap ARGV PARSE FAILURE (lnrent-y4m.14): the buyer CLI
@@ -173,7 +177,7 @@ fn argv_has_json(args: impl Iterator<Item = String>) -> bool {
 /// MISSING required subcommand (e.g. `lnrent-buyer --json order`) is a genuine parse failure an
 /// agent must receive as the `bad_request` envelope, not clap's help/plaintext — so it falls
 /// through to the `--json` check below.
-fn handle_parse_error(e: clap::Error, args: impl Iterator<Item = String>) -> ExitCode {
+fn handle_parse_error(e: clap::Error, args: impl Iterator<Item = std::ffi::OsString>) -> ExitCode {
     use clap::error::ErrorKind;
     if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
         e.exit(); // prints help/version to stdout, exits 0 — diverges
@@ -495,12 +499,27 @@ mod tests {
 
     #[test]
     fn argv_has_json_detects_the_flag_before_a_terminator() {
-        let has = |v: &[&str]| argv_has_json(v.iter().map(|s| s.to_string()));
+        use std::ffi::OsString;
+        let has = |v: &[&str]| argv_has_json(v.iter().map(OsString::from));
         assert!(has(&["listings", "--json"]));
         assert!(has(&["--json", "listings"]));
         assert!(!has(&["listings"]));
         // `--` ends option parsing, so a `--json` AFTER it is positional, not the flag.
         assert!(!has(&["listings", "--", "--json"]));
         assert!(has(&["--json", "--", "positional"]));
+    }
+
+    // codex PR-41: a non-UTF-8 argv token must NOT panic the scan (it would break the machine
+    // contract on exactly the bad input this path exists for). The flag is still found around it.
+    #[cfg(unix)]
+    #[test]
+    fn argv_has_json_survives_non_utf8_tokens() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let non_utf8 = OsString::from_vec(vec![0x66, 0x80, 0x6f]); // 'f', invalid byte, 'o'
+        let args = vec![non_utf8.clone(), OsString::from("--json")];
+        assert!(argv_has_json(args.into_iter()), "the flag is found past a non-UTF-8 token");
+        // And a lone non-UTF-8 token with no --json is simply not a match (no panic).
+        assert!(!argv_has_json(vec![non_utf8].into_iter()));
     }
 }
