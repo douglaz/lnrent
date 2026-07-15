@@ -544,7 +544,15 @@ pub fn open(path: impl AsRef<Path>) -> Result<Connection> {
         }
     }
     let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    // synchronous=FULL PINS money-write durability as a STATED invariant (lnrent-y4m.1), not a
+    // build-time default. The bundled sqlite already defaults WAL to FULL, so this is a no-op on the
+    // current build — but a future switch to a system/distro sqlite (where a NORMAL-in-WAL build
+    // default is common) would otherwise silently lower durability with no test to catch it. WAL +
+    // FULL fsyncs the WAL at every commit AND at each checkpoint, so a committed money write survives
+    // an OS crash / power loss. (Not a config knob — the money DB's durability is not operator-tunable.)
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
+    )?;
     // Integrity gate (lnrent-y4m.3): a corrupt/truncated state DB must fail startup LOUDLY here
     // rather than surface as a late opaque error on the money path. `quick_check` is the cheap
     // structural scan (it skips `integrity_check`'s expensive index-vs-table cross-check); it yields
@@ -2678,6 +2686,29 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count(&s, "SELECT count(*) FROM recipe").await, 2);
+    }
+
+    // lnrent-y4m.1: `open()` PINS `synchronous=FULL` so a committed money write is fsync'd durable
+    // regardless of the underlying sqlite build's WAL default. Assert EXACTLY 2 (FULL) — a silent
+    // drop to NORMAL(1) on a future system-sqlite switch must fail this test. A file DB (not
+    // `:memory:`), since `synchronous` is meaningless in memory.
+    #[tokio::test]
+    async fn open_pins_synchronous_full() {
+        let path = std::env::temp_dir().join(format!(
+            "lnrent-sync-full-{}-{}.sqlite",
+            std::process::id(),
+            42
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = open(&path).unwrap();
+        let sync: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 2, "money DB must open with synchronous=FULL (2), not NORMAL(1)/OFF(0)");
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
     }
 
     // `open()`'s startup gate: a healthy freshly-created file DB passes; an existing zero-byte DB
