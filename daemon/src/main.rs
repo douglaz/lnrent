@@ -314,12 +314,47 @@ fn bootstrap_input(args: BootstrapArgs) -> BootstrapInput {
     }
 }
 
+/// Log output encoding (lnrent-y4m.11). `Text` is the default plaintext formatter; `Json` is the
+/// opt-in structured formatter for downstream log processors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
+/// The `LNRENT_LOG_FORMAT` env var this daemon reads to select the log encoding.
+const LOG_FORMAT_ENV: &str = "LNRENT_LOG_FORMAT";
+
+/// Map an `LNRENT_LOG_FORMAT` value to a [`LogFormat`]: only a case-insensitive `"json"` selects
+/// JSON; unset, `"text"`, or ANY unrecognized value falls back to `Text` (the safe default —
+/// a typo must never silently disable logging or change today's behavior). Pure over its input so
+/// the mapping is unit-testable without touching the process-global subscriber.
+fn parse_log_format(value: Option<&str>) -> LogFormat {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("json") => LogFormat::Json,
+        _ => LogFormat::Text,
+    }
+}
+
+fn log_format_from_env() -> LogFormat {
+    parse_log_format(std::env::var(LOG_FORMAT_ENV).ok().as_deref())
+}
+
 /// The long-running daemon (lnrent-7fp.21): bootstrap the operator identity + config, open state
 /// ONCE, connect the Nostr engine, load the operator's recipe, and run the supervised M1a money path
 /// (IPC + Nostr inbound + settlement→capture + reconcile + maintenance) until a Ctrl-C / SIGTERM
 /// triggers a graceful shutdown.
 async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // Opt-in structured logging (lnrent-y4m.11): `LNRENT_LOG_FORMAT=json` initializes the JSON
+    // formatter so a stranger-operator can ship the money-event structured fields to Loki/ELK for
+    // log-based alerting; unset/anything else stays TODAY'S plaintext (the text branch is the
+    // literal, byte-for-byte-unchanged `fmt::init()`). Encoding ONLY — same fields, same level
+    // filtering, no RUST_LOG change. JSON logs are a pull/scrape path, NOT a substitute for the
+    // push alert sink (PR-5).
+    match log_format_from_env() {
+        LogFormat::Json => tracing_subscriber::fmt().json().init(),
+        LogFormat::Text => tracing_subscriber::fmt::init(),
+    }
 
     // With the `fedimint` feature the dependency tree has BOTH rustls providers (aws-lc-rs from
     // fedimint, ring from nostr), so rustls cannot auto-pick one — install aws-lc-rs as the process
@@ -830,6 +865,19 @@ mod tests {
 
     // Process-global env mutation must be serialized across tests.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // lnrent-y4m.11: the log-format selector. Only a case-insensitive "json" opts into JSON; unset,
+    // "text", and any typo fall back to Text so a bad value never silently changes logging.
+    #[test]
+    fn log_format_selector_defaults_to_text_and_only_json_opts_in() {
+        assert_eq!(parse_log_format(None), LogFormat::Text);
+        assert_eq!(parse_log_format(Some("text")), LogFormat::Text);
+        assert_eq!(parse_log_format(Some("json")), LogFormat::Json);
+        assert_eq!(parse_log_format(Some("JSON")), LogFormat::Json);
+        assert_eq!(parse_log_format(Some("  json  ")), LogFormat::Json);
+        assert_eq!(parse_log_format(Some("")), LogFormat::Text);
+        assert_eq!(parse_log_format(Some("yaml")), LogFormat::Text, "an unknown value is safe text");
+    }
 
     // lnrent-y4m.7 Part A: the single-threaded scrub removes the seed/secret env vars from the
     // daemon's own in-process environment, so `std::env::var` returns Err afterward. (We do NOT

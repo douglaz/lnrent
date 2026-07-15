@@ -22,7 +22,7 @@ toml = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util", "net", "signal"] }
 # Engine-owned graceful shutdown tracking for accepted inbound Nostr work.
 tokio-util = { version = "0.7", features = ["rt"] }
