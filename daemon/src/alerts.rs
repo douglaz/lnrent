@@ -100,6 +100,8 @@ pub enum AlertKind {
     /// An operator sweep was parked FAILED (a gateway-fee rise refused the capped pay, or a
     /// crash-recovered intent was superseded by a new liability) — gate1-operator-sweep (urw.3).
     SweepFailed,
+    /// An operator sweep has sat PENDING past the stuck threshold without progressing.
+    SweepStuck,
 }
 
 impl AlertKind {
@@ -113,6 +115,7 @@ impl AlertKind {
             AlertKind::HoldingsLow => "holdings_low",
             AlertKind::PaidServiceDestroyed => "paid_service_destroyed",
             AlertKind::SweepFailed => "sweep_failed",
+            AlertKind::SweepStuck => "sweep_stuck",
         }
     }
 }
