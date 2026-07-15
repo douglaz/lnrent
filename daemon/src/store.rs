@@ -445,29 +445,65 @@ pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 /// Apply any pending migrations, keyed on `PRAGMA user_version`. Idempotent: opening a
 /// current DB is a no-op; opening a v0 DB applies the §11 schema and sets `user_version=1`.
 pub fn migrate(conn: &Connection) -> Result<()> {
+    apply_migrations(conn, MIGRATIONS)
+}
+
+/// The migration engine, parameterized on the migration set so the ATOMICITY guarantee is
+/// unit-testable with a synthetic failing migration (lnrent-y4m.5). Each migration batch AND its
+/// `user_version` bump run inside ONE `BEGIN IMMEDIATE..COMMIT`, rolled back on any error: so
+/// `user_version` NEVER advances past a partially-applied migration, and a crash mid-migration
+/// leaves a clean pre-migration DB that re-applies fresh on the next open. SQLite DDL is
+/// transactional and `PRAGMA user_version` — a page-1 header field — is written inside the txn and
+/// rolls back with it (proven by `migration_rolls_back_atomically_on_failure`). A future
+/// MULTI-statement migration that half-applies (a crash between two of its statements, or between
+/// the batch and the bump) can therefore no longer corrupt the money DB's schema. Idempotent: a
+/// current DB is a no-op.
+fn apply_migrations(conn: &Connection, migrations: &[&str]) -> Result<()> {
     let mut current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    while (current as usize) < MIGRATIONS.len() {
-        if let Err(e) = conn.execute_batch(MIGRATIONS[current as usize]) {
-            if current == 2
-                && is_duplicate_suspend_not_before(&e)
-                && has_column(conn, "subscription", "suspend_not_before")?
-            {
-                // Fresh DBs apply the current CREATE TABLE first; legacy v2 DBs get the ALTER.
-            } else if current == 3 && is_duplicate_refund_resolution(&e) {
-                // Fresh DBs already have the resolver columns from the §11 schema, so the FIRST ALTER
-                // in the M4 batch is a duplicate — and `execute_batch` aborts at that first duplicate.
-                // A crash that applied only SOME of the three columns (user_version still 3) would
-                // re-enter here with the rest still missing, so add each MISSING column individually:
-                // a partially-applied migration self-heals instead of failing startup (review P2).
-                ensure_refund_resolution_columns(conn)?;
-            } else {
-                return Err(e.into());
+    while (current as usize) < migrations.len() {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        match apply_one_migration(conn, migrations, current) {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                current += 1;
+            }
+            Err(e) => {
+                // Undo the partial DDL AND the un-bumped user_version — the step is all-or-nothing.
+                // ROLLBACK's own failure must not mask the real migration error.
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
             }
         }
-        // user_version can't be a bound parameter; the value is an internal counter, not input.
-        conn.execute_batch(&format!("PRAGMA user_version = {}", current + 1))?;
-        current += 1;
     }
+    Ok(())
+}
+
+/// Apply ONE migration batch + its `user_version` bump; the caller wraps this in a transaction so
+/// the pair is atomic. The M3/M4 duplicate-column self-heal is preserved (a fresh DB already has
+/// the columns from the §11 schema, so the leading ALTER duplicates — caught and healed here —
+/// while a REAL error propagates to trigger the caller's ROLLBACK). The self-heal is gated on BOTH
+/// the specific migration index AND the specific duplicate-column error, so a synthetic test
+/// migration failing for any other reason never trips it.
+fn apply_one_migration(conn: &Connection, migrations: &[&str], current: i64) -> Result<()> {
+    if let Err(e) = conn.execute_batch(migrations[current as usize]) {
+        if current == 2
+            && is_duplicate_suspend_not_before(&e)
+            && has_column(conn, "subscription", "suspend_not_before")?
+        {
+            // Fresh DBs apply the current CREATE TABLE first; legacy v2 DBs get the ALTER.
+        } else if current == 3 && is_duplicate_refund_resolution(&e) {
+            // Fresh DBs already have the resolver columns from the §11 schema, so the FIRST ALTER
+            // in the M4 batch is a duplicate — and `execute_batch` aborts at that first duplicate.
+            // A crash that applied only SOME of the three columns (user_version still 3) would
+            // re-enter here with the rest still missing, so add each MISSING column individually:
+            // a partially-applied migration self-heals instead of failing startup (review P2).
+            ensure_refund_resolution_columns(conn)?;
+        } else {
+            return Err(e.into());
+        }
+    }
+    // user_version can't be a bound parameter; the value is an internal counter, not input.
+    conn.execute_batch(&format!("PRAGMA user_version = {}", current + 1))?;
     Ok(())
 }
 
@@ -1221,6 +1257,63 @@ mod tests {
         // `teardown_failure` (SCHEMA + migration 7, lnrent-urw.2) plus `sweep_attempt` (SCHEMA +
         // migration 8, gate1-operator-sweep, urw.3).
         assert_eq!(n, 18);
+    }
+
+    // lnrent-y4m.5: a migration + its user_version bump is ONE transaction. A synthetic migration
+    // whose SECOND statement fails must leave NOTHING behind — user_version unadvanced AND the
+    // first statement's table rolled back. This also proves PRAGMA user_version is transactional
+    // (the load-bearing assumption): if the header write did not roll back, user_version would be 1.
+    #[test]
+    fn migration_rolls_back_atomically_on_failure() {
+        let conn = Connection::open_in_memory().unwrap();
+        let bad = &["CREATE TABLE m5_probe (x INTEGER); INSERT INTO m5_absent VALUES (1);"];
+        let err = apply_migrations(&conn, bad).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("m5_absent")
+                || err.to_string().to_lowercase().contains("no such table"),
+            "expected the second statement to fail: {err}"
+        );
+        let uv: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 0, "user_version must not advance past a failed migration");
+        let probe: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='m5_probe'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(probe, 0, "the first statement's CREATE TABLE must roll back too");
+    }
+
+    // The success + idempotency half: a valid migration applies its DDL AND bumps user_version
+    // atomically, and re-running at the current version is a no-op.
+    #[test]
+    fn migration_applies_and_bumps_then_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        let one = &["CREATE TABLE m5_ok (x INTEGER);"];
+        apply_migrations(&conn, one).unwrap();
+        assert_eq!(
+            conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap(),
+            1
+        );
+        let ok: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='m5_ok'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ok, 1);
+        // Idempotent: current == migrations.len(), so the loop body never runs.
+        apply_migrations(&conn, one).unwrap();
+        assert_eq!(
+            conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap(),
+            1
+        );
     }
 
     // M6: the maintenance pass scans event_log every few seconds on the sole-writer connection;
