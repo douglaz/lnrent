@@ -225,6 +225,18 @@ fn harden_private_file(path: &Path, what: &str) -> Result<()> {
 /// in `WaitingForRefund`) from blocking the serial Refunder / maintenance pass (codex P1).
 const PAY_AWAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Retention floor for reapable CANCELED `fedimint_invoice` rows before the best-effort GC
+/// ([`gc_fedimint_invoice_index`], lnrent-y4m.15) may delete them (PAID rows are left — see that fn).
+/// Mirrors store.rs's `TERMINAL_ROW_RETENTION_SECS` (30 days).
+const FEDIMINT_INDEX_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// Minimum spacing between two flood-path index GC sweeps (lnrent-y4m.15): a burst of
+/// `create_invoice`s triggers at most one GC per hour ([`FedimintPayment::gc_index_if_due`]). The
+/// throttle is TIME-based via the injected `self.clock`, so tests drive it deterministically with a
+/// `TestClock`. A const, not a config knob — the reap is bounded, best-effort maintenance with no
+/// operator-tunable policy (matching store.rs's single-const discipline).
+const INDEX_GC_INTERVAL_SECS: i64 = 3600;
+
 const INDEX_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS fedimint_invoice (
     external_id   TEXT PRIMARY KEY,
@@ -238,6 +250,11 @@ CREATE TABLE IF NOT EXISTS fedimint_invoice (
     settled_at    INTEGER
 );
 CREATE INDEX IF NOT EXISTS fedimint_invoice_by_invoice_id ON fedimint_invoice (invoice_id);
+-- Backs the y4m.15 GC predicate (status='CANCELED' AND expires_at < cutoff). Under the
+-- distinct-external_id unpaid-order flood this table can hold hundreds of thousands of rows;
+-- without this index the hourly reap DELETE would full-scan while holding the sole index mutex
+-- that create/lookup/settlement synchronously wait on (review P2). Applies to existing DBs on open.
+CREATE INDEX IF NOT EXISTS fedimint_invoice_gc_idx ON fedimint_invoice (status, expires_at);
 CREATE TABLE IF NOT EXISTS fedimint_pay (
     idempotency_key  TEXT PRIMARY KEY,
     operation_id     TEXT NOT NULL,
@@ -276,6 +293,11 @@ pub struct FedimintPayment {
     /// Serializes outbound pay check->start->index so two concurrent same-key callers cannot both see
     /// an absent pay-index row before either has inserted the PENDING operation.
     pay_start_lock: tokio::sync::Mutex<()>,
+    /// Last time the terminal-index GC ran ([`gc_index_if_due`](Self::gc_index_if_due)), unix seconds
+    /// via `self.clock` (init 0, so the first production `create_invoice` sweeps). Throttles the
+    /// flood-path GC to at most one run per [`INDEX_GC_INTERVAL_SECS`]. The reap uses the distinct
+    /// `index` Mutex and the driver runs after `create_lock` is dropped, so the locks are never nested.
+    last_index_gc_at: Mutex<i64>,
 }
 
 impl FedimintPayment {
@@ -379,12 +401,13 @@ impl FedimintPayment {
             gateways,
             create_lock: tokio::sync::Mutex::new(()),
             pay_start_lock: tokio::sync::Mutex::new(()),
+            last_index_gc_at: Mutex::new(0),
         };
 
         // Backfill any invoice fedimint committed but the daemon never indexed (the crash window
         // between minting and idx_insert). FAIL-CLOSED (codex P1): refusing to start on a recovery
         // error is safer for real money than reopening the duplicate-mint window by continuing.
-        let recovered = recover_index_from_oplog(&me.client, &me.index)
+        let recovered = recover_index_from_oplog(&me.client, &me.index, me.clock.now())
             .await
             .context("fedimint: oplog index recovery failed; refusing to start")?;
         if recovered > 0 {
@@ -837,6 +860,34 @@ impl FedimintPayment {
         pay_idx_upsert(&self.index, idempotency_key, &op_hex, "PENDING", kind)?;
         Ok(outgoing.payment_type)
     }
+
+    /// Throttled, best-effort driver for the terminal `fedimint_invoice` index GC (lnrent-y4m.15),
+    /// called at the END of a successful `create_invoice` after the mint committed and OUTSIDE
+    /// `create_lock`. [`index_gc_due_and_stamp`] gates it to at most one reap per
+    /// [`INDEX_GC_INTERVAL_SECS`] over `last_index_gc_at`, timed by the injected `self.clock`
+    /// (deterministic under a `TestClock`). The SQLite work runs on Tokio's blocking pool so it does
+    /// not hold up the successful create response. BEST-EFFORT: a reap error is logged and swallowed,
+    /// so GC never changes the result of the already-committed mint.
+    fn gc_index_if_due(&self) {
+        let now = self.clock.now();
+        if !index_gc_due_and_stamp(&self.last_index_gc_at, now, INDEX_GC_INTERVAL_SECS) {
+            return;
+        }
+        let index = self.index.clone();
+        drop(tokio::task::spawn_blocking(
+            move || match gc_fedimint_invoice_index(&index, now, FEDIMINT_INDEX_RETENTION_SECS) {
+                Ok(0) => {}
+                Ok(reaped) => tracing::info!(
+                    reaped,
+                    "fedimint: reaped terminal invoice index rows past retention"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "fedimint: best-effort invoice index GC failed; ignoring"
+                ),
+            },
+        ));
+    }
 }
 
 /// The pre-send outlay ceiling [`FedimintPayment::pay_inner`] enforces before starting a NEW
@@ -891,7 +942,7 @@ impl PaymentBackend for FedimintPayment {
     ) -> Result<Invoice> {
         // Serialize check->mint->insert so two concurrent same-external_id callers can't both mint
         // (codex P1): the second waits here, then finds the index populated and returns the winner.
-        let _create_guard = self.create_lock.lock().await;
+        let create_guard = self.create_lock.lock().await;
         // Idempotent on external_id: a repeat (or crash-retry) returns the stored invoice, never a
         // second gateway invoice.
         if let Some(inv) = idx_get_by_external(&self.index, external_id)? {
@@ -957,6 +1008,10 @@ impl PaymentBackend for FedimintPayment {
                 true, // live: a freshly-created invoice pushes Settlement on Claimed
             ));
         }
+
+        // Never schedule index GC while holding create_lock.
+        drop(create_guard);
+        self.gc_index_if_due();
 
         Ok(inv)
     }
@@ -1265,6 +1320,9 @@ async fn run_receive_task(
                         })
                         .await;
                 }
+                // Poll once past the terminal update so Fedimint's caching wrapper persists the
+                // Claimed outcome in its operation log before this task drops the stream.
+                let _ = stream.next().await;
                 return;
             }
             LnReceiveState::Canceled { reason } => {
@@ -1275,6 +1333,10 @@ async fn run_receive_task(
                 if let Err(e) = idx_mark_canceled(&index, &op_hex) {
                     tracing::warn!(op = %op_hex, error = %e, "fedimint: marking canceled receive in index failed");
                 }
+                // The operation-log wrapper caches a terminal outcome only when polled through
+                // stream completion. Recovery can then distinguish this canceled operation from a
+                // paid one after the CANCELED index row is reaped.
+                let _ = stream.next().await;
                 return;
             }
             _ => {}
@@ -1284,10 +1346,13 @@ async fn run_receive_task(
 
 /// Scan the fedimint operation log for Receive ops stamped with an `lnrent_external_id` that the
 /// index is missing, and backfill them — closing the window where fedimint committed an invoice but
-/// the daemon crashed before persisting the index row (codex finding #3).
+/// the daemon crashed before persisting the index row (codex finding #3). A cached Canceled outcome
+/// is the only safe skip: invoice age alone cannot distinguish an unpaid expiry from a payment that
+/// settled while the daemon was down.
 async fn recover_index_from_oplog(
     client: &ClientHandleArc,
     index: &Arc<Mutex<Connection>>,
+    now: i64,
 ) -> Result<usize> {
     let log = client.operation_log();
     let mut backfilled = 0usize;
@@ -1312,6 +1377,23 @@ async fn recover_index_from_oplog(
             let LightningOperationMetaVariant::Receive { invoice, .. } = &meta.variant else {
                 continue;
             };
+            let outcome = match entry.try_outcome::<LnReceiveState>() {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "fedimint: receive outcome is undecodable; backfilling conservatively"
+                    );
+                    None
+                }
+            };
+            let expires_at = invoice
+                .expires_at()
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if !receive_backfill_needed(outcome.as_ref(), expires_at, now) {
+                continue;
+            }
             let Some(ext) = meta
                 .extra_meta
                 .get("lnrent_external_id")
@@ -1330,10 +1412,7 @@ async fn recover_index_from_oplog(
                 payment_hash: invoice.payment_hash().to_string(),
                 bolt11: invoice.to_string(),
                 amount_sat: invoice.amount_milli_satoshis().unwrap_or(0) / 1000,
-                expires_at: invoice
-                    .expires_at()
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0),
+                expires_at,
             };
             idx_insert(index, &inv, &op_hex)?;
             backfilled += 1;
@@ -1344,6 +1423,30 @@ async fn recover_index_from_oplog(
         }
     }
     Ok(backfilled)
+}
+
+/// Whether a receive operation found ONLY in the oplog should be re-indexed as a live invoice on
+/// recovery. Backfill iff it could still MATTER: it durably SETTLED (`Claimed` — the row is needed
+/// for settlement catch-up / refund provenance), OR it is not yet expired and not terminally
+/// `Canceled` (still able to receive a payment). A receive that is EXPIRED and not `Claimed` is
+/// DEAD and must NEVER be resurrected as OPEN — this is the y4m.15 review P1: a legacy or
+/// crash-window CANCELED invoice has an oplog outcome of `None` (the old receive task returned on
+/// the terminal item before Fedimint's wrapper cached the outcome — same EOF-drain gap as the pay
+/// dead-op ledger), so once the GC reaps its row, an outcome-only rule would re-backfill it as OPEN
+/// on the next restart, `watch()` would respawn every historical invoice, and the storage bound the
+/// GC exists to provide would be undone. The expiry gate closes that for every `None`/`Canceled`
+/// dead row while still recovering a genuinely live (unexpired) or settled (`Claimed`) one.
+///
+/// `expires_at == 0` (an unparseable/absent bolt11 expiry) is treated as NOT expired, so a live
+/// invoice with an odd expiry is never dropped — a missed settlement would be a money bug, whereas
+/// the worst case here (re-indexing a rare no-expiry dead row) is a storage nit; fedimint always
+/// sets an expiry, so this cannot mask a real dead row in practice.
+fn receive_backfill_needed(outcome: Option<&LnReceiveState>, expires_at: i64, now: i64) -> bool {
+    if matches!(outcome, Some(LnReceiveState::Claimed)) {
+        return true;
+    }
+    let expired = expires_at != 0 && expires_at < now;
+    !expired && !matches!(outcome, Some(LnReceiveState::Canceled { .. }))
 }
 
 /// Symmetric to [`recover_index_from_oplog`] but for OUTBOUND pays (lnrent-4gt). A crash in [`pay`]'s
@@ -1668,6 +1771,83 @@ fn idx_mark_canceled(index: &Mutex<Connection>, op_hex: &str) -> Result<()> {
         params![op_hex],
     )?;
     Ok(())
+}
+
+/// Reap past-retention CANCELED `fedimint_invoice` rows, returning the number deleted. A
+/// distinct-`external_id` unpaid-order flood inserts one CANCELED row per expired request and
+/// previously retained it forever — this is the flood fix.
+///
+/// The cutoff is clock-capped exactly as store.rs does (`< MIN(unixepoch(), ?now) - ?retention`):
+/// `MIN` pins it to whichever of real wall time or injected `now` is earlier, so a clock running ahead
+/// cannot reap a fresh row.
+///
+/// ONLY CANCELED rows are reaped. OPEN rows may still settle and are never touched. PAID rows are
+/// deliberately NOT reaped here, for two independent reasons (both raised in round-12 review):
+///  - It would be INEFFECTIVE: `recover_index_from_oplog` re-backfills any reaped PAID op from its
+///    cached `Claimed` oplog outcome (`receive_backfill_needed(Some(Claimed), ..) == true`) as an
+///    OPEN row, which `watch()`→`run_receive_task(live=false)` then re-marks PAID via
+///    `idx_mark_paid(None)` — leaving `settled_at` NULL and the row PERMANENTLY un-reapable. The reap
+///    yields no durable storage bound across restarts, only churn.
+///  - It would be UNSAFE: the PAID row is the record the supervisor settlement catch-up reads via
+///    `lookup`/`lookup_settlement`. A live settlement whose credit never reached the store (dropped
+///    `Settlement` send, missed capture) leaves the store invoice OPEN while this row is PAID;
+///    deleting it on age alone — before capture is durable — could strand a real payment.
+///
+/// PAID rows are also NOT a free-flood vector (a PAID row means a buyer actually paid, so it is
+/// bounded by real economic activity, exactly like `fedimint_pay`). Safe PAID-row tidy-up needs a
+/// trustworthy, recovery-stable timestamp and cross-DB proof the store captured the settlement; that
+/// design is deferred to the follow-up bead **lnrent-y4m.19** (which already owns the analogous
+/// `fedimint_pay` GC), not bolted on here.
+fn gc_fedimint_invoice_index(
+    index: &Mutex<Connection>,
+    now: i64,
+    retention_secs: i64,
+) -> Result<usize> {
+    // FLOOD FIX: past-retention CANCELED rows only (see the fn doc for why PAID rows are left).
+    // CHUNKED (adversarial y4m.15 review P2): the first sweep on a flooded DB can face hundreds of
+    // thousands of rows, and this DELETE holds the sole `index` mutex that create/lookup/settlement
+    // take SYNCHRONOUSLY on async worker threads — one unbounded statement would stall the whole
+    // fedimint money path for its duration. Delete in bounded batches by rowid, RELEASING the lock
+    // between batches so those callers interleave. `expires_at > 0` excludes a no/unparseable-expiry
+    // row (the review P3): its `0` sidesteps the retention floor AND recovery keeps it live
+    // (`receive_backfill_needed(None, 0, _) == true`), so reaping it would just churn a
+    // reap→rebackfill loop across restarts — GC and recovery must agree to leave it.
+    const BATCH: usize = 512;
+    let mut total = 0usize;
+    loop {
+        let deleted = {
+            let conn = index.lock().unwrap();
+            conn.execute(
+                "DELETE FROM fedimint_invoice WHERE rowid IN (
+                     SELECT rowid FROM fedimint_invoice
+                      WHERE status = 'CANCELED'
+                        AND expires_at > 0
+                        AND expires_at < MIN(unixepoch(), ?1) - ?2
+                      LIMIT ?3)",
+                params![now, retention_secs, BATCH],
+            )?
+        }; // lock released here — other index callers can run before the next batch
+        total += deleted;
+        if deleted < BATCH {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// Deterministic throttle gate for the create-path index GC (lnrent-y4m.15): under `last`'s lock,
+/// whether a GC is DUE (>= `interval_secs` since the last run) and, when due, STAMP `last = now` so a
+/// burst of creates triggers at most ONE reap per interval. Returns whether the caller should run it.
+/// Time-based via the injected clock's `now`, so the throttle is unit-tested with a `TestClock` and
+/// needs no live federation.
+fn index_gc_due_and_stamp(last: &Mutex<i64>, now: i64, interval_secs: i64) -> bool {
+    let mut last = last.lock().unwrap();
+    // A corrected-backward wall clock must not leave a future stamp suppressing GC indefinitely.
+    if now >= *last && now - *last < interval_secs {
+        return false;
+    }
+    *last = now;
+    true
 }
 
 // ---- the lnrent-owned outbound-pay index (refund idempotency, keyed by idempotency_key) ----------
@@ -2156,6 +2336,246 @@ mod index_tests {
         pay_idx_mark(&index, "key", "op-B", "SUCCEEDED").unwrap();
         let (op, status, _) = pay_idx_get(&index, "key").unwrap().unwrap();
         assert_eq!((op.as_str(), status.as_str()), ("op-B", "SUCCEEDED"));
+    }
+}
+
+#[cfg(test)]
+mod index_gc_tests {
+    //! Terminal `fedimint_invoice` index GC unit tests (lnrent-y4m.15). These are feature-gated with
+    //! the backend and exercise standalone seams without a live federation.
+    use super::{
+        gc_fedimint_invoice_index, index_gc_due_and_stamp, receive_backfill_needed,
+        FEDIMINT_INDEX_RETENTION_SECS, INDEX_GC_INTERVAL_SECS, INDEX_SCHEMA,
+    };
+    use crate::clock::{Clock, SystemClock, TestClock};
+    use fedimint_ln_client::receive::LightningReceiveError;
+    use fedimint_ln_client::LnReceiveState;
+    use rusqlite::{params, Connection};
+    use std::sync::Mutex;
+
+    /// Seed one row with an explicit status / expires_at / settled_at into a fresh in-memory index.
+    fn seed(conn: &Connection, ext: &str, status: &str, expires_at: i64, settled_at: Option<i64>) {
+        conn.execute(
+            "INSERT INTO fedimint_invoice
+               (external_id, operation_id, invoice_id, bolt11, payment_hash, amount_sat,
+                expires_at, status, settled_at)
+             VALUES (?1, ?2, ?3, 'lnbc1…', 'hash', 100, ?4, ?5, ?6)",
+            params![
+                ext,
+                format!("op-{ext}"),
+                format!("inv-{ext}"),
+                expires_at,
+                status,
+                settled_at
+            ],
+        )
+        .unwrap();
+    }
+
+    fn count(index: &Mutex<Connection>) -> i64 {
+        index
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM fedimint_invoice", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn exists(index: &Mutex<Connection>, ext: &str) -> bool {
+        let n: i64 = index
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM fedimint_invoice WHERE external_id = ?1",
+                params![ext],
+                |r| r.get(0),
+            )
+            .unwrap();
+        n > 0
+    }
+
+    // The flood reap deletes past-retention CANCELED rows ONLY. OPEN rows may still settle. PAID rows
+    // are NEVER reaped here (recovery would resurrect them un-reapably, and they back the settlement
+    // catch-up) — regardless of whether settled_at is known or NULL; see gc_fedimint_invoice_index.
+    #[test]
+    fn reaps_only_canceled_rows_past_retention() {
+        // A synthetic clock well below real unixepoch(), so MIN(unixepoch(), now) == now (the store.rs
+        // reaper idiom): cutoff = now - RETENTION. Rows strictly before the cutoff are reapable.
+        let now = 2 * FEDIMINT_INDEX_RETENTION_SECS;
+        let cutoff = FEDIMINT_INDEX_RETENTION_SECS; // now - RETENTION
+        let old = cutoff - 1; // strictly past the window -> reapable (if CANCELED)
+        let boundary = cutoff; // EXACTLY at the cutoff -> kept (strict `<`)
+        let recent = now; // within retention -> kept
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(INDEX_SCHEMA).unwrap();
+        // REAPED: only the past-retention CANCELED row.
+        seed(&conn, "canceled-old", "CANCELED", old, None);
+        // SURVIVES: a PAID row is never reaped even with a known, past-retention settled_at.
+        seed(&conn, "paid-old", "PAID", 0, Some(old));
+        seed(&conn, "canceled-boundary", "CANCELED", boundary, None); // strict `<` keeps the boundary
+        seed(&conn, "canceled-recent", "CANCELED", recent, None);
+        seed(&conn, "open-ancient", "OPEN", old, None); // OPEN has no terminal -> never reaped
+        seed(&conn, "paid-recent", "PAID", 0, Some(recent));
+        seed(&conn, "paid-null-settled", "PAID", old, None); // NULL settled_at -> never reaped either
+
+        let index = Mutex::new(conn);
+
+        let reaped = gc_fedimint_invoice_index(&index, now, FEDIMINT_INDEX_RETENTION_SECS).unwrap();
+        assert_eq!(reaped, 1, "only the past-retention CANCELED row is reaped");
+        assert!(!exists(&index, "canceled-old"));
+        assert!(exists(&index, "paid-old"), "PAID rows are never reaped");
+        assert!(exists(&index, "canceled-boundary"));
+        assert!(exists(&index, "canceled-recent"));
+        assert!(exists(&index, "open-ancient"));
+        assert!(exists(&index, "paid-recent"));
+        assert!(exists(&index, "paid-null-settled"));
+        assert_eq!(count(&index), 6);
+
+        // Idempotent: a second sweep at the same clock removes nothing more.
+        assert_eq!(
+            gc_fedimint_invoice_index(&index, now, FEDIMINT_INDEX_RETENTION_SECS).unwrap(),
+            0
+        );
+    }
+
+    // Adversarial y4m.15 review: the reap is CHUNKED (bounded mutex hold on a flooded DB), so a
+    // backlog larger than one batch is fully drained across batches; and a no-expiry (`expires_at
+    // == 0`) CANCELED row is NEVER reaped (P3) so GC and recovery agree to leave it (recovery keeps
+    // it live), avoiding a reap→rebackfill churn loop.
+    #[test]
+    fn reap_is_chunked_and_skips_zero_expiry_rows() {
+        let now = 2 * FEDIMINT_INDEX_RETENTION_SECS;
+        let old = FEDIMINT_INDEX_RETENTION_SECS - 1; // strictly past the window
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(INDEX_SCHEMA).unwrap();
+        // A backlog well over one 512-row batch — the batch loop must drain all of them.
+        let reapable = 512 * 2 + 37;
+        for i in 0..reapable {
+            seed(&conn, &format!("flood-{i}"), "CANCELED", old, None);
+        }
+        // A no-expiry CANCELED row: past the window by the `0 < cutoff` arithmetic, but excluded by
+        // `expires_at > 0` so it survives (recovery would keep it live).
+        seed(&conn, "canceled-zero-expiry", "CANCELED", 0, None);
+
+        let index = Mutex::new(conn);
+        let reaped = gc_fedimint_invoice_index(&index, now, FEDIMINT_INDEX_RETENTION_SECS).unwrap();
+        assert_eq!(reaped, reapable, "the whole backlog is drained across batches");
+        assert!(
+            exists(&index, "canceled-zero-expiry"),
+            "a zero-expiry CANCELED row is never reaped (GC/recovery agree to keep it)"
+        );
+        assert_eq!(count(&index), 1);
+    }
+
+    // The clock-cap (MIN(unixepoch(), now)): a wall clock that jumped far into the FUTURE cannot reap a
+    // fresh row. With `now` set absurdly high, the cutoff pins to the REAL unixepoch(), so a CANCELED
+    // row that just became terminal remains within retention and survives.
+    #[test]
+    fn future_now_cannot_reap_a_fresh_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(INDEX_SCHEMA).unwrap();
+        let real_now = SystemClock.now();
+        seed(&conn, "fresh-canceled", "CANCELED", real_now, None);
+        let index = Mutex::new(conn);
+
+        let huge_now = real_now + 10 * FEDIMINT_INDEX_RETENTION_SECS; // a badly-fast wall clock
+        let reaped =
+            gc_fedimint_invoice_index(&index, huge_now, FEDIMINT_INDEX_RETENTION_SECS).unwrap();
+        assert_eq!(
+            reaped, 0,
+            "a future `now` cannot reap a row fresh by the real clock"
+        );
+        assert!(exists(&index, "fresh-canceled"));
+    }
+
+    // Recovery backfills a receive iff it could still matter: settled (Claimed) or live (unexpired
+    // and not canceled). It must NOT resurrect a DEAD receive — the y4m.15 review P1: a legacy /
+    // crash-window CANCELED invoice has a `None` oplog outcome, so once the GC reaps its row an
+    // outcome-only rule would re-backfill it as OPEN on restart and `watch()` would respawn every
+    // historical invoice, undoing the storage bound. The expiry gate closes that.
+    #[test]
+    fn recovery_backfills_live_or_settled_but_never_a_dead_receive() {
+        const NOW: i64 = 1_000_000;
+        let canceled = LnReceiveState::Canceled {
+            reason: LightningReceiveError::Timeout,
+        };
+        let past = NOW - 1;
+        let future = NOW + 1;
+
+        // Settled (Claimed) always recovers — needed for settlement catch-up / refund provenance —
+        // even long past expiry.
+        assert!(receive_backfill_needed(Some(&LnReceiveState::Claimed), past, NOW));
+        // Live: unexpired, not-yet-terminal (None) or explicitly open — recover and watch it.
+        assert!(receive_backfill_needed(None, future, NOW));
+        // THE P1: expired + None (a legacy/crash-window canceled row) — DEAD, never resurrect.
+        assert!(!receive_backfill_needed(None, past, NOW));
+        // Expired + decodable Canceled — DEAD.
+        assert!(!receive_backfill_needed(Some(&canceled), past, NOW));
+        // Unexpired + Canceled — terminally dead even before expiry; skip.
+        assert!(!receive_backfill_needed(Some(&canceled), future, NOW));
+        // expires_at == 0 (unparseable/absent expiry) is treated as NOT expired, so a live invoice
+        // with an odd expiry is never dropped (a missed settlement would be a money bug).
+        assert!(receive_backfill_needed(None, 0, NOW));
+    }
+
+    // The throttle: two GC-due checks within the interval run the reap AT MOST once; after the interval
+    // elapses it runs again. Driven by a TestClock (deterministic, no federation).
+    #[test]
+    fn throttle_runs_at_most_once_per_interval() {
+        let last = Mutex::new(0i64);
+        let clock = TestClock::new(1_000_000);
+
+        // First check: due (last==0, now huge) -> runs, and stamps last=now.
+        assert!(index_gc_due_and_stamp(
+            &last,
+            clock.now(),
+            INDEX_GC_INTERVAL_SECS
+        ));
+        // A second check moments later, still within the interval -> NOT due (at most one per burst).
+        clock.advance(INDEX_GC_INTERVAL_SECS - 1);
+        assert!(!index_gc_due_and_stamp(
+            &last,
+            clock.now(),
+            INDEX_GC_INTERVAL_SECS
+        ));
+        // One more second reaches the interval boundary (>=) -> due again, stamps again.
+        clock.advance(1);
+        assert!(index_gc_due_and_stamp(
+            &last,
+            clock.now(),
+            INDEX_GC_INTERVAL_SECS
+        ));
+        // Immediately after that run -> not due.
+        assert!(!index_gc_due_and_stamp(
+            &last,
+            clock.now(),
+            INDEX_GC_INTERVAL_SECS
+        ));
+    }
+
+    #[test]
+    fn throttle_recovers_from_a_backward_clock_correction() {
+        let last = Mutex::new(0i64);
+        let future = 5_000_000_000i64;
+        assert!(index_gc_due_and_stamp(
+            &last,
+            future,
+            INDEX_GC_INTERVAL_SECS
+        ));
+
+        let corrected = 1_700_000_000i64;
+        assert!(index_gc_due_and_stamp(
+            &last,
+            corrected,
+            INDEX_GC_INTERVAL_SECS
+        ));
+        assert_eq!(*last.lock().unwrap(), corrected);
+        assert!(!index_gc_due_and_stamp(
+            &last,
+            corrected + INDEX_GC_INTERVAL_SECS - 1,
+            INDEX_GC_INTERVAL_SECS
+        ));
     }
 }
 
