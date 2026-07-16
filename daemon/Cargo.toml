@@ -91,22 +91,27 @@ lightning-invoice = { version = "0.33", features = ["std"] }
 hex = "0.4"
 
 # --- Real Fedimint backend (lnrent-7fp.4), behind the `fedimint` feature (DEFAULT ON; build with --no-default-features for the mock-only path) ---
-# Pinned to UPSTREAM fedimint v0.11.1 (tag commit 42ac7c9a — identical on the local checkout and on
-# github.com/fedimint/fedimint). A public git source so the repo is reproducible off this box and CI
-# can build the fedimint money path. Daemon-only (a 2nd DB engine, RocksDB C++; glibc-dynamic,
-# ADR-0015); never compiled into the wasm buyer. All optional so mock builds don't pull this tree.
-fedimint-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
-fedimint-core = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
+# Pinned to douglaz/fedimint branch `v0.11.1-pay-idempotency` = UPSTREAM v0.11.1 (tag commit
+# 2620789) + ONE backported fix: pay_bolt11_invoice checks its per-payment-hash idempotency
+# (completed-payment short-circuit + PreviousPaymentAttemptStillInProgress) BEFORE invoice expiry,
+# so re-submitting an already-attempted invoice yields the idempotent answer even after it lapses
+# (upstream PR fedimint/fedimint#8818, lnrent-7y1; Cargo.lock pins the exact rev). Return to the
+# upstream tag once a release includes the fix. A public git source so the repo is reproducible off
+# this box and CI can build the fedimint money path. Daemon-only (a 2nd DB engine, RocksDB C++;
+# glibc-dynamic, ADR-0015); never compiled into the wasm buyer. All optional so mock builds don't
+# pull this tree.
+fedimint-client = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
+fedimint-core = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
 # The federation-API trait (`IGlobalFederationApi`), for the lnrent-urw.4 liveness probe: a cheap
 # `session_count()` guardian round-trip. Not re-exported by fedimint-client, so a direct dep.
-fedimint-api-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
-fedimint-rocksdb = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
-fedimint-derive-secret = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
-fedimint-connectors = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
-fedimint-ln-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
-fedimint-ln-common = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
-fedimint-mint-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
-fedimint-wallet-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.1", optional = true }
+fedimint-api-client = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
+fedimint-rocksdb = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
+fedimint-derive-secret = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
+fedimint-connectors = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
+fedimint-ln-client = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
+fedimint-ln-common = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
+fedimint-mint-client = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
+fedimint-wallet-client = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
 # StreamExt::next on the fedimint settlement subscription streams (receive/pay state machines).
 futures-util = { version = "0.3", optional = true }
 
