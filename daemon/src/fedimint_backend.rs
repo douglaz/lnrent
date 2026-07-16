@@ -1571,6 +1571,17 @@ fn receive_backfill_needed(outcome: Option<&LnReceiveState>, expires_at: i64, no
 /// PENDING and ledger-dead candidates keep skipping); an undecodable oplog entry is logged +
 /// skipped (matching the receive side); `join_or_open` is fail-closed on a pass-level error
 /// (refuses to start).
+///
+/// This scan CANNOT be replaced by lazily re-paying the persisted invoice, even though our
+/// pinned client checks pay idempotency before invoice expiry (fedimint#8818, lnrent-7y1) and so
+/// answers a re-pay with the completed payment or the live attempt's op id (ADR-0017). The
+/// re-pay fall-through ("no completed payment, no active states") does NOT prove the recipient
+/// was never paid: the fedimint pay SM's `Refund` terminal only SUBMITS the refund tx, never
+/// observing acceptance, so a gateway that paid the recipient and claimed the contract while the
+/// daemon was down leaves that exact fall-through shape with the funds GONE (the refund tx
+/// rejects on the emptied contract). Only re-awaiting the operation's update stream — which this
+/// backfill enables — surfaces that difference (`Refunded` vs `UnexpectedError`, classified by
+/// [`classify_ln_pay_state`]); re-paying there would be an operator double-pay.
 async fn recover_pay_from_oplog(
     client: &ClientHandleArc,
     index: &Arc<Mutex<Connection>>,
@@ -2340,6 +2351,15 @@ enum PayStateClass {
     /// terminally-ambiguous op replays the same state on every re-subscribe, so it needs an
     /// operator/fedimint resolution, never an automatic second send. Marking FAILED here would let a
     /// later drive start a SECOND payment against a possibly-already-paid invoice (a double-pay).
+    ///
+    /// This arm is the SOLE guard for the rejected-refund shape (ADR-0017): a gateway that paid the
+    /// recipient and claimed the outgoing contract while the daemon was down leaves the pay SM in a
+    /// `Refund` terminal whose refund tx REJECTS on the emptied contract — the recipient was paid
+    /// from operator funds. fedimint's own per-invoice idempotency (`PaymentResult`) cannot see
+    /// refund-tx outcomes and reports that op exactly like a definitively-failed one; only this
+    /// stream classification (an accepted refund surfaces `Refunded` → [`Self::DefinitiveFailure`],
+    /// a rejected one `UnexpectedError` → here) tells them apart. Weakening it — or bypassing the
+    /// stream by trusting a re-pay's answer — reopens that double-pay.
     Ambiguous,
 }
 
