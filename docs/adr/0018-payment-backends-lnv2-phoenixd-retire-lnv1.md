@@ -61,5 +61,10 @@ to the simplification; cover the rest with backend choice, not with lnv1 mainten
 - There is no migration: lnrent is greenfield — no operator deployments exist. Retiring
   lnv1 means deleting it once a replacement backend is production-ready; the only lnv1
   wallet in the world is the author's own dogfood, drained by hand.
+- Refund destinations must be re-resolvable: order intake rejects raw bolt11 (requires
+  LN-address/LNURL), uniformly across backends — lnv2 cannot retry a failed send on the
+  same invoice, and per-generation re-resolution dissolves that gap structurally (it also
+  removes the cross-order same-invoice collision surface). Operator sweeps are unaffected
+  (interactive: a fresh invoice per attempt).
 - The Operator-seed backup story ("one backup covers identity AND the wallet") must be
   re-examined for phoenixd, which has its own seed.
