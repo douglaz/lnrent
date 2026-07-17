@@ -50,11 +50,13 @@ _Avoid_: tenant box, worker, node.
 ### Identity
 
 **Operator seed**:
-The single BIP39 mnemonic an Operator backs up. Every operator key derives from it: the
-Nostr identity keys (NIP-06) and the Fedimint client root secret (HKDF domain
-`lnrent:fedimint:v1`, §4.6). One backup covers identity AND the ecash client — but restoring
-the ecash position also needs the federation invite/config (the seed alone is not enough), so
-backup must include it. _Avoid_: wallet, private key.
+The single BIP39 mnemonic an Operator backs up. Every operator secret derives from it: the
+Nostr identity keys (NIP-06) and the Payment backend secret — the Fedimint client root
+secret (HKDF domain `lnrent:fedimint:v1`, §4.6) or the phoenixd seed (HKDF domain
+`lnrent:phoenixd:v1`). One backup covers identity AND the wallet — but restoring the wallet
+also needs the backend's config alongside the seed (the federation invite for Fedimint;
+phoenixd's channel recovery runs through its ACINQ peer), so backup must include it.
+_Avoid_: wallet, private key.
 
 **Master identity**:
 The Operator's brand, a Nostr key derived from the Operator seed at account 0.
