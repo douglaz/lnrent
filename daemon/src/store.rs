@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS invoice (
   kind               TEXT,    -- order | renewal
   bolt11             TEXT,
   amount_sat         INTEGER,
+  received_msat      INTEGER, -- actual wallet credit after backend receive fees; NULL on legacy rows
   status             TEXT,    -- OPEN | PAID | EXPIRED
   expires_at         INTEGER, -- bolt11 expiry; order reservation released at this
   applied_at         INTEGER, -- when settlement was captured/applied (durable applied marker)
@@ -418,13 +419,20 @@ UPDATE subscription SET next_deadline=NULL
  WHERE state IN ('PROVISIONING', 'REFUND_DUE', 'REFUNDED') AND next_deadline IS NOT NULL;
 ";
 
+// lnrent-3d5: lnv2 receiver-side gateway fees mean the wallet credit can be lower than the bolt11's
+// gross amount. Persist the exact msat credit so refunds, holdings, reconcile, and sweep authorization
+// never count that fee as spendable money. NULL preserves the lnv1/mock gross-credit meaning for
+// existing rows. Appended — never edit a shipped migration.
+const M11_INVOICE_RECEIVED_MSAT: &str =
+    "ALTER TABLE invoice ADD COLUMN received_msat INTEGER;";
+
 /// Ordered migrations (lnrent-7fp.3): index `i` upgrades the DB from schema version `i` to
 /// `i+1`. Version 1 is the §11 schema; version 2 adds `seen_message` (lnrent-7fp.5); version 3 adds
 /// `subscription.suspend_not_before` (lnrent-7fp.22); version 4 adds the `refund_attempt` resolver
 /// columns (lnrent-ug8); version 5 adds the idempotency-cache TTL-sweep indexes (lnrent-xjn);
 /// version 6 adds the event_log scan indexes; version 7 adds teardown failures; version 8 adds
 /// operator sweeps; version 9 adds terminal-row reaper indexes; version 10 backfills stale terminal
-/// deadline cursors (lnrent-y4m.4). A future
+/// deadline cursors (lnrent-y4m.4); version 11 records exact received msats (lnrent-3d5). A future
 /// schema change appends a new entry of `ALTER`/`CREATE` statements; **never edit a shipped migration**.
 const MIGRATIONS: &[&str] = &[
     SCHEMA,
@@ -437,6 +445,7 @@ const MIGRATIONS: &[&str] = &[
     M8_SWEEP_ATTEMPT,
     M9_TERMINAL_ROW_REAPER_INDEXES,
     M10_CLEAR_STALE_DEADLINE_CURSORS,
+    M11_INVOICE_RECEIVED_MSAT,
 ];
 
 /// The target schema version this binary expects (= number of migrations).
@@ -498,6 +507,11 @@ fn apply_one_migration(conn: &Connection, migrations: &[&str], current: i64) -> 
             // re-enter here with the rest still missing, so add each MISSING column individually:
             // a partially-applied migration self-heals instead of failing startup (review P2).
             ensure_refund_resolution_columns(conn)?;
+        } else if current == 10
+            && is_duplicate_received_msat(&e)
+            && has_column(conn, "invoice", "received_msat")?
+        {
+            // Fresh DBs already have the current column in SCHEMA; legacy v10 DBs get the ALTER.
         } else {
             return Err(e.into());
         }
@@ -522,6 +536,14 @@ fn is_duplicate_refund_resolution(e: &rusqlite::Error) -> bool {
             if msg.contains("duplicate column name: resolved_bolt11")
                 || msg.contains("duplicate column name: resolved_expiry")
                 || msg.contains("duplicate column name: resolution_gen")
+    )
+}
+
+fn is_duplicate_received_msat(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(_, Some(msg))
+            if msg.contains("duplicate column name: received_msat")
     )
 }
 
@@ -1034,13 +1056,16 @@ fn load_refund_readiness_liabilities(conn: &Connection) -> Result<Vec<RefundRead
                     -- MAX (not a bare grouped column): a REDELIVERED settlement re-journals the same
                     -- external_id, so aggregate deterministically — a NULL/malformed duplicate must
                     -- not zero out the real gross and understate `required_msat` (false coverage).
-                    MAX(CAST(json_extract(detail_json, '$.amount_sat') AS INTEGER)) AS amount_sat
+                    MAX(COALESCE(
+                        CAST(json_extract(detail_json, '$.received_msat') AS INTEGER) / 1000,
+                        CAST(json_extract(detail_json, '$.amount_sat') AS INTEGER)
+                    )) AS amount_sat
                FROM event_log
               WHERE kind IN ({SETTLE_REFUND_KINDS_SQL})
               GROUP BY external_id
          )
          SELECT r.external_id,
-                COALESCE(i.amount_sat, journal.amount_sat) AS received_sat,
+                COALESCE(i.received_msat / 1000, i.amount_sat, journal.amount_sat) AS received_sat,
                 r.status, r.idempotency_key, r.dest, r.resolved_bolt11,
                 r.resolved_expiry, r.resolution_gen
            FROM (
@@ -1103,7 +1128,11 @@ fn load_refund_readiness_liabilities(conn: &Connection) -> Result<Vec<RefundRead
     }
 
     let mut stmt = conn.prepare(
-        "SELECT i.external_id, i.amount_sat
+        // Net-of-fee received credit (COALESCE received_msat, else the gross for a full-credit backend):
+        // holdings/`expected_msat` are net (an lnv2 receive fee reduces the wallet), so EVERY liability
+        // bucket must be net too, or the readiness check compares net holdings against gross liabilities
+        // and falsely reports InsufficientBalance (reviewer P2). Mirrors the refund CTE above.
+        "SELECT i.external_id, COALESCE(i.received_msat / 1000, i.amount_sat)
            FROM invoice i
            JOIN subscription s ON s.id = i.subscription_id
           WHERE i.kind = 'order'
@@ -1132,7 +1161,8 @@ fn load_refund_readiness_liabilities(conn: &Connection) -> Result<Vec<RefundRead
     }
 
     let mut stmt = conn.prepare(
-        "SELECT i.external_id, i.amount_sat
+        // Net-of-fee received credit, same reason as the paid-undelivered bucket above (reviewer P2).
+        "SELECT i.external_id, COALESCE(i.received_msat / 1000, i.amount_sat)
            FROM invoice i
            LEFT JOIN subscription s ON s.id = i.subscription_id
           WHERE i.settled_at IS NOT NULL
@@ -1165,7 +1195,12 @@ fn load_refund_readiness_liabilities(conn: &Connection) -> Result<Vec<RefundRead
         "SELECT json_extract(e.detail_json, '$.external_id') AS external_id,
                 -- MAX for deterministic dedup across a redelivered settlement (see the refund CTE
                 -- above): a NULL/malformed duplicate must not understate this unreconciled liability.
-                MAX(CAST(json_extract(e.detail_json, '$.amount_sat') AS INTEGER)) AS amount_sat
+                -- Net-of-fee received credit (COALESCE received_msat, else the journaled gross) so an
+                -- orphan-settlement liability matches net holdings, same as every other bucket (P2).
+                MAX(COALESCE(
+                    CAST(json_extract(e.detail_json, '$.received_msat') AS INTEGER) / 1000,
+                    CAST(json_extract(e.detail_json, '$.amount_sat') AS INTEGER)
+                )) AS amount_sat
            FROM event_log e
            LEFT JOIN subscription s ON s.id = e.subscription_id
           WHERE e.kind IN ({SETTLE_REFUND_KINDS_SQL})

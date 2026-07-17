@@ -13,8 +13,9 @@
 //! ALLOW iff surplus_msat >= outlay_msat(sweep)
 //! ```
 //!
-//! - `receipts_msat`  = Σ gross of ALL captured receipts (settled invoice rows + settle-refund
-//!   journal entries), de-duped by external id — reused verbatim from the ledger, never re-summed.
+//! - `receipts_msat`  = Σ actual wallet credit of ALL captured receipts (settled invoice rows +
+//!   settle-refund journal entries), de-duped by external id — reused verbatim from the ledger,
+//!   never re-summed. Legacy rows without exact receive metadata fall back to gross.
 //! - `reserved_msat`  = Σ gross ONCE per external id of (a) captured receipts still AT RISK (their
 //!   sub is PENDING/PROVISIONING/RESUMING/REFUND_DUE — a state-machine refund path still exists) and
 //!   (b) every NON-terminal `refund_attempt` (status != 'SENT', incl. unpriceable). Fail closed:
@@ -73,8 +74,10 @@ pub(crate) fn read_surplus(conn: &Connection, exclude_sweep_id: Option<&str>) ->
     // `earned` — the IDENTICAL receipt base `expected_msat` uses (never re-summed here).
     let earned_msat = sum_receipts_msat(conn)?;
 
-    // `reserved`: external_id -> gross_sat, counted ONCE per external_id (a receipt with BOTH an
-    // at-risk sub and a refund row keys one map entry, so it is reserved once).
+    // `reserved`: external_id -> conservative whole-sat liability, counted ONCE per external_id (a
+    // receipt with BOTH an at-risk sub and a refund row keys one map entry, so it is reserved once).
+    // It may use invoice gross and therefore exceed lnv2's fee-adjusted credit; over-reserving only
+    // refuses a sweep and is the safe direction.
     let mut reserved: HashMap<String, u64> = HashMap::new();
     // `paid_out`: SENT refunds (same COALESCE provenance as reserved) + in-flight sweep caps.
     let mut paid_out_msat: u128 = 0;

@@ -116,6 +116,25 @@ pub trait PaymentBackend: Send + Sync {
         self.pay_refund_capped(bolt11, amount_sat, gross_sat, idempotency_key)
             .await
     }
+    /// Whether a definitively-`Failed` refund pay for a key can be RE-ATTEMPTED against the SAME
+    /// persisted invoice, or is TERMINAL PER INVOICE — so a retry needs a FRESH invoice at the next
+    /// generation. This is the ONE money-semantic the refund generation gate (`refund.rs`) needs to
+    /// know per backend:
+    ///  - **lnv1 / mock (default `true`).** A definite `Failed` re-attempts the same bolt11: the pinned
+    ///    fedimint lnv1 client checks pay idempotency BEFORE invoice expiry and starts a fresh op
+    ///    (`fedimint_backend.rs`), so a transient-cause failure on a still-unexpired, still-in-cap
+    ///    invoice is retried as-is.
+    ///  - **lnv2 (`false`).** `send` derives a DETERMINISTIC attempt-0 operation id from the invoice;
+    ///    once it reaches `Refunded`/`Failure` the SAME bolt11 can NEVER be re-sent (NO-RETRY,
+    ///    lnrent-3d5 / ADR-0018). The gate MUST re-resolve a fresh invoice at the next generation, or
+    ///    re-driving the dead key loops until the retry cap parks the refund `FAILED` — stranded money.
+    ///
+    /// A pure per-backend constant (not per-key state); the gate reads it to decide reuse-vs-re-resolve
+    /// on a `Failed`. It NEVER weakens any cap: whichever invoice is paid, the INV-1 preflight still
+    /// binds. Does not affect `Pending`/`Unknown` (those always re-await the same invoice, both backends).
+    fn failed_refund_can_reuse_invoice(&self) -> bool {
+        true
+    }
     /// Idempotent OUTLAY-capped pay for the operator sweep (gate1-operator-sweep, urw.3). Like
     /// [`pay_refund_capped`](Self::pay_refund_capped) it re-awaits an existing `SUCCEEDED`/`PENDING`
     /// operation for `idempotency_key`, but a NEW operation MUST refuse to start if
@@ -148,6 +167,12 @@ pub trait PaymentBackend: Send + Sync {
     async fn available_balance_msat(&self) -> Result<Option<u64>> {
         Ok(None)
     }
+    /// Actual wallet credit for a received invoice, after any backend-side receive fee. `None` means
+    /// the backend credits the gross invoice amount (the mock and lnv1). Recovery settlement catch-up
+    /// uses this local metadata so it never books an lnv2 invoice fee as spendable holdings.
+    async fn received_amount_msat(&self, _invoice_id: &str) -> Result<Option<u64>> {
+        Ok(None)
+    }
     /// Whether the backend can currently price and pay refunds.
     async fn refund_gateway_ready(&self) -> Result<bool> {
         Ok(true)
@@ -163,6 +188,16 @@ pub trait PaymentBackend: Send + Sync {
     /// Real money backends must leave this unsupported.
     async fn dev_settle(&self, _external_id: &str, _settled_at: i64) -> Result<()> {
         Err(anyhow::anyhow!(DEV_SETTLE_UNSUPPORTED))
+    }
+    /// FUNCTIONAL lnv2 doctor probe (ADR-0018, lnrent-3d5): is the configured backend's lnv2 money path
+    /// actually usable — the lnv2 module present on the federation AND an lnv2-capable gateway attached
+    /// and reachable? Config-presence is insufficient (ADR-0018), so this reaches the guardians/gateways.
+    /// A backend with NO lnv2 path (the mock, or a future phoenixd) returns [`Lnv2Probe::NotApplicable`],
+    /// which `lnrent preflight` renders as a SKIPPED (passing) check — exactly like the provider-token
+    /// skip. The distinct failure variants let the doctor emit a specific human diagnostic per state
+    /// (module absent vs gateway absent vs gateway unreachable vs guardians unreachable). Read-only.
+    async fn lnv2_functional_probe(&self) -> Result<Lnv2Probe> {
+        Ok(Lnv2Probe::NotApplicable)
     }
     /// Stream of settled payments (push). `Settlement.external_id` carries the order id
     /// (SPEC §6.1). M1a wires this to the Fedimint client settlement stream.
@@ -189,6 +224,30 @@ pub struct Invoice {
 pub struct RefundQuote {
     pub net_sat: u64,
     pub gateway_hint: Option<String>,
+}
+
+/// Result of the FUNCTIONAL lnv2 doctor probe ([`PaymentBackend::lnv2_functional_probe`], ADR-0018,
+/// lnrent-3d5). The lnv2 money path is usable ONLY when the lnv2 module is present on the joined
+/// federation AND at least one lnv2-capable gateway is attached and reachable — so the probe reaches
+/// the guardians and the gateway, never a mere config read. Each failure variant carries enough for the
+/// doctor to print a state-specific human diagnostic; the reachability variants carry the underlying
+/// error string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lnv2Probe {
+    /// lnv2 module present AND a reachable lnv2 gateway — the money path is functional.
+    Healthy,
+    /// The backend has no lnv2 money path at all (mock / non-fedimint). The doctor renders this as a
+    /// skipped, passing check — the check simply does not apply to this backend.
+    NotApplicable,
+    /// The federation guardians are unreachable, so module/gateway presence cannot even be determined.
+    GuardiansUnreachable(String),
+    /// The guardians are reachable but the joined federation exposes no lnv2 module (join an
+    /// lnv2-enabled federation).
+    ModuleAbsent,
+    /// The lnv2 module is present but the federation advertises no lnv2 gateway.
+    GatewayAbsent,
+    /// An lnv2 gateway is advertised but none is reachable (routing-info round-trip failed).
+    GatewayUnreachable(String),
 }
 
 /// Status of one of OUR inbound invoices (receiving). SPEC.md §6.1.
@@ -218,6 +277,9 @@ pub struct Settlement {
     pub invoice_id: String,
     pub external_id: String,
     pub amount_sat: u64,
+    /// Actual amount credited to the backend wallet after receiver-side fees. Billing still uses the
+    /// gross bolt11 `amount_sat`; refunds and holdings accounting use this money value.
+    pub received_msat: u64,
     pub settled_at: i64, // when the backend observed settlement (unix secs); capture sets
                          // paid_through = settled_at + period (§6.3), so it must come from here
 }
@@ -296,6 +358,7 @@ fn settle_mock_invoice(
         invoice_id: inv.id,
         external_id: external_id.to_string(),
         amount_sat: inv.amount_sat,
+        received_msat: inv.amount_sat.saturating_mul(1000),
         settled_at,
     };
     if let Some(tx) = &st.settle_tx {

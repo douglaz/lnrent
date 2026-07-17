@@ -2286,8 +2286,15 @@ mod tests {
 
         let mut calls = 0usize;
         for f in &files {
+            // A SEPARATE-FILE test module (`foo/tests.rs`, gated by `#[cfg(test)] mod tests;` in the
+            // parent) is entirely test code, but its `#[cfg(test)]` gate lives in the parent file — so
+            // the split heuristic below cannot see it. Skip `tests.rs` files wholesale: they are
+            // test-only by this repo's convention, and counting them would flag legitimate test calls.
+            if f.file_name().and_then(|n| n.to_str()) == Some("tests.rs") {
+                continue;
+            }
             let text = std::fs::read_to_string(f).unwrap();
-            // Non-test code precedes the first `#[cfg(test)]` in every file (Rust convention here).
+            // Non-test code precedes the first `#[cfg(test)]` in every other file (Rust convention here).
             let non_test = text.split("#[cfg(test)]").next().unwrap_or("");
             calls += non_test.matches(".available_balance_msat(").count();
         }

@@ -321,7 +321,7 @@ async fn run_preflight(sock: &str, as_json: bool) -> ExitCode {
 /// aggregate bit — a version-skewed or buggy daemon replying `ok:true` with missing or
 /// contradictory checks must exit 1, never silently pass. Future daemon-side checks are accepted
 /// (forward-compatible) but must each pass.
-const PREFLIGHT_REQUIRED_CHECKS: [&str; 3] = ["gateway", "federation", "provider_token"];
+const PREFLIGHT_REQUIRED_CHECKS: [&str; 4] = ["gateway", "federation", "lnv2", "provider_token"];
 
 /// PURE aggregate→exit mapping for `preflight`: exit 1 (distinct from the taxonomy codes 2..5)
 /// unless the reply is a WELL-FORMED passing report — aggregate `ok: true`, a checks array in
@@ -603,11 +603,15 @@ mod tests {
             }))
         };
         assert!(!preflight_checks_failed(&full_pass(&[
+            "gateway", "federation", "lnv2", "provider_token",
+        ])));
+        // A report MISSING a required check (here: lnv2) fails closed, even all-passing.
+        assert!(preflight_checks_failed(&full_pass(&[
             "gateway", "federation", "provider_token",
         ])));
         // Forward-compatible: an EXTRA (unknown) passing check is accepted.
         assert!(!preflight_checks_failed(&full_pass(&[
-            "gateway", "federation", "provider_token", "future_check",
+            "gateway", "federation", "lnv2", "provider_token", "future_check",
         ])));
 
         let fail = Reply::ok(json!({

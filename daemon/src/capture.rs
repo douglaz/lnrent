@@ -72,8 +72,10 @@ fn capture_txn(tx: &Transaction, s: &Settlement, now: i64) -> Result<Capture> {
             // OPEN -> PAID compare-and-swap (the durable applied marker). On the sole-writer actor
             // this always affects 1 row; the guard makes a duplicate apply a no-op anyway.
             let n = tx.execute(
-                "UPDATE invoice SET status='PAID', settled_at=?2, applied_at=?2 WHERE id=?1 AND status='OPEN'",
-                params![inv_id, s.settled_at],
+                "UPDATE invoice
+                    SET status='PAID', settled_at=?2, applied_at=?2, received_msat=?3
+                  WHERE id=?1 AND status='OPEN'",
+                params![inv_id, s.settled_at, s.received_msat as i64],
             )?;
             if n == 0 {
                 return Ok(Capture::NoOp);
@@ -85,8 +87,10 @@ fn capture_txn(tx: &Transaction, s: &Settlement, now: i64) -> Result<Capture> {
         // only when something actually changed so a redelivery doesn't append duplicate audit rows.
         _ => {
             let stamped = tx.execute(
-                "UPDATE invoice SET settled_at=?2 WHERE id=?1 AND settled_at IS NULL",
-                params![inv_id, s.settled_at],
+                "UPDATE invoice
+                    SET settled_at=?2, received_msat=COALESCE(received_msat, ?3)
+                  WHERE id=?1 AND settled_at IS NULL",
+                params![inv_id, s.settled_at, s.received_msat as i64],
             )?;
             let dest = sub_refund_dest(tx, sub_id.as_deref())?;
             let refunded = refund_intent(tx, sub_id.as_deref(), dest.as_deref(), s, now)?;
@@ -290,12 +294,15 @@ fn refund_intent(
     s: &Settlement,
     now: i64,
 ) -> Result<bool> {
+    // lnv2 credits `invoice - receive_fee`. Refund only whole sats from that ACTUAL wallet credit;
+    // flooring a sub-sat remainder is conservative and matches the whole-sat payout trait.
+    let refundable_sat = s.received_msat / 1000;
     insert_refund_attempt_txn(
         tx,
         sub_id,
         dest,
         &s.external_id,
-        Some(s.amount_sat as i64),
+        Some(refundable_sat as i64),
         now,
     )
 }
@@ -341,6 +348,7 @@ fn journal(
     let detail = serde_json::json!({
         "external_id": s.external_id,
         "amount_sat": s.amount_sat,
+        "received_msat": s.received_msat,
         "settled_at": s.settled_at,
     })
     .to_string();
@@ -363,7 +371,11 @@ fn journal_renew_resume(
 ) -> Result<()> {
     let detail = serde_json::json!({
         "external_id": s.external_id,
-        "amount_sat": s.amount_sat,
+        // Resume failure refunds the actual wallet credit, not the bolt11 gross. Keep the gross beside
+        // it for audit; `amount_sat` is the existing detached-refund baseline consumed by resume.rs.
+        "amount_sat": s.received_msat / 1000,
+        "invoice_amount_sat": s.amount_sat,
+        "received_msat": s.received_msat,
         "settled_at": s.settled_at,
         "previous_paid_through": previous_paid_through,
         "previous_suspend_not_before": previous_suspend_not_before,
@@ -434,6 +446,7 @@ mod tests {
             invoice_id: format!("inv-{external_id}"),
             external_id: external_id.to_string(),
             amount_sat: 1000,
+            received_msat: 1_000_000,
             settled_at,
         }
     }
@@ -1173,5 +1186,46 @@ mod tests {
             snb, None,
             "the renewal cleared the stale floor (which would otherwise pin suspension at 1300 > 1200)"
         );
+    }
+
+    #[tokio::test]
+    async fn receive_fee_reduces_refund_cap_and_persists_exact_credit() {
+        let s = mem_store();
+        seed(
+            &s,
+            "o-fee",
+            "PENDING",
+            None,
+            100,
+            10,
+            0,
+            Some("lnaddr@x"),
+            "order",
+            "EXPIRED",
+            "ext-fee",
+        )
+        .await;
+        let mut paid = settlement("ext-fee", 500);
+        paid.received_msat = 995_500;
+
+        assert_eq!(capture(&s, paid, 1).await.unwrap(), Capture::RefundDue);
+        let (refund_sat, received_msat): (i64, i64) = s
+            .read(|c| {
+                let refund_sat = c.query_row(
+                    "SELECT amount_sat FROM refund_attempt WHERE idempotency_key='refund:ext-fee'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let received_msat = c.query_row(
+                    "SELECT received_msat FROM invoice WHERE external_id='ext-fee'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok((refund_sat, received_msat))
+            })
+            .await
+            .unwrap();
+        assert_eq!(received_msat, 995_500, "the exact wallet credit is durable");
+        assert_eq!(refund_sat, 995, "whole-sat refunds floor the fee-adjusted credit");
     }
 }

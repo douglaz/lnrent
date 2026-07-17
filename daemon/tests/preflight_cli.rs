@@ -7,7 +7,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use lnrentd::backends::{
-    Invoice, MockPayment, PayStatus, PaymentBackend, PaymentStatus, Settlement,
+    Invoice, Lnv2Probe, MockPayment, PayStatus, PaymentBackend, PaymentStatus, Settlement,
 };
 use lnrentd::clock::{Clock, TestClock};
 use lnrentd::ipc;
@@ -78,6 +78,45 @@ impl PaymentBackend for GatewayDownPayment {
     }
     async fn backend_ready(&self) -> Result<bool> {
         Ok(true)
+    }
+    async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+        panic!("preflight must not watch settlements")
+    }
+}
+
+/// A backend whose gateway + federation are fine but the lnv2 functional probe fails (the federation
+/// exposes no lnv2 module) — the ADR-0018 doctor failure the exit gate must surface through the real
+/// binary.
+struct Lnv2ProbePayment(Lnv2Probe);
+
+#[async_trait]
+impl PaymentBackend for Lnv2ProbePayment {
+    async fn create_invoice(&self, _: u64, _: &str, _: u32, _: &str) -> Result<Invoice> {
+        panic!("preflight must not create invoices")
+    }
+    async fn lookup(&self, _: &str) -> Result<PaymentStatus> {
+        panic!("preflight must not look up invoices")
+    }
+    async fn lookup_settlement(&self, _: &str) -> Result<(PaymentStatus, Option<i64>)> {
+        panic!("preflight must not look up settlements")
+    }
+    async fn pay(&self, _: &str, _: u64, _: &str) -> Result<String> {
+        panic!("preflight must not pay")
+    }
+    async fn payment_status(&self, _: &str) -> Result<PayStatus> {
+        panic!("preflight must not check payment status")
+    }
+    async fn payment_status_by_key(&self, _: &str) -> Result<PayStatus> {
+        panic!("preflight must not check payment status by key")
+    }
+    async fn refund_gateway_ready(&self) -> Result<bool> {
+        Ok(true)
+    }
+    async fn backend_ready(&self) -> Result<bool> {
+        Ok(true)
+    }
+    async fn lnv2_functional_probe(&self) -> Result<Lnv2Probe> {
+        Ok(self.0.clone())
     }
     async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
         panic!("preflight must not watch settlements")
@@ -157,7 +196,10 @@ async fn json_preflight_all_ok_round_trips_with_stable_shape() {
 
     let checks = data["checks"].as_array().expect("checks array");
     let names: Vec<&str> = checks.iter().map(|c| c["name"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["gateway", "federation", "provider_token"]);
+    assert_eq!(
+        names,
+        vec!["gateway", "federation", "lnv2", "provider_token"]
+    );
     for c in checks {
         let mut check_keys = c
             .as_object()
@@ -171,6 +213,10 @@ async fn json_preflight_all_ok_round_trips_with_stable_shape() {
     }
     assert!(
         checks[2]["detail"].as_str().unwrap().contains("skipped"),
+        "MockPayment has no lnv2 money path, so the lnv2 check is SKIPPED"
+    );
+    assert!(
+        checks[3]["detail"].as_str().unwrap().contains("skipped"),
         "no recipe declares DO_TOKEN here, so the provider-token check is SKIPPED"
     );
 }
@@ -213,4 +259,90 @@ async fn doctor_alias_failed_check_exits_nonzero_with_diagnostics() {
         serde_json::json!(true),
         "federation is independent"
     );
+}
+
+// ADR-0018 doctor negative matrix through the REAL executable boundary. Every lnv2 state is asserted
+// in both human and JSON modes, including state-specific detail and the aggregate exit code ([9A]).
+#[tokio::test]
+async fn lnv2_probe_matrix_has_human_json_diagnostics_and_exit_codes() {
+    let cases = [
+        ("healthy", Lnv2Probe::Healthy, true, "module present"),
+        (
+            "guardians-down",
+            Lnv2Probe::GuardiansUnreachable("no consensus".into()),
+            false,
+            "guardians unreachable",
+        ),
+        (
+            "module-absent",
+            Lnv2Probe::ModuleAbsent,
+            false,
+            "no lnv2 module",
+        ),
+        (
+            "gateway-absent",
+            Lnv2Probe::GatewayAbsent,
+            false,
+            "no lnv2 gateway is attached",
+        ),
+        (
+            "gateway-unreachable",
+            Lnv2Probe::GatewayUnreachable("connection refused".into()),
+            false,
+            "gateway attached but unreachable",
+        ),
+    ];
+
+    for (i, (name, probe, healthy, diagnostic)) in cases.into_iter().enumerate() {
+        let human = run_cli(
+            &format!("l2-{i}-h"),
+            Arc::new(Lnv2ProbePayment(probe.clone())),
+            &["doctor"],
+        )
+        .await;
+        assert_eq!(
+            human.status.success(),
+            healthy,
+            "{name} human exit code: stderr={}",
+            String::from_utf8_lossy(&human.stderr)
+        );
+        let human_stdout = String::from_utf8_lossy(&human.stdout);
+        assert!(human_stdout.contains("lnv2"), "{name}: {human_stdout}");
+        assert!(
+            human_stdout.contains(diagnostic),
+            "{name} human diagnostic: {human_stdout}"
+        );
+        assert!(
+            human_stdout.contains(if healthy { "PASS" } else { "FAIL" }),
+            "{name} human aggregate: {human_stdout}"
+        );
+
+        let json = run_cli(
+            &format!("l2-{i}-j"),
+            Arc::new(Lnv2ProbePayment(probe)),
+            &["--json", "doctor"],
+        )
+        .await;
+        assert_eq!(
+            json.status.success(),
+            healthy,
+            "{name} json exit code: stderr={}",
+            String::from_utf8_lossy(&json.stderr)
+        );
+        let envelope: Value = serde_json::from_slice(&json.stdout).unwrap();
+        assert_eq!(envelope["ok"], serde_json::json!(true));
+        let data = &envelope["data"];
+        assert_eq!(data["ok"], serde_json::json!(healthy));
+        let lnv2 = data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "lnv2")
+            .expect("lnv2 check present");
+        assert_eq!(lnv2["ok"], serde_json::json!(healthy));
+        assert!(
+            lnv2["detail"].as_str().unwrap().contains(diagnostic),
+            "{name} JSON diagnostic: {lnv2}"
+        );
+    }
 }

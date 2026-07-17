@@ -167,10 +167,11 @@ impl From<ResolveError> for PlanError {
     }
 }
 
-/// The result of the INV-3 provenance check (spec §3.3). `Ok(received)` carries the gross sats the
-/// order actually received (positive, and equal to `refund_attempt.amount_sat`). `Forbidden(reason)`
-/// means there is no matching received payment — or the received amount is missing/non-positive, or it
-/// mismatches the refund row — so the refund MUST park FAILED and never pay.
+/// The result of the INV-3 provenance check (spec §3.3). `Ok(received)` carries the refundable
+/// whole-sat wallet credit (positive, and equal to `refund_attempt.amount_sat`; lnv2 floors
+/// `received_msat`, while legacy backends use invoice gross). `Forbidden(reason)` means there is no
+/// matching received payment — or the received amount is missing/non-positive, or it mismatches the
+/// refund row — so the refund MUST park FAILED and never pay.
 enum ProvenanceCheck {
     Ok(u64),
     Forbidden(String),
@@ -378,9 +379,9 @@ impl Refunder {
         }
 
         // INV-1: pay the fee-adjusted `pay_sat` (<= net cap), bounded by `received` so the backend's
-        // final cap preflight refuses any over-gross outlay. `refund_attempt.amount_sat` stays the GROSS
-        // received amount (`received`); only the payout — and the buyer-facing "sent" DM (review P2) —
-        // is reduced by the gateway fee.
+        // final cap preflight refuses any outlay above the refundable wallet credit. The stable
+        // `refund_attempt.amount_sat` remains that cap (`received`); only the payout — and the
+        // buyer-facing "sent" DM (review P2) — is reduced by the outbound gateway fee.
         tracing::debug!(refund = %row.id, gross = received, net_pay = pay_sat, gen, "paying capped refund");
         // Carry the quote-time gateway hint (lnrent-y4m.18) so this pay prefers the SAME gateway the
         // net cap was priced on; `None` on the re-await arms leaves the ordered probe unchanged. The
@@ -560,8 +561,11 @@ impl Refunder {
                     // generation can never settle as-is: it is EXPIRED, or the (otherwise static) gateway
                     // fee was RAISED by its operator so the persisted invoice — quoted at the old fee —
                     // now exceeds the INV-1 cap and would fail the preflight on every retry (operator
-                    // guidance). Otherwise the failure is transient (a gateway blip) and REUSING the
-                    // persisted invoice on a plain retry is correct.
+                    // guidance), or the backend's `Failed` is TERMINAL PER INVOICE so the same bolt11 can
+                    // never be re-sent (lnv2 NO-RETRY, lnrent-3d5 — see `failed_refund_can_reuse_invoice`).
+                    // Otherwise the failure is transient (a gateway blip) and — for a backend that CAN
+                    // re-pay the same bolt11 (lnv1) — REUSING the persisted invoice on a plain retry is
+                    // correct.
                     //
                     // `Pending`/`Unknown` are NEVER re-quoted or re-resolved (review P1): per the
                     // [`crate::backends::PayStatus`] contract `Unknown` is an in-flight payment that "can
@@ -572,7 +576,13 @@ impl Refunder {
                     PayStatus::Failed => {
                         let (net_cap, gateway_hint) = self.quote_net_cap(received).await?; // Err (gateway down) => Transient
                         let persisted_sat = parse_whole_sat(bolt11).unwrap_or(received);
-                        if expired || persisted_sat > net_cap {
+                        // lnv2's definite `Failed` is terminal for this invoice (NO-RETRY): the same
+                        // bolt11 can never be re-sent, so reusing it below would loop the dead key until
+                        // the retry cap strands the refund. Force a fresh-invoice re-resolution. lnv1/mock
+                        // re-pay the same invoice, so they keep the reuse fast-path.
+                        let backend_reuses_failed_invoice =
+                            self.payment.failed_refund_can_reuse_invoice();
+                        if expired || persisted_sat > net_cap || !backend_reuses_failed_invoice {
                             let owed_msat = net_cap.checked_mul(1000).ok_or_else(|| {
                                 PlanError::Structural(format!(
                                     "refund net amount {net_cap} sat overflows u64 msats"
@@ -659,15 +669,14 @@ impl Refunder {
     /// order. Valid provenance is either an `invoice` row for `external_id` showing received funds
     /// (`status='PAID'` OR `settled_at IS NOT NULL` — a LATE settlement stamps `settled_at` on an
     /// already-terminal/EXPIRED invoice without flipping it back to PAID), or a settle-refund
-    /// `event_log` entry for unmatched/orphan settlements that have no invoice row. The received amount
-    /// comes from that source and MUST equal the refund row's gross `amount_sat`; no provenance, a
-    /// missing/non-positive received amount, or a mismatch is `Forbidden` -> park FAILED.
+    /// `event_log` entry for unmatched/orphan settlements that have no invoice row. The fee-adjusted,
+    /// whole-sat refundable amount comes from that source and MUST equal the refund row's `amount_sat`;
+    /// no provenance, a missing/non-positive amount, or a mismatch is `Forbidden` -> park FAILED.
     ///
-    /// The exact `==` is safe across both creation sites today: provision's refund row and its
-    /// provenance amount are read from the SAME invoice row, and capture's matched-settlement row
-    /// amount equals the invoice amount because Lightning pays a bolt11 in full (settlement_amount ==
-    /// invoice_amount). A future partial/over-payment path would have to revisit this equality before a
-    /// legitimate refund could survive the guard (review P3).
+    /// The exact `==` is safe across both creation sites: provision reads the invoice's fee-adjusted
+    /// `received_msat / 1000`, while capture writes the refund row from the same settlement credit.
+    /// A future partial/over-payment path would have to revisit this equality before a legitimate
+    /// refund could survive the guard (review P3).
     async fn verify_refund_provenance(
         &self,
         row: &RefundRow,
@@ -697,9 +706,9 @@ impl Refunder {
         }
     }
 
-    /// The received gross sats for `external_id` from provenance: the paid/settled invoice first, else a
-    /// settle-refund journal entry (unmatched/orphan settlements that have no invoice row). `None` when
-    /// no provenance exists OR the source carries no usable amount.
+    /// The refundable whole sats for `external_id` from provenance: actual wallet credit after receive
+    /// fees, floored to whole sats. Legacy lnv1/mock rows fall back to the gross invoice amount. `None`
+    /// when no provenance exists OR the source carries no usable amount.
     async fn lookup_received_amount(&self, external_id: &str) -> Result<Option<i64>> {
         let ext = external_id.to_string();
         self.store
@@ -709,7 +718,7 @@ impl Refunder {
                 // back to the journal, which only covers the no-invoice (unmatched/orphan) case.
                 let inv: Option<Option<i64>> = c
                     .query_row(
-                        "SELECT amount_sat FROM invoice
+                        "SELECT COALESCE(received_msat / 1000, amount_sat) FROM invoice
                           WHERE external_id=?1 AND (status='PAID' OR settled_at IS NOT NULL)",
                         params![ext],
                         |r| r.get(0),
@@ -721,7 +730,11 @@ impl Refunder {
                 // (2) Settle-refund journal provenance (the unmatched/orphan settlement families).
                 let j: Option<Option<i64>> = c
                     .query_row(
-                        "SELECT json_extract(detail_json, '$.amount_sat') FROM event_log
+                        "SELECT COALESCE(
+                                    json_extract(detail_json, '$.received_msat') / 1000,
+                                    json_extract(detail_json, '$.amount_sat')
+                                )
+                           FROM event_log
                           WHERE kind IN ('settle_unmatched_refund', 'settle_terminal_refund',
                                          'settle_orphan_refund', 'settle_expired_refund')
                             AND json_extract(detail_json, '$.external_id') = ?1
@@ -813,8 +826,8 @@ impl Refunder {
 
     /// Commit the SENT bookkeeping and map the CAS outcome to a counter (a lost race is a `Noop`).
     /// `paid_sat` is the NET amount actually delivered to the buyer (after the gateway fee, or a
-    /// below-cap direct bolt11) — it is what the "sent" DM reports, distinct from the gross
-    /// `refund_attempt.amount_sat` ledger figure, which this never rewrites (review P2 / AC-9).
+    /// below-cap direct bolt11) — it is what the "sent" DM reports, distinct from the refundable-credit
+    /// `refund_attempt.amount_sat` ledger cap, which this never rewrites (review P2 / AC-9).
     async fn finish_sent(
         &self,
         row: &RefundRow,
@@ -1193,7 +1206,10 @@ pub fn external_id_from(idempotency_key: &str, refund_id: &str) -> String {
 /// actuator can supersede the stale parked-FAILED DM before the refunder enqueues the success one
 /// (lnrent-urw.5 / codex): both derive the id here.
 pub fn refund_outbox_id(idempotency_key: &str, refund_id: &str) -> String {
-    format!("outbox:refund:{}", external_id_from(idempotency_key, refund_id))
+    format!(
+        "outbox:refund:{}",
+        external_id_from(idempotency_key, refund_id)
+    )
 }
 
 /// Enqueue a `billing.refund` DM as a PENDING outbox row under a STABLE id (the OutboxSender
@@ -1311,6 +1327,9 @@ mod tests {
         status_lookup_fails: bool, // payment_status_by_key returns Err (an unqueryable backend)
         started: HashSet<String>, // keys payment_started_by_key reports as an in-flight (oplog) op
         net_cap: Option<u64>, // refund_net_sat override (the fee-adjusted cap); None => full gross
+        // Model the lnv2 NO-RETRY semantic: a definite Failed is terminal per invoice, so the gate must
+        // re-resolve a fresh invoice instead of reusing. Default false = lnv1/mock (can reuse).
+        no_reuse_failed: bool,
     }
 
     impl TestPayment {
@@ -1347,6 +1366,11 @@ mod tests {
         /// Override the fee-adjusted net cap that `refund_net_sat` returns.
         fn set_net_cap(&self, net_sat: u64) {
             self.inner.lock().unwrap().net_cap = Some(net_sat);
+        }
+        /// Model a backend (lnv2) whose definite `Failed` is terminal per invoice, so the generation
+        /// gate must re-resolve a fresh invoice rather than re-drive the dead key.
+        fn set_no_reuse_failed_invoice(&self) {
+            self.inner.lock().unwrap().no_reuse_failed = true;
         }
         /// Whether a `pay` (or `mark_paid`) ever recorded this key.
         fn was_paid(&self, key: &str) -> bool {
@@ -1431,6 +1455,9 @@ mod tests {
         async fn payment_started_by_key(&self, idempotency_key: &str) -> Result<bool> {
             Ok(self.inner.lock().unwrap().started.contains(idempotency_key))
         }
+        fn failed_refund_can_reuse_invoice(&self) -> bool {
+            !self.inner.lock().unwrap().no_reuse_failed
+        }
         async fn refund_net_sat(&self, gross_sat: u64) -> Result<u64> {
             Ok(self.inner.lock().unwrap().net_cap.unwrap_or(gross_sat))
         }
@@ -1491,10 +1518,12 @@ mod tests {
             .await
             .unwrap();
         rows.into_iter()
-            .map(|(recipient, p)| match serde_json::from_str::<Msg>(&p).unwrap() {
-                Msg::OperatorAlert(a) => (recipient, a.kind, a.subject),
-                other => panic!("expected operator.alert, got {}", other.type_str()),
-            })
+            .map(
+                |(recipient, p)| match serde_json::from_str::<Msg>(&p).unwrap() {
+                    Msg::OperatorAlert(a) => (recipient, a.kind, a.subject),
+                    other => panic!("expected operator.alert, got {}", other.type_str()),
+                },
+            )
             .collect()
     }
 
@@ -1815,7 +1844,10 @@ mod tests {
         // Seed a STALE deadline cursor so the terminal transition provably clears it (lnrent-y4m.4).
         store
             .transaction(|tx| {
-                tx.execute("UPDATE subscription SET next_deadline=1 WHERE id='sub-1'", [])?;
+                tx.execute(
+                    "UPDATE subscription SET next_deadline=1 WHERE id='sub-1'",
+                    [],
+                )?;
                 Ok(())
             })
             .await
@@ -1847,7 +1879,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(next_deadline, None, "REFUNDED clears next_deadline (lnrent-y4m.4)");
+        assert_eq!(
+            next_deadline, None,
+            "REFUNDED clears next_deadline (lnrent-y4m.4)"
+        );
         assert_eq!(
             scalar(
                 &store,
@@ -2071,7 +2106,10 @@ mod tests {
         let r = refunder_with_alerts(&store, &payment, &clock, "op-npub-hex");
 
         let report = r.drive().await.unwrap();
-        assert_eq!(report.retried, 1, "ambiguous pay stays PENDING/retried, never parks");
+        assert_eq!(
+            report.retried, 1,
+            "ambiguous pay stays PENDING/retried, never parks"
+        );
         assert_eq!(report.failed, 0);
 
         let alerts = operator_alerts(&store).await;
@@ -2638,6 +2676,47 @@ mod tests {
         let (resolved, gen) = resolution_of(&store, "ref-order:sub-1").await;
         assert_eq!(gen, 1, "generation unchanged");
         assert_eq!(resolved.as_deref(), Some("bolt11-g1"));
+    }
+
+    // THE GATE, lnv2 NO-RETRY (lnrent-3d5, reviewer P1): a definite Failed on a backend whose
+    // `failed_refund_can_reuse_invoice()` is FALSE (lnv2 — a terminal send can never re-pay the same
+    // bolt11) MUST re-resolve a FRESH invoice at the next generation EVEN when the persisted invoice is
+    // unexpired and in-cap. Reusing it would loop the dead key until the retry cap strands the refund.
+    // Mirrors `gen_failed_but_unexpired_reuses_same_invoice` (same unexpired/in-cap state) but flips the
+    // backend semantic — proving the seam, not the clock, drives the re-resolution ([9A] non-vacuity).
+    #[tokio::test]
+    async fn gen_failed_unexpired_reresolves_when_backend_cannot_reuse() {
+        let store = mem_store();
+        let payment = Arc::new(TestPayment::new());
+        payment.set_key_status("refund:order:sub-1:g1", PayStatus::Failed);
+        payment.set_no_reuse_failed_invoice(); // lnv2: Failed is terminal per invoice
+        let clock = TestClock::new(200); // now=200 < the seeded expiry 10_000 (UNEXPIRED)
+        let resolver = Arc::new(TestResolver::new(10_000));
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        seed_refund_resolved(&store, "sub-1", LN_ADDR, 500, "bolt11-g1", 10_000, 1).await;
+
+        let report = refunder_with(&store, &payment, &clock, resolver.clone())
+            .drive()
+            .await
+            .unwrap();
+
+        assert_eq!(report.sent, 1);
+        assert_eq!(
+            resolver.calls(),
+            1,
+            "an unexpired Failed re-resolves when the backend cannot re-pay the same invoice"
+        );
+        let (resolved, gen) = resolution_of(&store, "ref-order:sub-1").await;
+        assert_eq!(gen, 2, "generation bumped to 2 (fresh invoice), not reused");
+        assert_eq!(resolved.as_deref(), Some("resolved-bolt11-1"));
+        assert!(
+            payment.was_paid("refund:order:sub-1:g2"),
+            "paid the fresh gen-2 key, never re-drove the terminal gen-1 key"
+        );
+        assert!(
+            !payment.was_paid("refund:order:sub-1:g1"),
+            "the terminal gen-1 key was never re-attempted (NO-RETRY)"
+        );
     }
 
     // A STRUCTURAL resolution failure parks FAILED IMMEDIATELY — one attempt, NOT the retry cap, and

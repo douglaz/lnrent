@@ -16,8 +16,10 @@ use lnrentd::backends::{MockPayment, PaymentBackend};
 use lnrentd::backup;
 use lnrentd::clock::{Clock, SystemClock};
 use lnrentd::config::{self, BootstrapInput, PaymentMode, RawConfig};
+// lnv1 `fedimint_backend::FedimintPayment` stays in-tree but UNSELECTED (dormant, deleted by
+// lnrent-8ym); `payment_backend=fedimint` now builds the lnv2 backend below.
 #[cfg(feature = "fedimint")]
-use lnrentd::fedimint_backend::FedimintPayment;
+use lnrentd::lnv2_backend::Lnv2Payment;
 use lnrentd::ipc::IpcError;
 use lnrentd::nostr_engine::NostrEngine;
 use lnrentd::recipe::Recipe;
@@ -486,11 +488,13 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
     running.shutdown().await
 }
 
-/// Construct the real Fedimint payment backend for `payment_backend=fedimint` (lnrent-o6p go-live):
-/// join the configured federation with the operator's deterministic root secret and honor the
-/// operator's ORDERED gateway list (`[gateway] ++ gateway_fallbacks`), which the backend fails over
-/// through in order (lnrent-y4m.8). Compiled only with `--features fedimint`; the non-feature build
-/// rejects `fedimint` at bootstrap, so its variant just fails clearly if ever reached.
+/// Construct the real Fedimint payment backend for `payment_backend=fedimint` (lnrent-3d5, ADR-0018):
+/// the **lnv2** backend ([`Lnv2Payment`]) — the live ecash money path. The lnv1
+/// [`lnrentd::fedimint_backend::FedimintPayment`] stays in-tree but UNSELECTED (dormant) until
+/// lnrent-8ym deletes it. lnv2 selects gateways natively (by API url), so the configured
+/// `[fedimint] gateway` pubkey (an lnv1-era selector) is not consulted here. Compiled only with
+/// `--features fedimint`; the non-feature build rejects `fedimint` at
+/// bootstrap, so its variant just fails clearly if ever reached.
 #[cfg(feature = "fedimint")]
 async fn build_fedimint_backend(
     operator: &config::Operator,
@@ -501,18 +505,15 @@ async fn build_fedimint_backend(
         .fedimint
         .as_ref()
         .context("payment_backend=fedimint requires a [fedimint] config (invite + gateway)")?;
-    // The ordered failover list: the primary gateway first, then each configured fallback.
-    let gateways = fedi.gateways();
-    let backend = FedimintPayment::join_or_open_with_gateways(
+    let backend = Lnv2Payment::join_or_open(
         &fedi.invite,
         &operator.config.data_dir,
         operator.identity.fedimint_root_secret(),
-        &gateways,
         clock,
     )
     .await
-    .context("joining the configured Fedimint federation")?;
-    tracing::info!("fedimint payment backend joined; real ecash money path active");
+    .context("joining the configured lnv2 Fedimint federation")?;
+    tracing::info!("lnv2 fedimint payment backend joined; real ecash money path active");
     Ok(Arc::new(backend))
 }
 
