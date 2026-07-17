@@ -118,6 +118,15 @@ _Avoid_: tenant, node, deployment, server
 
 ### Billing
 
+**Payment backend**:
+The wallet the Operator chooses for a Control node: it receives Subscription payments
+and pays refunds and Sweeps. Exactly one per Control node, chosen at onboarding.
+The real choices: Fedimint ecash (the Operator joins a federation of their choosing —
+a federation is picked, not inherited) or phoenixd (self-custodial Lightning, no
+federation). Both are reasonable options; ecash for those who want a federation,
+phoenixd for those who don't. (`mock` exists for development only.)
+_Avoid_: wallet, node, payment provider.
+
 **Paid-through date**:
 The hard expiry timestamp of a Subscription. The Instance runs until this date; past
 it, unpaid, the service is interrupted. A renewal payment extends it by one period.

@@ -1,5 +1,10 @@
 # 0012 — Fedimint ecash is the primary receive backend for low-value rentals
 
+> Partially superseded by ADR-0018 (2026-07-17): phoenixd is promoted to a co-equal
+> alternative (the economics concern below is accepted as tolerable), and the fedimint
+> path moves to the lnv2 module with lnv1 retired. The capture-then-refund and
+> PaymentBackend-trait conclusions here stand.
+
 To RECEIVE a Lightning payment you need inbound liquidity. A fresh phoenixd operator has
 none, so the first payment triggers an on-the-fly channel open (service + on-chain fee)
 that can exceed a small-sat rental — the very low-value services lnrent leads with. Raw
