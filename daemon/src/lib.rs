@@ -13,6 +13,14 @@ pub mod domain;
 /// Real Fedimint backend (lnrent-7fp.4) — only when the `fedimint` feature is on (default OFF).
 #[cfg(feature = "fedimint")]
 pub mod fedimint_backend;
+/// Shared hardened data-dir path prep for the fedimint backends (lnrent-3d5).
+#[cfg(feature = "fedimint")]
+pub mod fedimint_paths;
+/// The lnv2 Fedimint backend (lnrent-3d5, ADR-0018): the backend `payment_backend=fedimint` now
+/// constructs. lnv1 `fedimint_backend` stays compiled but UNSELECTED until lnrent-8ym deletes it.
+/// Same `fedimint` feature gate.
+#[cfg(feature = "fedimint")]
+pub mod lnv2_backend;
 pub mod identity;
 pub mod ipc;
 /// Ledger-authoritative money core (lnrent-urw.10): `expected_msat`, the LOCAL sqlite lower bound on

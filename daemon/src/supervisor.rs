@@ -1774,6 +1774,21 @@ async fn settlement_catch_up(
         match payment.lookup_settlement(&inv_id).await {
             Ok((PaymentStatus::Paid, observed)) => {
                 let now = clock.now();
+                let received_msat = match payment.received_amount_msat(&inv_id).await {
+                    Ok(Some(msat)) => msat,
+                    // Backends without receiver-side fees use the gross invoice amount.
+                    Ok(None) => (amount_sat as u64).saturating_mul(1000),
+                    Err(e) => {
+                        // Do not book a guessed gross amount for lnv2: that could count a receive fee as
+                        // spendable and authorize an over-refund/sweep. Leave OPEN and retry catch-up.
+                        tracing::warn!(
+                            external = %external_id,
+                            error = %format!("{e:#}"),
+                            "settlement catch-up: received-amount lookup failed"
+                        );
+                        continue;
+                    }
+                };
                 // A LIVE-observed settlement carries its TRUE time (`Some`): use it EXACTLY, so a late
                 // live payment is refunded by capture's g5p gate (settled_at >= expires_at) instead of
                 // being stamped just-in-window and wrongly provisioned (lnrent-zwk). A RECOVERY
@@ -1804,6 +1819,7 @@ async fn settlement_catch_up(
                     invoice_id: inv_id,
                     external_id: external_id.clone(),
                     amount_sat: amount_sat as u64,
+                    received_msat,
                     settled_at,
                 };
                 match capture(store, settlement, now).await {
@@ -2221,6 +2237,22 @@ mod tests {
                         settled_at,
                         applied_at,
                     ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Stamp a net-of-fee wallet credit on an already-seeded invoice (an lnv2 receive fee makes the
+    /// credited contract smaller than the gross bolt11 amount).
+    async fn set_invoice_received_msat(store: &Store, external_id: &str, received_msat: i64) {
+        let external_id = external_id.to_string();
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "UPDATE invoice SET received_msat=?2 WHERE external_id=?1",
+                    rusqlite::params![external_id, received_msat],
                 )?;
                 Ok(())
             })
@@ -3073,6 +3105,40 @@ mod tests {
         assert_eq!(report.gross_liability_sat, 1);
         assert_eq!(report.required_msat, 1_000);
         assert_eq!(report.warning, None);
+    }
+
+    #[tokio::test]
+    async fn readiness_paid_undelivered_liability_uses_net_received_credit() {
+        // reviewer P2: a paid-undelivered order with an lnv2 receive fee (credited < gross) must count
+        // its NET credit as the liability, not the gross bolt11 amount — matching net holdings. A gross
+        // liability would overstate `required_msat` and falsely trip InsufficientBalance.
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "PENDING").await;
+        seed_invoice(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            "order",
+            1000, // gross bolt11 amount
+            "PAID",
+            Some(10),
+            None,
+        )
+        .await;
+        set_invoice_received_msat(&store, "order:sub-1", 995_500).await; // net 995 sat
+        let payment = readiness_payment(true);
+
+        let report = readiness(&store, &payment).await;
+
+        assert_eq!(report.liability_count, 1);
+        assert_eq!(
+            report.gross_liability_sat, 995,
+            "the liability is the net credited amount, not the 1000-sat gross"
+        );
+        assert_eq!(
+            report.required_msat, 995_000,
+            "required outlay is the net credit; a gross 1_000_000 would falsely overstate coverage"
+        );
     }
 
     #[tokio::test]

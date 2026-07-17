@@ -1570,6 +1570,7 @@ mod tests {
             invoice_id: format!("inv-{external_id}"),
             external_id: external_id.to_string(),
             amount_sat: 100,
+            received_msat: 100_000,
             settled_at,
         }
     }

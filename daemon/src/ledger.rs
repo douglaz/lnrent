@@ -4,16 +4,18 @@
 //! books figure the operator `reconcile` command (§F) compares the real wallet against. The single
 //! sanctioned live-balance read is the reconcile handler in `ipc.rs`; this module never reads it.
 //!
-//! `expected_msat = Σ gross receipts − Σ gross committed refunds − Σ sweep caps`, a CONSERVATIVE
-//! LOWER bound (≤ the real spendable wallet), `u128` with saturating subtraction (never underflows).
-//! Receipts are summed at gross — a Fedimint LNv1 receive claims the full invoice amount, no
-//! receiver-side fee. Committed refunds and sweeps subtract at their GROSS / MAX-outlay, which by
-//! INV-1 is ≥ the REAL outlay: `pay_refund_capped` (and the capped sweep) refuse any pay whose net
-//! payout + fee exceeds the received gross (`refund_attempt.amount_sat` IS that gross, refund.rs),
-//! so the fee comes OUT of the gross, never on top. Subtracting gross is therefore an
-//! over-subtraction — `expected_msat` never sits ABOVE the real wallet. The wallet legitimately runs
-//! ABOVE this floor (fee savings run it up), which is exactly why `reconcile` reads wallet ≥ expected
-//! as OK and only wallet < expected as DRIFT (a genuine loss / accounting gap for a human).
+//! `expected_msat = Σ wallet-credited receipts − Σ committed refund caps − Σ sweep caps`, a
+//! CONSERVATIVE LOWER bound (≤ the real spendable wallet), `u128` with saturating subtraction
+//! (never underflows). Receipts use exact `received_msat`: gross for lnv1/mock, invoice minus the
+//! gateway receive fee for lnv2. A committed refund subtracts its whole-sat REFUNDABLE WALLET-CREDIT
+//! cap (`refund_attempt.amount_sat`; `received_msat / 1000` for lnv2, legacy gross otherwise), while a
+//! sweep subtracts its MAX-outlay cap. INV-1 makes each cap ≥ the REAL outlay: `pay_refund_capped`
+//! refuses a debit above the refund cap, and capped sweep does the same for `max_outlay_msat`. Any
+//! sub-sat receive-credit remainder was never authorized for refund and stays on the receipt side.
+//! Subtracting the cap is therefore conservative — `expected_msat` never sits ABOVE the real wallet.
+//! The wallet legitimately runs ABOVE this floor (fee savings run it up), which is exactly why
+//! `reconcile` reads wallet ≥ expected as OK and only wallet < expected as DRIFT (a genuine loss /
+//! accounting gap for a human).
 //! Reading the balance in automatic paths creates reconciliation races and an automatic
 //! balance-query failure class; the ledger is the same history the balance aggregates, on a clock
 //! we control (ADR-0016 / §E rationale).
@@ -89,15 +91,16 @@ fn read_ledger_terms(conn: &Connection) -> Result<LedgerReads> {
     })
 }
 
-/// Σ gross of every captured receipt, de-duped by external payment id across BOTH INV-3 provenance
-/// classes and counted ONCE each. Returns msats (`gross_sat * 1000`). `pub(crate)`: the operator
-/// sweep (gate1-operator-sweep, urw.3) reuses the IDENTICAL receipt base for its surplus `earned`
-/// term, so the sweep can never authorize against a different receipt provenance than `expected_msat`.
+/// Σ actual wallet credit of every captured receipt, de-duped by external payment id across BOTH
+/// INV-3 provenance classes and counted ONCE each. Legacy rows fall back to `gross_sat * 1000`.
+/// `pub(crate)`: the operator sweep (gate1-operator-sweep, urw.3) reuses the IDENTICAL receipt base
+/// for its surplus `earned` term, so the sweep can never authorize against different provenance.
 pub(crate) fn sum_receipts_msat(conn: &Connection) -> Result<u128> {
     // Class A — settled invoice rows. `invoice.external_id` is UNIQUE, so no intra-class dup.
-    let mut gross_by_ext: HashMap<String, u64> = HashMap::new();
+    let mut received_by_ext: HashMap<String, u128> = HashMap::new();
     let mut stmt = conn.prepare(
-        "SELECT external_id, amount_sat
+        "SELECT external_id,
+                COALESCE(received_msat, CASE WHEN amount_sat > 0 THEN amount_sat * 1000 END)
            FROM invoice
           WHERE status = 'PAID' OR settled_at IS NOT NULL",
     )?;
@@ -105,21 +108,21 @@ pub(crate) fn sum_receipts_msat(conn: &Connection) -> Result<u128> {
         Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
     })?;
     for row in rows {
-        let (external_id, amount_sat) = row?;
-        if let Some(sat) = positive_sat(amount_sat) {
-            gross_by_ext.insert(external_id, sat);
+        let (external_id, received_msat) = row?;
+        if let Some(msat) = positive_msat(received_msat) {
+            received_by_ext.insert(external_id, msat);
         }
     }
 
-    // Class B — settle-refund journal entries. A receipt already counted in Class A keeps its
-    // invoice amount (precedence via `or_insert`), so one present in BOTH classes counts once.
-    // A settlement can be REDELIVERED (a fedimint reconnect re-journals the same external_id), so
-    // aggregate deterministically with MAX rather than picking an arbitrary GROUP-BY row: the
-    // duplicates carry the SAME amount, and MAX ignores a NULL/malformed duplicate in favor of the
-    // real positive value (codex-adversarial: a bare grouped column is non-deterministic).
+    // Class B — settle-refund journal entries. A receipt already counted in Class A keeps its invoice
+    // credit (precedence via `or_insert`), so one present in BOTH classes counts once. MAX makes a
+    // redelivered settlement deterministic and ignores a malformed duplicate.
     let class_b_sql = format!(
         "SELECT json_extract(detail_json, '$.external_id') AS external_id,
-                MAX(CAST(json_extract(detail_json, '$.amount_sat') AS INTEGER)) AS amount_sat
+                MAX(COALESCE(
+                    CAST(json_extract(detail_json, '$.received_msat') AS INTEGER),
+                    CAST(json_extract(detail_json, '$.amount_sat') AS INTEGER) * 1000
+                )) AS received_msat
            FROM event_log
           WHERE kind IN ({SETTLE_REFUND_KINDS_SQL})
           GROUP BY external_id"
@@ -129,15 +132,14 @@ pub(crate) fn sum_receipts_msat(conn: &Connection) -> Result<u128> {
         Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?))
     })?;
     for row in rows {
-        let (external_id, amount_sat) = row?;
-        let (Some(external_id), Some(sat)) = (external_id, positive_sat(amount_sat)) else {
+        let (external_id, received_msat) = row?;
+        let (Some(external_id), Some(msat)) = (external_id, positive_msat(received_msat)) else {
             continue;
         };
-        gross_by_ext.entry(external_id).or_insert(sat);
+        received_by_ext.entry(external_id).or_insert(msat);
     }
 
-    let gross_sat: u128 = gross_by_ext.values().map(|s| u128::from(*s)).sum();
-    Ok(gross_sat * 1000)
+    Ok(received_by_ext.values().copied().sum())
 }
 
 /// Every refund_attempt row that MIGHT have committed funds. FAILED rows are included and filtered
@@ -206,6 +208,10 @@ pub(crate) fn positive_sat(amount: Option<i64>) -> Option<u64> {
     }
 }
 
+fn positive_msat(amount: Option<i64>) -> Option<u128> {
+    positive_sat(amount).map(u128::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,7 +235,10 @@ mod tests {
             self.started.lock().unwrap().insert(key.to_string());
         }
         fn set_status(&self, key: &str, status: PayStatus) {
-            self.statuses.lock().unwrap().insert(key.to_string(), status);
+            self.statuses
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), status);
         }
     }
 
@@ -251,7 +260,12 @@ mod tests {
             unimplemented!("ledger tests check by key")
         }
         async fn payment_status_by_key(&self, key: &str) -> Result<PayStatus> {
-            Ok(*self.statuses.lock().unwrap().get(key).unwrap_or(&PayStatus::Unknown))
+            Ok(*self
+                .statuses
+                .lock()
+                .unwrap()
+                .get(key)
+                .unwrap_or(&PayStatus::Unknown))
         }
         async fn payment_started_by_key(&self, key: &str) -> Result<bool> {
             Ok(self.started.lock().unwrap().contains(key))
@@ -308,7 +322,10 @@ mod tests {
         });
 
         // 5 + 7 + 3 = 15 sat gross (extC counted once), no refunds/sweeps.
-        assert_eq!(expected_msat(&store, &no_start_payment()).await.unwrap(), 15_000);
+        assert_eq!(
+            expected_msat(&store, &no_start_payment()).await.unwrap(),
+            15_000
+        );
     }
 
     // A settlement REDELIVERED (fedimint reconnect) re-journals the same external_id. The receipt
@@ -320,7 +337,7 @@ mod tests {
             for detail in [
                 "{\"external_id\":\"extR\",\"amount_sat\":9}",
                 "{\"external_id\":\"extR\",\"amount_sat\":9}", // exact redelivery
-                "{\"external_id\":\"extR\"}",                  // malformed dup: amount absent -> NULL
+                "{\"external_id\":\"extR\"}", // malformed dup: amount absent -> NULL
             ] {
                 c.execute(
                     "INSERT INTO event_log (subscription_id, kind, detail_json, at)
@@ -331,7 +348,10 @@ mod tests {
             }
         });
         // Counted once at 9 sat (the NULL dup does not zero it out).
-        assert_eq!(expected_msat(&store, &no_start_payment()).await.unwrap(), 9_000);
+        assert_eq!(
+            expected_msat(&store, &no_start_payment()).await.unwrap(),
+            9_000
+        );
     }
 
     #[tokio::test]
@@ -420,7 +440,10 @@ mod tests {
         });
 
         // 100_000 msat − (20000 + 5000) = 75_000 msat; the FAILED sweep is not subtracted.
-        assert_eq!(expected_msat(&store, &no_start_payment()).await.unwrap(), 75_000);
+        assert_eq!(
+            expected_msat(&store, &no_start_payment()).await.unwrap(),
+            75_000
+        );
     }
 
     #[tokio::test]
@@ -435,7 +458,10 @@ mod tests {
         });
 
         // No `sweep_attempt` table (the default schema) → the sweep term is 0, no panic.
-        assert_eq!(expected_msat(&store, &no_start_payment()).await.unwrap(), 2_000);
+        assert_eq!(
+            expected_msat(&store, &no_start_payment()).await.unwrap(),
+            2_000
+        );
     }
 
     #[tokio::test]
@@ -457,5 +483,24 @@ mod tests {
 
         // 1_000 receipts − 5_000 SENT refund → saturates at 0 (never underflows below zero).
         assert_eq!(expected_msat(&store, &no_start_payment()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn expected_uses_actual_receive_credit_not_gross_invoice_amount() {
+        let store = store_with(|c| {
+            c.execute(
+                "INSERT INTO invoice
+                    (id, external_id, kind, amount_sat, received_msat, status)
+                 VALUES ('i-fee', 'ext-fee', 'order', 1000, 995500, 'PAID')",
+                [],
+            )
+            .unwrap();
+        });
+
+        assert_eq!(
+            expected_msat(&store, &no_start_payment()).await.unwrap(),
+            995_500,
+            "the gateway's inbound fee is not counted as spendable wallet holdings"
+        );
     }
 }

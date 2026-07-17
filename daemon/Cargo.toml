@@ -110,7 +110,20 @@ fedimint-derive-secret = { git = "https://github.com/douglaz/fedimint", branch =
 fedimint-connectors = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
 fedimint-ln-client = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
 fedimint-ln-common = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
+# The lnv2 client + common crates (lnrent-3d5, ADR-0018): the NEW real ecash money path. They ship
+# in the SAME already-pinned v0.11.1 source (the lnv2 crates there are byte-identical to upstream
+# v0.11.1 — the douglaz fork's ONE patch is lnv1-only), so this is no version bump, no new git source.
+# lnv2 eliminates lnv1's crash-recovery machinery by design: deterministic invoice-derived operation
+# ids (no oplog scan), truthful refund-acceptance-aware final states (no stream classification / dead-op
+# ledger). `-client` gives `LightningClientModule` (send/receive/await_final_*), `-common` the gateway
+# fee model (`PaymentFee`/`RoutingInfo`) the INV-1 cap is measured against. Same optional gating as the
+# lnv1 deps so mock-only builds pull neither tree.
+fedimint-lnv2-client = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
+fedimint-lnv2-common = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
 fedimint-mint-client = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
+# Decode the mint inputs/outputs in an accepted lnv2 claim transaction so received credit is the
+# actual wallet delta after consensus fees, not the incoming contract's pre-claim face value.
+fedimint-mint-common = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
 fedimint-wallet-client = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
 # StreamExt::next on the fedimint settlement subscription streams (receive/pay state machines).
 futures-util = { version = "0.3", optional = true }
@@ -129,7 +142,10 @@ fedimint = [
     "dep:fedimint-connectors",
     "dep:fedimint-ln-client",
     "dep:fedimint-ln-common",
+    "dep:fedimint-lnv2-client",
+    "dep:fedimint-lnv2-common",
     "dep:fedimint-mint-client",
+    "dep:fedimint-mint-common",
     "dep:fedimint-wallet-client",
     "dep:futures-util",
 ]

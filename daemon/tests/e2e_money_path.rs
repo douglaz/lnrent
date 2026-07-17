@@ -947,6 +947,7 @@ async fn suspended_paid_renewal_runs_resume_hook_before_active() {
         invoice_id: "inv-renew-resume-ok".to_string(),
         external_id: renewal_ext.to_string(),
         amount_sat: 100,
+        received_msat: 100_000,
         settled_at,
     };
     assert_eq!(
@@ -1031,6 +1032,7 @@ async fn permanent_resume_failure_refunds_renewal_and_restores_suspended_timers(
         invoice_id: "inv-renew-resume-fail".to_string(),
         external_id: renewal_ext.to_string(),
         amount_sat: 100,
+        received_msat: 100_000,
         settled_at,
     };
     assert_eq!(
@@ -1180,6 +1182,7 @@ async fn permanent_resume_failure_refunds_renewal_settled_while_hook_was_running
                 invoice_id: "inv-renew-resume-race-one".to_string(),
                 external_id: first_ext.to_string(),
                 amount_sat: 100,
+                received_msat: 100_000,
                 settled_at: 1_500,
             },
             clock.now(),
@@ -1202,6 +1205,7 @@ async fn permanent_resume_failure_refunds_renewal_settled_while_hook_was_running
                 invoice_id: "inv-renew-resume-race-two".to_string(),
                 external_id: second_ext.to_string(),
                 amount_sat: 200,
+                received_msat: 200_000,
                 settled_at: 1_600,
             },
             clock.now(),
@@ -1321,6 +1325,7 @@ async fn permanent_resume_failure_refunds_stacked_resuming_renewals() {
                 invoice_id: "inv-renew-resume-stacked-one".to_string(),
                 external_id: first_ext.to_string(),
                 amount_sat: 100,
+                received_msat: 100_000,
                 settled_at: 1_500,
             },
             clock.now(),
@@ -1337,6 +1342,7 @@ async fn permanent_resume_failure_refunds_stacked_resuming_renewals() {
                 invoice_id: "inv-renew-resume-stacked-two".to_string(),
                 external_id: second_ext.to_string(),
                 amount_sat: 100,
+                received_msat: 100_000,
                 settled_at: 1_600,
             },
             clock.now(),
@@ -1464,6 +1470,7 @@ async fn boot_recovery_redrives_resuming_to_active() {
         invoice_id: "inv-renew-resume-boot".to_string(),
         external_id: renewal_ext.to_string(),
         amount_sat: 100,
+        received_msat: 100_000,
         settled_at: START,
     };
     assert_eq!(
@@ -1568,6 +1575,7 @@ async fn active_renewal_stays_active_and_never_runs_resume() {
         invoice_id: "inv-renew-active-no-resume".to_string(),
         external_id: renewal_ext.to_string(),
         amount_sat: 100,
+        received_msat: 100_000,
         settled_at: START,
     };
     assert_eq!(

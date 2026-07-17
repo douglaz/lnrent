@@ -1418,6 +1418,7 @@ async fn run_receive_task(
                             invoice_id,
                             external_id,
                             amount_sat,
+                            received_msat: amount_sat.saturating_mul(1000),
                             settled_at: at,
                         })
                         .await;

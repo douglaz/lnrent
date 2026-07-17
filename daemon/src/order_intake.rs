@@ -2265,6 +2265,7 @@ mod tests {
                 invoice_id: format!("inv-{ext}"),
                 external_id: ext.to_string(),
                 amount_sat: dummy_recipe().pricing.amount_sat,
+                received_msat: dummy_recipe().pricing.amount_sat.saturating_mul(1000),
                 settled_at: 1234,
             },
             1234,
@@ -2414,6 +2415,7 @@ mod tests {
             invoice_id: format!("inv-{ext}"),
             external_id: ext.clone(),
             amount_sat: dummy_recipe().pricing.amount_sat,
+            received_msat: dummy_recipe().pricing.amount_sat.saturating_mul(1000),
             settled_at: now,
         };
         let outcome = crate::capture::capture(&store, settlement, now)
@@ -2581,6 +2583,7 @@ mod tests {
             invoice_id: format!("inv-{ext}"),
             external_id: ext.to_string(),
             amount_sat: dummy_recipe().pricing.amount_sat,
+            received_msat: dummy_recipe().pricing.amount_sat.saturating_mul(1000),
             settled_at: now,
         };
         let outcome = crate::capture::capture(&store, settlement, now)

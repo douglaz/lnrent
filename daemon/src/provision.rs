@@ -600,7 +600,8 @@ impl Provisioner {
                 Ok(c.query_row(
                     "SELECT s.state, s.buyer_pubkey, s.recipe_id, s.params_json, s.refund_dest,
                             s.period_s, s.renew_lead_s,
-                            oi.settled_at, oi.external_id, oi.amount_sat
+                            oi.settled_at, oi.external_id,
+                            COALESCE(oi.received_msat / 1000, oi.amount_sat)
                      FROM subscription s
                      LEFT JOIN invoice oi
                        ON oi.subscription_id = s.id AND oi.kind='order' AND oi.status='PAID'
