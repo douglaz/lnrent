@@ -53,7 +53,8 @@ to the simplification; cover the rest with backend choice, not with lnv1 mainten
 - `docs/specs/backend-strategy.md` (lnrent-bi8) carries the execution detail: phoenixd
   trait mapping, per-backend backup/reconcile stories, the lnv2 no-same-invoice-retry
   gap across all bolt11 surfaces, retirement sequencing.
-- Existing lnv1 deployments migrate by moving funds (a federation cannot be upgraded in
-  place); the retirement plan must include that operator runbook.
+- There is no migration: lnrent is greenfield — no operator deployments exist. Retiring
+  lnv1 means deleting it once a replacement backend is production-ready; the only lnv1
+  wallet in the world is the author's own dogfood, drained by hand.
 - The Operator-seed backup story ("one backup covers identity AND the wallet") must be
   re-examined for phoenixd, which has its own seed.
