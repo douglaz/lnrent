@@ -16,17 +16,21 @@ to the simplification; cover the rest with backend choice, not with lnv1 mainten
 ## Decision
 
 - **Fedimint ecash stays a primary receive path, via lnv2.** Operators join an
-  lnv2-enabled federation of their choosing. lnv2 backend work gates on a released,
-  API-stable lnv2 (verify against the adopted release tag, never moving master).
+  lnv2-enabled federation of their choosing. lnv2 is RELEASED — the client, common, and
+  server crates ship in v0.11.1, the version already pinned — so the lnv2 backend is
+  buildable now, with no version bump and no waiting (verified 2026-07-17 against the
+  pinned checkout: `send`, `FinalSendOperationState`, `await_final_send_operation_state`,
+  and the Refunding→Success refund-claim-failed recheck are all present).
 - **phoenixd is promoted to a co-equal alternative** for any operator who doesn't want a
   federation — no longer 0012's "secondary, larger-value only". 0012's economics concern
   (per-payment inbound-liquidity cost on small rentals) is accepted as tolerable:
   recurring subscription billing amortizes channel costs, and the operator sees the
   trade-off. Pricing guidance stays advisory, never gating.
-- **lnv1 is retired, not maintained.** Frozen now (hardened through y4m/kum, ADR-0017);
-  removed once the adopted lnv2 release ships and the backends above cover onboarding.
-  At lnv1 removal the ADR-0017 recovery machinery becomes deletable — and not before.
-  No dual-fedimint-module support, ever.
+- **lnv1 is deleted ASAP** (operator directive 2026-07-17). It never ships to a
+  third-party operator; it remains the dogfood backend only until the lnv2 backend
+  lands, then the lnv1 paths, the ADR-0017 recovery machinery, and the
+  fedimint-ln-client/-ln-common deps are removed together. No dual-fedimint-module
+  support, ever.
 - **Onboarding posture:** exactly one payment backend per Control node (0012's
   per-control-node choice stands). The doctor probes the configured backend
   FUNCTIONALLY: fedimint — lnv2 module present AND an lnv2-capable gateway attached and
@@ -47,9 +51,10 @@ to the simplification; cover the rest with backend choice, not with lnv1 mainten
 
 ## Consequences
 
-- The dep pins (douglaz/fedimint `v0.11.1-pay-idempotency`) are returned upstream only as
-  part of the lnv2 version bump — never as mechanical cleanup (the bump IS the lnv2
-  adoption event).
+- The dep pins (douglaz/fedimint `v0.11.1-pay-idempotency`) exist solely for lnv1's
+  pay path; at lnv1 deletion they return to the plain upstream `v0.11.1` tag. No
+  version bump is involved (lnv2 ships in v0.11.1). Upstream PR #8818 remains a valid
+  contribution for lnv1 users; lnrent just stops depending on it.
 - `docs/specs/backend-strategy.md` (lnrent-bi8) carries the execution detail: phoenixd
   trait mapping, per-backend backup/reconcile stories, the lnv2 no-same-invoice-retry
   gap across all bolt11 surfaces, retirement sequencing.
