@@ -5,7 +5,7 @@
 # Output (stdout): {"payload":{"host":<ipv4>,"port":22,"user":"root"}, "handles":{"droplet_id":<id>}}.
 # Env (from the daemon's environment, inherited by the hook):
 #   DO_TOKEN   (REQUIRED) DigitalOcean API token.
-#   DO_REGION  (default nyc3) DO_SIZE (default s-1vcpu-1gb) DO_IMAGE (default debian-12-x64).
+#   DO_REGION  (default nyc3) DO_SIZE (default s-1vcpu-1gb) DO_IMAGE (default debian-13-x64).
 #
 # IDEMPOTENT: the droplet is tagged `sub:<id>`; a re-run (daemon retry / boot recovery) finds the
 # existing droplet by tag and reuses it instead of creating a second one. Bounded poll (<120s hook
@@ -17,7 +17,7 @@ err() { echo "{\"error\":$(jq -Rn --arg m "$1" '$m')}" >&2; exit 1; }
 : "${DO_TOKEN:?DO_TOKEN not set — the operator must configure the DigitalOcean API token in the daemon env}"
 REGION="${DO_REGION:-nyc3}"
 SIZE="${DO_SIZE:-s-1vcpu-1gb}"
-IMAGE="${DO_IMAGE:-debian-12-x64}"
+IMAGE="${DO_IMAGE:-debian-13-x64}"
 API="https://api.digitalocean.com/v2"
 # Token rides in a 0600 temp file (curl -H @file), never argv — argv is world-readable via
 # /proc/<pid>/cmdline for the life of every API call. Timeouts keep a stalled DO endpoint from
