@@ -152,11 +152,21 @@ receipts minus everything still owed or at risk. Computed from the books alone �
 from the wallet balance (ADR-0016).
 _Avoid_: profit (accounting term), balance, available funds.
 
+**Refund**:
+Money the Operator owes back to a Buyer because a *paid* Order could not be delivered: a
+permanently failed provision, or a settlement landing on an already-expired invoice. A
+Buyer's cancel does NOT create one — the prepaid period simply runs out (ADR-0005). The
+amount is the *net wallet credit* for that Order, not the invoice face value, and the
+outbound Lightning fee comes out of it too, so a Buyer recovers less than they paid
+(ADR-0019). Never optional, unlike a Sweep.
+_Avoid_: reversal, chargeback, cancellation (a different thing — see Subscription states),
+payout (ambiguous with Sweep).
+
 **Sweep**:
 The Operator withdrawing Surplus out of the daemon's wallet to their own wallet. The
 only Operator-initiated outbound payment; refused whenever the owed amount cannot be
-bounded. (Target — ADR-0016 / docs/specs/gate1-operator-sweep.md; no sweep command
-exists in M1a yet.)
+bounded. (ADR-0016 / docs/specs/gate1-operator-sweep.md; `lnrent sweep <bolt11>` quotes
+by default and pays only with `--yes`.)
 _Avoid_: withdrawal, payout (ambiguous with refunds), cash out.
 
 **Reconcile (operator act)**:
