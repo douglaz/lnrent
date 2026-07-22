@@ -83,13 +83,15 @@ impl PaymentMode {
 /// federation invite is also part of the backup: the seed alone can't restore the ecash position
 /// (you must know which federation to rejoin), so onboard's backup must include it (§4.6).
 ///
-/// `gateway` is the PRIMARY Lightning gateway; `gateway_fallbacks` is an optional ORDERED list of
-/// standby gateways the backend fails over to when the primary is unreachable (lnrent-y4m.8). The
-/// selection list the backend tries in turn is `[gateway] ++ gateway_fallbacks` (see [`gateways`]),
-/// so a single-gateway operator sees no behavior change. `skip_serializing_if` OMITS
-/// `gateway_fallbacks` from the durable `fedimint.json` when it is empty, so a single-gateway config
-/// still writes byte-identical to before (mirrors the y4m.6 flag-omission trick); `serde(default)`
-/// lets an old on-disk config that predates the field parse as an empty list.
+/// `gateway` is the operator's Lightning gateway pubkey; `gateway_fallbacks` an optional list.
+/// NOTE (lnrent-8ym, 2026-07-22): these fields are currently NOT consumed by the payment backend.
+/// The lnv1 failover that read them (`[gateway] ++ gateway_fallbacks`, lnrent-y4m.8) lived in the
+/// deleted `fedimint_backend.rs`; the live lnv2 backend selects its gateway by API `SafeUrl` and
+/// does not consult this pubkey (`lnv2_backend.rs` / `main.rs`). The fields are retained (and
+/// `gateway` is still required at bootstrap) pending a decision to either wire them into lnv2's
+/// native selection or drop them — tracked as a follow-up. `skip_serializing_if` OMITS
+/// `gateway_fallbacks` from the durable `fedimint.json` when empty; `serde(default)` lets an old
+/// on-disk config that predates the field parse as an empty list.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FedimintConfig {
     pub invite: String,

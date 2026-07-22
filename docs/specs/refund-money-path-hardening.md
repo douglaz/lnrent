@@ -1,7 +1,7 @@
 # Spec: refund fee-deduction, liability-gated readiness, and refund provenance
 
-Status: **Implemented** (master: INV-1/INV-3 `b7a5421`, INV-2 `c07fe11`, final-gate edge fixes `bcf6922`, balance-query alarm + fee-change re-resolve `f35ee77`) — money-path hardening for the Fedimint payment backend wired in lnrent-o6p.
-Scope: `daemon/src/{backends.rs, fedimint_backend.rs, refund.rs, capture.rs, provision.rs, supervisor.rs, store.rs}`.
+Status: **Implemented** (master: INV-1/INV-3 `b7a5421`, INV-2 `c07fe11`, final-gate edge fixes `bcf6922`, balance-query alarm + fee-change re-resolve `f35ee77`) — money-path hardening wired in lnrent-o6p on the then-current lnv1 backend. *(2026-07-22: the lnv1 `fedimint_backend.rs` it targeted was deleted with lnv1 per ADR-0018/lnrent-8ym; the same INV-1/2/3 contracts were re-implemented for lnv2 in `lnv2_backend.rs` (lnrent-3d5). This spec stands as the money-path contract; read `fedimint_backend.rs` below as `lnv2_backend.rs`.)*
+Scope (as-built, lnv1): `daemon/src/{backends.rs, fedimint_backend.rs, refund.rs, capture.rs, provision.rs, supervisor.rs, store.rs}` — the money core (refund/capture/provision/supervisor/store) is backend-agnostic and unchanged; only `fedimint_backend.rs` → `lnv2_backend.rs`.
 Audience: the rb-lite implementer. This spec is the contract; tests below are mandatory ship gates.
 
 ## 1. Motivation

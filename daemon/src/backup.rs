@@ -551,7 +551,7 @@ fn restore_secret_file(src: &Path, dst: &Path) -> Result<()> {
 /// Recursively copy `src` -> `dst` (files + subdirs). Regular files are copied byte-for-byte via
 /// `fs::copy`, then tightened to owner-only (0600) and fsynced; created directories are tightened to
 /// owner-only (0700) and fsynced, consistent with the rest of the module's hardening. The fedimint
-/// subtree carries ecash-bearing material (the `client.db` RocksDB and the `lnrent_index.db`) that is
+/// subtree carries ecash-bearing material (the `client.db` RocksDB and the `lnv2_index.db`) that is
 /// at least as sensitive as the seed, so it gets the SAME 0600 hardening rather than inheriting the
 /// source's umask mode bits (review R2 P2). A symlink in the tree is REFUSED rather than silently
 /// dereferenced — the fedimint subtree is plain files/dirs, and following a link could pull bytes

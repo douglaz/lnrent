@@ -19,11 +19,11 @@ fn pass(s: &str) -> Option<Zeroizing<String>> {
 
 const FED_ID: &str = "fed11deadbeefcafe";
 
-/// A stand-in for the lnrent-owned fedimint idempotency index db. Backup treats the whole
+/// A stand-in for the lnrent-owned lnv2 idempotency index db (lnv2_index.db). Backup treats the whole
 /// `fedimint/` subtree (including any `*_index.db`) as opaque bytes, so this test only needs SOME
 /// populated sqlite db under the subtree to copy + reread — the exact table shape is immaterial.
 const INDEX_SCHEMA: &str = "\
-CREATE TABLE IF NOT EXISTS fedimint_invoice (
+CREATE TABLE IF NOT EXISTS lnv2_invoice (
     external_id   TEXT PRIMARY KEY,
     operation_id  TEXT NOT NULL,
     invoice_id    TEXT NOT NULL,
@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS fedimint_invoice (
     status        TEXT NOT NULL DEFAULT 'OPEN',
     settled_at    INTEGER
 );
-CREATE TABLE IF NOT EXISTS fedimint_pay (
+CREATE TABLE IF NOT EXISTS lnv2_pay (
     idempotency_key  TEXT PRIMARY KEY,
     operation_id     TEXT NOT NULL,
     backend_pay_id   TEXT NOT NULL,
@@ -98,23 +98,23 @@ fn populate_state_db(data_dir: &std::path::Path) {
 }
 
 /// Build a fake `fedimint/<FED_ID>/` subtree: a `client.db/` rocksdb dir with a sentinel file, and a
-/// populated `lnrent_index.db`.
+/// populated `lnv2_index.db`.
 fn populate_fedimint_dir(data_dir: &std::path::Path) {
     let fed_dir = data_dir.join("fedimint").join(FED_ID);
     let client_db = fed_dir.join("client.db");
     fs::create_dir_all(&client_db).unwrap();
     fs::write(client_db.join("CURRENT"), b"rocksdb-sentinel\n").unwrap();
 
-    let idx = Connection::open(fed_dir.join("lnrent_index.db")).unwrap();
+    let idx = Connection::open(fed_dir.join("lnv2_index.db")).unwrap();
     idx.execute_batch(INDEX_SCHEMA).unwrap();
     idx.execute(
-        "INSERT INTO fedimint_invoice (external_id, operation_id, invoice_id, bolt11, payment_hash, amount_sat, expires_at, status)
+        "INSERT INTO lnv2_invoice (external_id, operation_id, invoice_id, bolt11, payment_hash, amount_sat, expires_at, status)
          VALUES (?,?,?,?,?,?,?,?)",
         params!["ext-1", "op-1", "invid-1", "lnbc1example", "ph-1", 1234i64, 1_900_000_000i64, "PAID"],
     )
     .unwrap();
     idx.execute(
-        "INSERT INTO fedimint_pay (idempotency_key, operation_id, backend_pay_id, status, pay_kind)
+        "INSERT INTO lnv2_pay (idempotency_key, operation_id, backend_pay_id, status, pay_kind)
          VALUES (?,?,?,?,?)",
         params!["refund:ext-1", "op-2", "bpay-1", "SENT", "ln"],
     )
@@ -213,10 +213,10 @@ fn backup_restore_round_trip_reproduces_state_and_fedimint() {
     assert!(sentinel.is_file(), "restored rocksdb sentinel file");
     assert_eq!(fs::read_to_string(&sentinel).unwrap(), "rocksdb-sentinel\n");
 
-    let idx = Connection::open(rfed.join("lnrent_index.db")).unwrap();
+    let idx = Connection::open(rfed.join("lnv2_index.db")).unwrap();
     let (inv_status, inv_amount): (String, i64) = idx
         .query_row(
-            "SELECT status, amount_sat FROM fedimint_invoice WHERE external_id='ext-1'",
+            "SELECT status, amount_sat FROM lnv2_invoice WHERE external_id='ext-1'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -224,7 +224,7 @@ fn backup_restore_round_trip_reproduces_state_and_fedimint() {
     assert_eq!((inv_status.as_str(), inv_amount), ("PAID", 1234));
     let (pay_status, pay_kind): (String, String) = idx
         .query_row(
-            "SELECT status, pay_kind FROM fedimint_pay WHERE idempotency_key='refund:ext-1'",
+            "SELECT status, pay_kind FROM lnv2_pay WHERE idempotency_key='refund:ext-1'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -402,10 +402,10 @@ fn encrypted_backup_restore_round_trip_reproduces_state_and_fedimint() {
         0o600,
         "restored ecash file must be owner-only"
     );
-    let idx = Connection::open(rfed.join("lnrent_index.db")).unwrap();
+    let idx = Connection::open(rfed.join("lnv2_index.db")).unwrap();
     let (inv_status, inv_amount): (String, i64) = idx
         .query_row(
-            "SELECT status, amount_sat FROM fedimint_invoice WHERE external_id='ext-1'",
+            "SELECT status, amount_sat FROM lnv2_invoice WHERE external_id='ext-1'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -413,7 +413,7 @@ fn encrypted_backup_restore_round_trip_reproduces_state_and_fedimint() {
     assert_eq!((inv_status.as_str(), inv_amount), ("PAID", 1234));
     let (pay_status, pay_kind): (String, String) = idx
         .query_row(
-            "SELECT status, pay_kind FROM fedimint_pay WHERE idempotency_key='refund:ext-1'",
+            "SELECT status, pay_kind FROM lnv2_pay WHERE idempotency_key='refund:ext-1'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -889,7 +889,7 @@ fn restore_refuses_a_corrupt_backup_set() {
 
 #[test]
 fn backup_and_restore_harden_fedimint_files_to_0600() {
-    // The fedimint subtree carries ecash-bearing material (client.db, lnrent_index.db); both backup
+    // The fedimint subtree carries ecash-bearing material (client.db, lnv2_index.db); both backup
     // and restore must tighten it to owner-only rather than carry the source's umask mode (R2 P2).
     let base = temp_dir("perms");
     let data_dir = base.join("data");
@@ -900,7 +900,7 @@ fn backup_and_restore_harden_fedimint_files_to_0600() {
     // inherited 0600 from the test's umask).
     let src_fed = data_dir.join("fedimint").join(FED_ID);
     set_mode(&src_fed.join("client.db").join("CURRENT"), 0o644);
-    set_mode(&src_fed.join("lnrent_index.db"), 0o644);
+    set_mode(&src_fed.join("lnv2_index.db"), 0o644);
 
     let dest = base.join("backup");
     backup(&data_dir, &dest, None).unwrap();
@@ -911,7 +911,7 @@ fn backup_and_restore_harden_fedimint_files_to_0600() {
         "backed-up rocksdb file must be owner-only"
     );
     assert_eq!(
-        mode(&bk_fed.join("lnrent_index.db")),
+        mode(&bk_fed.join("lnv2_index.db")),
         0o600,
         "backed-up lnrent index must be owner-only"
     );
@@ -925,7 +925,7 @@ fn backup_and_restore_harden_fedimint_files_to_0600() {
         "restored rocksdb file must be owner-only"
     );
     assert_eq!(
-        mode(&r_fed.join("lnrent_index.db")),
+        mode(&r_fed.join("lnv2_index.db")),
         0o600,
         "restored lnrent index must be owner-only"
     );

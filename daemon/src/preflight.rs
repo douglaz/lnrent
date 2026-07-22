@@ -9,7 +9,7 @@
 //! post-start health gate, not a publication interlock.
 //!
 //! REUSED seams only — no new probes: gateway = [`PaymentBackend::refund_gateway_ready`] (the
-//! y4m.8 failover-aware money-path gateway-selection probe; fails closed, the Err carries the
+//! money-path gateway-readiness probe; fails closed, the Err carries the
 //! diagnostic), federation = [`PaymentBackend::backend_ready`] (the
 //! urw.4 `session_count()` guardian round-trip, distinct from gateway/balance — it proves the
 //! JOINED federation answers now; a bad invite fails `join_or_open` at daemon startup, so
