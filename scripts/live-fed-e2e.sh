@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live regtest Fedimint end-to-end proof: runs daemon/tests/fedimint_live.rs (the #[ignore]d
+# Live regtest Fedimint end-to-end proof: runs daemon/tests/lnv2_live.rs (the #[ignore]d
 # real-ecash test — issue, receive over the settlement stream, then pay ecash out, idempotently)
 # against a FRESH federation that devimint spins up (fedimintd + gatewayd + bitcoind + lightning).
 #
@@ -19,10 +19,10 @@ set -euo pipefail
 LNRENT="${LNRENT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 FEDI_WT="${FEDI_WT:-/tmp/fedimint-0.11.1}"
 
-echo "== 1/3 build the fedimint_live test binary (current daemon) =="
+echo "== 1/3 build the lnv2_live test binary (current daemon) =="
 cd "$LNRENT"
-nix develop . --command cargo test -p lnrentd --features fedimint --test fedimint_live --no-run
-TESTBIN="$(readlink -f "$(ls -t "$LNRENT"/target/debug/deps/fedimint_live-* | grep -vE '\.d$' | head -1)")"
+nix develop . --command cargo test -p lnrentd --features fedimint --test lnv2_live --no-run
+TESTBIN="$(readlink -f "$(ls -t "$LNRENT"/target/debug/deps/lnv2_live-* | grep -vE '\.d$' | head -1)")"
 test -x "$TESTBIN"
 echo "   test binary: $TESTBIN"
 

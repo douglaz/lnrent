@@ -16,8 +16,8 @@ use lnrentd::backends::{MockPayment, PaymentBackend};
 use lnrentd::backup;
 use lnrentd::clock::{Clock, SystemClock};
 use lnrentd::config::{self, BootstrapInput, PaymentMode, RawConfig};
-// lnv1 `fedimint_backend::FedimintPayment` stays in-tree but UNSELECTED (dormant, deleted by
-// lnrent-8ym); `payment_backend=fedimint` now builds the lnv2 backend below.
+// `payment_backend=fedimint` builds the lnv2 backend below (ADR-0018; the retired lnv1 backend was
+// deleted by lnrent-8ym).
 #[cfg(feature = "fedimint")]
 use lnrentd::lnv2_backend::Lnv2Payment;
 use lnrentd::ipc::IpcError;
@@ -367,7 +367,7 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
     // Config was loaded + the seed/secret env vars scrubbed by the synchronous entrypoint
     // (lnrent-y4m.7) before this runtime existed. Bootstrap is idempotent on a re-run (reads back
     // the persisted seed); it opens the state DB ONCE and hands back the shared store handle.
-    // Without the `fedimint` feature, FedimintPayment isn't compiled — reject `fedimint` BEFORE
+    // Without the `fedimint` feature, the lnv2 backend isn't compiled — reject `fedimint` BEFORE
     // bootstrap persists the operator row/seed (committing a `fedimint` row + `fedimint.json` would
     // brick a later `mock` retry, since the federation invite is never silently repointed). WITH the
     // feature, fedimint is a supported backend (lnrent-o6p) and is allowed to bootstrap.
@@ -489,9 +489,8 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
 }
 
 /// Construct the real Fedimint payment backend for `payment_backend=fedimint` (lnrent-3d5, ADR-0018):
-/// the **lnv2** backend ([`Lnv2Payment`]) — the live ecash money path. The lnv1
-/// [`lnrentd::fedimint_backend::FedimintPayment`] stays in-tree but UNSELECTED (dormant) until
-/// lnrent-8ym deletes it. lnv2 selects gateways natively (by API url), so the configured
+/// the **lnv2** backend ([`Lnv2Payment`]) — the live ecash money path (the retired lnv1 backend was
+/// deleted by lnrent-8ym). lnv2 selects gateways natively (by API url), so the configured
 /// `[fedimint] gateway` pubkey (an lnv1-era selector) is not consulted here. Compiled only with
 /// `--features fedimint`; the non-feature build rejects `fedimint` at
 /// bootstrap, so its variant just fails clearly if ever reached.

@@ -1,13 +1,16 @@
-//! Live regtest integration for the lnv2 Fedimint backend (lnrent-3d5, ADR-0018), mirroring
-//! `fedimint_live.rs`. Compiled ONLY with `--features fedimint` and `#[ignore]`d by default — it needs
+//! Live regtest integration for the lnv2 Fedimint backend (lnrent-3d5, ADR-0018). Compiled ONLY with
+//! `--features fedimint` and `#[ignore]`d by default — it needs
 //! a running devimint federation whose lnv2 module + an lnv2-capable gateway are attached, and is never
 //! part of the normal `cargo test` (CI has no federation). It is the FUNCTIONAL proof that
 //! `Lnv2Payment` issues, receives, and pays real (regtest) ecash via `fedimint-lnv2-client` — and that
 //! the send is idempotent on the refund key (the property the whole idempotency design protects).
 //!
-//! Run it via the pre-built test binary under a fresh dev-fed (see `fedimint_live.rs` for the one-time
-//! worktree setup — the invocation is identical, only the `--test` name changes):
+//! Run it via the pre-built test binary under a fresh dev-fed:
 //!
+//!   # one-time: a v0.11.1 worktree + the fedimint workspace (devimint + fedimintd/gatewayd/cli):
+//!   git -C ~/p/fedimint worktree add /tmp/fedimint-0.11.1 v0.11.1
+//!   cd /tmp/fedimint-0.11.1 && nix develop --command cargo build
+//!   # build this test binary in the lnrent devshell, then run it under a fresh dev-fed:
 //!   cd ~/projects/lnrent && nix develop . --command \
 //!     cargo test -p lnrentd --features fedimint --test lnv2_live --no-run
 //!   TESTBIN=$(ls -t ~/projects/lnrent/target/debug/deps/lnv2_live-* | grep -vE '\.d$' | head -1)

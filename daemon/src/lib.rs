@@ -10,15 +10,13 @@ pub mod capture;
 pub mod clock;
 pub mod config;
 pub mod domain;
-/// Real Fedimint backend (lnrent-7fp.4) — only when the `fedimint` feature is on (default OFF).
-#[cfg(feature = "fedimint")]
-pub mod fedimint_backend;
-/// Shared hardened data-dir path prep for the fedimint backends (lnrent-3d5).
+/// Shared hardened data-dir path prep for the fedimint backend (lnrent-3d5).
 #[cfg(feature = "fedimint")]
 pub mod fedimint_paths;
-/// The lnv2 Fedimint backend (lnrent-3d5, ADR-0018): the backend `payment_backend=fedimint` now
-/// constructs. lnv1 `fedimint_backend` stays compiled but UNSELECTED until lnrent-8ym deletes it.
-/// Same `fedimint` feature gate.
+/// The lnv2 Fedimint backend (lnrent-3d5, ADR-0018): the backend `payment_backend=fedimint`
+/// constructs — the live ecash money path. Only when the `fedimint` feature is on (default ON;
+/// build `--no-default-features` for the mock-only path). The retired lnv1 backend was deleted by
+/// lnrent-8ym (ADR-0018).
 #[cfg(feature = "fedimint")]
 pub mod lnv2_backend;
 pub mod identity;

@@ -1,8 +1,7 @@
-//! Shared, hardened data-dir path preparation for the fedimint payment backends (lnrent-3d5). Both the
-//! (dormant) lnv1 [`crate::fedimint_backend`] and the live [`crate::lnv2_backend`] lay their fedimint
-//! rocksdb + lnrent-owned sqlite index under `data_dir/fedimint/<federation_id>/`; this module owns the
-//! create-and-harden of that tree so the lnv2 backend does not duplicate the lnv1 copy (lnv1's private
-//! version stays until lnrent-8ym deletes it).
+//! Shared, hardened data-dir path preparation for the fedimint payment backend (lnrent-3d5). The live
+//! [`crate::lnv2_backend`] lays its fedimint rocksdb + lnrent-owned sqlite index under
+//! `data_dir/fedimint/<federation_id>/`; this module owns the create-and-harden of that tree. (The
+//! retired lnv1 backend, which shared this module, was deleted by lnrent-8ym.)
 //!
 //! The confidentiality boundary is the **0700 directories** (`fedimint/`, `<federation>/`, the client
 //! db dir): once owner-only, the note/wallet material inside is unreadable to co-tenant local users

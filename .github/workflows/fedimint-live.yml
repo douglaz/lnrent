@@ -1,6 +1,6 @@
 name: fedimint-live
 
-# The LIVE Fedimint e2e: build daemon/tests/fedimint_live.rs (which is #[ignore]d in
+# The LIVE Fedimint e2e: build daemon/tests/lnv2_live.rs (which is #[ignore]d in
 # the per-push CI) and run it under a real regtest federation that devimint spins up
 # (fedimintd + gatewayd + bitcoind + lightning + esplora). Real ecash money-path proof
 # (receive + pay) on regtest — no mainnet, no DigitalOcean billing.
@@ -57,12 +57,12 @@ jobs:
 
       # Build the (ignored) live test binary in OUR devshell — running the prebuilt
       # binary avoids a nested nix-shell PATH clash with fedimint's devshell.
-      - name: build the fedimint_live test binary
+      - name: build the lnv2_live test binary
         id: build
         run: |
           nix develop . --command cargo test -p lnrentd --features fedimint \
-            --test fedimint_live --no-run
-          TESTBIN=$(ls -t target/debug/deps/fedimint_live-* | grep -vE '\.d$' | head -1)
+            --test lnv2_live --no-run
+          TESTBIN=$(ls -t target/debug/deps/lnv2_live-* | grep -vE '\.d$' | head -1)
           test -x "$TESTBIN"
           echo "testbin=$(readlink -f "$TESTBIN")" >> "$GITHUB_OUTPUT"
           echo "built: $(readlink -f "$TESTBIN")"

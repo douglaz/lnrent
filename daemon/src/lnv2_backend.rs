@@ -1,8 +1,8 @@
 //! Real **lnv2** Fedimint `PaymentBackend` (lnrent-3d5, ADR-0018) — ecash receive + refund via the
-//! `fedimint-lnv2-client` module, the backend `payment_backend=fedimint` now constructs. The lnv1
-//! [`crate::fedimint_backend::FedimintPayment`] stays in-tree but UNSELECTED (dormant) until
-//! lnrent-8ym deletes it; this is the live money path. Feature-gated behind the `fedimint` cargo
-//! feature (default ON). Daemon-only (rocksdb C++, glibc-dynamic); never compiled into the wasm buyer.
+//! `fedimint-lnv2-client` module, the backend `payment_backend=fedimint` constructs. This is the live
+//! money path; the retired lnv1 backend was deleted by lnrent-8ym (ADR-0018). Feature-gated behind the
+//! `fedimint` cargo feature (default ON). Daemon-only (rocksdb C++, glibc-dynamic); never compiled into
+//! the wasm buyer.
 //!
 //! ## Why lnv2 needs far less machinery than lnv1 (ADR-0018)
 //! lnv1 forced ~2k lines of crash-recovery into the daemon (oplog scan, the kum dead-op ledger, pay
@@ -1798,7 +1798,6 @@ mod real {
     use fedimint_core::util::SafeUrl;
     use fedimint_core::Amount;
     use fedimint_derive_secret::DerivableSecret;
-    use fedimint_ln_common::lightning_invoice::Bolt11Invoice;
     use fedimint_lnv2_client::{
         FinalSendOperationState, LightningClientInit, LightningClientModule,
         LightningOperationMeta, ReceiveOperationState, SendPaymentError,
@@ -1810,6 +1809,7 @@ mod real {
     use fedimint_rocksdb::RocksDb;
     use fedimint_wallet_client::WalletClientInit;
     use futures_util::StreamExt;
+    use lightning_invoice::Bolt11Invoice;
 
     use super::{
         extract_lnrent_key, GatewaySendFee, Lnv2NewInvoice, Lnv2Ops, ReceiveFinal, SendAttempt,

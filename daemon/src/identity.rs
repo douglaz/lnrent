@@ -38,7 +38,7 @@ use crate::ipc::IpcError;
 ///
 /// FINAL (lnrent-o6p): bead .4 confirmed this 32-byte secret is exactly what `fedimint-client` 0.11.1
 /// consumes — it is wrapped as the `DerivableSecret` root under `RootSecret::StandardDoubleDerive`
-/// (`fedimint_backend.rs`), proven live (receive + pay + backup/restore against a real federation).
+/// (`lnv2_backend.rs`), proven live (receive + pay + backup/restore against a real federation).
 /// It is therefore the IMMUTABLE on-funds anchor: the operator's ecash position derives from the seed
 /// and this `info`, so it MUST NOT change once real funds exist (changing it would orphan the ecash).
 /// The seed is the BIP-39 mnemonic with an EMPTY passphrase; the `v1` suffix versions the scheme.

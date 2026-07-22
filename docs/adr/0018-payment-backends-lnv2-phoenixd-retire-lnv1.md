@@ -51,10 +51,18 @@ to the simplification; cover the rest with backend choice, not with lnv1 mainten
 
 ## Consequences
 
-- The dep pins (douglaz/fedimint `v0.11.1-pay-idempotency`) exist solely for lnv1's
-  pay path; at lnv1 deletion they return to the plain upstream `v0.11.1` tag. No
+- The dep pins are on the douglaz/fedimint `v0.11.1-pay-idempotency` fork. That fork is
+  upstream `v0.11.1` + two commits — #8818 pay-idempotency (on `fedimint-ln-client`, the
+  lnv1 crate) and the tpe 1-of-1 fix (on `crypto/tpe`, whose panicking fn only
+  `fedimint-gwv2-client` calls, not in lnrent's tree). At lnv1 deletion (lnrent-8ym) the
+  two lnv1 crates are dropped, so NEITHER fork commit touches anything lnrent still
+  compiles: the built lnv2 output is byte-identical to the plain upstream `v0.11.1` tag.
+  **The pins are KEPT on the fork anyway** (operator decision, lnrent-8ym 2026-07-22), as
+  standing patch infrastructure — lnrent carries fedimint patches regularly and the
+  gateway image (lnrent-e96) builds from the same fork. Returning to the tag was the
+  original plan; it was reversed because it is churn for zero functional change. No
   version bump is involved (lnv2 ships in v0.11.1). Upstream PR #8818 remains a valid
-  contribution for lnv1 users; lnrent just stops depending on it.
+  contribution for lnv1 users.
 - `docs/specs/backend-strategy.md` (lnrent-bi8) carries the execution detail: phoenixd
   trait mapping, per-backend backup/reconcile stories, the lnv2 no-same-invoice-retry
   gap across all bolt11 surfaces, retirement sequencing.

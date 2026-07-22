@@ -1,5 +1,13 @@
 # 0017 — Pay-path crash recovery stays oplog-based; re-paying is not an outcome oracle
 
+> **Status (lnrent-8ym): recovery machinery deleted with lnv1, per ADR-0018.** The lnv1 backend
+> this ADR describes — its oplog scan (`recover_pay_from_oplog`), the `fedimint_pay_dead_op`
+> dead-op ledger, and the `PayStateClass` update-stream classification — was removed when lnv1 was
+> retired. The lnv2 backend (`lnv2_backend.rs`) needs none of it: deterministic invoice-derived
+> operation ids and truthful refund-acceptance-aware final states replace the recovery stack by
+> design (see ADR-0018). This ADR is kept as history and as the method reference for *why* re-paying
+> is not an outcome oracle — the fedimint-internals analysis below remains valid.
+
 The daemon's outbound-pay crash recovery (`recover_pay_from_oplog`, lnrent-4gt/kum) scans
 fedimint's operation log on startup and backfills the lnrent `fedimint_pay` idempotency row
 for any committed pay operation the crash window (op committed, row not yet upserted) left

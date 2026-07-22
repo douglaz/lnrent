@@ -90,16 +90,18 @@ lightning-invoice = { version = "0.33", features = ["std"] }
 # Hex-compare the bolt11 description_hash against sha256(metadata) (sha2 is already a dep above).
 hex = "0.4"
 
-# --- Real Fedimint backend (lnrent-7fp.4), behind the `fedimint` feature (DEFAULT ON; build with --no-default-features for the mock-only path) ---
-# Pinned to douglaz/fedimint branch `v0.11.1-pay-idempotency` = UPSTREAM v0.11.1 (tag commit
-# 2620789) + ONE backported fix: pay_bolt11_invoice checks its per-payment-hash idempotency
-# (completed-payment short-circuit + PreviousPaymentAttemptStillInProgress) BEFORE invoice expiry,
-# so re-submitting an already-attempted invoice yields the idempotent answer even after it lapses
-# (upstream PR fedimint/fedimint#8818, lnrent-7y1; Cargo.lock pins the exact rev). Return to the
-# upstream tag once a release includes the fix. A public git source so the repo is reproducible off
-# this box and CI can build the fedimint money path. Daemon-only (a 2nd DB engine, RocksDB C++;
-# glibc-dynamic, ADR-0015); never compiled into the wasm buyer. All optional so mock builds don't
-# pull this tree.
+# --- Real Fedimint backend (lnv2, lnrent-3d5/ADR-0018), behind the `fedimint` feature (DEFAULT ON;
+# build with --no-default-features for the mock-only path) ---
+# Pinned to the douglaz/fedimint FORK (branch v0.11.1-pay-idempotency), KEPT past lnv1 deletion by
+# operator decision (lnrent-8ym, 2026-07-22). The fork is upstream v0.11.1 + two commits — the #8818
+# pay-idempotency backport (on fedimint-ln-client, the deleted lnv1 crate) and the tpe 1-of-1 fix (on
+# crypto/tpe, whose panicking fn only fedimint-gwv2-client calls — not in lnrent's tree). NEITHER
+# touches any crate lnrent still compiles, so the built lnv2 output is byte-identical to the upstream
+# tag; the fork is kept as standing patch infrastructure (lnrent carries fedimint patches regularly;
+# the gateway image lnrent-e96 also builds from it), not because its current contents are needed.
+# A public git source so the repo is reproducible off this box and CI can build the fedimint money
+# path. Daemon-only (a 2nd DB engine, RocksDB C++; glibc-dynamic, ADR-0015); never compiled into the
+# wasm buyer. All optional so mock builds don't pull this tree.
 fedimint-client = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
 fedimint-core = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
 # The federation-API trait (`IGlobalFederationApi`), for the lnrent-urw.4 liveness probe: a cheap
@@ -108,16 +110,12 @@ fedimint-api-client = { git = "https://github.com/douglaz/fedimint", branch = "v
 fedimint-rocksdb = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
 fedimint-derive-secret = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
 fedimint-connectors = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
-fedimint-ln-client = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
-fedimint-ln-common = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
-# The lnv2 client + common crates (lnrent-3d5, ADR-0018): the NEW real ecash money path. They ship
-# in the SAME already-pinned v0.11.1 source (the lnv2 crates there are byte-identical to upstream
-# v0.11.1 — the douglaz fork's ONE patch is lnv1-only), so this is no version bump, no new git source.
-# lnv2 eliminates lnv1's crash-recovery machinery by design: deterministic invoice-derived operation
-# ids (no oplog scan), truthful refund-acceptance-aware final states (no stream classification / dead-op
-# ledger). `-client` gives `LightningClientModule` (send/receive/await_final_*), `-common` the gateway
-# fee model (`PaymentFee`/`RoutingInfo`) the INV-1 cap is measured against. Same optional gating as the
-# lnv1 deps so mock-only builds pull neither tree.
+# The lnv2 client + common crates (lnrent-3d5, ADR-0018): the real ecash money path, from the same
+# douglaz/fedimint fork. lnv2 eliminates lnv1's crash-recovery machinery by design: deterministic
+# invoice-derived operation ids (no oplog scan), truthful refund-acceptance-aware final states (no
+# stream classification / dead-op ledger). `-client` gives `LightningClientModule`
+# (send/receive/await_final_*), `-common` the gateway fee model (`PaymentFee`/`RoutingInfo`) the INV-1
+# cap is measured against. Optional so mock-only builds pull neither tree.
 fedimint-lnv2-client = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
 fedimint-lnv2-common = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
 fedimint-mint-client = { git = "https://github.com/douglaz/fedimint", branch = "v0.11.1-pay-idempotency", optional = true }
@@ -132,7 +130,7 @@ futures-util = { version = "0.3", optional = true }
 # Fedimint is ON by default (alpha/beta dogfood — the real ecash money path). Build with
 # --no-default-features for the mock-only M1a path (no fedimint/rocksdb tree, no live federation).
 default = ["fedimint"]
-# Compile the real Fedimint backend (daemon/src/fedimint_backend.rs).
+# Compile the real Fedimint backend (daemon/src/lnv2_backend.rs).
 fedimint = [
     "dep:fedimint-client",
     "dep:fedimint-core",
@@ -140,8 +138,6 @@ fedimint = [
     "dep:fedimint-rocksdb",
     "dep:fedimint-derive-secret",
     "dep:fedimint-connectors",
-    "dep:fedimint-ln-client",
-    "dep:fedimint-ln-common",
     "dep:fedimint-lnv2-client",
     "dep:fedimint-lnv2-common",
     "dep:fedimint-mint-client",
@@ -158,6 +154,6 @@ nostr-relay-builder = "0.44"
 # recoverable signing + sha256 hashes. Already compiled as a `lightning-invoice` dependency; the
 # dev-dep just makes the InvoiceBuilder usable from tests. Default features include `secp-recovery`.
 bitcoin = "0.32"
-# Directly DELETE a fedimint_pay index row in the fedimint_live oplog-recovery test, to simulate the
-# pay() crash window (op committed, local row not yet upserted). Same version as the daemon dep.
+# Direct sqlite access from the integration tests (e.g. the backup test seeds/reads the state DB and
+# fedimint index fixtures). Same version as the daemon dep.
 rusqlite = { version = "0.31", features = ["bundled"] }

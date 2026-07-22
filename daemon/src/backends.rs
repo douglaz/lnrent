@@ -1,6 +1,6 @@
 //! The `PaymentBackend` money seam (SPEC.md §6.1): its DTOs (`Invoice`, `PaymentStatus`,
 //! `PayStatus`, `Settlement`) plus the in-memory `MockPayment` fixture. The real Fedimint
-//! backend lives in `fedimint_backend.rs` (ADR-0012); provisioning is hook-driven (`runner.rs`
+//! backend lives in `lnv2_backend.rs` (ADR-0018); provisioning is hook-driven (`runner.rs`
 //! + recipes), not a trait here.
 
 use anyhow::{bail, Result};
@@ -120,10 +120,9 @@ pub trait PaymentBackend: Send + Sync {
     /// persisted invoice, or is TERMINAL PER INVOICE — so a retry needs a FRESH invoice at the next
     /// generation. This is the ONE money-semantic the refund generation gate (`refund.rs`) needs to
     /// know per backend:
-    ///  - **lnv1 / mock (default `true`).** A definite `Failed` re-attempts the same bolt11: the pinned
-    ///    fedimint lnv1 client checks pay idempotency BEFORE invoice expiry and starts a fresh op
-    ///    (`fedimint_backend.rs`), so a transient-cause failure on a still-unexpired, still-in-cap
-    ///    invoice is retried as-is.
+    ///  - **mock / default (`true`).** A definite `Failed` re-attempts the same bolt11 in place: the
+    ///    default backend re-drives the same persisted invoice, so a transient-cause failure on a
+    ///    still-unexpired, still-in-cap invoice is retried as-is.
     ///  - **lnv2 (`false`).** `send` derives a DETERMINISTIC attempt-0 operation id from the invoice;
     ///    once it reaches `Refunded`/`Failure` the SAME bolt11 can NEVER be re-sent (NO-RETRY,
     ///    lnrent-3d5 / ADR-0018). The gate MUST re-resolve a fresh invoice at the next generation, or

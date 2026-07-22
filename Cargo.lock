@@ -29,17 +29,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aes"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
-dependencies = [
- "cfg-if",
- "cipher",
- "cpufeatures 0.2.17",
-]
-
-[[package]]
 name = "age"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1470,15 +1459,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
-name = "email_address"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1019fa28f600f5b581b7a603d515c3f1635da041ca211b5055804788673abfe"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "embedded-io"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1893,40 +1873,6 @@ version = "0.11.1"
 source = "git+https://github.com/douglaz/fedimint?branch=v0.11.1-pay-idempotency#642f3ed86afeccd7932b43a35a90f5bb5c6b7282"
 dependencies = [
  "bitcoin_hashes",
-]
-
-[[package]]
-name = "fedimint-ln-client"
-version = "0.11.1"
-source = "git+https://github.com/douglaz/fedimint?branch=v0.11.1-pay-idempotency#642f3ed86afeccd7932b43a35a90f5bb5c6b7282"
-dependencies = [
- "anyhow",
- "aquamarine",
- "assert_matches",
- "async-stream",
- "async-trait",
- "bitcoin",
- "erased-serde",
- "fedimint-api-client",
- "fedimint-client-module",
- "fedimint-core",
- "fedimint-derive-secret",
- "fedimint-eventlog",
- "fedimint-ln-common",
- "fedimint-logging",
- "futures",
- "itertools 0.14.0",
- "lightning-invoice",
- "lnurl-rs",
- "rand 0.8.6",
- "reqwest",
- "serde",
- "serde_json",
- "strum 0.27.2",
- "strum_macros 0.27.2",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -4083,8 +4029,6 @@ dependencies = [
  "fedimint-connectors",
  "fedimint-core",
  "fedimint-derive-secret",
- "fedimint-ln-client",
- "fedimint-ln-common",
  "fedimint-lnv2-client",
  "fedimint-lnv2-common",
  "fedimint-mint-client",
@@ -4113,25 +4057,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "zeroize",
-]
-
-[[package]]
-name = "lnurl-rs"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41eacdd87b675792f7752f3dd0937a00241a504c3956c47f72986490662e1db4"
-dependencies = [
- "aes",
- "anyhow",
- "base64 0.22.1",
- "bech32 0.11.1",
- "bitcoin",
- "cbc",
- "email_address",
- "reqwest",
- "serde",
- "serde_json",
- "url",
 ]
 
 [[package]]
