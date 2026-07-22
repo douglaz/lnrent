@@ -153,12 +153,13 @@ from the wallet balance (ADR-0016).
 _Avoid_: profit (accounting term), balance, available funds.
 
 **Refund**:
-Money the Operator owes back to a Buyer because a *paid* Order could not be delivered: a
-permanently failed provision, or a settlement landing on an already-expired invoice. A
-Buyer's cancel does NOT create one — the prepaid period simply runs out (ADR-0005). The
-amount is the *net wallet credit* for that Order, not the invoice face value, and the
-outbound Lightning fee comes out of it too, so a Buyer recovers less than they paid
-(ADR-0019). Never optional, unlike a Sweep.
+Money the Operator owes back to a Buyer for a *paid* receipt that could not be turned into
+service. It arises across the Subscription lifecycle, not just at first order: a permanently
+failed provision, a settlement landing on an already-expired invoice, a paid renewal whose
+resume hook fails permanently, or a terminal/late renewal settlement. A Buyer's cancel does
+NOT create one — the prepaid period simply runs out (ADR-0005). The amount is the *net wallet
+credit* for that receipt, not the invoice face value, and the outbound Lightning fee comes out
+of it too, so a Buyer recovers less than they paid (ADR-0019). Never optional, unlike a Sweep.
 _Avoid_: reversal, chargeback, cancellation (a different thing — see Subscription states),
 payout (ambiguous with Sweep).
 
@@ -172,8 +173,9 @@ _Avoid_: withdrawal, payout (ambiguous with refunds), cash out.
 **Reconcile (operator act)**:
 The explicit, on-demand comparison of the wallet against the books, reporting whether
 they agree. The single sanctioned reading of the wallet balance; it informs a human and
-never authorizes anything. (Target — in M1a `lnrent money` still reads the live balance
-and no reconcile command exists yet; ADR-0016 / gate1 specs land this.) Distinct from the *reconcile loop* (the timer-driven
+never authorizes anything. (`lnrent reconcile` is the ONLY command that reads the wallet
+balance; a plain `lnrent money` reports the ledger's expected holdings and makes no balance
+call — ADR-0016.) Distinct from the *reconcile loop* (the timer-driven
 subscription state machine walker, SPEC §6.5) — same word, different thing; say
 "reconcile command" vs "reconcile loop" when ambiguous.
 _Avoid_: audit, balance check.

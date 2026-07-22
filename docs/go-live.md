@@ -143,6 +143,13 @@ Share the listing coordinate / operator npub.
   dropped. Inspect the per-item list with `lnrent refunds`; once the buyer's endpoint recovers, re-drive one
   with `lnrent refund-retry <id>` (it reruns the real resolver + capped-pay path — there is no cancel verb,
   abandoning a liability stays a manual decision).
+- **A refund returns LESS than the buyer paid, and at tiny prices the haircut is stark.** The refund is
+  capped at what the order actually credited (net of receive + consensus fees), and the outbound Lightning
+  fee comes out of that too, so the buyer never gets the full invoice back (ADR-0019). At the shipped price
+  scale this is noise; at a very low price it is not — a live 50-sat order refunded ~36 sat (~72%). If you
+  set a low price, know you are also setting a poor refund experience, and price with a margin over your DO
+  cost, the round-trip Lightning fees, AND the Fedimint consensus fees on both the receive and the refund
+  send (the outbound debit is the payout plus the gateway fee plus the send's own mint consensus fees).
 - **Watch for owed teardowns:** `lnrent teardowns` (and the `open_teardowns` count in `lnrent status`)
   lists provider resources the daemon failed to tear down — a `destroy` hook that failed, or a stuck
   provision-failure cleanup. A droplet that failed to delete keeps billing you until this clears; the
