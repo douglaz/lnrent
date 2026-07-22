@@ -7,14 +7,14 @@
 //! fedimint client — the live "ecash-spendable-after-restore" proof is a separate follow-up (PART B).
 //!
 //! The data-dir layout it captures (see `config.rs` for the data dir + sqlite path, and
-//! `fedimint_backend.rs` for the fedimint paths):
+//! `fedimint_paths.rs` for the fedimint paths):
 //!
 //! - `<data_dir>/lnrent.sqlite`             — the lnrent state DB (WAL mode): subscriptions /
 //!   invoices / paid_through / reservations / the refund ledger / outbox / op_invocation.
 //! - `<data_dir>/fedimint.json`             — the federation invite/config (iff fedimint configured).
 //! - `<data_dir>/operator.seed`             — the BIP39 seed (iff present).
 //! - `<data_dir>/fedimint/<federation_id>/` — the fedimint client RocksDB (`client.db/`) AND the
-//!   lnrent-owned `lnrent_index.db` (the `fedimint_invoice` / `fedimint_pay` idempotency index).
+//!   lnrent-owned `lnv2_index.db` (the `lnv2_invoice` / `lnv2_pay` idempotency index).
 //!
 //! The sqlite is captured with `VACUUM INTO` — a single coherent artifact that folds in the WAL, so
 //! the `-wal`/`-shm` sidecars are never raw-copied. The fedimint directory + the config + the seed
@@ -62,7 +62,7 @@ const STATE_DB_FILE: &str = "lnrent.sqlite";
 const SEED_FILE: &str = "operator.seed";
 /// The Fedimint join config (matches `config.rs`'s `FEDIMINT_CONFIG_FILE`).
 const FEDIMINT_CONFIG_FILE: &str = "fedimint.json";
-/// The per-federation fedimint subtree (matches `fedimint_backend.rs`'s `data_dir/fedimint/<id>/`).
+/// The per-federation fedimint subtree (matches `fedimint_paths.rs`'s `data_dir/fedimint/<id>/`).
 const FEDIMINT_DIR: &str = "fedimint";
 /// The daemon's IPC socket (matches `main.rs`'s `data_dir.join("lnrent.sock")`); a *live* socket is
 /// the cheap "is a daemon running against this data dir?" tell.
@@ -214,7 +214,7 @@ fn backup_plaintext(data_dir: &Path, dest: &Path, src_db: &Path) -> Result<Manif
     harden_file_0600(&dest_db)?;
     fsync_file(&dest_db)?;
 
-    // 2. The fedimint subtree (client.db rocksdb + lnrent_index.db), copied as opaque bytes.
+    // 2. The fedimint subtree (client.db rocksdb + lnv2_index.db), copied as opaque bytes.
     let src_fed = data_dir.join(FEDIMINT_DIR);
     let fedimint_dir = src_fed.is_dir();
     let mut federations = Vec::new();

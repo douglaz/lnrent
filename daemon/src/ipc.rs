@@ -85,7 +85,7 @@ impl Request {
     /// local sqlite txn + reply that comfortably fits `SHUTDOWN_DRAIN` (`RefundRetry` only CASes a
     /// row to PENDING; the admin transitions and `DevSettle` are single txns). The ONE exception is
     /// `Request::Sweep`, whose dispatch awaits a real Lightning/fedimint pay bounded at
-    /// `fedimint_backend::PAY_AWAIT_TIMEOUT` (120s) — far above `SHUTDOWN_DRAIN`. We STILL do not
+    /// `lnv2_backend::PAY_AWAIT_TIMEOUT` (120s) — far above `SHUTDOWN_DRAIN`. We STILL do not
     /// cancel it: dropping an in-flight capped pay mid-settle would risk paying out without recording
     /// SENT, so money safety wins over drain promptness. A slow `Sweep` in flight at shutdown can
     /// therefore still overrun the drain and force the supervisor abort — but that is a PRE-EXISTING

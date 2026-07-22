@@ -19,9 +19,9 @@ fn pass(s: &str) -> Option<Zeroizing<String>> {
 
 const FED_ID: &str = "fed11deadbeefcafe";
 
-/// The lnrent-owned fedimint idempotency index schema (mirrors `fedimint_backend.rs`'s
-/// `INDEX_SCHEMA`; inlined here because that module is `fedimint`-feature-gated). The test only
-/// needs a populated `lnrent_index.db` to copy + reread, so this fixture stands in for it.
+/// A stand-in for the lnrent-owned fedimint idempotency index db. Backup treats the whole
+/// `fedimint/` subtree (including any `*_index.db`) as opaque bytes, so this test only needs SOME
+/// populated sqlite db under the subtree to copy + reread — the exact table shape is immaterial.
 const INDEX_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS fedimint_invoice (
     external_id   TEXT PRIMARY KEY,

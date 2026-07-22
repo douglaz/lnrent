@@ -2923,7 +2923,7 @@ mod tests {
     // defer/strand), NOT the backend-level dedup of an in-flight op. The mock's status override
     // (Pending) and its `paid` map are independent, so `pay()` here simply records the bare-key
     // payment; the real dedup-against-an-in-flight-op guarantee belongs to the Fedimint backend and is
-    // exercised in fedimint_live (lnrent-4gt PART 2), not by this mock.
+    // exercised in the live backend test (lnv2_live), not by this mock.
     #[tokio::test]
     async fn legacy_bare_key_pending_bolt11_reenters_pay() {
         let store = mem_store();
