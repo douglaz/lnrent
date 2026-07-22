@@ -99,9 +99,9 @@ async fn lnv2_receive_and_pay_live() {
     // Default HALF the receive, so lowering only RECV_SAT stays coherent (1000 -> 500 unchanged).
     let pay_sat = amt_sat("LNRENT_LIVE_PAY_SAT", recv_sat / 2);
     assert!(
-        pay_sat < recv_sat,
-        "LNRENT_LIVE_PAY_SAT ({pay_sat}) must be strictly below LNRENT_LIVE_RECV_SAT ({recv_sat}): \
-         the receive fee takes a cut, so an equal/greater payout can never be funded"
+        (1..recv_sat).contains(&pay_sat),
+        "LNRENT_LIVE_PAY_SAT ({pay_sat}) must be in 1..{recv_sat}: at least 1 sat so the run actually \
+         proves the outbound send, and strictly below the receive since its fee takes a cut"
     );
     let ext = format!("ext-lnv2-{}", run_id());
     let refund_key = format!("refund-lnv2-{}", run_id());
@@ -212,9 +212,9 @@ async fn lnv2_send_failure_is_terminal_live() {
     // 2/5 of the funding (1000 -> 400 unchanged) so lowering only RECV_SAT cannot strand it above.
     let pay_sat = amt_sat("LNRENT_LIVE_FAIL_PAY_SAT", fund_sat * 2 / 5);
     assert!(
-        pay_sat < fund_sat,
-        "LNRENT_LIVE_FAIL_PAY_SAT ({pay_sat}) must be strictly below LNRENT_LIVE_RECV_SAT \
-         ({fund_sat}): the receive fee takes a cut, so an equal/greater payout can never be funded"
+        (1..fund_sat).contains(&pay_sat),
+        "LNRENT_LIVE_FAIL_PAY_SAT ({pay_sat}) must be in 1..{fund_sat}: at least 1 sat so a send is \
+         actually attempted, and strictly below the funding since its receive fee takes a cut"
     );
     let ext = format!("ext-lnv2-fail-{}", run_id());
     let refund_key = format!("refund-lnv2-fail-{}", run_id());
