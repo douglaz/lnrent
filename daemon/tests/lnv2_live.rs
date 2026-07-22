@@ -277,3 +277,108 @@ async fn lnv2_send_failure_is_terminal_live() {
         "LNV2 SEND-FAILURE TEST PASSED — definitive failure is terminal + NO-RETRY on the bolt11"
     );
 }
+
+/// PROOF that a COLD backup/restore preserves the lnv2 ecash position across box death (lnrent-2ad —
+/// the live half; the offline `tests/backup.rs` proves only the file-level byte round-trip). This is
+/// the lnv2 port of the `fedimint_backup_restore_preserves_ecash_live` test deleted with lnv1
+/// (lnrent-8ym): receive ecash + pay a refund out, back up the STOPPED data dir, restore it into a
+/// FRESH dir, reopen `Lnv2Payment` there, and assert the prior pay status survived AND the recovered
+/// ecash is still SPENDABLE (a second refund pays out). Only a real federation can prove the fedimint
+/// POSITION is live after restore — the offline test cannot reopen the backend (that needs guardians).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running devimint federation with lnv2 (FM_INVITE_CODE on the env)"]
+async fn lnv2_backup_restore_preserves_ecash_live() {
+    let invite = std::env::var("FM_INVITE_CODE")
+        .expect("FM_INVITE_CODE — run under `devimint dev-fed --exec`");
+    let src_dir = data_dir("lnv2-bk-src");
+    let recv_sat = amt_sat("LNRENT_LIVE_RECV_SAT", 1000);
+    // Two payouts out of the funded position: pay1 before backup, pay2 from the RESTORED ecash.
+    // Defaults 3/10 + 2/10 keep the historical 1000 -> 300/200 and stay coherent when RECV_SAT is
+    // lowered (50 -> 15/10). Both >= 1 and pay1+pay2 < recv so the second send is fundable post-fee.
+    let pay1_sat = amt_sat("LNRENT_LIVE_BK_PAY1_SAT", recv_sat * 3 / 10);
+    let pay2_sat = amt_sat("LNRENT_LIVE_BK_PAY2_SAT", recv_sat * 2 / 10);
+    assert!(
+        pay1_sat >= 1 && pay2_sat >= 1 && pay1_sat + pay2_sat < recv_sat,
+        "LNRENT_LIVE_BK_PAY1_SAT ({pay1_sat}) + PAY2_SAT ({pay2_sat}) must each be >= 1 and sum below \
+         LNRENT_LIVE_RECV_SAT ({recv_sat}): receive + send fees take cuts, so an equal/greater total \
+         can never be funded"
+    );
+    let ext = format!("ext-lnv2-bk-{}", run_id());
+    let key1 = format!("refund-lnv2-bk1-{}", run_id());
+    let key2 = format!("refund-lnv2-bk2-{}", run_id());
+    let root_secret = [23u8; 32];
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
+    // --- fund + pay the first refund out under key1 -----------------------------------------------
+    let backend = Lnv2Payment::join_or_open(&invite, &src_dir, &root_secret, clock.clone())
+        .await
+        .expect("join the regtest federation via lnv2");
+    let mut settlements = backend.watch().await.expect("open settlement stream");
+    let inv = backend
+        .create_invoice(recv_sat, "lnv2 bk fund", 3600, &ext)
+        .await
+        .expect("mint an lnv2 gateway bolt11");
+    fedimint_cli(&["ln-pay", &inv.bolt11]);
+    tokio::time::timeout(Duration::from_secs(90), settlements.recv())
+        .await
+        .expect("a settlement arrives within 90s")
+        .expect("settlement channel open");
+
+    let pay1_msat = (pay1_sat * 1000).to_string();
+    let dest1 = bolt11_of(&fedimint_cli(&["ln-invoice", "--amount", &pay1_msat]));
+    tokio::time::timeout(
+        Duration::from_secs(90),
+        backend.pay_refund_capped(&dest1, pay1_sat, recv_sat, &key1),
+    )
+    .await
+    .expect("pay1 completes within 90s")
+    .expect("pay the first refund out");
+    assert_eq!(
+        backend.payment_status_by_key(&key1).await.unwrap(),
+        PayStatus::Succeeded,
+        "the first refund Succeeded before backup"
+    );
+
+    // --- BOX DEATH: drop the backend (rocksdb closes). backup() needs a state DB present, so create a
+    //     minimal valid lnrent.sqlite (this test has no daemon store; the offline test covers state-DB
+    //     reproduction — here the focus is the fedimint POSITION surviving restore). ---------------
+    drop(settlements);
+    drop(backend);
+    rusqlite::Connection::open(src_dir.join("lnrent.sqlite"))
+        .expect("create a stub state DB so backup() has one to capture");
+    let bk_dest = std::env::temp_dir().join(format!("lnrent-lnv2-bk-dest-{}", std::process::id()));
+    let restored = data_dir("lnv2-bk-restored");
+    // restore() refuses a non-empty target; use a fresh dir so a re-run starts clean.
+    let _ = std::fs::remove_dir_all(&restored);
+    lnrentd::backup::backup(&src_dir, &bk_dest, None).expect("cold backup of the stopped data dir");
+    lnrentd::backup::restore(&bk_dest, &restored, false, None)
+        .expect("restore into a fresh data dir");
+
+    // --- reopen on the RESTORED dir: prior pay status survives + the ecash is still SPENDABLE -------
+    let backend2 = Lnv2Payment::join_or_open(&invite, &restored, &root_secret, clock.clone())
+        .await
+        .expect("reopen the lnv2 client from the restored backup");
+    assert_eq!(
+        backend2.payment_status_by_key(&key1).await.unwrap(),
+        PayStatus::Succeeded,
+        "the prior refund's status survived the backup/restore"
+    );
+    let pay2_msat = (pay2_sat * 1000).to_string();
+    let dest2 = bolt11_of(&fedimint_cli(&["ln-invoice", "--amount", &pay2_msat]));
+    tokio::time::timeout(
+        Duration::from_secs(90),
+        backend2.pay_refund_capped(&dest2, pay2_sat, recv_sat, &key2),
+    )
+    .await
+    .expect("pay2 completes within 90s")
+    .expect("the restored ecash is spendable");
+    assert_eq!(
+        backend2.payment_status_by_key(&key2).await.unwrap(),
+        PayStatus::Succeeded,
+        "a second refund pays out from the RESTORED ecash position"
+    );
+
+    println!(
+        "LNV2 BACKUP/RESTORE TEST PASSED — pay status preserved + ecash spendable after restore"
+    );
+}
