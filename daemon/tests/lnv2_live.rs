@@ -41,6 +41,43 @@ fn fedimint_cli(args: &[&str]) -> serde_json::Value {
         .unwrap_or_else(|_| serde_json::Value::String(stdout.trim().to_string()))
 }
 
+/// Amounts are env-overridable so the same test can run against a live (mainnet) federation at a
+/// trivial size. Defaults preserve the regtest/devimint behaviour exactly.
+fn amt_sat(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .map(|v| v.parse().unwrap_or_else(|e| panic!("{var}={v:?}: {e}")))
+        .unwrap_or(default)
+}
+
+/// The client data dir. Ephemeral (pid-scoped) by default, as devimint wants; against a live
+/// federation set `LNRENT_LIVE_DATA_DIR` so residual ecash lands in a wallet we can drain later
+/// rather than in a temp dir that gets reaped.
+fn data_dir(suffix: &str) -> std::path::PathBuf {
+    let dir = match std::env::var("LNRENT_LIVE_DATA_DIR") {
+        Ok(base) => std::path::PathBuf::from(base).join(suffix),
+        Err(_) => std::env::temp_dir().join(format!("lnrent-{suffix}-{}", std::process::id())),
+    };
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A per-RUN id, used to make invoice `external_id`s and refund keys unique across runs.
+///
+/// With the default (pid-scoped) data dir every run gets a fresh wallet, so constant ids were fine.
+/// With `LNRENT_LIVE_DATA_DIR` the wallet PERSISTS, and constant ids would make a second run a
+/// no-op instead of a test: `create_invoice` is idempotent on `external_id` (it would hand back the
+/// already-PAID invoice, so no settlement ever arrives) and `pay_refund_capped` is idempotent on its
+/// key (it would return the previous op without sending). Stable WITHIN a run — the idempotency
+/// assertions still re-use the same id deliberately — and distinct ACROSS runs.
+fn run_id() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after the unix epoch")
+        .as_nanos()
+        .to_string()
+}
+
 fn bolt11_of(v: &serde_json::Value) -> String {
     v.get("invoice")
         .and_then(|x| x.as_str())
@@ -57,8 +94,17 @@ fn bolt11_of(v: &serde_json::Value) -> String {
 async fn lnv2_receive_and_pay_live() {
     let invite = std::env::var("FM_INVITE_CODE")
         .expect("FM_INVITE_CODE — run under `devimint dev-fed --exec`");
-    let data_dir = std::env::temp_dir().join(format!("lnrent-lnv2-live-{}", std::process::id()));
-    std::fs::create_dir_all(&data_dir).unwrap();
+    let data_dir = data_dir("lnv2-live");
+    let recv_sat = amt_sat("LNRENT_LIVE_RECV_SAT", 1000);
+    // Default HALF the receive, so lowering only RECV_SAT stays coherent (1000 -> 500 unchanged).
+    let pay_sat = amt_sat("LNRENT_LIVE_PAY_SAT", recv_sat / 2);
+    assert!(
+        (1..recv_sat).contains(&pay_sat),
+        "LNRENT_LIVE_PAY_SAT ({pay_sat}) must be in 1..{recv_sat}: at least 1 sat so the run actually \
+         proves the outbound send, and strictly below the receive since its fee takes a cut"
+    );
+    let ext = format!("ext-lnv2-{}", run_id());
+    let refund_key = format!("refund-lnv2-{}", run_id());
     let root_secret = [17u8; 32];
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
@@ -71,11 +117,11 @@ async fn lnv2_receive_and_pay_live() {
 
     // 1. create_invoice is idempotent on external_id.
     let inv = backend
-        .create_invoice(1000, "lnrent lnv2 receive", 3600, "ext-lnv2-1")
+        .create_invoice(recv_sat, "lnrent lnv2 receive", 3600, &ext)
         .await
         .expect("mint an lnv2 gateway bolt11");
     let inv_again = backend
-        .create_invoice(1000, "lnrent lnv2 receive", 3600, "ext-lnv2-1")
+        .create_invoice(recv_sat, "lnrent lnv2 receive", 3600, &ext)
         .await
         .expect("create_invoice idempotent");
     assert_eq!(inv.id, inv_again.id, "same external_id -> same invoice");
@@ -93,8 +139,8 @@ async fn lnv2_receive_and_pay_live() {
         .await
         .expect("a settlement arrives within 90s")
         .expect("settlement channel open");
-    assert_eq!(settlement.external_id, "ext-lnv2-1");
-    assert_eq!(settlement.amount_sat, 1000);
+    assert_eq!(settlement.external_id, ext);
+    assert_eq!(settlement.amount_sat, recv_sat);
     assert!(
         settlement.received_msat < settlement.amount_sat * 1000,
         "the live arm exposes the lnv2 gateway receive fee ([9A])"
@@ -122,26 +168,24 @@ async fn lnv2_receive_and_pay_live() {
         "invoice is Paid after settlement"
     );
 
-    // 3. pay out: our client now holds ~1000 sat ecash; pay a 500-sat invoice, idempotently.
-    let dest = bolt11_of(&fedimint_cli(&["ln-invoice", "--amount", "500000"]));
+    // 3. pay out: our client now holds the received ecash; pay a smaller invoice, idempotently.
+    let pay_msat = (pay_sat * 1000).to_string();
+    let dest = bolt11_of(&fedimint_cli(&["ln-invoice", "--amount", &pay_msat]));
     let pay_id = tokio::time::timeout(
         Duration::from_secs(90),
-        backend.pay_refund_capped(&dest, 500, 1000, "refund-lnv2-1"),
+        backend.pay_refund_capped(&dest, pay_sat, recv_sat, &refund_key),
     )
     .await
     .expect("pay completes within 90s")
     .expect("pay 500 sat out");
     assert_eq!(
-        backend
-            .payment_status_by_key("refund-lnv2-1")
-            .await
-            .unwrap(),
+        backend.payment_status_by_key(&refund_key).await.unwrap(),
         PayStatus::Succeeded,
         "the refund key is Succeeded"
     );
     // Re-pay the same key: idempotent, no double-pay.
     let pay_id_again = backend
-        .pay_refund_capped(&dest, 500, 1000, "refund-lnv2-1")
+        .pay_refund_capped(&dest, pay_sat, recv_sat, &refund_key)
         .await
         .expect("pay idempotent on key");
     assert_eq!(
@@ -149,7 +193,9 @@ async fn lnv2_receive_and_pay_live() {
         "same key -> same op id, never a second send"
     );
 
-    println!("LNV2 LIVE TEST PASSED — received 1000 sat, paid 500 sat out (idempotent)");
+    println!(
+        "LNV2 LIVE TEST PASSED — received {recv_sat} sat, paid {pay_sat} sat out (idempotent)"
+    );
 }
 
 /// PROOF that a DEFINITIVELY-failed lnv2 send parks the key FAILED and never re-sends the same bolt11
@@ -160,8 +206,18 @@ async fn lnv2_receive_and_pay_live() {
 async fn lnv2_send_failure_is_terminal_live() {
     let invite = std::env::var("FM_INVITE_CODE")
         .expect("FM_INVITE_CODE — run under `devimint dev-fed --exec`");
-    let data_dir = std::env::temp_dir().join(format!("lnrent-lnv2-fail-{}", std::process::id()));
-    std::fs::create_dir_all(&data_dir).unwrap();
+    let data_dir = data_dir("lnv2-fail");
+    let fund_sat = amt_sat("LNRENT_LIVE_RECV_SAT", 1000);
+    // Strictly below `fund_sat` so the send is attemptable at all after the receive fee. Defaults to
+    // 2/5 of the funding (1000 -> 400 unchanged) so lowering only RECV_SAT cannot strand it above.
+    let pay_sat = amt_sat("LNRENT_LIVE_FAIL_PAY_SAT", fund_sat * 2 / 5);
+    assert!(
+        (1..fund_sat).contains(&pay_sat),
+        "LNRENT_LIVE_FAIL_PAY_SAT ({pay_sat}) must be in 1..{fund_sat}: at least 1 sat so a send is \
+         actually attempted, and strictly below the funding since its receive fee takes a cut"
+    );
+    let ext = format!("ext-lnv2-fail-{}", run_id());
+    let refund_key = format!("refund-lnv2-fail-{}", run_id());
     let root_secret = [19u8; 32];
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
@@ -170,9 +226,9 @@ async fn lnv2_send_failure_is_terminal_live() {
         .expect("join the regtest federation via lnv2");
     let mut settlements = backend.watch().await.expect("open settlement stream");
 
-    // Fund ~1000 sat so a send can be attempted at all.
+    // Fund the wallet so a send can be attempted at all.
     let inv = backend
-        .create_invoice(1000, "fund", 3600, "ext-lnv2-fail")
+        .create_invoice(fund_sat, "fund", 3600, &ext)
         .await
         .expect("mint invoice");
     fedimint_cli(&["ln-pay", &inv.bolt11]);
@@ -182,10 +238,11 @@ async fn lnv2_send_failure_is_terminal_live() {
         .expect("channel open");
 
     // A 1-second-expiry destination invoice, then wait it out so the send cannot succeed.
+    let pay_msat = (pay_sat * 1000).to_string();
     let dest = bolt11_of(&fedimint_cli(&[
         "ln-invoice",
         "--amount",
-        "400000",
+        &pay_msat,
         "--expiry-time",
         "1",
     ]));
@@ -193,23 +250,20 @@ async fn lnv2_send_failure_is_terminal_live() {
 
     let first = tokio::time::timeout(
         Duration::from_secs(90),
-        backend.pay_refund_capped(&dest, 400, 1000, "refund-lnv2-fail"),
+        backend.pay_refund_capped(&dest, pay_sat, fund_sat, &refund_key),
     )
     .await
     .expect("pay attempt completes within 90s");
     assert!(first.is_err(), "an expired-invoice send must not succeed");
     assert_eq!(
-        backend
-            .payment_status_by_key("refund-lnv2-fail")
-            .await
-            .unwrap(),
+        backend.payment_status_by_key(&refund_key).await.unwrap(),
         PayStatus::Failed,
         "a definitive send failure parks the key FAILED (a fresh generation re-resolves)"
     );
 
     // NO-RETRY: re-driving the SAME key stays terminal Err — it does not re-send the same bolt11.
     let again = backend
-        .pay_refund_capped(&dest, 400, 1000, "refund-lnv2-fail")
+        .pay_refund_capped(&dest, pay_sat, fund_sat, &refund_key)
         .await;
     assert!(
         again.is_err(),

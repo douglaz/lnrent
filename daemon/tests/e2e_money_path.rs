@@ -3127,7 +3127,7 @@ async fn do_vps_full_order_provisions_a_real_droplet() {
     std::env::set_var("DO_TOKEN", &token); // the supervisor-spawned provision hook inherits this
     std::env::set_var("DO_REGION", "nyc3");
     std::env::set_var("DO_SIZE", "s-1vcpu-1gb");
-    std::env::set_var("DO_IMAGE", "debian-12-x64");
+    std::env::set_var("DO_IMAGE", "debian-13-x64");
 
     let recipe = Recipe::load(format!("{}/../recipes/do-vps", env!("CARGO_MANIFEST_DIR")))
         .expect("load do-vps recipe");
@@ -3268,7 +3268,7 @@ async fn do_vps_real_payment_provisions_a_real_vm() {
     std::env::set_var("DO_TOKEN", &token);
     std::env::set_var("DO_REGION", "nyc3");
     std::env::set_var("DO_SIZE", "s-1vcpu-1gb");
-    std::env::set_var("DO_IMAGE", "debian-12-x64");
+    std::env::set_var("DO_IMAGE", "debian-13-x64");
 
     // A 1-sat do-vps (override the price so the cheap order is payable from a small wallet).
     let mut recipe = Recipe::load(format!("{}/../recipes/do-vps", env!("CARGO_MANIFEST_DIR")))
