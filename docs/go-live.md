@@ -32,7 +32,8 @@ There is no separate wallet key.
 ## 1. Decisions to make (yours to choose)
 
 - **Federation** — a MAINNET Fedimint federation you trust to custody your working balance, with an active
-  Lightning gateway. You need its invite code (`fed1…`) and the gateway's pubkey.
+  Lightning gateway (the daemon selects one natively from the federation — you do not configure a gateway).
+  You need its invite code (`fed1…`).
 - **Mnemonic** — a fresh, backed-up BIP-39 mnemonic (see §0).
 - **Compute** — a DigitalOcean account + API token (`DO_TOKEN`) with billing configured. The droplets are a
   real fiat cost you pay DO; the sats you receive are separate — price accordingly.
@@ -57,7 +58,7 @@ nix develop . --command cargo build --release -p lnrentd -p lnrent-buyer-cli
 
 ```sh
 LNRENT_DATA_DIR=/srv/lnrent/data LNRENT_PAYMENT_BACKEND=fedimint \
-LNRENT_FEDIMINT_INVITE=fed1… LNRENT_FEDIMINT_GATEWAY=<gateway_pubkey> \
+LNRENT_FEDIMINT_INVITE=fed1… \
 LNRENT_MNEMONIC="…your backed-up mnemonic…" \
 LNRENT_RELAYS=wss://relay-a,wss://relay-b \
   ./target/release/lnrentd bootstrap
@@ -66,7 +67,7 @@ LNRENT_RELAYS=wss://relay-a,wss://relay-b \
 Idempotent (re-reads the persisted seed on a re-run). Note the operator **npub** it prints — that is your
 listing author + DM peer. BACK UP the mnemonic now if you haven't (§0).
 
-**Never set `LNRENT_MNEMONIC` (or the `LNRENT_FEDIMINT_*` vars) on the RUN invocation or in the
+**Never set `LNRENT_MNEMONIC` or `LNRENT_FEDIMINT_INVITE` on the RUN invocation or in the
 systemd unit/EnvironmentFile** — they are bootstrap-only. The run daemon reads the seed from the
 persisted 0600 `operator.seed`. Even if you do supply the seed via the env, the daemon now closes
 the misuse path in code (lnrent-y4m.7): every recipe hook is spawned with a **cleared environment** —

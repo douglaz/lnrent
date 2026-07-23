@@ -52,7 +52,7 @@ groups into go-live gates:
   delete otherwise bills the operator invisibly), federation-liveness / refund / relay actuators, and
   a ledger-authoritative money core where the wallet balance is read in exactly one place.
 - **HARDEN** (before scale): terminal-row GC, disk-full/corruption handling on the money path, hook
-  secret hygiene, gateway failover, a `preflight`/`doctor` command, and encrypted backups.
+  secret hygiene, a `preflight`/`doctor` command, and encrypted backups.
 
 The money-correctness core (idempotent capture, fee-capped crash-recoverable refunds, SSRF-hardened
 refund resolver) is deliberately **out of scope** for these gates — they add durability and
@@ -86,7 +86,7 @@ token and select the fedimint backend at runtime:
 
 ```sh
 # One-time bootstrap: persists the seed (0600) + federation config into the data dir.
-LNRENT_PAYMENT_BACKEND=fedimint LNRENT_FEDIMINT_INVITE=fed1… LNRENT_FEDIMINT_GATEWAY=<gateway_pubkey> \
+LNRENT_PAYMENT_BACKEND=fedimint LNRENT_FEDIMINT_INVITE=fed1… \
 LNRENT_MNEMONIC="…" LNRENT_DATA_DIR=./data LNRENT_RELAYS=wss://relay.example \
   nix develop . --command cargo run -p lnrentd --bin lnrentd -- bootstrap
 

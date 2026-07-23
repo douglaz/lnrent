@@ -131,7 +131,7 @@ fn backup_restore_round_trip_reproduces_state_and_fedimint() {
     populate_fedimint_dir(&data_dir);
     fs::write(
         data_dir.join("fedimint.json"),
-        r#"{"invite":"fed11invite","gateway":"03gateway"}"#,
+        r#"{"invite":"fed11invite"}"#,
     )
     .unwrap();
     fs::write(
@@ -235,7 +235,7 @@ fn backup_restore_round_trip_reproduces_state_and_fedimint() {
     // --- config + seed reproduce ---
     assert_eq!(
         fs::read_to_string(restored.join("fedimint.json")).unwrap(),
-        r#"{"invite":"fed11invite","gateway":"03gateway"}"#
+        r#"{"invite":"fed11invite"}"#
     );
     assert!(restored.join("operator.seed").is_file());
 
@@ -270,7 +270,7 @@ fn encrypted_backup_restore_round_trip_reproduces_state_and_fedimint() {
     populate_fedimint_dir(&data_dir);
     fs::write(
         data_dir.join("fedimint.json"),
-        r#"{"invite":"fed11invite","gateway":"03gateway"}"#,
+        r#"{"invite":"fed11invite"}"#,
     )
     .unwrap();
     fs::write(data_dir.join("operator.seed"), SEED_WORDS).unwrap();
@@ -424,7 +424,7 @@ fn encrypted_backup_restore_round_trip_reproduces_state_and_fedimint() {
     // --- config + seed reproduce byte-for-byte ---
     assert_eq!(
         fs::read_to_string(restored.join("fedimint.json")).unwrap(),
-        r#"{"invite":"fed11invite","gateway":"03gateway"}"#
+        r#"{"invite":"fed11invite"}"#
     );
     assert_eq!(fs::read_to_string(restored.join("operator.seed")).unwrap(), SEED_WORDS);
     assert_eq!(mode(&restored.join("operator.seed")), 0o600);
@@ -1029,7 +1029,6 @@ const LNRENT_ENV: &[&str] = &[
     "LNRENT_PAYMENT_BACKEND",
     "LNRENT_COMPUTE_BACKEND",
     "LNRENT_FEDIMINT_INVITE",
-    "LNRENT_FEDIMINT_GATEWAY",
     "LNRENT_MNEMONIC",
     "LNRENT_CONFIG",
 ];
