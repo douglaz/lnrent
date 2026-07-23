@@ -19,10 +19,26 @@ AUTH=(-H @"$HDR" --connect-timeout 10 --max-time 20)
 
 in_set() { jq -e --arg v "$2" "$1 | index(\$v) != null" >/dev/null 2>&1; } # $1=jq slug-array  $2=value  <<< json
 
+# Fetch every page of a DigitalOcean list endpoint, concatenating the `.<key>` array across all
+# pages into one `{<key>: [...]}` object so the callers' jq predicates see the COMPLETE set. DO
+# caps a page at 200 items and returns `.links.pages.next` (an absolute, query-complete URL) while
+# more remain; reading only the first page would false-reject a valid slug that sorts onto a later
+# page (e.g. a size past the first 200). $1=collection key, $2=first-page URL (query already baked in).
+do_collection() {
+  local key="$1" url="$2" acc='[]' page next
+  while [[ -n "$url" ]]; do
+    page="$(curl -fsS "${AUTH[@]}" "$url")" || return 1
+    acc="$(jq -c --argjson acc "$acc" --arg k "$key" '$acc + (.[$k] // [])' <<<"$page")" || return 1
+    next="$(jq -r '.links.pages.next // empty' <<<"$page")"
+    url="$next"
+  done
+  jq -cn --argjson items "$acc" --arg k "$key" '{($k): $items}'
+}
+
 # Validate the REGION first: image and size availability are both region-scoped below, so a bad
 # region must fail here with its own diagnostic instead of surfacing as a misleading
 # "image/size not available in <bad region>" from a later, region-dependent check.
-regions="$(curl -fsS "${AUTH[@]}" --get --data-urlencode 'per_page=200' "${API}/regions")" \
+regions="$(do_collection regions "${API}/regions?per_page=200")" \
   || err "DO_REGION=$REGION could not be validated — DigitalOcean regions metadata read failed"
 in_set '[.regions[] | select(.available) | .slug]' "$REGION" <<<"$regions" \
   || err "DO_REGION=$REGION is not an available DigitalOcean region slug"
@@ -36,14 +52,14 @@ in_set '[.regions[] | select(.available) | .slug]' "$REGION" <<<"$regions" \
 # false-blocked. Scope: this debian recipe (`[os] supports=["debian"]`) validates distribution slugs;
 # overriding DO_IMAGE to a marketplace/custom image is outside the validated domain and yields a
 # fail-closed preflight (safe — it can only block launch, never admit a bad config).
-images="$(curl -fsS "${AUTH[@]}" --get --data-urlencode 'type=distribution' --data-urlencode 'per_page=200' "${API}/images")" \
+images="$(do_collection images "${API}/images?type=distribution&per_page=200")" \
   || err "DO_IMAGE=$IMAGE could not be validated — DigitalOcean images metadata read failed"
 image_min_disk="$(jq -er --arg image "$IMAGE" --arg region "$REGION" \
   'first(.images[] | select(.slug == $image and .status != "retired" and .status != "deleted" and (.regions | index($region) != null))) | .min_disk_size | numbers' \
   <<<"$images")" \
   || err "DO_IMAGE=$IMAGE is not an available DigitalOcean distribution image in DO_REGION=$REGION (retired, misspelled, or not offered in that region)"
 
-sizes="$(curl -fsS "${AUTH[@]}" --get --data-urlencode 'per_page=200' "${API}/sizes")" \
+sizes="$(do_collection sizes "${API}/sizes?per_page=200")" \
   || err "DO_SIZE=$SIZE could not be validated — DigitalOcean sizes metadata read failed"
 size_disk="$(jq -er --arg size "$SIZE" --arg region "$REGION" \
   'first(.sizes[] | select(.slug == $size and .available and (.regions | index($region) != null))) | .disk | numbers' \
