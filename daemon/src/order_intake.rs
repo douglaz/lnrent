@@ -40,6 +40,11 @@ use crate::store::Store;
 const INVOICE_EXPIRY_S: u32 = 3600;
 const MIN_RENEWAL_INVOICE_EXPIRY_S: i64 = 60;
 
+/// The stateless informational `billing.notice` message an owner gets when their `sub.cancel`
+/// or `renew.request` lands while the subscription is transiently `RESUMING` (lnrent-z4u,
+/// option (a)). Shared so the cancel and renew branches cannot drift apart.
+const RESUMING_RETRY_NOTICE: &str = "a renewal is being applied — please retry in a moment";
+
 /// The order-intake integrator: implements [`OrderHandler`] over the injected store, payment
 /// backend, clock, recipe, and host budget. Cheap to share behind an `Arc` (the engine holds it
 /// as `Arc<dyn OrderHandler>`).
@@ -328,6 +333,20 @@ impl OrderIntake {
             tracing::warn!(sub = %req.subscription_id, "renew.request from a non-owner — dropped");
             return Ok(());
         }
+        // lnrent-z4u: see handle_cancel for the decision. A renew that lands while the sub is
+        // transiently RESUMING gets the SAME stateless informational notice — renew has no wire
+        // error variant, so BillingNotice is the informational channel — owner-only (this branch
+        // sits after the owner check) and with NO state change. Deliberately not a RESUMING->X
+        // shortcut / resume-driver hook (the reverted P1 trap noted in handle_cancel).
+        if state == "RESUMING" {
+            let notice = Msg::BillingNotice(BillingNotice {
+                subscription_id: req.subscription_id.clone(),
+                state: "RESUMING".to_string(),
+                message: RESUMING_RETRY_NOTICE.to_string(),
+            });
+            out.reply(&sender, &notice).await?;
+            return Ok(());
+        }
         if !matches!(state.as_str(), "ACTIVE" | "SUSPENDED") {
             tracing::warn!(sub = %req.subscription_id, %state, "renew.request for a non-renewable state — dropped");
             return Ok(());
@@ -379,7 +398,7 @@ impl OrderIntake {
         &self,
         sender: PublicKey,
         cancel: SubCancel,
-        _out: &dyn Outbound,
+        out: &dyn Outbound,
     ) -> Result<()> {
         let sub_id = cancel.subscription_id;
         let Some((buyer_hex, state)) = self.load_cancel_auth(&sub_id).await? else {
@@ -388,6 +407,24 @@ impl OrderIntake {
         };
         if buyer_hex != sender.to_hex() {
             tracing::warn!(sub = %sub_id, "sub.cancel from a non-owner — dropped");
+            return Ok(());
+        }
+        // lnrent-z4u, option (a): a cancel that lands while the sub is transiently RESUMING gets a
+        // STATELESS informational BillingNotice (better operability — the product surface), not the
+        // old silent drop. This branch sits AFTER the owner check and BEFORE the state gate, so it is
+        // owner-only: a non-owner still hits the silent drop above and never learns the sub exists.
+        // We deliberately do NOT shortcut RESUMING -> CANCELLED, queue a pending cancel, or hook the
+        // resume driver: any such state write would race/bypass the resume driver's CAS on
+        // state='RESUMING' (resume.rs) — a reverted P1 trap. Cancel/renew are made to *function*
+        // during RESUMING by NOTHING here; this is UX only. Other non-actionable states keep the
+        // silent drop below.
+        if state == "RESUMING" {
+            let notice = Msg::BillingNotice(BillingNotice {
+                subscription_id: sub_id.clone(),
+                state: "RESUMING".to_string(),
+                message: RESUMING_RETRY_NOTICE.to_string(),
+            });
+            out.reply(&sender, &notice).await?;
             return Ok(());
         }
         if !matches!(state.as_str(), "ACTIVE" | "SUSPENDED") {
@@ -1878,6 +1915,147 @@ mod tests {
         assert_eq!(
             count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
             1
+        );
+    }
+
+    // lnrent-z4u: a cancel or renew that lands while the sub is transiently RESUMING gets a
+    // STATELESS informational BillingNotice (option (a)) — owner-only — and the RESUMING state is
+    // NEVER changed. No RESUMING->CANCELLED shortcut, no renewal invoice, no persisted outbox row:
+    // the resume driver keeps sole ownership of the state='RESUMING' CAS.
+    #[tokio::test]
+    async fn cancel_and_renew_during_resuming_notify_owner_without_state_change() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        seed_renewable_sub(&store, "sub-c", &buyer_hex, "RESUMING", 5000, 500, None).await;
+        seed_renewable_sub(&store, "sub-r", &buyer_hex, "RESUMING", 5000, 500, None).await;
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1234),
+            dummy_recipe(),
+            budget_with_room(),
+        );
+
+        // Owner cancel while RESUMING -> informational notice, state UNCHANGED.
+        let out = RecordingOutbound::default();
+        handler
+            .handle(buyer.public_key(), cancel("sub-c"), &out)
+            .await
+            .unwrap();
+        match out.only().1 {
+            Msg::BillingNotice(n) => {
+                assert_eq!(n.subscription_id, "sub-c");
+                assert_eq!(n.state, "RESUMING", "the notice reports the live RESUMING state");
+            }
+            other => panic!("expected a billing.notice, got {other:?}"),
+        }
+        assert_eq!(
+            sub_state_and_deadline(&store, "sub-c").await.0,
+            "RESUMING",
+            "cancel must not move a RESUMING sub"
+        );
+
+        // Owner renew while RESUMING -> the same informational notice, state UNCHANGED.
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                Msg::RenewRequest(RenewRequest {
+                    id: "r1".into(),
+                    subscription_id: "sub-r".into(),
+                }),
+                &out,
+            )
+            .await
+            .unwrap();
+        match out.only().1 {
+            Msg::BillingNotice(n) => {
+                assert_eq!(n.subscription_id, "sub-r");
+                assert_eq!(n.state, "RESUMING");
+            }
+            other => panic!("expected a billing.notice, got {other:?}"),
+        }
+        assert_eq!(
+            sub_state_and_deadline(&store, "sub-r").await.0,
+            "RESUMING",
+            "renew must not move a RESUMING sub"
+        );
+
+        // The notice is STATELESS and NOTHING else happens: no persisted outbox row, no renewal
+        // invoice, no cached inbound_request row, and no RESUMING row flipped to CANCELLED.
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM outbox").await,
+            0,
+            "the RESUMING notice is a direct reply, not a persisted outbox row"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
+            0,
+            "no renewal invoice is minted for a RESUMING sub"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM inbound_request").await,
+            0,
+            "the stateless notice caches no idempotency row"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM subscription WHERE state='CANCELLED'").await,
+            0,
+            "no RESUMING row is cancelled"
+        );
+    }
+
+    // lnrent-z4u: the RESUMING notice is owner-only. A non-owner cancel/renew for a RESUMING sub
+    // stays a SILENT drop (no reply) so an outsider never learns the sub exists or its state.
+    #[tokio::test]
+    async fn cancel_and_renew_during_resuming_from_nonowner_are_silent() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let stranger = Keys::generate();
+        seed_renewable_sub(
+            &store,
+            "sub-1",
+            &buyer.public_key().to_hex(),
+            "RESUMING",
+            5000,
+            500,
+            None,
+        )
+        .await;
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1234),
+            dummy_recipe(),
+            budget_with_room(),
+        );
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(stranger.public_key(), cancel("sub-1"), &out)
+            .await
+            .unwrap();
+        handler
+            .handle(
+                stranger.public_key(),
+                Msg::RenewRequest(RenewRequest {
+                    id: "r1".into(),
+                    subscription_id: "sub-1".into(),
+                }),
+                &out,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            out.messages().is_empty(),
+            "a non-owner never gets the RESUMING notice"
+        );
+        assert_eq!(
+            sub_state_and_deadline(&store, "sub-1").await.0,
+            "RESUMING",
+            "a non-owner request never changes state"
         );
     }
 
