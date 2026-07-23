@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# DigitalOcean VPS preflight hook. Read-only metadata requests only: never creates a resource.
+#
+# These are the same parameter expressions used by `provision`; keep them identical.
+set -euo pipefail
+
+err() { echo "{\"error\":$(jq -Rn --arg m "$1" '$m')}" >&2; exit 1; }
+
+: "${DO_TOKEN:?DO_TOKEN not set — the operator must configure the DigitalOcean API token in the daemon env}"
+REGION="${DO_REGION:-nyc3}"
+SIZE="${DO_SIZE:-s-1vcpu-1gb}"
+IMAGE="${DO_IMAGE:-debian-13-x64}"
+API="https://api.digitalocean.com/v2"
+
+# Keep the token out of argv and bound every metadata request.
+HDR="$(mktemp)"; trap 'rm -f "$HDR"' EXIT
+printf 'Authorization: Bearer %s\n' "$DO_TOKEN" > "$HDR"
+AUTH=(-H @"$HDR" --connect-timeout 10 --max-time 20)
+
+in_set() { jq -e --arg v "$2" "$1 | index(\$v) != null" >/dev/null 2>&1; } # $1=jq slug-array  $2=value  <<< json
+
+# Fetch every page of a DigitalOcean list endpoint, concatenating the `.<key>` array across all
+# pages into one `{<key>: [...]}` object so the callers' jq predicates see the COMPLETE set. DO
+# caps a page at 200 items and returns `.links.pages.next` (an absolute, query-complete URL) while
+# more remain; reading only the first page would false-reject a valid slug that sorts onto a later
+# page (e.g. a size past the first 200). $1=collection key, $2=first-page URL (query already baked in).
+do_collection() {
+  local key="$1" url="$2" acc='[]' page next
+  while [[ -n "$url" ]]; do
+    page="$(curl -fsS "${AUTH[@]}" "$url")" || return 1
+    acc="$(jq -c --argjson acc "$acc" --arg k "$key" '$acc + (.[$k] // [])' <<<"$page")" || return 1
+    next="$(jq -r '.links.pages.next // empty' <<<"$page")"
+    url="$next"
+  done
+  jq -cn --argjson items "$acc" --arg k "$key" '{($k): $items}'
+}
+
+# Validate the REGION first: image and size availability are both region-scoped below, so a bad
+# region must fail here with its own diagnostic instead of surfacing as a misleading
+# "image/size not available in <bad region>" from a later, region-dependent check.
+regions="$(do_collection regions "${API}/regions?per_page=200")" \
+  || err "DO_REGION=$REGION could not be validated — DigitalOcean regions metadata read failed"
+in_set '[.regions[] | select(.available) | .slug]' "$REGION" <<<"$regions" \
+  || err "DO_REGION=$REGION is not an available DigitalOcean region slug"
+
+# Validate the image the way droplet-create actually gates it: the slug must resolve to an image that
+# is NOT retired/deleted (the debian-12-x64 422 regression) AND is offered in $REGION. Slug membership
+# alone is insufficient — DigitalOcean documents a `retired` image status and can keep a retired slug
+# in the listing, and an image can simply not be offered in this region. The `!= retired/deleted` test
+# is fail-safe: the API scopes `status` to custom images, so a base image with an absent/other status
+# still passes on region membership (the authoritative deployability signal) and is never
+# false-blocked. Scope: this debian recipe (`[os] supports=["debian"]`) validates distribution slugs;
+# overriding DO_IMAGE to a marketplace/custom image is outside the validated domain and yields a
+# fail-closed preflight (safe — it can only block launch, never admit a bad config).
+images="$(do_collection images "${API}/images?type=distribution&per_page=200")" \
+  || err "DO_IMAGE=$IMAGE could not be validated — DigitalOcean images metadata read failed"
+image_min_disk="$(jq -er --arg image "$IMAGE" --arg region "$REGION" \
+  'first(.images[] | select(.slug == $image and .status != "retired" and .status != "deleted" and (.regions | index($region) != null))) | .min_disk_size | numbers' \
+  <<<"$images")" \
+  || err "DO_IMAGE=$IMAGE is not an available DigitalOcean distribution image in DO_REGION=$REGION (retired, misspelled, or not offered in that region)"
+
+sizes="$(do_collection sizes "${API}/sizes?per_page=200")" \
+  || err "DO_SIZE=$SIZE could not be validated — DigitalOcean sizes metadata read failed"
+size_disk="$(jq -er --arg size "$SIZE" --arg region "$REGION" \
+  'first(.sizes[] | select(.slug == $size and .available and (.regions | index($region) != null))) | .disk | numbers' \
+  <<<"$sizes")" \
+  || err "DO_SIZE=$SIZE is not available in DO_REGION=$REGION"
+
+(( size_disk >= image_min_disk )) \
+  || err "DO_SIZE=$SIZE has ${size_disk}GB disk, below DO_IMAGE=$IMAGE minimum ${image_min_disk}GB"
+
+jq -n --arg image "$IMAGE" --arg size "$SIZE" --arg region "$REGION" \
+  '{ok:true, image:$image, size:$size, region:$region}'

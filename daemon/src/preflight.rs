@@ -137,16 +137,14 @@ pub fn read_token_env() -> Option<Zeroizing<String>> {
     std::env::var(DO_TOKEN_ENV).ok().map(Zeroizing::new)
 }
 
-/// The full preflight report: run the three checks in a stable order (gateway, federation,
-/// provider_token) and fold the aggregate. Pure over its inputs — the payment seams, the loaded
-/// recipes, the pre-read token, the injected probe — so every branch is unit-testable with no
-/// network.
+/// Run the checks in a stable order and fold their aggregate. Pure over the injected seams except
+/// for optional recipe hooks, which use the bounded [`crate::runner::run_hook`] path.
 ///
-/// SERIALIZED process-wide (adversarial y4m.9 review): each report holds up to ~40s of guardian
-/// round-trips + a provider API call, and the IPC loop spawns one task per connection, so
-/// unserialized concurrent preflights would amplify load onto the shared fedimint client and the
-/// provider API (contending with money-path operations). Queued callers still each get a fresh
-/// report; every probe inside is individually time-bounded, so the queue drains.
+/// SERIALIZED process-wide (adversarial y4m.9 review): each report holds several bounded network
+/// probes plus up to [`crate::runner::DEFAULT_TIMEOUT`] per recipe hook, and the IPC loop spawns one
+/// task per connection, so unserialized concurrent preflights would amplify load onto the shared
+/// fedimint client and provider APIs (contending with money-path operations). Queued callers still
+/// each get a fresh report; every probe inside is individually time-bounded, so the queue drains.
 pub async fn preflight_report(
     payment: &Arc<dyn PaymentBackend>,
     recipes: &[Recipe],
@@ -155,12 +153,15 @@ pub async fn preflight_report(
 ) -> Value {
     static SERIALIZE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _one_at_a_time = SERIALIZE.lock().await;
-    let checks = [
+    let mut checks = vec![
         gateway_check(payment).await,
         federation_check(payment).await,
         lnv2_check(payment).await,
         provider_token_check(recipes, token, probe).await,
     ];
+    if let Some(check) = recipe_preflight_check(recipes).await {
+        checks.push(check);
+    }
     json!({
         "ok": aggregate_ok(&checks),
         "checks": checks,
@@ -168,8 +169,8 @@ pub async fn preflight_report(
 }
 
 /// The aggregate verdict the CLI's nonzero-exit gate rests on: every check `ok`. Pure. A skipped
-/// check counts ok only because a skip is emitted solely when the dependency is genuinely not
-/// configured (see [`provider_token_check`]).
+/// check counts ok only when the dependency is genuinely not configured or the loaded recipe does
+/// not declare the optional hook (see [`provider_token_check`] and [`recipe_preflight_check`]).
 pub fn aggregate_ok(checks: &[PreflightCheck]) -> bool {
     checks.iter().all(|c| c.ok)
 }
@@ -355,6 +356,47 @@ async fn provider_token_check(
     }
 }
 
+/// Fold recipe-owned provisioning validation into one provider-agnostic check. Runner failures
+/// retain structured hook stderr in the detail; a loaded recipe without the optional hook skips.
+async fn recipe_preflight_check(recipes: &[Recipe]) -> Option<PreflightCheck> {
+    const NAME: &str = "recipe_preflight";
+    if recipes.is_empty() {
+        return None;
+    }
+    let mut ran_hook = false;
+    for recipe in recipes {
+        let hook = recipe.preflight_hook();
+        if !hook.exists() {
+            continue;
+        }
+        ran_hook = true;
+        if let Err(e) = crate::runner::run_hook(
+            &hook,
+            &json!({}),
+            crate::runner::DEFAULT_TIMEOUT,
+            &recipe.provisioning.env,
+        )
+        .await
+        {
+            return Some(PreflightCheck::fail(
+                NAME,
+                format!(
+                    "recipe `{}` preflight hook rejected the provisioning params: {e:#}",
+                    recipe.service.id
+                ),
+            ));
+        }
+    }
+    Some(if ran_hook {
+        PreflightCheck::pass(
+            NAME,
+            "recipe preflight hook validated provisioning parameters",
+        )
+    } else {
+        PreflightCheck::pass(NAME, "skipped: recipe declares no preflight hook")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +525,45 @@ mod tests {
         Recipe::load(&dir).expect("load recipe")
     }
 
+    /// Require the token probe without loading do-vps's real networked preflight hook.
+    fn do_token_recipe() -> Recipe {
+        let mut r = load_recipe("dummy");
+        r.provisioning.env = vec![DO_TOKEN_ENV.to_string()];
+        r
+    }
+
+    /// Point a valid recipe at an optional fake executable hook.
+    fn temp_recipe_with_preflight(name: &str, script: Option<&str>) -> Recipe {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lnrent-preflight-1sr-{name}-{}-{nanos}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        if let Some(body) = script {
+            let path = dir.join("preflight");
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut r = load_recipe("dummy");
+        r.dir = dir;
+        r
+    }
+
+    fn recipe_preflight(v: &Value) -> &Value {
+        checks(v)
+            .iter()
+            .find(|c| c["name"] == json!("recipe_preflight"))
+            .expect("recipe_preflight check present")
+    }
+
     fn token(s: &str) -> Option<Zeroizing<String>> {
         Some(Zeroizing::new(s.to_string()))
     }
@@ -510,7 +591,16 @@ mod tests {
             .iter()
             .map(|c| c["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, vec!["gateway", "federation", "lnv2", "provider_token"]);
+        assert_eq!(
+            names,
+            vec![
+                "gateway",
+                "federation",
+                "lnv2",
+                "provider_token",
+                "recipe_preflight"
+            ]
+        );
         assert!(checks(&v).iter().all(|c| c["ok"] == json!(true)));
         assert!(
             checks(&v)[2]["detail"].as_str().unwrap().contains("skipped"),
@@ -661,13 +751,13 @@ mod tests {
         assert!(check.detail.contains("timed out after 10ms"));
     }
 
-    // The do-vps recipe declares DO_TOKEN, so an ABSENT token is a FAILURE (not a skip) and no
-    // network probe is attempted. A blank/whitespace token is likewise unusable and fails before
-    // reaching the provider.
+    // A recipe declaring DO_TOKEN makes an ABSENT token a FAILURE (not a skip) and no network probe
+    // is attempted. A blank/whitespace token is likewise unusable and fails before reaching the
+    // provider.
     #[tokio::test]
     async fn required_token_absent_or_blank_fails_without_probing() {
         let payment = seam_payment(Seam::Ready, Seam::Ready);
-        let recipes = [load_recipe("do-vps")];
+        let recipes = [do_token_recipe()];
         for tok in [None, token(""), token("  \n")] {
             let v = preflight_report(&payment, &recipes, tok, &PanicProbe).await;
             assert_eq!(v["ok"], json!(false));
@@ -686,7 +776,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_token_fails_distinctly_without_probing() {
         let payment = seam_payment(Seam::Ready, Seam::Ready);
-        let recipes = [load_recipe("do-vps")];
+        let recipes = [do_token_recipe()];
         for tok in [token("dop_v1\nsecret"), token("dop v1 secret"), token("dop_v1_\u{7f}")] {
             let v = preflight_report(&payment, &recipes, tok, &PanicProbe).await;
             assert_eq!(v["ok"], json!(false));
@@ -704,7 +794,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_token_fails_distinctly_and_never_leaks() {
         let payment = seam_payment(Seam::Ready, Seam::Ready);
-        let recipes = [load_recipe("do-vps")];
+        let recipes = [do_token_recipe()];
         for status in [401u16, 403] {
             let v = preflight_report(
                 &payment,
@@ -730,7 +820,7 @@ mod tests {
         let payment = seam_payment(Seam::Ready, Seam::Ready);
         let v = preflight_report(
             &payment,
-            &[load_recipe("do-vps")],
+            &[do_token_recipe()],
             token("dop_v1_x"),
             &StatusProbe(500),
         )
@@ -749,7 +839,7 @@ mod tests {
         let payment = seam_payment(Seam::Ready, Seam::Ready);
         let v = preflight_report(
             &payment,
-            &[load_recipe("do-vps")],
+            &[do_token_recipe()],
             token("dop_v1_x"),
             &FailProbe,
         )
@@ -767,7 +857,7 @@ mod tests {
         let payment = seam_payment(Seam::Ready, Seam::Ready);
         let v = preflight_report(
             &payment,
-            &[load_recipe("do-vps")],
+            &[do_token_recipe()],
             token("dop_v1_secret"),
             &StatusProbe(200),
         )
@@ -780,6 +870,48 @@ mod tests {
             .unwrap()
             .contains("accepted"));
         assert!(!serde_json::to_string(&v).unwrap().contains("dop_v1_secret"));
+    }
+
+    // Regression anchor: retired `debian-12-x64` reached a paid buyer as a 422 "You specified an
+    // invalid image for Droplet creation"; this hook failure must stop orders before payment.
+    #[tokio::test]
+    async fn invalid_image_fails_recipe_preflight() {
+        let payment = seam_payment(Seam::Ready, Seam::Ready);
+        let recipe = temp_recipe_with_preflight(
+            "invalid-image",
+            Some("#!/bin/sh\necho '{\"error\":\"DO_IMAGE=debian-12-x64 invalid\"}' >&2\nexit 1\n"),
+        );
+        let v = preflight_report(&payment, &[recipe], None, &PanicProbe).await;
+
+        assert_eq!(v["ok"], json!(false));
+        let check = recipe_preflight(&v);
+        assert_eq!(check["ok"], json!(false));
+        assert!(check["detail"].as_str().unwrap().contains("debian-12-x64"));
+    }
+
+    #[tokio::test]
+    async fn valid_config_passes_recipe_preflight() {
+        let payment = seam_payment(Seam::Ready, Seam::Ready);
+        let recipe = temp_recipe_with_preflight(
+            "valid",
+            Some("#!/usr/bin/env bash\necho '{\"ok\":true,\"image\":\"debian-13-x64\"}'\n"),
+        );
+        let v = preflight_report(&payment, &[recipe], None, &PanicProbe).await;
+
+        assert_eq!(v["ok"], json!(true), "a valid config passes preflight");
+        assert_eq!(recipe_preflight(&v)["ok"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn recipe_without_preflight_hook_skips() {
+        let payment = seam_payment(Seam::Ready, Seam::Ready);
+        let recipe = temp_recipe_with_preflight("no-hook", None);
+        let v = preflight_report(&payment, &[recipe], None, &PanicProbe).await;
+
+        assert_eq!(v["ok"], json!(true));
+        let check = recipe_preflight(&v);
+        assert_eq!(check["ok"], json!(true));
+        assert!(check["detail"].as_str().unwrap().contains("skipped"));
     }
 
     // The aggregate is a pure all-of over the per-check verdicts.
