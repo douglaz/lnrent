@@ -405,10 +405,11 @@ fn fee_matches_payment_fee_absolute_fee() {
 }
 
 #[test]
-fn lnv2_send_usable_matches_the_lnv2_send_policy() {
-    // Mirrors lnv2 send()'s pre-funding gate (client lib.rs:576-582): send_fee.le(&SEND_FEE_LIMIT)
-    // [100 sat + 1.5%, LEXICOGRAPHIC base-then-ppm] AND expiration_delta <= EXPIRATION_DELTA_LIMIT
-    // [1440], checked for BOTH the default and minimum schedules.
+fn lnv2_send_usable_enforces_limits_componentwise_stricter_than_send() {
+    // lnrent's selection guard enforces the client's hard limits (lib.rs:576-582): 100 sat + 1.5% fee
+    // AND expiration_delta <= EXPIRATION_DELTA_LIMIT [1440], for BOTH the default and minimum schedules.
+    // The guard is COMPONENTWISE (base AND ppm each within limit) and thus deliberately STRICTER than
+    // send()'s LEXICOGRAPHIC send_fee.le(&SEND_FEE_LIMIT) gate (lnrent-z2v).
     let usable = |d_base, d_ppm, m_base, m_ppm, d_exp, m_exp| {
         lnv2_send_usable(&GatewaySendFee {
             default_base_msat: d_base,
@@ -421,16 +422,21 @@ fn lnv2_send_usable_matches_the_lnv2_send_policy() {
     };
     // Exactly at the fee + expiration limits: usable.
     assert!(usable(100_000, 15_000, 100_000, 15_000, 1440, 1440));
-    // Base one msat over the limit: refused (base dominates the lexicographic order).
+    // Base one msat over the limit: refused.
     assert!(!usable(100_001, 0, 0, 0, 0, 0));
     // Base at the limit, ppm one over: refused.
     assert!(!usable(100_000, 15_001, 0, 0, 0, 0));
+    // z2v regression anchor: low base (just under the 100_000 limit) + a ppm FAR over the 15_000 limit.
+    // The OLD lexicographic compare ACCEPTED this (base 99_999 < 100_000 sorts the tuple below the limit
+    // regardless of ppm); the componentwise guard REJECTS it so its proportional fee can never blow the
+    // ~1.5%+100sat ceiling / INV-1 cap.
+    assert!(!usable(99_999, 1_000_000, 99_999, 1_000_000, 1440, 1440));
     // A cheap DEFAULT but an over-limit MINIMUM schedule is still refused (both must pass).
     assert!(!usable(0, 0, 100_001, 0, 0, 0));
     // Expiration one block over the limit on either schedule: refused.
     assert!(!usable(0, 0, 0, 0, 1441, 0));
     assert!(!usable(0, 0, 0, 0, 0, 1441));
-    // Well inside every limit: usable.
+    // Well inside every limit: usable (a genuinely cheap gateway is NOT falsely rejected).
     assert!(usable(0, 10_000, 0, 10_000, 100, 100));
 }
 

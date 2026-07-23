@@ -61,10 +61,23 @@ Order credited** — `floor(received_msat / 1000)` sat, i.e. `PayCap::Gross(gros
 advertised schedule; the payout is searched so `payout + worst_fee ≤ gross`), not an atomic
 guarantee: lnv2's `send` takes no max-fee parameter and re-fetches routing info **and funds** after
 our check (`daemon/src/lnv2_backend.rs`). Two residual exposures remain. (1) A gateway that
-*re-prices* between our preflight and the send — bounded solely by lnv2 `send`'s own fee gate, which
-is not a tight ceiling: it compares `PaymentFee` **lexicographically (base, then ppm)**
-(`lnv2_send_usable`), so a re-priced low-base/high-ppm schedule passes it while charging well above
-1.5% + 100 sat (tracked in lnrent-z2v). (2) A concurrent **incoming claim** (a receive settling)
+*re-prices* between our gateway selection and upstream `send`'s routing-info refetch. lnrent's own
+selection now applies a **componentwise** fee guard (`lnv2_send_usable`: `base ≤ 100_000 msat && ppm
+≤ 15_000`, z2v Part 1), strictly tighter than upstream `send`'s **lexicographic** `PaymentFee` gate
+(base, then ppm) — componentwise-accept implies lexicographic-accept, so the guard never *selects* a
+low-base/high-ppm gateway visible at preflight (its proportional fee could exceed the reserved cap)
+while never pinning a gateway `send` would refuse. What remains is a genuine send-time TOCTOU: a
+gateway that advertises a componentwise-safe schedule at selection, then re-prices to
+low-base/high-ppm before upstream `send` re-fetches routing info; `send`'s lexicographic gate accepts
+that reprice (a `99_999`-base schedule sorts below the limit regardless of ppm) and lnrent's
+selection-time guard, having already run, cannot see it. **Recorded decision (z2v Part 2): RETAIN
+this residual; do not patch the fork.** The attack requires a guardian-vetted gateway to maliciously
+re-price within the sub-second window between selection and `send`'s refetch, to skim one refund's
+fee — below the risk bar, and the componentwise selection guard already closes the preflight-visible
+hole. A componentwise check at `send`'s own use boundary inside the douglaz/fedimint fork (kept
+indefinitely as standing patch infrastructure, lnrent-8ym/e96) is the only place that truly prevents
+the overrun and remains available as option 3 if the bar changes. (2) A concurrent **incoming
+claim** (a receive settling)
 that changes the ecash note set between our dry-run and the send: `pay_inner`'s `pay_start_lock`
 serializes *outbound* pays (so no refund or sweep can interleave), but not inbound claims, and mint
 consensus fees are non-monotone in note selection, so the finalized debit can differ slightly from
