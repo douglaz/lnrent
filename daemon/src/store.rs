@@ -119,7 +119,8 @@ CREATE TABLE IF NOT EXISTS subscription (
   paid_through         INTEGER, -- hard expiry
   soft_date            INTEGER, -- renewal recommended from here
   next_deadline        INTEGER, -- reconcile-loop cursor
-  suspend_not_before   INTEGER, -- suspend FLOOR set ONLY by downtime credit (§6.5)
+  -- suspend_not_before (downtime-credit FLOOR, §6.5) lives ONLY in migration 3, never the v1
+  -- baseline, so a fresh install adds it exactly once (lnrent-ux7). See M3_SUSPEND_NOT_BEFORE.
   created_at           INTEGER,
   updated_at           INTEGER
 );
@@ -315,7 +316,11 @@ CREATE INDEX IF NOT EXISTS seen_message_seen_at_idx ON seen_message(seen_at);
 /// availability before suspension. `paid_through` is NEVER moved (it anchors prepaid money AND the
 /// `renew:auto:<sub>:<paid_through>` invoice key); the floor self-expires once a later renewal pushes
 /// `paid_through` past it. Existing rows get NULL — no credit, which is correct. Appended as a NEW
-/// migration — never edit a shipped migration.
+/// migration — never edit a shipped migration. This migration is the SOLE home of the column
+/// (removed from the v1 baseline SCHEMA, lnrent-ux7): a fresh install adds it here exactly once, and
+/// `apply_one_migration` guards the ALTER with a `has_column` PRE-CHECK — a DB that already has the
+/// column (an old base-SCHEMA DB, or a prior/partial M3) SKIPS the ALTER, with no duplicate-column
+/// error-string swallow.
 const M3_SUSPEND_NOT_BEFORE: &str =
     "ALTER TABLE subscription ADD COLUMN suspend_not_before INTEGER;";
 
@@ -327,8 +332,8 @@ const M3_SUSPEND_NOT_BEFORE: &str =
 /// refunds under, so a legacy refund dedups on it — lnrent-4gt), gen>=1 is `refund:<external_id>:g<gen>`
 /// — so a retry never double-pays and only a CURRENT-gen
 /// Failed+expired invoice is ever re-resolved. Mirrors the §11 schema (added to the `refund_attempt`
-/// CREATE TABLE above), so — like `suspend_not_before` — a fresh DB applies the CREATE first and this
-/// ALTER is a tolerated duplicate, while a legacy DB gets the ALTER. Appended — never edit a shipped
+/// CREATE TABLE above), so a fresh DB applies the CREATE first and this ALTER is a tolerated
+/// duplicate (self-healed below), while a legacy DB gets the ALTER. Appended — never edit a shipped
 /// migration.
 const M4_REFUND_RESOLUTION: &str = "
 ALTER TABLE refund_attempt ADD COLUMN resolved_bolt11 TEXT;
@@ -488,45 +493,41 @@ fn apply_migrations(conn: &Connection, migrations: &[&str]) -> Result<()> {
 }
 
 /// Apply ONE migration batch + its `user_version` bump; the caller wraps this in a transaction so
-/// the pair is atomic. The M3/M4 duplicate-column self-heal is preserved (a fresh DB already has
-/// the columns from the §11 schema, so the leading ALTER duplicates — caught and healed here —
-/// while a REAL error propagates to trigger the caller's ROLLBACK). The self-heal is gated on BOTH
-/// the specific migration index AND the specific duplicate-column error, so a synthetic test
-/// migration failing for any other reason never trips it.
+/// the pair is atomic. M3 (`suspend_not_before`) is applied idempotently by a `has_column` PRE-CHECK
+/// that SKIPS its ALTER when the column is already present (a legacy old-base-SCHEMA DB, or a
+/// prior/partial M3) — the column lives ONLY in that migration now (lnrent-ux7), so no
+/// duplicate-column error can arise and none is swallowed. The M4/M11 duplicate-column self-heal is
+/// preserved (those columns are still in the §11 schema, so the leading ALTER duplicates on a fresh
+/// DB — caught and healed here — while a REAL error propagates to trigger the caller's ROLLBACK).
+/// Each self-heal is gated on BOTH the specific migration index AND the specific duplicate-column
+/// error, so a synthetic test migration failing for any other reason never trips it.
 fn apply_one_migration(conn: &Connection, migrations: &[&str], current: i64) -> Result<()> {
-    if let Err(e) = conn.execute_batch(migrations[current as usize]) {
-        if current == 2
-            && is_duplicate_suspend_not_before(&e)
-            && has_column(conn, "subscription", "suspend_not_before")?
-        {
-            // Fresh DBs apply the current CREATE TABLE first; legacy v2 DBs get the ALTER.
-        } else if current == 3 && is_duplicate_refund_resolution(&e) {
-            // Fresh DBs already have the resolver columns from the §11 schema, so the FIRST ALTER
-            // in the M4 batch is a duplicate — and `execute_batch` aborts at that first duplicate.
-            // A crash that applied only SOME of the three columns (user_version still 3) would
-            // re-enter here with the rest still missing, so add each MISSING column individually:
-            // a partially-applied migration self-heals instead of failing startup (review P2).
-            ensure_refund_resolution_columns(conn)?;
-        } else if current == 10
-            && is_duplicate_received_msat(&e)
-            && has_column(conn, "invoice", "received_msat")?
-        {
-            // Fresh DBs already have the current column in SCHEMA; legacy v10 DBs get the ALTER.
-        } else {
-            return Err(e.into());
+    // M3 lives ONLY in the migration set (removed from the v1 baseline). Skip its ALTER when the
+    // column already exists so migrate() stays idempotent for a DB that predates the baseline change
+    // — no reliance on matching a duplicate-column error STRING.
+    let skip = current == 2 && has_column(conn, "subscription", "suspend_not_before")?;
+    if !skip {
+        if let Err(e) = conn.execute_batch(migrations[current as usize]) {
+            if current == 3 && is_duplicate_refund_resolution(&e) {
+                // Fresh DBs already have the resolver columns from the §11 schema, so the FIRST ALTER
+                // in the M4 batch is a duplicate — and `execute_batch` aborts at that first duplicate.
+                // A crash that applied only SOME of the three columns (user_version still 3) would
+                // re-enter here with the rest still missing, so add each MISSING column individually:
+                // a partially-applied migration self-heals instead of failing startup (review P2).
+                ensure_refund_resolution_columns(conn)?;
+            } else if current == 10
+                && is_duplicate_received_msat(&e)
+                && has_column(conn, "invoice", "received_msat")?
+            {
+                // Fresh DBs already have the current column in SCHEMA; legacy v10 DBs get the ALTER.
+            } else {
+                return Err(e.into());
+            }
         }
     }
     // user_version can't be a bound parameter; the value is an internal counter, not input.
     conn.execute_batch(&format!("PRAGMA user_version = {}", current + 1))?;
     Ok(())
-}
-
-fn is_duplicate_suspend_not_before(e: &rusqlite::Error) -> bool {
-    matches!(
-        e,
-        rusqlite::Error::SqliteFailure(_, Some(msg))
-            if msg.contains("duplicate column name: suspend_not_before")
-    )
 }
 
 fn is_duplicate_refund_resolution(e: &rusqlite::Error) -> bool {
@@ -1455,6 +1456,59 @@ mod tests {
             .query_row("SELECT count(*) FROM recipe", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "re-migrating a current db is a no-op (no data loss)");
+    }
+
+    // lnrent-ux7: `suspend_not_before` now lives ONLY in migration 3 (removed from the v1 baseline
+    // SCHEMA), so a fresh migrate() must ADD it exactly once via the M3 ALTER, and a second migrate()
+    // on the same DB must be a clean no-op — the has_column pre-check skips the ALTER, so it never
+    // re-runs or errors.
+    #[test]
+    fn migrate_adds_suspend_not_before_once_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(
+            has_column(&conn, "subscription", "suspend_not_before").unwrap(),
+            "a fresh migrate() yields a subscription table WITH suspend_not_before"
+        );
+        assert_eq!(
+            conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0)).unwrap(),
+            SCHEMA_VERSION
+        );
+
+        // A second migrate() is a no-op: version unchanged and the column still present. If the M3
+        // ALTER re-ran it would error "duplicate column name: suspend_not_before".
+        migrate(&conn).unwrap();
+        assert_eq!(
+            conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0)).unwrap(),
+            SCHEMA_VERSION,
+            "a second migrate() on the same DB is a no-op"
+        );
+        assert!(has_column(&conn, "subscription", "suspend_not_before").unwrap());
+    }
+
+    // lnrent-ux7 (CRITICAL): migrate() MUST NOT break a DB that ALREADY has `suspend_not_before` (an
+    // old base-SCHEMA DB, or a prior/partial M3). Build a complete current DB — which has the column —
+    // rewind user_version to just before M3, and re-migrate: the has_column PRE-CHECK must SKIP the M3
+    // ALTER (no "duplicate column name" error) and the chain must reach current with the column intact.
+    #[test]
+    fn migrate_does_not_break_db_that_already_has_suspend_not_before() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(has_column(&conn, "subscription", "suspend_not_before").unwrap());
+        // Rewind to just before M3 (index 2); the column is already present from the first migrate().
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+
+        migrate(&conn).unwrap(); // must not error on the already-present M3 column
+
+        assert_eq!(
+            conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0)).unwrap(),
+            SCHEMA_VERSION,
+            "re-migration reaches current, skipping the already-present M3 column"
+        );
+        assert!(
+            has_column(&conn, "subscription", "suspend_not_before").unwrap(),
+            "the column is retained (never dropped or re-added)"
+        );
     }
 
     // A simulated legacy (v0) DB — schema applied but user_version never set, with data — must

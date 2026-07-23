@@ -392,12 +392,14 @@ fn journal_renew_resume(
 mod tests {
     use super::*;
     use crate::backends::Settlement;
-    use crate::store::{Store, SCHEMA};
+    use crate::store::{migrate, Store};
     use rusqlite::Connection;
 
+    // Build via migrate() (not raw SCHEMA) so the store carries every applied migration — including
+    // `subscription.suspend_not_before` (migration 3, §6.5), which the downtime-credit tests read.
     fn mem_store() -> Store {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).unwrap();
         Store::spawn(conn)
     }
 

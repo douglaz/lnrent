@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rusqlite::{params, OptionalExtension};
 
@@ -415,9 +415,18 @@ impl OrderIntake {
     /// Issue the daemon soft-date auto-renewal invoice for `subscription_id` (no buyer request),
     /// where `cycle_anchor` is the `paid_through` being renewed — so one cycle yields one invoice
     /// via the deterministic `renew:auto:<sub>:<cycle_anchor>` external_id (§6.6). Sends
-    /// `billing.invoice` with no `request_id` to the subscription's buyer. This is the issuance
-    /// seam the soft-date deadline firing (lnrent-7fp.9) invokes; this bead does not fire it.
-    pub async fn issue_soft_date_renewal(
+    /// `billing.invoice` with no `request_id` to the subscription's buyer.
+    ///
+    /// TEST-ONLY seam (lnrent-ux7): this helper sizes its invoice to a FIXED `INVOICE_EXPIRY_S` (1h)
+    /// and is NOT the production auto-renewal path. Production soft-date auto-renewals fire from
+    /// [`crate::reconcile::Reconciler::fire_soft_reminder`], which sizes the invoice expiry to the
+    /// downtime-CREDITED renewal window `B = effective_suspend_at + retention_s` (§6.5). The fixed
+    /// expiry here is deliberate — this seam exists only to exercise the issuance/outbox plumbing, so
+    /// it intentionally does not pull in the subscription's floor/retention reads that credited sizing
+    /// needs. Gated `#[cfg(test)]` so the fixed-expiry helper cannot be reached from production and
+    /// mistaken for the auto-renewal path; its sole caller is a unit test.
+    #[cfg(test)]
+    async fn issue_soft_date_renewal(
         &self,
         subscription_id: &str,
         cycle_anchor: i64,
@@ -687,6 +696,10 @@ impl OrderIntake {
             .await
     }
 
+    // Only reached by the `#[cfg(test)]` `issue_soft_date_renewal` seam above, so it is test-gated
+    // too (else it is dead code in production builds). The credit-aware `renew.request` path resolves
+    // its buyer inline via `load_renewable`.
+    #[cfg(test)]
     async fn load_buyer(&self, sub_id: &str) -> Result<PublicKey> {
         let id = sub_id.to_string();
         let hex: Option<String> = self
@@ -701,7 +714,8 @@ impl OrderIntake {
                 .flatten())
             })
             .await?;
-        let hex = hex.ok_or_else(|| anyhow!("subscription {sub_id} has no buyer to renew for"))?;
+        let hex =
+            hex.ok_or_else(|| anyhow::anyhow!("subscription {sub_id} has no buyer to renew for"))?;
         PublicKey::from_hex(&hex).context("parsing subscription buyer pubkey")
     }
 }
@@ -1068,7 +1082,7 @@ fn unavailable(message: &str) -> WireError {
 mod tests {
     use super::*;
     use crate::clock::TestClock;
-    use crate::store::{Store, SCHEMA};
+    use crate::store::{migrate, Store};
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::{
@@ -1082,9 +1096,11 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::json;
 
+    // Build via migrate() (not raw SCHEMA) so the store carries every applied migration — including
+    // `subscription.suspend_not_before` (migration 3, §6.5), which the credited-renewal tests read.
     fn mem_store() -> Store {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).unwrap();
         Store::spawn(conn)
     }
 
