@@ -68,13 +68,15 @@
 //! lnv2's `send(None)`: the INV-1 cap must be measured against the ACTUAL paying gateway's advertised
 //! fee (lnv2's `SEND_FEE_LIMIT` of 1.5%+100sat is far looser than "payout+fee <= gross"). So the pay
 //! path pins ONE gateway: `reachable_gateway_preferring` iterates the registered gateways in order and
-//! returns the first that answers `routing_info` AND that lnv2 `send()` would ACCEPT — i.e. whose send
-//! fee/expiration are within the client's hard limits (`lnv2_send_usable`, mirroring client
-//! lib.rs:576-582). Selecting a gateway lnv2 will refuse is NOT free: `send()` returns a retryable error
-//! before funding, PREPARED is removed, and the deterministic-order selection would re-pick the SAME
-//! refused endpoint on every Refunder drive — the refund would stay PENDING forever even when a
-//! compliant gateway is registered (and the doctor probe, which shares this selection, would falsely
-//! report Healthy). Skipping refused gateways during selection restores the failover lnv1's y4m.8 gave.
+//! returns the first that answers `routing_info` AND passes lnrent's componentwise send-fee/expiration
+//! guard (`lnv2_send_usable`). That guard is stricter than the client's lexicographic fee gate: it skips
+//! both gateways `send()` would refuse and low-base/high-ppm gateways `send()` would accept but whose fee
+//! could exceed lnrent's INV-1 cap. Selecting a gateway lnv2 will refuse is NOT free: `send()` returns a
+//! retryable error before funding, PREPARED is removed, and the deterministic-order selection would
+//! re-pick the SAME refused endpoint on every Refunder drive — the refund would stay PENDING forever even
+//! when a compliant gateway is registered (and the doctor probe, which shares this selection, would
+//! falsely report Healthy). Skipping refused gateways during selection restores the failover lnv1's
+//! y4m.8 gave.
 //! `refund_quote` selects such a gateway and prices the total ecash debit — gateway fee + lnv2 consensus
 //! output fee + the mint inputs/change outputs chosen by Fedimint's own funding algorithm — under BOTH
 //! possible gateway schedules, then reserves the larger outlay and returns the API url as the opaque
@@ -379,16 +381,33 @@ const LNV2_SEND_FEE_LIMIT_BASE_MSAT: u64 = 100_000;
 const LNV2_SEND_FEE_LIMIT_PPM: u64 = 15_000;
 const LNV2_EXPIRATION_DELTA_LIMIT: u64 = 1440;
 
-/// Whether lnv2 `send()` would ACCEPT this gateway (fee + expiration within the client's hard limits).
-/// `send()`'s fee gate is `send_fee.le(&SEND_FEE_LIMIT)` where `PaymentFee` derives a LEXICOGRAPHIC order
-/// (base, then ppm); the tuple compare reproduces it exactly. We require BOTH the direct-swap (`minimum`)
-/// and lightning-swap (`default`) schedules within limit because the not-yet-known destination invoice
-/// decides which `send_parameters` applies — the same worst-of-both the INV-1 cap reserves. A gateway
-/// that fails this is skipped during selection: pinning it would make `send()` refuse before funding and
-/// the deterministic-order selection re-pick the SAME endpoint every drive, stranding the refund PENDING.
+/// Whether lnrent will SELECT this gateway for an lnv2 send (fee + expiration within limit). lnrent's
+/// guard is COMPONENTWISE (`base <= LIMIT_BASE && ppm <= LIMIT_PPM`) and is therefore deliberately
+/// STRICTER than upstream `send()`'s gate `send_fee.le(&SEND_FEE_LIMIT)`, which — because `PaymentFee`
+/// derives a LEXICOGRAPHIC order (base, then ppm) — ACCEPTS a low-base/high-ppm schedule (e.g. `99_999`
+/// base + an arbitrarily large ppm sorts below the limit on the base field alone). Rejecting that case
+/// is intentional (lnrent-z2v): its proportional fee could exceed the ~1.5%+100sat ceiling and lnrent's
+/// reserved INV-1 cap.
+///
+/// The anti-stranding rationale still holds in ONE direction: the guard stays AT LEAST as strict as
+/// `send()`, so it never pins a gateway `send()` would refuse — the stranding mode the original comment
+/// guarded against (a refused endpoint the deterministic-order selection re-picks every drive, leaving
+/// the refund PENDING forever). The new, ACCEPTED failure mode — skipping a gateway `send()` would have
+/// used — is fail-closed and money-safe: the refund stays PENDING (a transient no-gateway quote failure)
+/// rather than selecting an advertised schedule that could exceed its reserved INV-1 cap. This guard is
+/// selection-time defense-in-depth, NOT a send-time overpay backstop: the INV-1 preflight and
+/// `net_payout_sat` constrain the selected routing-info snapshot, but upstream `send()` refetches that
+/// info and its lexicographic gate can still admit a low-base/high-ppm reprice in the documented race
+/// window. Within the selected snapshot, the guard avoids an over-ceiling gateway the cap would
+/// otherwise reject at pay time (a FAILED-then-requote generation burn) or that would shrink the refund
+/// payout — the correct trade.
+///
+/// Both the direct-swap (`minimum`) and lightning-swap (`default`) schedules must be within limit (fee
+/// and expiration delta) because the not-yet-known destination invoice decides which `send_parameters`
+/// applies — the same worst-of-both the INV-1 cap reserves.
 fn lnv2_send_usable(fee: &GatewaySendFee) -> bool {
     let fee_within = |base: u64, ppm: u64| {
-        (base, ppm) <= (LNV2_SEND_FEE_LIMIT_BASE_MSAT, LNV2_SEND_FEE_LIMIT_PPM)
+        base <= LNV2_SEND_FEE_LIMIT_BASE_MSAT && ppm <= LNV2_SEND_FEE_LIMIT_PPM
     };
     fee_within(fee.default_base_msat, fee.default_ppm)
         && fee_within(fee.minimum_base_msat, fee.minimum_ppm)
@@ -623,14 +642,14 @@ impl Lnv2Payment {
             {
                 Ok(Ok(Some(fee))) if lnv2_send_usable(&fee) => return Ok((gw, fee)),
                 Ok(Ok(Some(_))) => {
-                    // Reachable but lnv2 `send()` would REFUSE its fee/expiration (a misconfigured
-                    // gateway advertising above the client's 1.5%+100sat / 1440-block limits). Skip it
-                    // and continue failover: pinning it would leave the refund PENDING and re-select the
-                    // SAME refused endpoint on every drive, and would make the doctor probe (which shares
-                    // this selection) falsely report Healthy for an unusable pay path.
+                    // Reachable but outside lnrent's componentwise fee/expiration guard. This includes
+                    // gateways `send()` would refuse and low-base/high-ppm gateways it would accept
+                    // lexicographically but which could exceed INV-1. Skip either; pinning the former
+                    // strands the refund PENDING, while selecting the latter risks overpaying.
                     last_err = Some(anyhow::anyhow!(
                         "lnv2 gateway {gw} advertises a send fee/expiration above the lnv2 client \
-                         limits (1.5%+100sat / 1440 blocks); skipping"
+                         limit in at least one component; lnrent enforces these limits componentwise \
+                         (100_000 msat base / 15_000 ppm / 1440 blocks); skipping"
                     ));
                 }
                 Ok(Ok(None)) => {}
