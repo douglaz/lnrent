@@ -172,6 +172,11 @@ impl Recipe {
         self.dir.join(name)
     }
 
+    /// Absolute path to this recipe's optional provisioning-parameter preflight hook.
+    pub fn preflight_hook(&self) -> PathBuf {
+        self.hook("preflight")
+    }
+
     /// Look up a declared management operation by name (SPEC.md §7.4).
     pub fn operation(&self, name: &str) -> Option<&Operation> {
         self.operations.iter().find(|op| op.name == name)

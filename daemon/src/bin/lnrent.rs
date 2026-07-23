@@ -320,8 +320,16 @@ async fn run_preflight(sock: &str, as_json: bool) -> ExitCode {
 /// exit-0 is an AGENT GATE, so the CLI validates the report STRUCTURALLY instead of trusting the
 /// aggregate bit — a version-skewed or buggy daemon replying `ok:true` with missing or
 /// contradictory checks must exit 1, never silently pass. Future daemon-side checks are accepted
-/// (forward-compatible) but must each pass.
-const PREFLIGHT_REQUIRED_CHECKS: [&str; 4] = ["gateway", "federation", "lnv2", "provider_token"];
+/// (forward-compatible) but must each pass. `recipe_preflight` is required (lnrent-1sr): a current
+/// daemon always emits it once a recipe is loaded (SKIP when the recipe declares no preflight hook),
+/// so an older daemon that omits it — silently dropping the provisioning-param guard — must fail here.
+const PREFLIGHT_REQUIRED_CHECKS: [&str; 5] = [
+    "gateway",
+    "federation",
+    "lnv2",
+    "provider_token",
+    "recipe_preflight",
+];
 
 /// PURE aggregate→exit mapping for `preflight`: exit 1 (distinct from the taxonomy codes 2..5)
 /// unless the reply is a WELL-FORMED passing report — aggregate `ok: true`, a checks array in
@@ -603,15 +611,20 @@ mod tests {
             }))
         };
         assert!(!preflight_checks_failed(&full_pass(&[
-            "gateway", "federation", "lnv2", "provider_token",
+            "gateway", "federation", "lnv2", "provider_token", "recipe_preflight",
         ])));
         // A report MISSING a required check (here: lnv2) fails closed, even all-passing.
         assert!(preflight_checks_failed(&full_pass(&[
-            "gateway", "federation", "provider_token",
+            "gateway", "federation", "provider_token", "recipe_preflight",
+        ])));
+        // lnrent-1sr: a report missing recipe_preflight (a version-skewed pre-1sr daemon) fails
+        // closed — the provisioning-param guard must not silently vanish.
+        assert!(preflight_checks_failed(&full_pass(&[
+            "gateway", "federation", "lnv2", "provider_token",
         ])));
         // Forward-compatible: an EXTRA (unknown) passing check is accepted.
         assert!(!preflight_checks_failed(&full_pass(&[
-            "gateway", "federation", "lnv2", "provider_token", "future_check",
+            "gateway", "federation", "lnv2", "provider_token", "recipe_preflight", "future_check",
         ])));
 
         let fail = Reply::ok(json!({

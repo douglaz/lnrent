@@ -134,7 +134,12 @@ async fn run_cli(
     fs::create_dir_all(&data_dir).unwrap();
     let sock = data_dir.join("lnrent.sock");
     let store = mem_store();
-    let recipes = Arc::new(Vec::<Recipe>::new());
+    // A daemon always serves a recipe in production (M1a: one recipe), so preflight always emits the
+    // `recipe_preflight` check. The dummy fixture declares no `preflight` hook, so that check is SKIP
+    // (ok:true) — mirroring a recipe that opts out (lnrent-1sr).
+    let dummy = Recipe::load(format!("{}/../recipes/dummy", env!("CARGO_MANIFEST_DIR")))
+        .expect("load dummy recipe");
+    let recipes = Arc::new(vec![dummy]);
     let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_000));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let sock_for_server = sock.clone();
@@ -198,7 +203,13 @@ async fn json_preflight_all_ok_round_trips_with_stable_shape() {
     let names: Vec<&str> = checks.iter().map(|c| c["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
-        vec!["gateway", "federation", "lnv2", "provider_token"]
+        vec![
+            "gateway",
+            "federation",
+            "lnv2",
+            "provider_token",
+            "recipe_preflight"
+        ]
     );
     for c in checks {
         let mut check_keys = c
