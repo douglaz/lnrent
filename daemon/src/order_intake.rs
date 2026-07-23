@@ -339,8 +339,12 @@ impl OrderIntake {
         // sits after the owner check) and with NO state change. Deliberately not a RESUMING->X
         // shortcut / resume-driver hook (the reverted P1 trap noted in handle_cancel).
         if state == "RESUMING" {
+            // request_id echoes THIS renew.request so the buyer's `renew()` matches it exactly (like
+            // a billing.invoice) — a relay-replayed stale RESUMING notice from an earlier request
+            // carries a different id and cannot masquerade as this request's reply (lnrent-zs2).
             let notice = Msg::BillingNotice(BillingNotice {
                 subscription_id: req.subscription_id.clone(),
+                request_id: Some(req.id.clone()),
                 state: "RESUMING".to_string(),
                 message: RESUMING_RETRY_NOTICE.to_string(),
             });
@@ -419,8 +423,12 @@ impl OrderIntake {
         // during RESUMING by NOTHING here; this is UX only. Other non-actionable states keep the
         // silent drop below.
         if state == "RESUMING" {
+            // cancel is fire-and-forget (no request correlation), so this notice carries no
+            // request_id — it reaches the buyer as an unsolicited async DM (zs2 targets the renew
+            // path, where the client awaits and needs the request-correlated notice).
             let notice = Msg::BillingNotice(BillingNotice {
                 subscription_id: sub_id.clone(),
+                request_id: None,
                 state: "RESUMING".to_string(),
                 message: RESUMING_RETRY_NOTICE.to_string(),
             });
@@ -434,6 +442,7 @@ impl OrderIntake {
 
         let notice = Msg::BillingNotice(BillingNotice {
             subscription_id: sub_id.clone(),
+            request_id: None,
             state: "CANCELLED".to_string(),
             message:
                 "subscription cancelled; service runs until the paid period ends, then terminates"

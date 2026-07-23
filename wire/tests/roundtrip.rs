@@ -69,6 +69,7 @@ fn sample_messages() -> Vec<Msg> {
         }),
         Msg::BillingNotice(BillingNotice {
             subscription_id: "sub-1".into(),
+            request_id: None,
             state: "SUSPENDED".into(),
             message: "Your subscription expired and is suspended.".into(),
         }),

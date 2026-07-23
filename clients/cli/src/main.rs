@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use lnrent_buyer_core::{BuyerClient, BuyerError};
+use lnrent_buyer_core::{BuyerClient, BuyerError, RenewReply};
 use lnrent_wire::{Keys, ParsedListing, PublicKey};
 use nostr_sdk::ToBech32;
 use serde_json::{json, Value};
@@ -266,10 +266,18 @@ async fn run(cli: Cli) -> Result<Value, BuyerError> {
             }
             Ok(data)
         }
-        Cmd::Renew { sub_id, .. } => {
-            let inv = buyer.renew(&sub_id).await?;
-            to_data(&inv)
-        }
+        Cmd::Renew { sub_id, .. } => match buyer.renew(&sub_id).await? {
+            // The normal case: a payable renewal invoice, rendered exactly as before.
+            RenewReply::Invoice(inv) => to_data(&inv),
+            // The sub is transiently RESUMING (lnrent-zs2/z4u): surface the operator's "retry in a
+            // moment" notice as a clean, non-error result instead of the old timeout.
+            RenewReply::Retry(notice) => Ok(json!({
+                "subscription_id": notice.subscription_id,
+                "state": notice.state,
+                "message": notice.message,
+                "retry": true,
+            })),
+        },
         Cmd::Delivery {
             cmd: DeliveryCmd::Resend { sub_id },
         } => {

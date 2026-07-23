@@ -21,7 +21,7 @@ pub use relay::BrowserRelay;
 pub use signer::WebSigner;
 
 #[cfg(target_arch = "wasm32")]
-use lnrent_buyer_core::BuyerClient;
+use lnrent_buyer_core::{BuyerClient, RenewReply};
 #[cfg(target_arch = "wasm32")]
 pub use signer::Nip07Signer;
 
@@ -166,11 +166,12 @@ impl WebBuyer {
         {
             let relay = self.relay();
             let buyer = self.client(&relay);
-            let invoice = buyer
-                .renew(&subscription_id)
-                .await
-                .map_err(buyer_error_js)?;
-            ok_serialize(&invoice)
+            // lnrent-zs2: a RESUMING sub answers with a "retry in a moment" notice rather than an
+            // invoice; serialize whichever the operator sent so the web UI can render it.
+            match buyer.renew(&subscription_id).await.map_err(buyer_error_js)? {
+                RenewReply::Invoice(invoice) => ok_serialize(&invoice),
+                RenewReply::Retry(notice) => ok_serialize(&notice),
+            }
         }
 
         #[cfg(not(target_arch = "wasm32"))]
