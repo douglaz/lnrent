@@ -48,10 +48,11 @@ use crate::store::Store;
 const MAX_REFUND_ATTEMPTS: i64 = 5;
 
 /// Total wall-clock bound on resolving ONE refund's destination per drive (the LNURL-pay flow: a DNS
-/// lookup + the lnurlp fetch + the callback fetch, each already individually bounded). The drive
-/// resolves rows SERIALLY, so without a per-row cap a single slow or hostile buyer endpoint could
-/// stall every other pending refund behind it (review P2). On timeout the row stays PENDING (a
-/// resolution defer, attempts UNCHANGED) and is retried next drive.
+/// lookup + the lnurlp fetch + the callback fetch, each already individually bounded). This per-row cap
+/// bounds how long a single slow or hostile buyer endpoint can occupy its concurrency slot; the drive
+/// itself now resolves up to [`REFUND_DRIVE_CONCURRENCY`] rows at once (lnrent-26b), so such an endpoint
+/// no longer stalls every other pending refund behind it (review P2). On timeout the row stays PENDING
+/// (a resolution defer, attempts UNCHANGED) and is retried next drive.
 const RESOLUTION_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How long a refund may sit PENDING — deferred WITHOUT progress (a transient resolution failure that
@@ -62,6 +63,18 @@ const RESOLUTION_DEADLINE: Duration = Duration::from_secs(60);
 /// so it never starves the real payment of its retry budget. A const, not a knob (revisit only if
 /// dogfood shows the need).
 const RESOLUTION_STUCK_ALERT_S: i64 = 6 * 3600;
+
+/// How many PENDING refunds one [`Refunder::drive`] resolves+pays CONCURRENTLY. Each `process`'s slow
+/// phase is resolving a LN-address/LNURL `dest` (up to [`RESOLUTION_DEADLINE`]); driving rows serially
+/// let one slow/hostile buyer endpoint delay every other pending refund behind it (bounded to <=60s
+/// each by the per-row deadline, but poor throughput under many refunds — lnrent-26b). A small FIXED
+/// bound (never unbounded) so a slow endpoint only occupies its OWN slot. This parallelizes the
+/// resolution phase ONLY — the outbound `pay` stays serialized by the backend's `pay_start_lock` (no
+/// double-pay), so K is a resolution-throughput knob, not a pay-parallelism one. Money-path safety is
+/// unchanged: `process` runs on DISTINCT rows and is serialized where it matters by the single-writer
+/// store actor + the per-row status CAS + generation-bound idempotency (lnrent-ug8/4gt). A const, not
+/// a knob.
+const REFUND_DRIVE_CONCURRENCY: usize = 8;
 
 /// What one [`Refunder::drive`] did. Every count is a normal result, not an error; the supervisor
 /// (lnrent-7fp.21) can log it and tests assert on rows directly.
@@ -80,7 +93,10 @@ pub struct RefundReport {
 
 /// Drains PENDING `refund_attempt` rows. Holds the injected seams (the same store + payment the rest
 /// of the money path uses, plus a clock); the supervisor (lnrent-7fp.21) constructs it and calls
-/// [`Refunder::drive`].
+/// [`Refunder::drive`]. `Clone` is cheap (a `Store` handle + `Arc` seams) — [`Refunder::drive`]
+/// clones it per row so it can fan the per-row [`Refunder::process`] out onto its own task under the
+/// bounded-concurrency driver ([`REFUND_DRIVE_CONCURRENCY`]).
+#[derive(Clone)]
 pub struct Refunder {
     store: Store,
     payment: Arc<dyn PaymentBackend>,
@@ -267,12 +283,34 @@ impl Refunder {
     /// double-enqueue).
     pub async fn drive(&self) -> Result<RefundReport> {
         let mut report = RefundReport::default();
-        for row in self.pending_refunds().await? {
-            match self.process(row).await? {
+        let mut rows = self.pending_refunds().await?.into_iter();
+        // BOUNDED-concurrency driver (lnrent-26b): keep up to REFUND_DRIVE_CONCURRENCY `process`
+        // futures in flight — each on its own task holding a cheap clone of the shared seams — so one
+        // slow/hostile `dest` resolution occupies only its OWN slot instead of stalling every other
+        // pending refund behind it. Fold each Outcome into the report AS IT COMPLETES; completion order
+        // is irrelevant because the tallies are commutative counts. Semantics otherwise match the old
+        // serial `for row { process(row).await? }`:
+        //  - the same sent/retried/failed tallies (Noop contributes nothing);
+        //  - the first hard error still aborts the drive — `??` returns it (a JoinError panic or a
+        //    `process` Err), and dropping the JoinSet CANCELS the in-flight siblings. That is SAFE:
+        //    `process` is CAS/generation-idempotent (lnrent-ug8/4gt), so a cancelled row simply stays
+        //    PENDING and is retried next drive, never double-paying.
+        let mut inflight = tokio::task::JoinSet::new();
+        for row in rows.by_ref().take(REFUND_DRIVE_CONCURRENCY) {
+            let this = self.clone();
+            inflight.spawn(async move { this.process(row).await });
+        }
+        while let Some(joined) = inflight.join_next().await {
+            match joined?? {
                 Outcome::Sent => report.sent += 1,
                 Outcome::Retried => report.retried += 1,
                 Outcome::Failed => report.failed += 1,
                 Outcome::Noop => {}
+            }
+            // Refill the freed slot so at most REFUND_DRIVE_CONCURRENCY run at once (never unbounded).
+            if let Some(row) = rows.next() {
+                let this = self.clone();
+                inflight.spawn(async move { this.process(row).await });
             }
         }
         Ok(report)
@@ -749,8 +787,9 @@ impl Refunder {
     }
 
     /// Resolve `dest` to a bolt11, mapping a [`ResolveError`] to a [`PlanError`]. Bounded by a
-    /// per-row [`RESOLUTION_DEADLINE`] so one slow/hostile buyer endpoint can't stall the serial
-    /// drive (review P2); a deadline overrun is TRANSIENT — the row stays PENDING for the next drive.
+    /// per-row [`RESOLUTION_DEADLINE`] so one slow/hostile buyer endpoint can't occupy its concurrency
+    /// slot past that cap (review P2); a deadline overrun is TRANSIENT — the row stays PENDING for the
+    /// next drive.
     async fn resolve_dest(
         &self,
         dest: &str,
@@ -3610,5 +3649,125 @@ mod tests {
             payment.was_paid("refund:order:sub-1:g1"),
             "the fresh gen-1 refund paid for the default-quoted net cap"
         );
+    }
+
+    // BOUNDED-concurrency drive (lnrent-26b): one slow/hostile `dest` resolution must NOT delay the
+    // other pending refunds. The stalled endpoint is `sub-0` — FIRST in the drive's (created_at, id)
+    // order — so under the old serial `for` loop it would block every other refund behind it and the
+    // fast three could never reach SENT while it hangs. Proving they DO reach SENT while it is still
+    // resolving is the deterministic form of the AC's "wall-clock ~ one deadline, not N×deadline".
+    #[tokio::test]
+    async fn slow_resolution_does_not_stall_other_refunds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        // Resolves every `dest` immediately EXCEPT the one stall dest, which blocks in resolution
+        // until the test releases it — a slow/hostile buyer endpoint occupying its own slot.
+        struct StallResolver {
+            stall_dest: String,
+            entered: Notify, // fired when the stall dest ENTERS resolution (the test waits on it)
+            release: Notify, // the test fires this to unblock the stalled resolution
+            stall_calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl RefundResolver for StallResolver {
+            async fn resolve(
+                &self,
+                dest: &str,
+                _owed: u64,
+                now: i64,
+            ) -> Result<Resolved, ResolveError> {
+                if dest == self.stall_dest {
+                    self.stall_calls.fetch_add(1, Ordering::SeqCst);
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                Ok(Resolved {
+                    bolt11: format!("resolved-{dest}"),
+                    expiry: now + 3600,
+                })
+            }
+        }
+
+        let store = mem_store();
+        let payment = Arc::new(TestPayment::new());
+        let clock = TestClock::new(1_000);
+
+        // sub-0 = the stalled endpoint (sorts first); sub-1..3 = fast endpoints. All are LN-address
+        // dests so each goes through `resolve_dest` (gen-1 resolution), and each has INV-3 provenance.
+        let stall_dest = "stall@buyer";
+        let fast = ["fast1@buyer", "fast2@buyer", "fast3@buyer"];
+        seed_sub(&store, "sub-0", "REFUND_DUE", "buyer-hex").await;
+        seed_refund(&store, "sub-0", Some(stall_dest), Some(500)).await;
+        for (i, d) in fast.iter().enumerate() {
+            let sub = format!("sub-{}", i + 1);
+            seed_sub(&store, &sub, "REFUND_DUE", "buyer-hex").await;
+            seed_refund(&store, &sub, Some(d), Some(500)).await;
+        }
+
+        let resolver = Arc::new(StallResolver {
+            stall_dest: stall_dest.to_string(),
+            entered: Notify::new(),
+            release: Notify::new(),
+            stall_calls: AtomicUsize::new(0),
+        });
+        let r = refunder_with(
+            &store,
+            &payment,
+            &clock,
+            resolver.clone() as Arc<dyn RefundResolver>,
+        );
+        let handle = tokio::spawn(async move { r.drive().await });
+
+        // The stalled endpoint has entered resolution and is now blocked there.
+        tokio::time::timeout(Duration::from_secs(5), resolver.entered.notified())
+            .await
+            .expect("the stall dest should enter resolution");
+
+        // While it is still resolving, the OTHER three refunds complete CONCURRENTLY — they do NOT
+        // queue behind it. (Under the old serial drive, sub-0 being first means these never run.)
+        let fast_ids = ["ref-order:sub-1", "ref-order:sub-2", "ref-order:sub-3"];
+        let all_fast_sent = async {
+            loop {
+                let mut sent = 0;
+                for id in fast_ids {
+                    if refund_row(&store, id).await.0 == "SENT" {
+                        sent += 1;
+                    }
+                }
+                if sent == fast_ids.len() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), all_fast_sent)
+            .await
+            .expect("the fast refunds must complete without waiting for the stalled one");
+
+        // ...and the stalled refund is STILL PENDING, its resolution still blocked: definitive proof
+        // a slow endpoint did not delay the unrelated refunds beyond the per-row deadline.
+        assert_eq!(refund_row(&store, "ref-order:sub-0").await.0, "PENDING");
+        assert!(
+            !handle.is_finished(),
+            "the drive is still awaiting the stalled refund"
+        );
+        assert_eq!(resolver.stall_calls.load(Ordering::SeqCst), 1);
+
+        // Release the stalled endpoint; the drive finishes and every refund is ultimately SENT — the
+        // report tallies are commutative and independent of completion order.
+        resolver.release.notify_one();
+        let report = handle.await.unwrap().unwrap();
+        assert_eq!(report.sent, 4, "all four refunds ultimately SENT");
+        assert_eq!(report.retried, 0);
+        assert_eq!(report.failed, 0);
+        for id in [
+            "ref-order:sub-0",
+            "ref-order:sub-1",
+            "ref-order:sub-2",
+            "ref-order:sub-3",
+        ] {
+            assert_eq!(refund_row(&store, id).await.0, "SENT");
+        }
     }
 }
