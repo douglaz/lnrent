@@ -488,6 +488,16 @@ impl Reconciler {
                     )?;
                     if n == 1 {
                         journal(tx, &c.id, "downtime_credit", now)?;
+                        // Do NOT widen an already-reminded sub's OPEN `renew:auto:<sub>:<pt>` invoice
+                        // expiry to the credited boundary here: its Lightning expiry is baked into the
+                        // BOLT11 at mint (`Lnv2Payment::create_invoice` -> `receive(expiry_s)`), and
+                        // create is idempotent on external_id, so no re-mint can extend it — a
+                        // daemon-only `expires_at` bump would just make the row read OPEN while the
+                        // backend reports Expired (a status divergence, no payability gained). The
+                        // credited window stays payable via the correct seams: a reminder that fires
+                        // AFTER the credit is sized to B by `fire_soft_reminder` (§6.5 FIX B), and a
+                        // pre-credit-reminded buyer recovers through the credit-aware `renew.request`
+                        // (order_intake, sized to `effective_suspend_at + retention_s`). (lnrent-ux7)
                         credited += 1;
                     }
                 }
