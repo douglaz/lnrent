@@ -992,6 +992,7 @@ impl Reconciler {
         });
         let billing_notice = Msg::BillingNotice(BillingNotice {
             subscription_id: sub_id.to_string(),
+            request_id: None,
             state: "ACTIVE".to_string(),
             message: "renewal available; pay before paid_through to avoid suspension".to_string(),
         });
@@ -1050,6 +1051,7 @@ impl Reconciler {
 
         let notice = Msg::BillingNotice(BillingNotice {
             subscription_id: sub_id.to_string(),
+            request_id: None,
             state: "SUSPENDED".to_string(),
             message: "subscription suspended for non-payment; renew to resume".to_string(),
         });

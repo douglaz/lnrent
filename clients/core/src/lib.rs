@@ -12,7 +12,7 @@ pub mod client;
 pub mod error;
 pub mod relay;
 
-pub use client::BuyerClient;
+pub use client::{BuyerClient, RenewReply};
 pub use error::{BuyerError, ErrEnvelope};
 pub use relay::{Clock, GiftWrapStream, Relay, RelayError};
 

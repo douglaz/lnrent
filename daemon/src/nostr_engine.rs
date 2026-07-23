@@ -3324,6 +3324,7 @@ mod tests {
         for i in 0..2u32 {
             let msg = Msg::BillingNotice(lnrent_wire::BillingNotice {
                 subscription_id: format!("sub-{i}"),
+                request_id: None,
                 state: "ACTIVE".into(),
                 message: "spoofed operator response".into(),
             });

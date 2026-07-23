@@ -8,9 +8,9 @@
 use std::time::Duration;
 
 use lnrent_wire::{
-    gift_unwrap, gift_wrap, parse_listing, BillingInvoice, DeliveryResendRequest, Event, Msg,
-    NostrSigner, OpRequest, OpResult, OpStatus, OperationDecl, OrderInvoice, OrderRequest,
-    ParsedListing, ProvisionReady, PublicKey, RenewRequest, SubCancel, WireError,
+    gift_unwrap, gift_wrap, parse_listing, BillingInvoice, BillingNotice, DeliveryResendRequest,
+    Event, Msg, NostrSigner, OpRequest, OpResult, OpStatus, OperationDecl, OrderInvoice,
+    OrderRequest, ParsedListing, ProvisionReady, PublicKey, RenewRequest, SubCancel, WireError,
 };
 use serde_json::Value;
 
@@ -19,6 +19,21 @@ use crate::relay::{Clock, Relay, RelayError};
 
 fn transport(e: RelayError) -> BuyerError {
     BuyerError::Transport(e.0)
+}
+
+/// The outcome of [`BuyerClient::renew`] (lnrent-zs2). A renewal request against an
+/// ACTIVE/SUSPENDED sub is answered by a request-correlated `billing.invoice` (`Invoice`); a
+/// request that lands while the sub is transiently RESUMING is answered by a request-correlated
+/// `billing.notice` asking the buyer to retry once the resume completes (`Retry`, lnrent-z4u). Both
+/// carry this request's `request_id`, so the `renew` matcher accepts either and the RESUMING case
+/// surfaces as operator feedback instead of a timeout — while a relay-replayed stale notice from an
+/// earlier request (different id) is ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenewReply {
+    /// A payable renewal invoice for the requested subscription.
+    Invoice(BillingInvoice),
+    /// A transient "retry in a moment" notice (the sub is mid-resume); no invoice was issued.
+    Retry(BillingNotice),
 }
 
 /// A buyer talking to ONE operator over a relay. Holds the injected seams + the operator pubkey and
@@ -172,10 +187,17 @@ impl<'a, R: Relay, S: NostrSigner, C: Clock> BuyerClient<'a, R, S, C> {
 
     // -- billing + management (SPEC.md §5.1, §6.2, §7.4) ----------------------------------------
 
-    /// Request a renewal invoice on demand: send `renew.request` and await the `billing.invoice`
-    /// correlated by `request_id`. An invalid renewal (unknown sub / non-owner / non-renewable
-    /// state) is dropped by the operator with no reply, surfacing here as a timeout.
-    pub async fn renew(&self, subscription_id: &str) -> Result<BillingInvoice, BuyerError> {
+    /// Request a renewal invoice on demand: send `renew.request` and await the operator's reply.
+    /// Two replies are accepted (lnrent-zs2): the request-correlated `billing.invoice`
+    /// ([`RenewReply::Invoice`], the normal case) and — for a sub the operator is transiently
+    /// resuming — a request-correlated `billing.notice` ([`RenewReply::Retry`], lnrent-z4u). The
+    /// daemon answers a renew during RESUMING with the notice INSTEAD of an invoice, echoing this
+    /// request's `request_id`, so the notice is accepted immediately (no invoice is coming) and a
+    /// relay-replayed stale RESUMING notice from an earlier request — carrying a different id —
+    /// cannot masquerade as this request's reply. An otherwise-invalid renewal (unknown sub /
+    /// non-owner / non-renewable state) is dropped by the operator with no reply, surfacing here as
+    /// a timeout.
+    pub async fn renew(&self, subscription_id: &str) -> Result<RenewReply, BuyerError> {
         let id = self.clock.new_request_id();
         let request = self
             .wrap(Msg::RenewRequest(RenewRequest {
@@ -188,16 +210,36 @@ impl<'a, R: Relay, S: NostrSigner, C: Clock> BuyerClient<'a, R, S, C> {
         let operator = self.operator;
         let (sender, reply) = self
             .exchange(Some(&request), move |sender, m| {
-                sender == &operator
-                    && matches!(m, Msg::BillingInvoice(bi)
-                        if bi.request_id.as_deref() == Some(&want_id)
-                            && bi.subscription_id == want_sub)
+                if sender != &operator {
+                    return false;
+                }
+                match m {
+                    // The renewal invoice answering THIS request (request_id + sub correlated).
+                    Msg::BillingInvoice(bi) => {
+                        bi.request_id.as_deref() == Some(&want_id) && bi.subscription_id == want_sub
+                    }
+                    // The transient-RESUMING answer to THIS request (lnrent-z4u/zs2): the daemon
+                    // replies with a request-correlated billing.notice INSTEAD of an invoice, so
+                    // accept it immediately — no invoice is coming for this request. request_id
+                    // correlation excludes a relay-replayed stale RESUMING notice from an earlier
+                    // request (its id differs), and only state "RESUMING" qualifies (the operator
+                    // emits same-sub notices for ACTIVE/SUSPENDED/CANCELLED too).
+                    Msg::BillingNotice(n) => {
+                        n.request_id.as_deref() == Some(&want_id)
+                            && n.subscription_id == want_sub
+                            && n.state == "RESUMING"
+                    }
+                    _ => false,
+                }
             })
             .await?;
-        self.check_sender(&sender, "billing.invoice")?;
+        self.check_sender(&sender, "renew reply")?;
         match reply {
-            Msg::BillingInvoice(bi) => Ok(bi),
-            _ => unreachable!("the matcher restricts to a request-correlated billing.invoice"),
+            Msg::BillingInvoice(invoice) => Ok(RenewReply::Invoice(invoice)),
+            Msg::BillingNotice(notice) => Ok(RenewReply::Retry(notice)),
+            _ => unreachable!(
+                "the matcher restricts to a request-correlated billing.invoice or RESUMING billing.notice"
+            ),
         }
     }
 
@@ -713,5 +755,174 @@ mod tests {
 
         assert_eq!(err.exit_code(), 6);
         assert_eq!(err.envelope().code, "unauthorized");
+    }
+
+    // A billing.invoice reply for the CANONICAL sub/request-id: renew returns RenewReply::Invoice
+    // (rendered exactly as before the RenewReply split).
+    fn billing_invoice(subscription_id: &str, request_id: Option<&str>) -> Msg {
+        Msg::BillingInvoice(BillingInvoice {
+            subscription_id: subscription_id.into(),
+            request_id: request_id.map(Into::into),
+            bolt11: "lnbcrenew1".into(),
+            amount_sat: 100,
+            due_at: 4_000,
+            expires_at: 5_000,
+        })
+    }
+
+    fn resuming_notice(subscription_id: &str, request_id: Option<&str>) -> Msg {
+        Msg::BillingNotice(BillingNotice {
+            subscription_id: subscription_id.into(),
+            request_id: request_id.map(Into::into),
+            state: "RESUMING".into(),
+            message: "a renewal is being applied — please retry in a moment".into(),
+        })
+    }
+
+    // renew.request -> billing.invoice, correlated by request_id + subscription_id (happy path).
+    #[tokio::test]
+    async fn renew_returns_invoice_on_billing_invoice() {
+        let op = Keys::generate();
+        let buyer = Keys::generate();
+        let clock = TestClock::default();
+        let relay = FakeRelay::new();
+        relay.queue(reply(&op, &buyer.public_key(), billing_invoice("sub-1", Some("req-0"))).await);
+
+        let c = client(&relay, &buyer, &clock, op.public_key());
+        match c.renew("sub-1").await.expect("renew reply") {
+            RenewReply::Invoice(inv) => {
+                assert_eq!(inv.subscription_id, "sub-1");
+                assert_eq!(inv.request_id.as_deref(), Some("req-0"));
+                assert_eq!(inv.bolt11, "lnbcrenew1");
+            }
+            RenewReply::Retry(n) => panic!("expected an invoice, got a retry notice: {n:?}"),
+        }
+        assert_eq!(
+            relay.published_len(),
+            1,
+            "exactly one gift-wrapped renew.request was published"
+        );
+    }
+
+    // lnrent-zs2: a renew against a transiently RESUMING sub is answered by a request-correlated
+    // billing.notice (echoing this request's id). It must surface as RenewReply::Retry — the buyer
+    // sees the operator's feedback, NOT the old timeout.
+    #[tokio::test]
+    async fn renew_against_resuming_sub_returns_retry() {
+        let op = Keys::generate();
+        let buyer = Keys::generate();
+        let clock = TestClock::default();
+        let relay = FakeRelay::new();
+        relay.queue(reply(&op, &buyer.public_key(), resuming_notice("sub-1", Some("req-0"))).await);
+
+        let c = client(&relay, &buyer, &clock, op.public_key());
+        match c.renew("sub-1").await.expect("renew reply (retry)") {
+            RenewReply::Retry(notice) => {
+                assert_eq!(notice.subscription_id, "sub-1");
+                assert_eq!(notice.state, "RESUMING");
+                assert!(
+                    notice.message.contains("retry"),
+                    "the notice carries the retry-in-a-moment message"
+                );
+            }
+            RenewReply::Invoice(inv) => panic!("expected a retry notice, got an invoice: {inv:?}"),
+        }
+    }
+
+    // Correlation is by subscription_id: a billing.notice for a DIFFERENT sub must not satisfy this
+    // renew — keep reading until the correlated invoice for the requested sub arrives.
+    #[tokio::test]
+    async fn renew_skips_notice_for_a_different_sub() {
+        let op = Keys::generate();
+        let buyer = Keys::generate();
+        let clock = TestClock::default();
+        let relay = FakeRelay::new();
+        relay.queue(reply(&op, &buyer.public_key(), resuming_notice("other-sub", Some("req-0"))).await);
+        relay.queue(reply(&op, &buyer.public_key(), billing_invoice("sub-1", Some("req-0"))).await);
+
+        let c = client(&relay, &buyer, &clock, op.public_key());
+        match c.renew("sub-1").await.expect("correlated invoice wins") {
+            RenewReply::Invoice(inv) => assert_eq!(inv.subscription_id, "sub-1"),
+            RenewReply::Retry(n) => panic!("a foreign-sub notice must not satisfy renew: {n:?}"),
+        }
+    }
+
+    // lnrent-zs2 (reviewer P2): relays replay stored gift wraps, so a same-sub RESUMING notice from
+    // an EARLIER renew (different request_id) can be replayed ahead of this request's reply. The
+    // request_id correlation must ignore that stale notice — otherwise the buyer would be told to
+    // "retry in a moment" for a sub the operator is now answering with a real invoice (or dropping).
+    #[tokio::test]
+    async fn renew_ignores_stale_request_id_notice_and_prefers_correlated_invoice() {
+        let op = Keys::generate();
+        let buyer = Keys::generate();
+        let clock = TestClock::default();
+        let relay = FakeRelay::new();
+        // A replayed RESUMING notice from a PRIOR request (req-OLD), then THIS request's invoice.
+        relay.queue(reply(&op, &buyer.public_key(), resuming_notice("sub-1", Some("req-OLD"))).await);
+        relay.queue(reply(&op, &buyer.public_key(), billing_invoice("sub-1", Some("req-0"))).await);
+
+        let c = client(&relay, &buyer, &clock, op.public_key());
+        match c.renew("sub-1").await.expect("correlated invoice wins") {
+            RenewReply::Invoice(inv) => {
+                assert_eq!(inv.subscription_id, "sub-1");
+                assert_eq!(inv.request_id.as_deref(), Some("req-0"));
+            }
+            RenewReply::Retry(n) => {
+                panic!("a stale-request-id notice must not preempt the live invoice: {n:?}")
+            }
+        }
+    }
+
+    // lnrent-zs2 regression: billing.notice is a general type, and the buyer's giftwrap subscription
+    // replays the full history. A stale same-sub notice for a NON-RESUMING state (e.g. CANCELLED)
+    // must NOT be surfaced as a retry when the operator drops the renew (non-renewable state) with no
+    // reply — that would tell the buyer to "retry in a moment" for a permanently non-renewable sub.
+    // Only a RESUMING notice qualifies; anything else leaves the honest timeout intact.
+    #[tokio::test]
+    async fn renew_ignores_stale_non_resuming_notice_and_times_out() {
+        let op = Keys::generate();
+        let buyer = Keys::generate();
+        let clock = TestClock::default();
+        let relay = FakeRelay::new();
+        let cancelled = Msg::BillingNotice(BillingNotice {
+            subscription_id: "sub-1".into(),
+            request_id: None,
+            state: "CANCELLED".into(),
+            message: "subscription cancelled; service runs until the paid period ends".into(),
+        });
+        relay.queue(reply(&op, &buyer.public_key(), cancelled).await);
+
+        let c = client(&relay, &buyer, &clock, op.public_key());
+        let err = c
+            .renew("sub-1")
+            .await
+            .expect_err("a stale CANCELLED notice must not become a retry");
+        assert!(
+            matches!(err, BuyerError::Timeout(_)),
+            "expected a timeout, got {err:?}"
+        );
+    }
+
+    // lnrent-zs2 (reviewer P2, no-invoice variant): the buyer renews a sub the operator now DROPS as
+    // non-renewable (no reply). Only a stale RESUMING notice from an EARLIER request (req-OLD) is
+    // replayed. request_id correlation must ignore it and surface the honest timeout — NOT a false
+    // "retry in a moment" for a permanently dead sub.
+    #[tokio::test]
+    async fn renew_ignores_stale_resuming_notice_from_another_request_and_times_out() {
+        let op = Keys::generate();
+        let buyer = Keys::generate();
+        let clock = TestClock::default();
+        let relay = FakeRelay::new();
+        relay.queue(reply(&op, &buyer.public_key(), resuming_notice("sub-1", Some("req-OLD"))).await);
+
+        let c = client(&relay, &buyer, &clock, op.public_key());
+        let err = c
+            .renew("sub-1")
+            .await
+            .expect_err("a stale-request-id RESUMING notice must not become a retry");
+        assert!(
+            matches!(err, BuyerError::Timeout(_)),
+            "expected a timeout, got {err:?}"
+        );
     }
 }

@@ -96,9 +96,16 @@ pub struct BillingInvoice {
 }
 
 /// `billing.notice` — operator → buyer. A renewal reminder / suspend / terminate notice (§5.1).
+///
+/// `request_id` correlates the notice to an originating buyer request when there is one — set ONLY
+/// for the transient-RESUMING answer to a `renew.request` (lnrent-z4u/zs2), so the buyer's `renew()`
+/// can match it exactly like a `billing.invoice` and NOT confuse a relay-replayed stale notice (or an
+/// unsolicited reminder/suspend/terminate notice, which carry `None`) for its live reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BillingNotice {
     pub subscription_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub state: String,
     pub message: String,
 }
@@ -378,6 +385,11 @@ impl Msg {
             // `billing.invoice` carries a `request_id` only when answering a `renew.request`;
             // an operator-initiated soft-date invoice has none (§5.1, §6.2).
             Msg::BillingInvoice(m) => m.request_id.as_deref(),
+            // `billing.notice` carries a `request_id` only for the transient-RESUMING answer to a
+            // `renew.request` (lnrent-zs2); unsolicited notices (reminder/suspend/terminate/cancel)
+            // have none. Exposing it here lets `dedupe_id` suppress a relay-replayed duplicate of
+            // that specific reply and lets consumers correlate it like a `billing.invoice`.
+            Msg::BillingNotice(m) => m.request_id.as_deref(),
             _ => None,
         }
     }
