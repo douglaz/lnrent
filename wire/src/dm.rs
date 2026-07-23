@@ -385,6 +385,11 @@ impl Msg {
             // `billing.invoice` carries a `request_id` only when answering a `renew.request`;
             // an operator-initiated soft-date invoice has none (§5.1, §6.2).
             Msg::BillingInvoice(m) => m.request_id.as_deref(),
+            // `billing.notice` carries a `request_id` only for the transient-RESUMING answer to a
+            // `renew.request` (lnrent-zs2); unsolicited notices (reminder/suspend/terminate/cancel)
+            // have none. Exposing it here lets `dedupe_id` suppress a relay-replayed duplicate of
+            // that specific reply and lets consumers correlate it like a `billing.invoice`.
+            Msg::BillingNotice(m) => m.request_id.as_deref(),
             _ => None,
         }
     }

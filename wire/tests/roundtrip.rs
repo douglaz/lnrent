@@ -254,6 +254,34 @@ fn op_result_request_id_correlates_to_op_request_id() {
 }
 
 #[test]
+fn billing_notice_request_id_correlates_only_for_the_resuming_renew_reply() {
+    // lnrent-zs2: the transient-RESUMING answer to a renew.request carries the request id, so
+    // request_id()/dedupe_id() treat it as a specific reply (correlate + suppress relay replays).
+    let sender = Keys::generate();
+    let correlated = Msg::BillingNotice(BillingNotice {
+        subscription_id: "sub-1".into(),
+        request_id: Some("req-7".into()),
+        state: "RESUMING".into(),
+        message: "a renewal is being applied — please retry in a moment".into(),
+    });
+    assert_eq!(correlated.request_id(), Some("req-7"));
+    assert_eq!(
+        correlated.dedupe_id(&sender.public_key()),
+        Some(format!("{}:billing.notice:req-7", sender.public_key().to_hex())),
+    );
+
+    // An unsolicited notice (reminder/suspend/terminate/cancel) has no request id and is not deduped.
+    let unsolicited = Msg::BillingNotice(BillingNotice {
+        subscription_id: "sub-1".into(),
+        request_id: None,
+        state: "SUSPENDED".into(),
+        message: "subscription suspended for non-payment; renew to resume".into(),
+    });
+    assert_eq!(unsolicited.request_id(), None);
+    assert_eq!(unsolicited.dedupe_id(&sender.public_key()), None);
+}
+
+#[test]
 fn dedupe_id_is_stable_and_distinguishes_messages() {
     let sender = Keys::generate();
     let sender_pubkey = sender.public_key();
