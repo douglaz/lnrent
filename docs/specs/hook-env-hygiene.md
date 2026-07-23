@@ -17,8 +17,8 @@ the mnemonic out of argv/ps), config.rs:457 reads it, and nothing ever `remove_v
 BIP39 master seed (controls the operator identity AND all ecash) sits in the daemon env for its
 lifetime and is copied into every hook process: exposed to any hook's `set -x`, env-dumping tool
 failure, crash core, or `/proc/<hook-pid>/environ`. This violates SPEC §13 ("secrets ride stdin
-JSON, not argv or env"). `LNRENT_FEDIMINT_INVITE`/`LNRENT_FEDIMINT_GATEWAY` ride along (lower
-severity, same class).
+JSON, not argv or env"). `LNRENT_FEDIMINT_INVITE` rides along (lower severity, same class; the
+`LNRENT_FEDIMINT_GATEWAY` var was dropped in lnrent-o4k as inert).
 
 One documented dependency on inheritance exists: go-live.md §4 passes `DO_TOKEN` via the daemon
 env and the do-vps hooks read `$DO_TOKEN` (verified: recipes/do-vps/* require it).
@@ -28,8 +28,9 @@ env and the do-vps hooks read `$DO_TOKEN` (verified: recipes/do-vps/* require it
 ### A. Scrub bootstrap secrets from the daemon's own env
 
 Immediately after `raw_config_from_env` has been consumed at startup (both `bootstrap` and `run`
-paths), `std::env::remove_var` every `LNRENT_MNEMONIC` / `LNRENT_FEDIMINT_INVITE` /
-`LNRENT_FEDIMINT_GATEWAY` var. **Scope of this guarantee (be precise):** `remove_var` updates the
+paths), `std::env::remove_var` every `LNRENT_MNEMONIC` / `LNRENT_FEDIMINT_INVITE` var (the inert
+`LNRENT_FEDIMINT_GATEWAY` var was dropped in lnrent-o4k). **Scope of this guarantee (be precise):**
+`remove_var` updates the
 libc `environ` array, so subsequent `std::env::var` lookups AND — combined with §B's `.env_clear()`
 — child-hook inheritance no longer see the secret. It does **NOT** overwrite the initial environment
 block the kernel placed on the stack at `exec`, so on Linux `/proc/<pid>/environ` of the *daemon

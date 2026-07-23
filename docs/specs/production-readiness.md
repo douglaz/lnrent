@@ -248,14 +248,15 @@ Three operability blind spots that leave the operator able to *see* trouble but 
   documented exception: the go-live §4 run invocation passes `DO_TOKEN=<token>` via the daemon env and
   the do-vps hooks read `$DO_TOKEN`, so the allowlist MUST include it (or the recipe grows a declared
   env-passthrough list) and go-live.md must be re-verified in the same change.
-- **PR-13 — Gateway failover.** Config carries one `gateway` pubkey (`config.rs:88`); the backend pins it
-  and fails closed when down (`fedimint_backend.rs:653-659`), blocking **both** refunds and receiving
-  (invoice creation requires a gateway — no ecash-native receive path). Remedy today is edit-config +
-  restart. Add a gateway list with failover, or a hot-swap command. (The receive-side single-point-of-
-  failure is inherent to the LN-invoice receive model; document it.)
+- **PR-13 — Gateway failover (superseded by lnv2).** The lnv1 backend's configured gateway list and
+  failover path were deleted with lnv1 (lnrent-8ym). The live lnv2 backend discovers registered
+  gateways and selects one natively by API `SafeUrl`; lnrent-o4k therefore removed the inert
+  gateway-pubkey config instead of carrying an operator list or adding a hot-swap command. Receiving
+  and refunds still require an available federation gateway, which the preflight/readiness checks
+  probe, but no follow-up config failover work remains.
 - **PR-14 — `lnrent preflight`/`doctor` with real reachability checks.** Bootstrap validation is strong on
-  durable-state integrity but pings nothing external — a well-formed-but-wrong gateway/invite passes and
-  only fails at runtime `join_or_open`; `DO_TOKEN` validity isn't checked at startup (go-live relies on a
+  durable-state integrity but pings nothing external — a well-formed-but-wrong invite passes and only
+  fails at runtime `join_or_open`; `DO_TOKEN` validity isn't checked at startup (go-live relies on a
   manual `curl`). Add a preflight that actually probes gateway + federation + provider token. (SPEC already
   describes `lnrent doctor`; it is unimplemented.)
 - **PR-15 — IPC socket bind→chmod window + no peer-cred.** `ipc.rs:110-113` does `bind` then a *separate*

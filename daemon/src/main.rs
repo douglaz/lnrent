@@ -75,9 +75,6 @@ struct BootstrapArgs {
     /// Env: LNRENT_FEDIMINT_INVITE.
     #[arg(long)]
     fedimint_invite: Option<String>,
-    /// Fedimint gateway. Env: LNRENT_FEDIMINT_GATEWAY.
-    #[arg(long)]
-    fedimint_gateway: Option<String>,
     /// The operator BIP39 mnemonic (first bootstrap only; read back from the data dir afterward).
     /// Prefer LNRENT_MNEMONIC / a config file / stdin so it doesn't land in the process table.
     #[arg(long)]
@@ -167,12 +164,8 @@ fn main() -> ExitCode {
 }
 
 /// The bootstrap SECRET env vars scrubbed after the config load consumes them (lnrent-y4m.7). Mirror
-/// of the `ENV_MNEMONIC` / `ENV_FEDIMINT_*` names in `config.rs`.
-const SECRET_ENV_VARS: &[&str] = &[
-    "LNRENT_MNEMONIC",
-    "LNRENT_FEDIMINT_INVITE",
-    "LNRENT_FEDIMINT_GATEWAY",
-];
+/// of the `ENV_MNEMONIC` / `ENV_FEDIMINT_INVITE` names in `config.rs`.
+const SECRET_ENV_VARS: &[&str] = &["LNRENT_MNEMONIC", "LNRENT_FEDIMINT_INVITE"];
 
 /// Remove the bootstrap secrets from the daemon's own process env, AFTER the synchronous config load
 /// has consumed them and BEFORE the tokio runtime spawns worker threads (so this `remove_var` cannot
@@ -296,10 +289,10 @@ fn bootstrap_input(args: BootstrapArgs) -> BootstrapInput {
         // layers still parse for back-compat, but a supplied value is ignored with a warning.
         compute_backend: None,
         fedimint_invite: args.fedimint_invite,
-        fedimint_gateway: args.fedimint_gateway,
-        // No bootstrap CLI flag for the failover fallback list (lnrent-y4m.8): gateway fallbacks are
-        // supplied via the config file / stdin JSON `fedimint_gateway_fallbacks` array (or already
-        // durable in fedimint.json). The single-gateway `--fedimint-gateway` flag is unchanged.
+        // lnrent-o4k: no CLI flag for the dead gateway knobs (the `--fedimint-gateway` flag was
+        // dropped). They survive on RawConfig only so an OLDER build's config file / stdin doc still
+        // parses (deny_unknown_fields); the flags layer never sources them.
+        fedimint_gateway: None,
         fedimint_gateway_fallbacks: None,
         mnemonic: args.mnemonic,
         // No bootstrap CLI flag for the draining-holdings floor (lnrent-urw.7); it is a runtime
@@ -490,8 +483,7 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
 
 /// Construct the real Fedimint payment backend for `payment_backend=fedimint` (lnrent-3d5, ADR-0018):
 /// the **lnv2** backend ([`Lnv2Payment`]) — the live ecash money path (the retired lnv1 backend was
-/// deleted by lnrent-8ym). lnv2 selects gateways natively (by API url), so the configured
-/// `[fedimint] gateway` pubkey (an lnv1-era selector) is not consulted here. Compiled only with
+/// deleted by lnrent-8ym). lnv2 selects gateways natively (by API url). Compiled only with
 /// `--features fedimint`; the non-feature build rejects `fedimint` at
 /// bootstrap, so its variant just fails clearly if ever reached.
 #[cfg(feature = "fedimint")]
@@ -503,7 +495,7 @@ async fn build_fedimint_backend(
         .config
         .fedimint
         .as_ref()
-        .context("payment_backend=fedimint requires a [fedimint] config (invite + gateway)")?;
+        .context("payment_backend=fedimint requires a [fedimint] config (the federation invite)")?;
     let backend = Lnv2Payment::join_or_open(
         &fedi.invite,
         &operator.config.data_dir,
