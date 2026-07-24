@@ -15,21 +15,29 @@
 //!   `ops/`-containment — not re-checked here), and op-param validation;
 //! - the hook itself via [`runner::run_hook`].
 //!
-//! It is deliberately the SIMPLEST correct dispatcher: there is NO in-flight task registry. A
-//! concurrent duplicate that finds someone else's `RUNNING` row defers by returning `Err` so the
-//! transport reprocesses the wrap later — by then the first attempt has committed a terminal state.
-//! A hook failure is a committed, cached `op.result` error, never a handler `Err` (which would
-//! re-run the hook on transport retry) and never a daemon wedge.
+//! A concurrent duplicate of an op that is STILL RUNNING in THIS process ATTACHES to the in-flight
+//! invocation (a small registry INTERNAL to [`OpDispatch`], lnrent-c95) and is served that
+//! invocation's terminal result the moment it commits — the hook still runs AT MOST ONCE (only the
+//! claim owner runs it; duplicates only await). A duplicate that finds a `RUNNING` row but NO
+//! in-process handle still defers by returning `Err` so the transport reprocesses the wrap later
+//! and re-reads the authoritative row (see [`OpDispatch::attach_or_defer`] for the causes that
+//! actually reach that arm). An owner that exits WITHOUT a committed terminal (early error,
+//! panic, task cancellation) wakes its attached duplicates into that SAME defer rather than a
+//! fabricated terminal — only the durable row is authoritative. A hook failure is a committed,
+//! cached `op.result` error, never a handler `Err` (which would re-run the hook on transport retry)
+//! and never a daemon wedge.
 //!
-//! Production wiring (into `main.rs` / `run_inbound`, plus calling [`OpDispatch::recover_interrupted_ops`]
-//! at startup) is lnrent-7fp.21's job; this bead only exposes the handler and the recovery method.
+//! Production wiring is lnrent-7fp.21's and already shipped: the supervisor constructs this handler
+//! and awaits [`OpDispatch::recover_interrupted_ops`] during boot recovery.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
+use tokio::sync::watch;
 
 use lnrent_wire::{Msg, OpRequest, OpResult, PublicKey, WireError};
 
@@ -51,6 +59,10 @@ pub struct OpDispatch {
     store: Store,
     clock: Arc<dyn Clock>,
     recipe: Recipe,
+    /// lnrent-c95 in-flight registry (see [`InflightRegistry`]). `Default`-initialized so it stays
+    /// OUT of the public `new`/supervisor wiring — a single shared `OpDispatch` whose `handle` is
+    /// called concurrently is all this needs.
+    inflight: InflightRegistry,
 }
 
 /// The outcome of the lookup → auth → claim transaction (steps 1–3 in [`OpDispatch::claim`]):
@@ -75,7 +87,8 @@ enum Claim {
         subscription_id: String,
         op: String,
     },
-    /// A concurrent duplicate is mid-flight (`RUNNING`, not ours). Defer-and-retry: do NOT re-run.
+    /// A concurrent duplicate found a `RUNNING` row (not a fresh terminal). ATTACH to the in-flight
+    /// owner if it lives in THIS process (lnrent-c95), else defer-and-retry. NEVER re-runs.
     Running,
     /// Auth reject (no row existed): unknown sub OR not the owner. Reply `unauthorized`, persist
     /// NOTHING — an unauthenticated stranger leaves no durable artifact (gdu.3).
@@ -85,12 +98,139 @@ enum Claim {
     NotActive,
 }
 
+/// A CLONE-able snapshot of an owner invocation's outcome, published on the in-flight registry's
+/// `watch` so a concurrent IN-PROCESS duplicate (lnrent-c95) can build the SAME `op.result` the
+/// owner committed — WITHOUT re-running the hook. `Done`/`Errored` mirror the cached-resend
+/// [`Claim`] variants (STORED subscription_id/op, carrying the SAME result/error JSON the owner
+/// cached so the duplicate's reply is byte-identical) and are published ONLY after the durable
+/// terminal commit returned `Ok`. Those labels come from the owner's in-memory `req`, not from a
+/// re-read of the row, and that IS the stored pair: ONE `req` feeds both the claim `INSERT` (see
+/// [`OpDispatch::claim`], which writes `req.subscription_id`/`req.op` verbatim) and this publish.
+///
+/// `NoTerminal` is what the owner's [`InflightGuard`] publishes if it exits WITHOUT having OBSERVED
+/// a committed terminal (store error / early return / panic / TASK CANCELLATION), and it wakes the
+/// duplicate into the same `Err`-DEFER the orphan path uses — deliberately NOT a fabricated
+/// `interrupted()` reply. **A cancelled owner can still commit**: the store actor runs a queued job
+/// even when its caller was cancelled, so an owner aborted inside `commit_terminal` may yet make
+/// `DONE`/`ERROR` durable. Fabricating a terminal there would CONTRADICT the durable cache;
+/// deferring instead makes the next redelivery read the authoritative row. This is the reason
+/// `NoTerminal` never becomes a reply — referenced, not restated, at its other use sites.
+#[derive(Clone)]
+enum InflightOutcome {
+    Done {
+        result_json: String,
+        subscription_id: String,
+        op: String,
+    },
+    Errored {
+        error_json: String,
+        subscription_id: String,
+        op: String,
+    },
+    NoTerminal,
+}
+
+/// In-flight op registry (lnrent-c95), INTERNAL to [`OpDispatch`] (never threaded through its public
+/// `new`/supervisor wiring): `(sender_hex, request_id)` → a `watch` broadcasting the owner's
+/// terminal [`InflightOutcome`]. A `watch` (not a oneshot) so a LATE subscriber still reads the
+/// final value. The `std::sync::Mutex` is held ONLY for map insert/lookup/remove — NEVER across an
+/// `.await` (see [`OpDispatch::attach_or_defer`]).
+type InflightRegistry =
+    Arc<StdMutex<HashMap<(String, String), watch::Sender<Option<InflightOutcome>>>>>;
+
+/// Publishes the owner invocation's [`InflightOutcome`] to any attached duplicate AND removes the
+/// registry entry on EVERY owner exit path (lnrent-c95 concurrency invariants):
+/// - a normal terminal calls [`InflightGuard::publish`] with the COMMITTED outcome;
+/// - ANY other exit (store-layer `Err`, `?`-propagation, panic, task cancellation) runs `Drop`,
+///   which publishes `NoTerminal` — so an awaiting duplicate can NEVER hang; it defers instead —
+///   and removes the entry, so the registry never leaks.
+///
+/// The entry is inserted by [`InflightGuard::register`], never by a caller: the map insert and the
+/// guard that owns its removal are created TOGETHER, so both invariants hold BY CONSTRUCTION.
+struct InflightGuard {
+    registry: InflightRegistry,
+    key: (String, String),
+    tx: watch::Sender<Option<InflightOutcome>>,
+    published: bool,
+}
+
+impl InflightGuard {
+    /// Insert a fresh in-flight entry for `key` AND return the guard that owns its cleanup — the
+    /// ONLY way an entry enters the registry (lnrent-c95). The two steps live in one infallible,
+    /// non-yielding constructor rather than in separate caller statements so no future `.await`,
+    /// `?`, or panic can ever land BETWEEN them: an entry inserted without its guard would strand a
+    /// live `watch::Sender` in the map forever with nothing left to publish `NoTerminal`, hanging
+    /// every duplicate that later subscribes. Same standard as [`Self::publish`]'s flag-first order:
+    /// hold the invariant by construction, not by auditing the call site.
+    fn register(registry: &InflightRegistry, key: (String, String)) -> Self {
+        let (tx, _) = watch::channel::<Option<InflightOutcome>>(None);
+        registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone(), tx.clone());
+        Self {
+            registry: registry.clone(),
+            key,
+            tx,
+            published: false,
+        }
+    }
+
+    /// Publish the owner's committed terminal outcome, then drop the entry. Marks the guard before
+    /// the owner's fallible reply so cancellation or relay failure cannot overwrite the durable
+    /// terminal with a spurious `NoTerminal` defer.
+    fn publish(&mut self, outcome: InflightOutcome) {
+        // Marked FIRST, before either side effect: `published` means "this guard owns a committed
+        // terminal, so `Drop` must not overwrite it with `NoTerminal`". Setting it after the send
+        // would leave a window where an unwind between the two runs `Drop`, replacing a committed
+        // `Done`/`Errored` with a defer. Unreachable today (neither statement below can panic), but
+        // the flag-first order makes the invariant hold by construction rather than by audit.
+        self.published = true;
+        // `send_replace` (NOT `send`): store the outcome UNCONDITIONALLY, even when no duplicate has
+        // subscribed yet. `send` drops the value and errs when `receiver_count() == 0`, which opens a
+        // race — a duplicate that subscribes in the window between this store and the `remove` below
+        // would then read the stale `None` and, on the channel closing, needlessly defer an op that
+        // actually committed a terminal it could have been served. `send_replace` closes that: the
+        // value is durable in the `watch` until the entry is removed, so any pre-remove subscriber
+        // reads the real outcome; a post-remove lookup finds no handle and defers (the SAFE window).
+        let _ = self.tx.send_replace(Some(outcome));
+        remove_inflight(&self.registry, &self.key);
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if !self.published {
+            // The owner exited WITHOUT observing a committed terminal (store error / early return /
+            // panic / task cancellation): wake any attached duplicate with `NoTerminal` (never leave
+            // it hanging) so it DEFERS, then remove the entry. It must not fabricate a terminal: a
+            // cancelled owner's store job is already queued and can still commit `DONE`/`ERROR`, so
+            // only the durable row is authoritative (see [`InflightOutcome`]). Otherwise the row
+            // stays `RUNNING` for `recover_interrupted_ops` — unchanged.
+            // `send_replace` (not `send`) for the same reason as `publish`: store the outcome even
+            // with zero current subscribers so a duplicate racing the remove reads it, not a hang.
+            let _ = self.tx.send_replace(Some(InflightOutcome::NoTerminal));
+            remove_inflight(&self.registry, &self.key);
+        }
+    }
+}
+
+/// Remove an in-flight registry entry, recovering from a poisoned lock: `Drop` must never
+/// double-panic, and a poisoned map must still drop the entry.
+fn remove_inflight(registry: &InflightRegistry, key: &(String, String)) {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(key);
+}
+
 impl OpDispatch {
     pub fn new(store: Store, clock: Arc<dyn Clock>, recipe: Recipe) -> Self {
         Self {
             store,
             clock,
             recipe,
+            inflight: InflightRegistry::default(),
         }
     }
 
@@ -125,44 +265,27 @@ impl OpDispatch {
                 subscription_id,
                 op,
             } => {
-                // Cached success: a DONE row always holds an object `data` (we reject non-object
-                // hook output before committing), so the decode is safe; fall back defensively.
-                // Echo the STORED subscription_id/op so a reused id can't relabel the cached reply.
-                let data = serde_json::from_str::<Value>(&result_json)
-                    .ok()
-                    .filter(Value::is_object)
-                    .unwrap_or_else(|| json!({}));
-                out.reply(
-                    &sender,
-                    &Msg::OpResult(OpResult::ok(req.id, subscription_id, op, data)),
-                )
-                .await?;
-                return Ok(());
+                // Cached success: resend the STORED result (see `resend_done`). Echo the STORED
+                // subscription_id/op so a reused id can't relabel the cached reply.
+                return self
+                    .resend_done(&sender, &req.id, subscription_id, op, &result_json, out)
+                    .await;
             }
             Claim::Errored {
                 error_json,
                 subscription_id,
                 op,
             } => {
-                let error = serde_json::from_str::<WireError>(&error_json)
-                    .unwrap_or_else(|_| interrupted());
-                out.reply(
-                    &sender,
-                    &Msg::OpResult(OpResult::err(req.id, subscription_id, op, error)),
-                )
-                .await?;
-                return Ok(());
+                return self
+                    .resend_errored(&sender, &req.id, subscription_id, op, &error_json, out)
+                    .await;
             }
             Claim::Running => {
-                // A concurrent duplicate owns the RUNNING row. Don't re-run and don't reply with a
-                // half-baked state — return Err so the transport does NOT mark the wrap seen and
-                // reprocesses it later, by which point the first attempt has committed DONE/ERROR
-                // (run_hook caps at DEFAULT_TIMEOUT, so it terminates). Defer-and-retry is the
-                // minimal correct M1a behavior — no in-flight task registry.
-                return Err(anyhow!(
-                    "op.request {} from {sender_hex} is already RUNNING (concurrent duplicate); deferring",
-                    req.id
-                ));
+                // lnrent-c95: a duplicate found a RUNNING row (not a fresh terminal). Attach to the
+                // in-flight owner if it lives in THIS process (serve its result the moment it
+                // commits), else defer so a redelivery re-reads the durable row. NEVER re-runs the
+                // hook and NEVER commits terminal state — see `attach_or_defer`.
+                return self.attach_or_defer(&sender, &req, &sender_hex, out).await;
             }
             // Row-free AUTH rejects (gdu.3, spec §C). The reply is IDENTICAL for a nonexistent sub
             // and someone else's sub (both `unauthorized`) — no existence leak. The reply itself
@@ -176,22 +299,59 @@ impl OpDispatch {
             }
         };
 
-        // From here the RUNNING claim is OURS and the sender is AUTHORIZED. Every BUSINESS outcome
-        // below (unknown/invalid/hook result) commits a terminal DONE/ERROR and replies. A
-        // store-layer error (a failed read or terminal commit) instead propagates `Err`, leaving the
-        // row RUNNING — never re-run inline; the next startup's `recover_interrupted_ops` flips it to
-        // the cached `interrupted` error, and the buyer's later retry resends that. So the hook still
-        // runs at most once.
+        // From here the RUNNING claim is OURS and the sender is AUTHORIZED (gdu.3). lnrent-c95:
+        // register this invocation in the in-flight registry BEFORE running the hook, so a concurrent
+        // IN-PROCESS duplicate (a `Claim::Running` that finds this handle) ATTACHES to our result
+        // instead of Err-deferring. `guard` publishes our terminal `InflightOutcome` and removes the
+        // entry on EVERY owner exit path — the normal terminal via `publish`, and any other exit
+        // (store `Err`, `?`, panic, task cancellation) via its `Drop`, which publishes `NoTerminal`
+        // so an attached duplicate can NEVER hang (it defers instead).
+        //
+        // INVARIANTS (lnrent-c95): the hook runs AT MOST ONCE — only this owner path runs it
+        // (`run_owned`); duplicates only await. No lock is held across an `.await` (the map mutex is
+        // insert/lookup/remove-only). The registry never leaks (removed on every exit) — `register`
+        // inserts the entry and builds its guard in ONE step, so neither can exist without the other.
+        // A store-layer error still propagates `Err`, leaving the row RUNNING for the next startup's
+        // `recover_interrupted_ops` — unchanged. NARROW, SAFE window (no locking added to close it): a
+        // duplicate that looks up between this claim-commit and the `register` below — or after the
+        // owner's publish+remove — finds no handle and defers, getting the committed terminal on the
+        // next redelivery.
+        let mut guard = InflightGuard::register(&self.inflight, (sender_hex, req.id.clone()));
+        // `run_owned` resolves/validates/runs the hook and commits+replies the OWNER's terminal. Its
+        // terminal helpers publish through `guard` immediately AFTER the durable commit and BEFORE
+        // awaiting the owner's fallible relay reply. On `?` before a commit, `guard` drops without a
+        // terminal and publishes `NoTerminal`, deferring any attached duplicate.
+        self.run_owned(&sender, &req, subscription_state, now, out, &mut guard)
+            .await
+    }
 
+    /// The owner-only tail of [`Self::dispatch`] once WE hold the `RUNNING` claim (lnrent-c95
+    /// extracted it so the in-flight registry can wrap it): resolve → validate → run the hook outside
+    /// any txn → commit the terminal `DONE`/`ERROR`, publish it to attached duplicates, and reply to
+    /// the OWNER. Publication happens after the commit but before fallible owner reply I/O. A
+    /// store-layer error (a failed read or terminal commit) instead propagates `Err`, leaving the row
+    /// `RUNNING`; `recover_interrupted_ops` flips it on the next startup, and `guard` publishes
+    /// `NoTerminal` on drop (deferring any attached duplicate). The hook runs AT MOST ONCE — only
+    /// this path runs it.
+    async fn run_owned(
+        &self,
+        sender: &PublicKey,
+        req: &OpRequest,
+        subscription_state: String,
+        now: i64,
+        out: &dyn Outbound,
+        guard: &mut InflightGuard,
+    ) -> Result<()> {
+        let sender_hex = sender.to_hex();
         // 2. RESOLVE the op. Unknown, or a non-`request` kind (interactive is out of scope here), is
         //    `unknown_op`. Past auth → STILL commits a terminal ERROR row (cached-resend), unchanged.
         //    Hook-name safety / `ops/`-containment was enforced at load by Recipe::validate
         //    (lnrent-7fp.6) — not re-checked here.
         let Some(op) = self.recipe.operation(&req.op) else {
-            return self.fail(&sender, &req, unknown_op(), now, out).await;
+            return self.fail(sender, req, unknown_op(), now, out, guard).await;
         };
         if op.kind != "request" {
-            return self.fail(&sender, &req, unknown_op(), now, out).await;
+            return self.fail(sender, req, unknown_op(), now, out, guard).await;
         }
 
         // 3. VALIDATE params against the op schema (reject unknown/missing/mistyped). Past auth →
@@ -199,11 +359,12 @@ impl OpDispatch {
         if let Err(e) = validate_op_params(op, &req.params) {
             return self
                 .fail(
-                    &sender,
-                    &req,
+                    sender,
+                    req,
                     invalid_params(cap_message(e.to_string())),
                     now,
                     out,
+                    guard,
                 )
                 .await;
         }
@@ -246,15 +407,16 @@ impl OpDispatch {
                 if !stdout_json.is_object() {
                     return self
                         .fail(
-                            &sender,
-                            &req,
+                            sender,
+                            req,
                             hook_failed("operation hook did not return a JSON object".into()),
                             now,
                             out,
+                            guard,
                         )
                         .await;
                 }
-                self.done(&sender, &req, stdout_json, now, out).await
+                self.done(sender, req, stdout_json, now, out, guard).await
             }
             Err(e) => {
                 // A timeout vs any other failure (nonzero exit / cap breach / non-JSON). Neither is
@@ -272,9 +434,206 @@ impl OpDispatch {
                     );
                     hook_failed(HOOK_FAILED_MESSAGE.into())
                 };
-                self.fail(&sender, &req, error, now, out).await
+                self.fail(sender, req, error, now, out, guard).await
             }
         }
+    }
+
+    /// Build + send the cached `op.result` OK for a `DONE` invocation — shared by the [`Claim::Done`]
+    /// cached-resend arm and the lnrent-c95 in-flight attach path, so an attached duplicate's reply
+    /// is byte-identical to the owner's committed result. `subscription_id`/`op` are the STORED ones
+    /// (an echoed reused id can't relabel the cached reply). A `DONE` `result_json` always holds an
+    /// object `data` (non-object hook output is rejected before commit), so the decode is safe; fall
+    /// back defensively.
+    async fn resend_done(
+        &self,
+        sender: &PublicKey,
+        request_id: &str,
+        subscription_id: String,
+        op: String,
+        result_json: &str,
+        out: &dyn Outbound,
+    ) -> Result<()> {
+        let data = serde_json::from_str::<Value>(result_json)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        out.reply(
+            sender,
+            &Msg::OpResult(OpResult::ok(
+                request_id.to_string(),
+                subscription_id,
+                op,
+                data,
+            )),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Build + send the cached `op.result` err for an `ERROR` invocation — shared by the
+    /// [`Claim::Errored`] cached-resend arm and the lnrent-c95 attach path (STORED subscription_id/op,
+    /// same `error_json`).
+    async fn resend_errored(
+        &self,
+        sender: &PublicKey,
+        request_id: &str,
+        subscription_id: String,
+        op: String,
+        error_json: &str,
+        out: &dyn Outbound,
+    ) -> Result<()> {
+        let error = serde_json::from_str::<WireError>(error_json).unwrap_or_else(|_| interrupted());
+        out.reply(
+            sender,
+            &Msg::OpResult(OpResult::err(
+                request_id.to_string(),
+                subscription_id,
+                op,
+                error,
+            )),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// [`Claim::Running`] resolution (lnrent-c95). Look the `(sender_hex, request_id)` key up in the
+    /// in-flight registry:
+    /// - PRESENT → the first attempt is STILL RUNNING in THIS process. Subscribe to its terminal
+    ///   `watch` — dropping the map lock BEFORE awaiting, so the lock is NEVER held across an
+    ///   `.await` — await the owner's [`InflightOutcome`], then reply to the DUPLICATE's sender with
+    ///   the SAME `op.result` the owner committed (STORED subscription_id/op, not the duplicate's).
+    ///   The hook is NOT re-run and NO terminal state is committed — only the owner commits. If the
+    ///   owner exits WITHOUT a committed terminal it publishes [`InflightOutcome::NoTerminal`] and
+    ///   we fall back to the same `Err`-defer as below (never a fabricated terminal).
+    ///   COST: parking holds this wrap's inbound concurrency permit for the REST of the owner's run,
+    ///   where the pre-c95 defer released it after one store round-trip. Deliberate — that wait is
+    ///   exactly what buys a served buyer instead of silence until redelivery — and it is bounded by
+    ///   the owner's OWN occupancy of its slot: the wait ends at the owner's terminal (which the hook
+    ///   timeout bounds) and the drop guard covers every non-terminal exit. The full permit-budget
+    ///   trade-off is recorded in the lnrent-c95 bead/PR, not frozen here.
+    /// - ABSENT → re-read the authoritative row, because the owner may have committed and removed its
+    ///   handle since [`Self::claim`] returned [`Claim::Running`]. Resend a terminal immediately; if
+    ///   the row is still `RUNNING` — a true orphan, or the narrow claim-commit → registry-insert
+    ///   window — keep the pre-c95 `Err`-defer (no reply, wrap NOT marked seen). Deferring rather
+    ///   than replying or committing is what preserves crash recovery and must not regress: a stale
+    ///   `RUNNING` row is flipped to a cached `interrupted` error by the next startup's
+    ///   `recover_interrupted_ops`.
+    async fn attach_or_defer(
+        &self,
+        sender: &PublicKey,
+        req: &OpRequest,
+        sender_hex: &str,
+        out: &dyn Outbound,
+    ) -> Result<()> {
+        let key = (sender_hex.to_string(), req.id.clone());
+        // Lock ONLY to subscribe; drop it (end of block) BEFORE the await below.
+        let maybe_rx = {
+            let map = self
+                .inflight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.get(&key).map(watch::Sender::subscribe)
+        };
+        let Some(mut rx) = maybe_rx else {
+            // The claim can be stale: the owner may have committed and publish+removed between the
+            // claim transaction and this registry lookup. Re-read the durable row and serve such a
+            // terminal immediately through the SAME cached-resend helpers. This read never claims,
+            // runs, or commits anything, so hook-at-most-once remains owner-only.
+            match self.reread_existing(sender_hex, &req.id).await? {
+                Some(Claim::Done {
+                    result_json,
+                    subscription_id,
+                    op,
+                }) => {
+                    return self
+                        .resend_done(sender, &req.id, subscription_id, op, &result_json, out)
+                        .await;
+                }
+                Some(Claim::Errored {
+                    error_json,
+                    subscription_id,
+                    op,
+                }) => {
+                    return self
+                        .resend_errored(sender, &req.id, subscription_id, op, &error_json, out)
+                        .await;
+                }
+                // Still RUNNING (or defensively absent/non-terminal): preserve the pre-c95 defer.
+                // This includes a true orphan and the explicitly acceptable claim-commit →
+                // registry-insert window. No lock is held across this store await.
+                _ => {}
+            }
+            return Err(anyhow!(
+                "op.request {} from {sender_hex} is already RUNNING with no in-process handle \
+                 (owner not registered here, or exited without committing a terminal); deferring",
+                req.id
+            ));
+        };
+        // PRESENT → attach. `info`, not `debug`: this is the only silent registry path (both defer
+        // arms already warn), and it can park a wrap for the owner's remaining run — log it while it
+        // is parked, not after. The `duplicate_*` labels are the DUPLICATE's own; the reply below
+        // uses the owner's STORED subscription_id/op (see [`Claim::Done`]), which for a reused
+        // request_id can legitimately differ.
+        tracing::info!(
+            request_id = %req.id,
+            duplicate_subscription_id = %req.subscription_id,
+            duplicate_op = %req.op,
+            "duplicate op.request attached to the in-flight invocation"
+        );
+        // Await the owner's outcome. `borrow_and_update` reads-and-marks the current value, so a
+        // terminal published before we subscribed is seen immediately; otherwise `changed()` blocks
+        // until the owner publishes (or its drop guard publishes `NoTerminal`).
+        let outcome = loop {
+            if let Some(outcome) = rx.borrow_and_update().clone() {
+                break outcome;
+            }
+            if rx.changed().await.is_err() {
+                // The owner dropped its sender without publishing. The drop guard always publishes
+                // `NoTerminal` FIRST, so this is only reachable defensively — treat it the same.
+                break InflightOutcome::NoTerminal;
+            }
+        };
+        match outcome {
+            InflightOutcome::Done {
+                result_json,
+                subscription_id,
+                op,
+            } => {
+                self.resend_done(sender, &req.id, subscription_id, op, &result_json, out)
+                    .await
+            }
+            InflightOutcome::Errored {
+                error_json,
+                subscription_id,
+                op,
+            } => {
+                self.resend_errored(sender, &req.id, subscription_id, op, &error_json, out)
+                    .await
+            }
+            // The owner exited WITHOUT observing a committed terminal. There is nothing authoritative
+            // to echo AND we must not invent one: a cancelled owner's queued store job can still
+            // commit `DONE`/`ERROR` after this point, so replying a permanent `interrupted` could
+            // contradict the durable cache. DEFER exactly like the orphan arm above — no reply, not
+            // marked seen — and let the next redelivery read the row (cached terminal, or another
+            // defer until `recover_interrupted_ops` resolves it). This is also precisely the pre-c95
+            // behavior for this case, so it regresses nothing.
+            InflightOutcome::NoTerminal => Err(anyhow!(
+                "op.request {} from {sender_hex} is still RUNNING (in-flight owner exited without a committed terminal); deferring",
+                req.id
+            )),
+        }
+    }
+
+    /// Re-read an invocation after a registry miss without claiming or authorizing anything. This
+    /// closes the commit+publish/remove race in [`Self::attach_or_defer`]: only a durable terminal is
+    /// served; a still-`RUNNING` or absent row remains a safe defer.
+    async fn reread_existing(&self, sender_hex: &str, request_id: &str) -> Result<Option<Claim>> {
+        let sender_hex = sender_hex.to_string();
+        let request_id = request_id.to_string();
+        self.store
+            .read(move |connection| lookup_existing(connection, &sender_hex, &request_id))
+            .await
     }
 
     /// Steps 1–3 (lookup → authorize → claim) in ONE serialized transaction, keyed
@@ -405,7 +764,11 @@ impl OpDispatch {
             .await
     }
 
-    /// Commit `DONE` (result_json = the hook's stdout JSON) and reply `op.result` ok.
+    /// Commit `DONE` (result_json = the hook's stdout JSON) and reply `op.result` ok to the OWNER
+    /// after publishing [`InflightOutcome::Done`] to attached duplicates. The outcome carries the
+    /// SAME `result_json` so the duplicate rebuilds a byte-identical reply via
+    /// [`Self::resend_done`]. Publishing before the fallible owner reply prevents a committed result
+    /// from being replaced by the guard's fallback `NoTerminal` defer.
     async fn done(
         &self,
         sender: &PublicKey,
@@ -413,10 +776,23 @@ impl OpDispatch {
         data: Value,
         now: i64,
         out: &dyn Outbound,
+        guard: &mut InflightGuard,
     ) -> Result<()> {
         let result_json = serde_json::to_string(&data)?;
-        self.commit_terminal(sender, &req.id, "DONE", Some(result_json), None, now)
-            .await?;
+        self.commit_terminal(
+            sender,
+            &req.id,
+            "DONE",
+            Some(result_json.clone()),
+            None,
+            now,
+        )
+        .await?;
+        guard.publish(InflightOutcome::Done {
+            result_json,
+            subscription_id: req.subscription_id.clone(),
+            op: req.op.clone(),
+        });
         out.reply(
             sender,
             &Msg::OpResult(OpResult::ok(
@@ -430,8 +806,10 @@ impl OpDispatch {
         Ok(())
     }
 
-    /// Commit `ERROR` (error_json = `error`) and reply `op.result` err. A business failure is ALWAYS
-    /// this path — a committed, cached error — never a handler `Err`.
+    /// Commit `ERROR` (error_json = `error`) and reply `op.result` err to the OWNER. A business
+    /// failure is ALWAYS this path — a committed, cached error — never a handler `Err`. Publishes
+    /// [`InflightOutcome::Errored`] immediately after the commit and before the fallible owner reply,
+    /// carrying the SAME `error_json` so the duplicate rebuilds a byte-identical reply.
     async fn fail(
         &self,
         sender: &PublicKey,
@@ -439,16 +817,38 @@ impl OpDispatch {
         error: WireError,
         now: i64,
         out: &dyn Outbound,
+        guard: &mut InflightGuard,
     ) -> Result<()> {
         let error_json = serde_json::to_string(&error)?;
-        self.commit_terminal(sender, &req.id, "ERROR", None, Some(error_json), now)
-            .await?;
+        self.commit_terminal(
+            sender,
+            &req.id,
+            "ERROR",
+            None,
+            Some(error_json.clone()),
+            now,
+        )
+        .await?;
+        guard.publish(InflightOutcome::Errored {
+            error_json,
+            subscription_id: req.subscription_id.clone(),
+            op: req.op.clone(),
+        });
         self.reply_error(sender, req, error, out).await
     }
 
     /// The terminal commit (SPEC.md §7.4): flip OUR `RUNNING` row to `DONE`/`ERROR` with the cached
     /// payload + `finished_at`, in one transaction. Guarded on `state='RUNNING'` so it only ever
-    /// finalizes the claim we hold (a concurrent recovery that already swept the row is a no-op).
+    /// finalizes the claim we hold — a row that already left `RUNNING` matches nothing, and that is
+    /// caught below rather than passed off as a successful commit.
+    ///
+    /// `Ok` here means the row DID leave `RUNNING`, which is what lets [`InflightGuard::publish`]
+    /// treat the outcome as durable — and lnrent-c95 widened that guarantee from the owner's single
+    /// reply to a broadcast at every attached duplicate. So the affected-row count is CHECKED: on
+    /// every live path it is exactly `1`, and a `0` would mean the row we own is no longer ours to
+    /// finalize, so nothing we could publish is authoritative. `Err` instead, which drops `guard`
+    /// unpublished → `NoTerminal` → owner and duplicates both DEFER to the durable row. A cheap
+    /// assertion of the standing rule: only the row is authoritative, never a fabricated terminal.
     async fn commit_terminal(
         &self,
         sender: &PublicKey,
@@ -461,12 +861,15 @@ impl OpDispatch {
         let (s, r, st) = (sender.to_hex(), request_id.to_string(), state.to_string());
         self.store
             .transaction(move |tx| {
-                tx.execute(
+                let updated = tx.execute(
                     "UPDATE op_invocation
                         SET state=?3, result_json=?4, error_json=?5, finished_at=?6
                       WHERE sender_pubkey=?1 AND request_id=?2 AND state='RUNNING'",
                     params![s, r, st, result_json, error_json, now],
                 )?;
+                if updated == 0 {
+                    bail!("op_invocation ({s}, {r}) left RUNNING before its {st} commit");
+                }
                 Ok(())
             })
             .await
@@ -511,9 +914,14 @@ impl OpHandler for OpDispatch {
 /// Read any existing `op_invocation` for `(sender_hex, request_id)` and classify it into the
 /// resend/defer [`Claim`] variants — `Done`/`Errored`, else `Running` for a live (`RUNNING`, not
 /// ours) or any unexpected non-terminal state. `None` = no row yet (proceed to auth + claim).
-/// Shared by [`OpDispatch::claim`]'s top-of-txn lookup and its post-`INSERT` conflict re-read.
-fn lookup_existing(tx: &Transaction, sender_hex: &str, request_id: &str) -> Result<Option<Claim>> {
-    let row = tx
+/// Shared by [`OpDispatch::claim`]'s two transaction lookups and the registry-miss terminal re-read
+/// in [`OpDispatch::reread_existing`].
+fn lookup_existing(
+    connection: &rusqlite::Connection,
+    sender_hex: &str,
+    request_id: &str,
+) -> Result<Option<Claim>> {
+    let row = connection
         .query_row(
             "SELECT state, result_json, error_json, subscription_id, op FROM op_invocation
                   WHERE sender_pubkey=?1 AND request_id=?2",
@@ -541,7 +949,8 @@ fn lookup_existing(tx: &Transaction, sender_hex: &str, request_id: &str) -> Resu
                 subscription_id: sub_db.unwrap_or_default(),
                 op: op_db.unwrap_or_default(),
             },
-            // RUNNING (or any unexpected non-terminal): not ours, do not re-run.
+            // RUNNING (or any unexpected non-terminal): a live/orphaned claim — dispatch will
+            // attach-or-defer (lnrent-c95), never re-run.
             _ => Claim::Running,
         }
     }))
@@ -666,7 +1075,10 @@ mod tests {
     use super::*;
     use crate::clock::TestClock;
     use crate::store::{Store, SCHEMA};
-    use std::sync::Mutex;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
 
     use lnrent_wire::{Keys, OpStatus};
     use nostr::EventId;
@@ -725,6 +1137,29 @@ mod tests {
             let mut m = self.messages();
             assert_eq!(m.len(), 1, "expected exactly one sent message, got {m:?}");
             m.pop().unwrap()
+        }
+    }
+
+    /// Fails the owner's first reply after its terminal commit, then records later replies. This
+    /// models fallible relay I/O while an in-process duplicate is already attached.
+    #[derive(Default)]
+    struct FailFirstOutbound {
+        attempts: AtomicUsize,
+        sent: Mutex<Vec<(PublicKey, Msg)>>,
+    }
+    #[async_trait]
+    impl Outbound for FailFirstOutbound {
+        async fn reply(&self, recipient: &PublicKey, msg: &Msg) -> Result<EventId> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                bail!("simulated owner reply failure");
+            }
+            self.sent.lock().unwrap().push((*recipient, msg.clone()));
+            Ok(EventId::all_zeros())
+        }
+    }
+    impl FailFirstOutbound {
+        fn messages(&self) -> Vec<(PublicKey, Msg)> {
+            self.sent.lock().unwrap().clone()
         }
     }
 
@@ -1378,5 +1813,730 @@ mod tests {
             .await,
             0
         );
+    }
+
+    // ---- lnrent-c95: in-flight registry (concurrent in-process duplicate attach) ----
+
+    /// A `dummy`-based recipe with one extra `request` op whose hook this test controls (a temp
+    /// `ops/<op>` script). Returns the recipe plus the temp dir and the `counter`/`release` file
+    /// paths the caller bakes into the hook body (see [`write_hook`]). The counter file lets a test
+    /// observe when the hook has STARTED (⇒ owner's RUNNING claim + registry entry are in place) and
+    /// prove it ran EXACTLY ONCE; the release file gates when the hook finishes.
+    fn blocking_recipe(
+        label: &str,
+        op: &str,
+    ) -> (
+        Recipe,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let mut recipe = dummy_recipe();
+        let dir = std::env::temp_dir().join(format!("lnrent-c95-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("ops")).unwrap();
+        let counter = dir.join("count");
+        let release = dir.join("release");
+        // Fresh state even if a same-pid prior run left files behind.
+        let _ = std::fs::remove_file(&counter);
+        let _ = std::fs::remove_file(&release);
+        recipe.dir = dir.clone();
+        recipe.operations.push(Operation {
+            name: op.into(),
+            label: op.into(),
+            kind: "request".into(),
+            hook: op.into(),
+            params: vec![],
+        });
+        (recipe, dir, counter, release)
+    }
+
+    fn write_hook(dir: &std::path::Path, op: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let hook = dir.join("ops").join(op);
+        std::fs::write(&hook, body).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A hook that records ONE byte to `counter` on start, blocks until `release` exists, then either
+    /// emits `{"ran":true}` (ok) or exits nonzero (fail). Absolute paths are baked in — the hook
+    /// gets no arbitrary env.
+    fn blocking_hook_body(
+        counter: &std::path::Path,
+        release: &std::path::Path,
+        ok: bool,
+    ) -> String {
+        let tail = if ok {
+            "echo '{\"ran\":true}'".to_string()
+        } else {
+            "echo boom >&2\nexit 3".to_string()
+        };
+        format!(
+            "#!/usr/bin/env bash\nprintf x >> '{}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\n{}\n",
+            counter.display(),
+            release.display(),
+            tail
+        )
+    }
+
+    /// Poll `f` every 10ms up to ~5s; panic with `what` if it never becomes true. Used to observe
+    /// filesystem / registry state without a fixed sleep.
+    async fn poll_until<F: FnMut() -> bool>(mut f: F, what: &str) {
+        for _ in 0..500 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    fn counter_len(counter: &std::path::Path) -> u64 {
+        std::fs::metadata(counter).map(|m| m.len()).unwrap_or(0)
+    }
+
+    // Test 8 (c95 core): a duplicate `(sender, request_id)` arriving while the FIRST attempt's hook
+    // is STILL RUNNING in this process ATTACHES to the in-flight invocation and receives the SAME
+    // op.result — and the hook runs EXACTLY ONCE (only the owner runs it). Proof of "attached while
+    // RUNNING": we release the hook only AFTER observing the duplicate has subscribed to the owner's
+    // watch (receiver_count ≥ 1) while the owner is still blocked (no terminal committed).
+    // TWO duplicates attach, not one: the `watch` is a fan-out primitive and every subscriber must be
+    // served, so a regression to a single-consumer channel (oneshot) would hang or drop one of them.
+    // The SECOND duplicate carries DIFFERENT labels (`sub-2`/`other_op`) so the assertions below pin
+    // "echo the STORED subscription_id/op, not the duplicate's" — the attach-path twin of
+    // `cached_done_resends_after_sub_suspended`. With every duplicate sent as `sub-1`/`block_ok` the
+    // label assertions would hold even if the attach arm echoed `req`, proving nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_duplicate_attaches_to_running_owner_and_hook_runs_once() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        seed_sub(&store, "sub-1", &buyer_hex, "ACTIVE").await;
+
+        let (recipe, dir, counter, release) = blocking_recipe("attach-ok", "block_ok");
+        write_hook(
+            &dir,
+            "block_ok",
+            &blocking_hook_body(&counter, &release, true),
+        );
+        let handler = Arc::new(dispatcher(store.clone(), TestClock::new(1000), recipe));
+        let out = Arc::new(RecordingOutbound::default());
+        let key = (buyer_hex.clone(), "dup".to_string());
+
+        // Owner: claims RUNNING, inserts the registry entry, then blocks in the hook.
+        let owner = {
+            let (h, o, pk) = (handler.clone(), out.clone(), buyer.public_key());
+            tokio::spawn(async move {
+                h.handle(
+                    pk,
+                    op_req("dup", "sub-1", "block_ok", json!({})),
+                    o.as_ref(),
+                )
+                .await
+            })
+        };
+        // The hook has started ⇒ the owner's RUNNING row is committed and the registry entry inserted.
+        poll_until(|| counter_len(&counter) >= 1, "owner hook to start").await;
+
+        // Duplicates: same (sender, request_id) ⇒ Claim::Running ⇒ attach to the in-flight owner.
+        // The second one is labeled `sub-2`/`other_op` (a reused request id with different labels);
+        // it must still be served the OWNER's stored `sub-1`/`block_ok` result.
+        let spawn_dup = |sub: &'static str, op: &'static str| {
+            let (h, o, pk) = (handler.clone(), out.clone(), buyer.public_key());
+            tokio::spawn(async move {
+                h.handle(pk, op_req("dup", sub, op, json!({})), o.as_ref())
+                    .await
+            })
+        };
+        let dup = spawn_dup("sub-1", "block_ok");
+        let dup2 = spawn_dup("sub-2", "other_op");
+        // BOTH duplicates have SUBSCRIBED (attached) to the owner's watch while the owner is still
+        // blocked — this is the "duplicate arrives while RUNNING" moment.
+        poll_until(
+            || {
+                handler
+                    .inflight
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .map(watch::Sender::receiver_count)
+                    .unwrap_or(0)
+                    >= 2
+            },
+            "both duplicates to attach to the in-flight watch",
+        )
+        .await;
+        // Owner has not committed a terminal yet (still blocked on the hook).
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM op_invocation WHERE state='RUNNING'"
+            )
+            .await,
+            1,
+            "the owner is still RUNNING when the duplicate attaches"
+        );
+
+        // Release: the hook finishes ONCE, the owner commits DONE + publishes, the duplicate resends.
+        std::fs::write(&release, b"go").unwrap();
+        let r_owner = tokio::time::timeout(std::time::Duration::from_secs(10), owner)
+            .await
+            .expect("owner did not finish")
+            .unwrap();
+        let r_dup = tokio::time::timeout(std::time::Duration::from_secs(10), dup)
+            .await
+            .expect("attached duplicate hung (it must never hang)")
+            .unwrap();
+        let r_dup2 = tokio::time::timeout(std::time::Duration::from_secs(10), dup2)
+            .await
+            .expect("second attached duplicate hung (the watch must fan out to every subscriber)")
+            .unwrap();
+        r_owner.unwrap();
+        r_dup.unwrap();
+        r_dup2.unwrap();
+
+        // All three got an op.result.ok with the SAME data + STORED labels.
+        let msgs = out.messages();
+        assert_eq!(
+            msgs.len(),
+            3,
+            "owner + BOTH attached duplicates each reply exactly once"
+        );
+        let results: Vec<OpResult> = msgs
+            .iter()
+            .map(|(_, m)| match m {
+                Msg::OpResult(r) => r.clone(),
+                other => panic!("expected op.result, got {other:?}"),
+            })
+            .collect();
+        assert!(results.iter().all(|r| r.status == OpStatus::Ok));
+        assert!(
+            results.iter().all(|r| r.data == results[0].data),
+            "every attached duplicate gets the SAME result as the owner"
+        );
+        assert_eq!(results[0].data.as_ref().unwrap()["ran"], json!(true));
+        for r in &results {
+            assert_eq!(r.request_id, "dup");
+            // STORED labels — `sub-2`/`other_op` (the second duplicate's own) must NOT appear.
+            assert_eq!(r.subscription_id, "sub-1");
+            assert_eq!(r.op, "block_ok");
+        }
+
+        // The hook ran EXACTLY ONCE (only the owner), and exactly one DONE row was committed.
+        assert_eq!(counter_len(&counter), 1, "the hook ran exactly once");
+        assert_eq!(count(&store, "SELECT count(*) FROM op_invocation").await, 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM op_invocation WHERE state='DONE'"
+            )
+            .await,
+            1
+        );
+        // The registry entry was removed on the terminal — no leak.
+        assert!(
+            handler.inflight.lock().unwrap().is_empty(),
+            "registry must not leak after a terminal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Test 9 (c95): an owner whose hook ERRORS publishes the error to the attached duplicate — both
+    // get the SAME op.result.err ("hook_failed") and the hook still runs exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_duplicate_attaches_to_erroring_owner() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        seed_sub(&store, "sub-1", &buyer_hex, "ACTIVE").await;
+
+        let (recipe, dir, counter, release) = blocking_recipe("attach-err", "block_err");
+        write_hook(
+            &dir,
+            "block_err",
+            &blocking_hook_body(&counter, &release, false),
+        );
+        let handler = Arc::new(dispatcher(store.clone(), TestClock::new(1000), recipe));
+        let out = Arc::new(RecordingOutbound::default());
+        let key = (buyer_hex.clone(), "dup".to_string());
+
+        let owner = {
+            let (h, o, pk) = (handler.clone(), out.clone(), buyer.public_key());
+            tokio::spawn(async move {
+                h.handle(
+                    pk,
+                    op_req("dup", "sub-1", "block_err", json!({})),
+                    o.as_ref(),
+                )
+                .await
+            })
+        };
+        poll_until(|| counter_len(&counter) >= 1, "owner hook to start").await;
+
+        let dup = {
+            let (h, o, pk) = (handler.clone(), out.clone(), buyer.public_key());
+            tokio::spawn(async move {
+                h.handle(
+                    pk,
+                    op_req("dup", "sub-1", "block_err", json!({})),
+                    o.as_ref(),
+                )
+                .await
+            })
+        };
+        poll_until(
+            || {
+                handler
+                    .inflight
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .map(watch::Sender::receiver_count)
+                    .unwrap_or(0)
+                    >= 1
+            },
+            "duplicate to attach to the in-flight watch",
+        )
+        .await;
+
+        std::fs::write(&release, b"go").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), owner)
+            .await
+            .expect("owner did not finish")
+            .unwrap()
+            // A hook failure is a cached op.result error, NOT a handler Err.
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), dup)
+            .await
+            .expect("attached duplicate hung (it must never hang)")
+            .unwrap()
+            .unwrap();
+
+        let msgs = out.messages();
+        assert_eq!(msgs.len(), 2);
+        for (_, m) in &msgs {
+            match m {
+                Msg::OpResult(r) => {
+                    assert_eq!(r.status, OpStatus::Error);
+                    assert_eq!(r.error.as_ref().unwrap().code, "hook_failed");
+                    assert_eq!(r.subscription_id, "sub-1");
+                    assert_eq!(r.op, "block_err");
+                }
+                other => panic!("expected op.result, got {other:?}"),
+            }
+        }
+        assert_eq!(counter_len(&counter), 1, "the hook ran exactly once");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM op_invocation WHERE state='ERROR'"
+            )
+            .await,
+            1
+        );
+        assert!(
+            handler.inflight.lock().unwrap().is_empty(),
+            "registry must not leak after a terminal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Test 10 (c95): a RUNNING op_invocation with NO registry entry — the shape left by an owner that
+    // exited without committing a terminal, and by a crashed prior process whose boot recovery has
+    // not run — still Err-DEFERS (the pre-c95 crash-recovery behavior) and does NOT hang
+    // (attach_or_defer returns immediately, never awaiting). No reply is sent and the row is
+    // untouched, so the next startup's recover_interrupted_ops can flip it to `interrupted`.
+    #[tokio::test]
+    async fn orphaned_running_row_defers_and_does_not_hang() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let sender_hex = buyer.public_key().to_hex();
+        seed_sub(&store, "sub-1", &sender_hex, "ACTIVE").await;
+
+        // Pre-seed a RUNNING row with NO in-process registry entry (a crash mid-op).
+        {
+            let s = sender_hex.clone();
+            store
+                .transaction(move |tx| {
+                    tx.execute(
+                        "INSERT INTO op_invocation
+                            (sender_pubkey, request_id, subscription_id, op, state, created_at)
+                         VALUES (?1, 'op-orphan', 'sub-1', 'restart', 'RUNNING', 500)",
+                        params![s],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        let handler = dispatcher(store.clone(), TestClock::new(1000), dummy_recipe());
+        let out = RecordingOutbound::default();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handler.handle(
+                buyer.public_key(),
+                op_req("op-orphan", "sub-1", "restart", json!({})),
+                &out,
+            ),
+        )
+        .await
+        .expect("orphaned-RUNNING defer must not hang");
+        assert!(
+            res.is_err(),
+            "an orphaned RUNNING row Err-defers (pre-c95 behavior)"
+        );
+        assert!(out.messages().is_empty(), "a defer sends no reply");
+        // The row is untouched (still RUNNING) and no registry entry was created.
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM op_invocation WHERE state='RUNNING'"
+            )
+            .await,
+            1
+        );
+        assert!(handler.inflight.lock().unwrap().is_empty());
+    }
+
+    // Test 11 (c95 race regression): `claim()` can read RUNNING, then the owner can commit and
+    // publish+remove before `attach_or_defer` looks in the registry. A registry miss must therefore
+    // re-read the durable row and immediately resend a terminal DONE/ERROR rather than needlessly
+    // Err-deferring it to another relay redelivery. Calling `attach_or_defer` directly models the
+    // stale `Claim::Running` already held by the duplicate while keeping the interleaving
+    // deterministic.
+    #[tokio::test]
+    async fn registry_miss_rereads_and_resends_terminal_row() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let sender_hex = buyer.public_key().to_hex();
+        let seeded_sender = sender_hex.clone();
+        let error_json = serde_json::to_string(&hook_failed("boom".into())).unwrap();
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO op_invocation
+                        (sender_pubkey, request_id, subscription_id, op, state, result_json,
+                         created_at, finished_at)
+                     VALUES (?1, 'just-done', 'stored-sub', 'stored-op', 'DONE',
+                             '{\"fresh\":true}', 500, 600)",
+                    params![seeded_sender],
+                )?;
+                tx.execute(
+                    "INSERT INTO op_invocation
+                        (sender_pubkey, request_id, subscription_id, op, state, error_json,
+                         created_at, finished_at)
+                     VALUES (?1, 'just-errored', 'stored-sub', 'stored-op', 'ERROR',
+                             ?2, 500, 600)",
+                    params![seeded_sender, error_json],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let handler = dispatcher(store, TestClock::new(1000), dummy_recipe());
+        let out = RecordingOutbound::default();
+        for request_id in ["just-done", "just-errored"] {
+            let req = OpRequest {
+                id: request_id.into(),
+                subscription_id: "duplicate-sub".into(),
+                op: "duplicate-op".into(),
+                params: json!({}),
+            };
+            handler
+                .attach_or_defer(&buyer.public_key(), &req, &sender_hex, &out)
+                .await
+                .expect("a terminal row must be resent immediately after a registry miss");
+        }
+
+        let messages = out.messages();
+        assert_eq!(messages.len(), 2);
+        let Msg::OpResult(done) = &messages[0].1 else {
+            panic!("expected DONE op.result");
+        };
+        assert_eq!(done.status, OpStatus::Ok);
+        assert_eq!(done.data.as_ref().unwrap()["fresh"], json!(true));
+        assert_eq!(done.subscription_id, "stored-sub");
+        assert_eq!(done.op, "stored-op");
+        let Msg::OpResult(errored) = &messages[1].1 else {
+            panic!("expected ERROR op.result");
+        };
+        assert_eq!(errored.status, OpStatus::Error);
+        assert_eq!(errored.error.as_ref().unwrap().code, "hook_failed");
+        assert_eq!(errored.subscription_id, "stored-sub");
+        assert_eq!(errored.op, "stored-op");
+        assert!(handler.inflight.lock().unwrap().is_empty());
+    }
+
+    // Test 14 (c95 regression for the publish race): the owner may publish its terminal through
+    // `InflightGuard::publish` BEFORE any duplicate has subscribed (`receiver_count() == 0`). The
+    // production method MUST use `send_replace`, not `send`: `send` drops the value and errs when
+    // there are no receivers, so a duplicate that subscribes an instant later — still in the window
+    // before the registry entry is removed — would read a stale `None` and needlessly defer an op
+    // that actually committed a terminal it could have been served. Keep a sender clone so this test
+    // can model that late subscriber after `publish` removes the registry entry. (Under plain `send`
+    // this reads `None` and panics.)
+    #[tokio::test]
+    async fn zero_receiver_publish_is_visible_to_a_late_subscriber() {
+        let registry = InflightRegistry::default();
+        let key = ("buyer".to_string(), "request".to_string());
+        // Through the production constructor, so this exercises the real insert+guard pairing.
+        let mut guard = InflightGuard::register(&registry, key.clone());
+        let late_subscriber = registry.lock().unwrap().get(&key).unwrap().clone();
+
+        // No receiver is live now — mirrors "no duplicate has subscribed yet". Exercise the
+        // production publish method, including its registry removal and `published` bookkeeping.
+        guard.publish(InflightOutcome::Done {
+            result_json: "{\"ran\":true}".into(),
+            subscription_id: "sub-1".into(),
+            op: "block_ok".into(),
+        });
+        assert!(registry.lock().unwrap().is_empty());
+
+        // A duplicate subscribes only now, after the zero-receiver publish. Bind the clone before
+        // the match so the `watch::Ref` borrow is released immediately (not held across arms).
+        let mut rx = late_subscriber.subscribe();
+        let current = rx.borrow_and_update().clone();
+        match current {
+            Some(InflightOutcome::Done {
+                subscription_id,
+                op,
+                ..
+            }) => {
+                assert_eq!(subscription_id, "sub-1");
+                assert_eq!(op, "block_ok");
+            }
+            Some(_) => panic!("late subscriber read a non-Done outcome"),
+            None => panic!(
+                "late subscriber read a stale None (publish used `send`, not `send_replace`)"
+            ),
+        }
+    }
+
+    // Test 15 (c95 regression): a terminal commit is authoritative even if the owner's subsequent
+    // relay reply fails. The attached duplicate must receive the committed DONE result, never the
+    // guard's fallback `NoTerminal` defer; publishing before awaiting owner I/O also prevents a stalled or
+    // cancelled owner reply from withholding that terminal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owner_reply_failure_after_commit_still_publishes_done_to_duplicate() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        seed_sub(&store, "sub-1", &buyer_hex, "ACTIVE").await;
+
+        let (recipe, dir, counter, release) = blocking_recipe("owner-reply-fail", "block_ok");
+        write_hook(
+            &dir,
+            "block_ok",
+            &blocking_hook_body(&counter, &release, true),
+        );
+        let handler = Arc::new(dispatcher(store.clone(), TestClock::new(1000), recipe));
+        let out = Arc::new(FailFirstOutbound::default());
+        let key = (buyer_hex, "dup".to_string());
+
+        let owner = {
+            let (h, o, pk) = (handler.clone(), out.clone(), buyer.public_key());
+            tokio::spawn(async move {
+                h.handle(
+                    pk,
+                    op_req("dup", "sub-1", "block_ok", json!({})),
+                    o.as_ref(),
+                )
+                .await
+            })
+        };
+        poll_until(|| counter_len(&counter) >= 1, "owner hook to start").await;
+
+        let duplicate = {
+            let (h, o, pk) = (handler.clone(), out.clone(), buyer.public_key());
+            tokio::spawn(async move {
+                h.handle(
+                    pk,
+                    op_req("dup", "sub-1", "block_ok", json!({})),
+                    o.as_ref(),
+                )
+                .await
+            })
+        };
+        poll_until(
+            || {
+                handler
+                    .inflight
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .map(watch::Sender::receiver_count)
+                    .unwrap_or(0)
+                    >= 1
+            },
+            "duplicate to attach to the in-flight watch",
+        )
+        .await;
+
+        std::fs::write(&release, b"go").unwrap();
+        let owner_result = tokio::time::timeout(std::time::Duration::from_secs(10), owner)
+            .await
+            .expect("owner did not finish")
+            .unwrap();
+        let duplicate_result = tokio::time::timeout(std::time::Duration::from_secs(10), duplicate)
+            .await
+            .expect("attached duplicate hung")
+            .unwrap();
+
+        // WHICH task consumes `FailFirstOutbound`'s attempt-0 failure is deliberately NOT asserted:
+        // `guard.publish` wakes the attached duplicate BEFORE the owner calls `out.reply`, so on a
+        // multi-thread runtime either task can reach the outbound first. Assert what c95 actually
+        // guarantees, order-independently: BOTH tasks attempted a reply — which is what proves the
+        // duplicate was served the COMMITTED terminal and not the guard's `NoTerminal` defer, since a
+        // defer replies nothing — exactly one hit the simulated failure, and the single message that
+        // did get through is that committed DONE (the owner's and the duplicate's are byte-identical
+        // by construction: same `result_json`, same STORED subscription_id/op).
+        assert_eq!(
+            out.attempts.load(Ordering::SeqCst),
+            2,
+            "owner AND attached duplicate must each attempt a reply (a deferred duplicate would not)"
+        );
+        assert_eq!(
+            usize::from(owner_result.is_err()) + usize::from(duplicate_result.is_err()),
+            1,
+            "exactly one reply hits the simulated failure, the other succeeds \
+             (owner={owner_result:?}, duplicate={duplicate_result:?})"
+        );
+        let messages = out.messages();
+        assert_eq!(messages.len(), 1, "only the second reply attempt succeeds");
+        match &messages[0].1 {
+            Msg::OpResult(result) => {
+                assert_eq!(result.status, OpStatus::Ok);
+                assert_eq!(result.data.as_ref().unwrap()["ran"], json!(true));
+                assert_eq!(result.subscription_id, "sub-1");
+                assert_eq!(result.op, "block_ok");
+            }
+            other => panic!("expected op.result, got {other:?}"),
+        }
+        assert_eq!(counter_len(&counter), 1, "the hook ran exactly once");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM op_invocation WHERE state='DONE'"
+            )
+            .await,
+            1
+        );
+        assert!(
+            handler.inflight.lock().unwrap().is_empty(),
+            "registry must not leak after owner reply failure"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Test 16 (c95): an owner whose TASK IS CANCELLED mid-invocation (the inbound drain deadline's
+    // `abort_per_wrap` does exactly this) must NOT hand its attached duplicate a fabricated terminal.
+    // The store actor runs an already-queued job even when its caller was cancelled, so a cancelled
+    // owner can still commit DONE/ERROR durably; replying a permanent `interrupted` here would
+    // contradict the durable cache. The duplicate must instead DEFER (Err, no reply, wrap not marked
+    // seen) — the pre-c95 behavior — and must NOT hang. Cancelling inside the blocking hook is the
+    // cleanest reachable proxy: no terminal is committed, the row stays RUNNING, and the drop guard
+    // is what wakes the duplicate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_owner_defers_the_attached_duplicate_instead_of_faking_a_terminal() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        seed_sub(&store, "sub-1", &buyer_hex, "ACTIVE").await;
+
+        let (recipe, dir, counter, release) = blocking_recipe("owner-cancelled", "block_ok");
+        write_hook(
+            &dir,
+            "block_ok",
+            &blocking_hook_body(&counter, &release, true),
+        );
+        let handler = Arc::new(dispatcher(store.clone(), TestClock::new(1000), recipe));
+        let out = Arc::new(RecordingOutbound::default());
+        let key = (buyer_hex, "dup".to_string());
+
+        let owner = {
+            let (h, o, pk) = (handler.clone(), out.clone(), buyer.public_key());
+            tokio::spawn(async move {
+                h.handle(
+                    pk,
+                    op_req("dup", "sub-1", "block_ok", json!({})),
+                    o.as_ref(),
+                )
+                .await
+            })
+        };
+        poll_until(|| counter_len(&counter) >= 1, "owner hook to start").await;
+
+        let duplicate = {
+            let (h, o, pk) = (handler.clone(), out.clone(), buyer.public_key());
+            tokio::spawn(async move {
+                h.handle(
+                    pk,
+                    op_req("dup", "sub-1", "block_ok", json!({})),
+                    o.as_ref(),
+                )
+                .await
+            })
+        };
+        poll_until(
+            || {
+                handler
+                    .inflight
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .map(watch::Sender::receiver_count)
+                    .unwrap_or(0)
+                    >= 1
+            },
+            "duplicate to attach to the in-flight watch",
+        )
+        .await;
+
+        // Cancel the owner while it is still in the hook (the `release` file is never written): its
+        // `InflightGuard` drops WITHOUT a published terminal.
+        owner.abort();
+        // Await cancellation so the owner's future (and therefore `InflightGuard`) has finished
+        // dropping before the registry-cleanup assertion below. The duplicate is woken by the
+        // guard's publish before its subsequent remove, so awaiting only the duplicate would race
+        // that remove.
+        let owner_error = tokio::time::timeout(std::time::Duration::from_secs(10), owner)
+            .await
+            .expect("aborted owner did not finish")
+            .expect_err("aborted owner unexpectedly completed");
+        assert!(
+            owner_error.is_cancelled(),
+            "owner abort must cancel its task"
+        );
+        let duplicate_result = tokio::time::timeout(std::time::Duration::from_secs(10), duplicate)
+            .await
+            .expect("attached duplicate hung after the owner was cancelled")
+            .unwrap();
+
+        assert!(
+            duplicate_result.is_err(),
+            "a duplicate attached to a cancelled owner must Err-defer, never fabricate a terminal"
+        );
+        assert!(
+            out.messages().is_empty(),
+            "a defer sends no reply (nothing may contradict the durable row)"
+        );
+        // Nothing terminal was committed and the registry did not leak.
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM op_invocation WHERE state='RUNNING'"
+            )
+            .await,
+            1,
+            "the cancelled owner's row stays RUNNING for recover_interrupted_ops"
+        );
+        assert!(
+            handler.inflight.lock().unwrap().is_empty(),
+            "the drop guard must remove the registry entry on cancellation"
+        );
+        // No `release` write is needed: dropping the owner's future drops `run_hook`, whose
+        // process-group guard (lnrent-y4m.12) kills the still-blocked hook — no orphan spins on it.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
