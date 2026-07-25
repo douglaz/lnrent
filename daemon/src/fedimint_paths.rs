@@ -1,7 +1,9 @@
-//! Shared, hardened data-dir path preparation for the fedimint payment backend (lnrent-3d5). The live
-//! [`crate::lnv2_backend`] lays its fedimint rocksdb + lnrent-owned sqlite index under
-//! `data_dir/fedimint/<federation_id>/`; this module owns the create-and-harden of that tree. (The
-//! retired lnv1 backend, which shared this module, was deleted by lnrent-8ym.)
+//! Shared, hardened data-dir path preparation for the payment backends. The live `lnv2_backend` lays
+//! its fedimint rocksdb + lnrent-owned sqlite index under `data_dir/fedimint/<federation_id>/`; this
+//! module owns the create-and-harden of that tree. (The retired lnv1 backend, which shared this
+//! module, was deleted by lnrent-8ym.) [`prepare_private_file`] is also reused directly by the
+//! phoenixd backend (lnrent-xk3) for its index db, so this module is NOT feature-gated — it is pure
+//! std/libc and pulls no fedimint dependency.
 //!
 //! The confidentiality boundary is the **0700 directories** (`fedimint/`, `<federation>/`, the client
 //! db dir): once owner-only, the note/wallet material inside is unreadable to co-tenant local users
@@ -96,7 +98,11 @@ fn harden_private_dir(path: &Path, what: &str) -> Result<()> {
         .with_context(|| format!("perms on {what} {}", path.display()))
 }
 
-fn prepare_private_file(path: &Path, what: &str) -> Result<()> {
+/// Create (0600, `O_NOFOLLOW`) or vet-and-harden ONE regular file inside an already-private data dir,
+/// refusing a symlinked or non-regular target. Also used directly by the phoenixd backend
+/// (lnrent-xk3) for its `phoenixd_index.db`, which lives beside the state DB rather than under a
+/// federation dir — hence `pub` rather than module-private.
+pub fn prepare_private_file(path: &Path, what: &str) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {

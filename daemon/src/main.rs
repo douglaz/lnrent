@@ -22,6 +22,9 @@ use lnrentd::config::{self, BootstrapInput, PaymentMode, RawConfig};
 use lnrentd::lnv2_backend::Lnv2Payment;
 use lnrentd::ipc::IpcError;
 use lnrentd::nostr_engine::NostrEngine;
+// `payment_backend=phoenixd` builds the external-service backend below (ADR-0018, lnrent-xk3). NOT
+// feature-gated: phoenixd needs no fedimint tree.
+use lnrentd::phoenixd_backend::{FeeSchedule, PhoenixdPayment};
 use lnrentd::recipe::Recipe;
 use lnrentd::refund_resolver::Resolver;
 use lnrentd::supervisor::{Intervals, Supervisor};
@@ -64,7 +67,8 @@ struct BootstrapArgs {
     /// Daemon data dir (holds the 0600 seed, fedimint config, and state DB). Env: LNRENT_DATA_DIR.
     #[arg(long)]
     data_dir: Option<String>,
-    /// Receive backend: `mock` (M1a default) or `fedimint`. Env: LNRENT_PAYMENT_BACKEND.
+    /// Receive backend: `mock` (M1a default), `fedimint`, or `phoenixd`. Env:
+    /// LNRENT_PAYMENT_BACKEND.
     #[arg(long)]
     payment_backend: Option<String>,
     /// A Nostr relay URL; repeat for several. A supplied set overrides lower-precedence relays
@@ -75,6 +79,12 @@ struct BootstrapArgs {
     /// Env: LNRENT_FEDIMINT_INVITE.
     #[arg(long)]
     fedimint_invite: Option<String>,
+    /// phoenixd HTTP base URL (required when payment_backend=phoenixd). Remote hosts must be
+    /// https://; plain http:// is accepted only for loopback. Env: LNRENT_PHOENIXD_URL. There is
+    /// deliberately NO flag for the api password — it would land in the process table; supply it via
+    /// LNRENT_PHOENIXD_API_PASSWORD, a config file, or stdin.
+    #[arg(long)]
+    phoenixd_url: Option<String>,
     /// The operator BIP39 mnemonic (first bootstrap only; read back from the data dir afterward).
     /// Prefer LNRENT_MNEMONIC / a config file / stdin so it doesn't land in the process table.
     #[arg(long)]
@@ -164,8 +174,12 @@ fn main() -> ExitCode {
 }
 
 /// The bootstrap SECRET env vars scrubbed after the config load consumes them (lnrent-y4m.7). Mirror
-/// of the `ENV_MNEMONIC` / `ENV_FEDIMINT_INVITE` names in `config.rs`.
-const SECRET_ENV_VARS: &[&str] = &["LNRENT_MNEMONIC", "LNRENT_FEDIMINT_INVITE"];
+/// of the `ENV_MNEMONIC` / `ENV_FEDIMINT_INVITE` / `ENV_PHOENIXD_API_PASSWORD` names in `config.rs`.
+const SECRET_ENV_VARS: &[&str] = &[
+    "LNRENT_MNEMONIC",
+    "LNRENT_FEDIMINT_INVITE",
+    "LNRENT_PHOENIXD_API_PASSWORD",
+];
 
 /// Remove the bootstrap secrets from the daemon's own process env, AFTER the synchronous config load
 /// has consumed them and BEFORE the tokio runtime spawns worker threads (so this `remove_var` cannot
@@ -294,6 +308,15 @@ fn bootstrap_input(args: BootstrapArgs) -> BootstrapInput {
         // parses (deny_unknown_fields); the flags layer never sources them.
         fedimint_gateway: None,
         fedimint_gateway_fallbacks: None,
+        phoenixd_url: args.phoenixd_url,
+        // No CLI flag for the phoenixd api password (lnrent-xk3): a secret on argv is world-readable
+        // through `/proc/<pid>/cmdline`. Env / config file / stdin only. The operator-verified fee
+        // schedule (ADR-0019) likewise has no flag — it belongs in the config document.
+        phoenixd_api_password: None,
+        phoenixd_fee_schedule_version: None,
+        phoenixd_fee_base_msat: None,
+        phoenixd_fee_ppm: None,
+        phoenixd: None,
         mnemonic: args.mnemonic,
         // No bootstrap CLI flag for the draining-holdings floor (lnrent-urw.7); it is a runtime
         // warning-condition knob read from env (LNRENT_MIN_HOLDINGS_WARN_MSAT) / the config file.
@@ -408,6 +431,10 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
                 let backend = build_fedimint_backend(&operator, clock.clone()).await?;
                 (backend, None)
             }
+            PaymentMode::Phoenixd => {
+                let backend = build_phoenixd_backend(&operator, clock.clone())?;
+                (backend, None)
+            }
         };
 
     // The operator's recipe (M1a single-recipe): only a recipe that PASSES validation is served.
@@ -514,6 +541,45 @@ async fn build_fedimint_backend(
     _clock: Arc<dyn Clock>,
 ) -> Result<Arc<dyn PaymentBackend>> {
     anyhow::bail!("payment_backend=fedimint requires building lnrentd with --features fedimint")
+}
+
+/// Construct the phoenixd payment backend for `payment_backend=phoenixd` (lnrent-xk3, ADR-0018): an
+/// HTTP client of the operator's OWN external phoenixd node. Available in every build (no cargo
+/// feature), and deliberately does not contact the node here — a momentarily-down phoenixd must not
+/// wedge daemon startup; readiness is reported by the preflight/doctor seams instead.
+fn build_phoenixd_backend(
+    operator: &config::Operator,
+    clock: Arc<dyn Clock>,
+) -> Result<Arc<dyn PaymentBackend>> {
+    let phoenixd = operator.config.phoenixd.as_ref().context(
+        "payment_backend=phoenixd requires a phoenixd config (phoenixd_url + phoenixd_api_password)",
+    )?;
+    // ADR-0019: the trampoline schedule INV-1 reserves against is a version-verified DEFAULT the
+    // operator may replace with one they verified for their own phoenixd release.
+    let fee_schedule = match &phoenixd.fee_schedule {
+        Some(supplied) => FeeSchedule {
+            verified_version: supplied.version.clone(),
+            base_msat: supplied.base_msat,
+            ppm: supplied.ppm,
+        },
+        None => FeeSchedule::default(),
+    };
+    let backend = PhoenixdPayment::open(
+        &phoenixd.url,
+        &phoenixd.api_password,
+        fee_schedule.clone(),
+        &operator.config.data_dir,
+        clock,
+    )
+    .context("opening the phoenixd payment backend")?;
+    tracing::info!(
+        url = %phoenixd.url,
+        fee_schedule_version = %fee_schedule.verified_version,
+        fee_base_msat = fee_schedule.base_msat,
+        fee_ppm = fee_schedule.ppm,
+        "phoenixd payment backend ready; real money path active"
+    );
+    Ok(Arc::new(backend))
 }
 
 /// Load + validate the operator's recipe(s) and return the single one M1a serves (lowest id wins,

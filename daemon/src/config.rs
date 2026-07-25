@@ -52,11 +52,14 @@ const FEDIMINT_CONFIG_FILE: &str = "fedimint.json";
 
 /// The receive backend the operator runs (SPEC.md §11 `payment_backend`). M1a defaults to `mock`
 /// (the .4 MockPayment decision); `fedimint` is the real primary backend (ADR-0012) and REQUIRES a
-/// federation invite. `mock` requires none.
+/// federation invite. `phoenixd` (ADR-0018, lnrent-xk3) is the co-equal non-federation choice: an
+/// operator-managed EXTERNAL service lnrent talks to over HTTP, so it requires a url + api password.
+/// `mock` requires none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaymentMode {
     Mock,
     Fedimint,
+    Phoenixd,
 }
 
 impl PaymentMode {
@@ -65,15 +68,20 @@ impl PaymentMode {
         match self {
             PaymentMode::Mock => "mock",
             PaymentMode::Fedimint => "fedimint",
+            PaymentMode::Phoenixd => "phoenixd",
         }
     }
 
+    /// Parse the wire/storage spelling. Also the singular validator for a value read back out of the
+    /// durable operator row — [`persist_operator_row`] rejects anything this cannot parse rather than
+    /// carrying an unknown backend forward.
     fn parse(s: &str) -> Result<Self, IpcError> {
         match s {
             "mock" => Ok(PaymentMode::Mock),
             "fedimint" => Ok(PaymentMode::Fedimint),
+            "phoenixd" => Ok(PaymentMode::Phoenixd),
             other => Err(config_err(format!(
-                "unknown payment_backend `{other}` (expected `mock` or `fedimint`)"
+                "unknown payment_backend `{other}` (expected `mock`, `fedimint` or `phoenixd`)"
             ))),
         }
     }
@@ -109,6 +117,68 @@ impl fmt::Debug for FedimintConfig {
     }
 }
 
+/// phoenixd connection config — REQUIRED only when `payment_backend = phoenixd` (ADR-0018,
+/// lnrent-xk3). phoenixd is an operator-managed EXTERNAL service: lnrent is only an HTTP client, so
+/// this is a pointer at that service (base `url`) plus the full-access `api_password` phoenixd
+/// authenticates with (HTTP Basic, EMPTY username).
+///
+/// Deliberately NOT persisted into the data dir the way `fedimint.json` is. The fedimint invite must
+/// be durable because the seed alone cannot restore the ecash position (you must know which
+/// federation to rejoin, §4.6); the phoenixd wallet lives inside phoenixd itself under phoenixd's own
+/// seed, so writing this live API password to disk would add a secret-at-rest surface with no
+/// recovery benefit. The operator supplies it every start (env / config file / stdin) exactly like
+/// the relay list. What IS durable is `operator.payment_backend='phoenixd'`, which still pins the
+/// money-routing backend against a silent re-point.
+///
+/// `api_password` is a §13 secret: zeroized on drop, redacted in [`fmt::Debug`], and never
+/// interpolated into an error or log line (the backend puts it in an `Authorization` header, never in
+/// a URL, so a reqwest error's URL echo cannot leak it either).
+#[derive(Clone, PartialEq, Eq)]
+pub struct PhoenixdConfig {
+    /// The phoenixd HTTP base URL, normalized to end in `/` so relative endpoint joins keep any
+    /// reverse-proxy sub-path. Validated by [`validate_phoenixd_url`]: `https://` anywhere, plain
+    /// `http://` ONLY to a loopback host.
+    pub url: String,
+    pub api_password: String,
+    /// The operator's OWN verified trampoline fee schedule, replacing the build's version-verified
+    /// default (ADR-0019). `None` = use the default. See [`PhoenixdFeeSchedule`].
+    pub fee_schedule: Option<PhoenixdFeeSchedule>,
+}
+
+/// An operator-supplied phoenixd trampoline fee schedule + the phoenixd release they verified it
+/// against (`[phoenixd] fee_schedule_version/fee_base_msat/fee_ppm`).
+///
+/// phoenixd accepts no max-fee parameter, so lnrent can only KNOW its outbound fee, never impose one:
+/// INV-1 on phoenixd rests on this external constant. ADR-0019 therefore requires a version-verified
+/// default that the money path fails CLOSED against — and this override is the other half of that
+/// requirement, the way an operator clears the refusal after upgrading phoenixd. Supplying it is a
+/// claim that you read THIS release's schedule; understating it under-reserves, which is the
+/// direction that breaks INV-1 (a refund costing more than the receipt it refunds).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PhoenixdFeeSchedule {
+    /// The `getinfo.version` release this schedule was verified on (a build suffix such as
+    /// `0.9.0-b072567` matches the `0.9.0` release).
+    pub version: String,
+    pub base_msat: u64,
+    pub ppm: u64,
+}
+
+impl Drop for PhoenixdConfig {
+    fn drop(&mut self) {
+        self.api_password.zeroize();
+    }
+}
+
+impl fmt::Debug for PhoenixdConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PhoenixdConfig")
+            .field("url", &self.url)
+            .field("api_password", &"<redacted>")
+            .field("fee_schedule", &self.fee_schedule)
+            .finish()
+    }
+}
+
 /// The loaded operator runtime config — the SPEC.md §11 `operator` row plus the data dir.
 #[derive(Clone)]
 pub struct OperatorConfig {
@@ -118,6 +188,8 @@ pub struct OperatorConfig {
     pub compute_backend: String,
     /// Present iff `payment_backend = fedimint`.
     pub fedimint: Option<FedimintConfig>,
+    /// Present iff `payment_backend = phoenixd` (lnrent-xk3).
+    pub phoenixd: Option<PhoenixdConfig>,
     /// Draining-holdings warning floor in msats (lnrent-urw.7, spec §D; ADR-0016). `0` DISABLES the
     /// warning; a positive value is a **BOOKS floor**, compared against `ledger::expected_msat` — the
     /// ledger's conservative lower bound = Σ captured receipts − SENT/started refunds − sweep caps.
@@ -141,9 +213,25 @@ impl fmt::Debug for OperatorConfig {
             .field("payment_backend", &self.payment_backend)
             .field("compute_backend", &self.compute_backend)
             .field("fedimint", &self.fedimint)
+            .field("phoenixd", &self.phoenixd)
             .field("min_holdings_warn_msat", &self.min_holdings_warn_msat)
             .finish()
     }
+}
+
+/// The nested `[phoenixd]` config-file / stdin block (lnrent-xk3). `RawConfig::sanitized` folds it
+/// into [`RawConfig`]'s flat `phoenixd_*` fields before source precedence is applied, so the block
+/// and the flat fields are two spellings of one input, never two sources.
+#[derive(Default, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawPhoenixdConfig {
+    pub url: Option<String>,
+    pub api_password: Option<String>,
+    /// The operator-verified trampoline fee schedule (ADR-0019). All three go together; see
+    /// [`PhoenixdFeeSchedule`].
+    pub fee_schedule_version: Option<String>,
+    pub fee_base_msat: Option<u64>,
+    pub fee_ppm: Option<u64>,
 }
 
 /// The raw, unresolved bootstrap input — exactly what a config file / flags / env / stdin provide
@@ -169,6 +257,26 @@ pub struct RawConfig {
     /// consulted, and no env var / CLI flag exposes them (an operator is never asked for the value).
     pub fedimint_gateway: Option<String>,
     pub fedimint_gateway_fallbacks: Option<Vec<String>>,
+    /// phoenixd base URL — REQUIRED when `payment_backend = phoenixd` (lnrent-xk3). Validated by
+    /// [`validate_phoenixd_url`]: remote hosts MUST be `https://`.
+    pub phoenixd_url: Option<String>,
+    /// phoenixd full-access `http-password` — REQUIRED when `payment_backend = phoenixd`. A §13
+    /// secret (zeroized here, redacted in [`PhoenixdConfig`]'s `Debug`). No CLI flag exposes it: a
+    /// password on argv lands in `/proc/<pid>/cmdline`, so it comes from env / config file / stdin
+    /// only (the same reasoning that keeps the mnemonic off the recommended path).
+    pub phoenixd_api_password: Option<String>,
+    /// The operator-verified phoenixd trampoline fee schedule (ADR-0019) — OPTIONAL, and all three
+    /// fields must be supplied together. Absent = the build's version-verified default schedule,
+    /// which the money path fails closed against on any other phoenixd release. No env var or CLI
+    /// flag: this is a deliberate, verified-once operator statement, not a per-start knob.
+    pub phoenixd_fee_schedule_version: Option<String>,
+    pub phoenixd_fee_base_msat: Option<u64>,
+    pub phoenixd_fee_ppm: Option<u64>,
+    /// Documented config-file/stdin shape: `[phoenixd] url=... api_password=...` (plus the optional
+    /// `fee_schedule_version`/`fee_base_msat`/`fee_ppm`). The flat fields above are the canonical
+    /// merged representation used by env/CLI layers; sanitization folds this block into them before
+    /// applying source precedence.
+    pub phoenixd: Option<RawPhoenixdConfig>,
     /// The BIP39 seed (mnemonic). Optional here because a re-bootstrap reads the persisted seed
     /// from the data dir; a FIRST bootstrap must supply it (else a structured `seed_missing`).
     pub mnemonic: Option<String>,
@@ -191,6 +299,15 @@ impl Zeroize for RawConfig {
         }
         if let Some(invite) = self.fedimint_invite.as_mut() {
             invite.zeroize();
+        }
+        // The phoenixd API password is a §13 secret on the same footing as the invite.
+        if let Some(password) = self.phoenixd_api_password.as_mut() {
+            password.zeroize();
+        }
+        if let Some(phoenixd) = self.phoenixd.as_mut() {
+            if let Some(password) = phoenixd.api_password.as_mut() {
+                password.zeroize();
+            }
         }
     }
 }
@@ -255,6 +372,7 @@ pub async fn bootstrap(raw: RawConfig, store: &Store) -> Result<Operator, IpcErr
     // durable Fedimint config before `persist_operator_row` commits mutable row updates (relays /
     // compute), so a failed config reload can't leave partially-mutated durable state (review P2).
     validate_inherited_fedimint_config_before_store(store, &identity, &config, &raw).await?;
+    validate_inherited_phoenixd_config_before_store(store, &identity, &config, &raw).await?;
 
     // Persist the single operator row. On a re-bootstrap this reconciles the mutable config against
     // the stored row — it never silently changes the money-routing backend, and inherits any omitted
@@ -266,6 +384,13 @@ pub async fn bootstrap(raw: RawConfig, store: &Store) -> Result<Operator, IpcErr
     config.payment_backend = persisted.payment_backend;
     config.fedimint =
         resolve_durable_fedimint_config(&config.data_dir, config.payment_backend, &raw)?;
+    // A re-bootstrap that OMITTED `payment_backend` can inherit phoenixd. The pre-store validation
+    // above already proved these credentials are present and valid; resolve them again here only to
+    // populate the returned runtime config after the persisted backend becomes authoritative.
+    config.phoenixd = match config.payment_backend {
+        PaymentMode::Phoenixd => Some(supplied_phoenixd_config(&raw)?),
+        PaymentMode::Mock | PaymentMode::Fedimint => None,
+    };
 
     if seed.persist_after_success {
         write_seed(
@@ -296,6 +421,10 @@ const ENV_RELAYS: &str = "LNRENT_RELAYS";
 const ENV_PAYMENT_BACKEND: &str = "LNRENT_PAYMENT_BACKEND";
 const ENV_COMPUTE_BACKEND: &str = "LNRENT_COMPUTE_BACKEND";
 const ENV_FEDIMINT_INVITE: &str = "LNRENT_FEDIMINT_INVITE";
+/// phoenixd connection env (lnrent-xk3). `LNRENT_PHOENIXD_API_PASSWORD` is a §13 secret and is
+/// scrubbed from the process env after the config load consumes it (`main.rs SECRET_ENV_VARS`).
+const ENV_PHOENIXD_URL: &str = "LNRENT_PHOENIXD_URL";
+const ENV_PHOENIXD_API_PASSWORD: &str = "LNRENT_PHOENIXD_API_PASSWORD";
 const ENV_MNEMONIC: &str = "LNRENT_MNEMONIC";
 /// Optional path to a config file, an alternative to the `--config` flag.
 const ENV_CONFIG: &str = "LNRENT_CONFIG";
@@ -416,11 +545,12 @@ pub fn inbound_rate_refill_per_min() -> u32 {
 }
 
 /// Whether the GATE-1 alert sink (PR-5, lnrent-urw.1) is enabled. Default follows the payment
-/// backend — ON for `fedimint` (real money warrants surfacing), OFF for `mock` — and
-/// `LNRENT_ALERTS_ENABLED` (`true`/`false`/`1`/`0`) overrides it. A non-boolean value warns and
-/// keeps the default (a dead knob must never wedge startup).
+/// backend — ON for every REAL money backend (`fedimint`, `phoenixd`: a stranded refund or a stuck
+/// sweep must reach the operator), OFF for `mock` — and `LNRENT_ALERTS_ENABLED`
+/// (`true`/`false`/`1`/`0`) overrides it. A non-boolean value warns and keeps the default (a dead
+/// knob must never wedge startup).
 pub fn alerts_enabled(payment_backend: PaymentMode) -> bool {
-    let default = payment_backend == PaymentMode::Fedimint;
+    let default = payment_backend != PaymentMode::Mock;
     match std::env::var(ENV_ALERTS_ENABLED) {
         Err(_) => default,
         Ok(v) if v.trim().is_empty() => default,
@@ -469,6 +599,28 @@ impl RawConfig {
     /// lower-precedence source in [`from_sources`]. The mnemonic is filtered IN PLACE (no trimmed
     /// copy is made — `resolve_seed` trims it later) to avoid spreading the secret across buffers.
     fn sanitized(mut self) -> RawConfig {
+        let mut phoenixd = self.phoenixd.take().unwrap_or_default();
+        let phoenixd_url = non_empty(self.phoenixd_url.as_deref())
+            .or_else(|| non_empty(phoenixd.url.as_deref()));
+        let phoenixd_api_password = overlay_secret_string(
+            sanitize_secret_string(self.phoenixd_api_password.take()),
+            sanitize_secret_string(phoenixd.api_password.take()),
+        );
+        // The flat spelling and the `[phoenixd]` block are two spellings of ONE schedule, so the
+        // block never fills in a field the flat spelling left out (see `overlay_fee_schedule`).
+        let (phoenixd_fee_schedule_version, phoenixd_fee_base_msat, phoenixd_fee_ppm) =
+            overlay_fee_schedule(
+                (
+                    non_empty(self.phoenixd_fee_schedule_version.as_deref()),
+                    self.phoenixd_fee_base_msat,
+                    self.phoenixd_fee_ppm,
+                ),
+                (
+                    non_empty(phoenixd.fee_schedule_version.as_deref()),
+                    phoenixd.fee_base_msat,
+                    phoenixd.fee_ppm,
+                ),
+            );
         let mnemonic = match self.mnemonic.take() {
             Some(mut mnemonic) if mnemonic.trim().is_empty() => {
                 mnemonic.zeroize();
@@ -490,6 +642,12 @@ impl RawConfig {
             // no secret-scrubbing is warranted (a gateway pubkey is public, not the seed/invite).
             fedimint_gateway: non_empty(self.fedimint_gateway.as_deref()),
             fedimint_gateway_fallbacks: self.fedimint_gateway_fallbacks.take(),
+            phoenixd_url,
+            phoenixd_api_password,
+            phoenixd_fee_schedule_version,
+            phoenixd_fee_base_msat,
+            phoenixd_fee_ppm,
+            phoenixd: None,
             mnemonic,
             // A numeric knob has no blank/whitespace form to strip; carry it through unchanged.
             min_holdings_warn_msat: self.min_holdings_warn_msat,
@@ -502,6 +660,23 @@ impl RawConfig {
         let mnemonic = overlay_secret_string(self.mnemonic.take(), lower.mnemonic.take());
         let fedimint_invite =
             overlay_secret_string(self.fedimint_invite.take(), lower.fedimint_invite.take());
+        let phoenixd_api_password = overlay_secret_string(
+            self.phoenixd_api_password.take(),
+            lower.phoenixd_api_password.take(),
+        );
+        let (phoenixd_fee_schedule_version, phoenixd_fee_base_msat, phoenixd_fee_ppm) =
+            overlay_fee_schedule(
+                (
+                    self.phoenixd_fee_schedule_version.take(),
+                    self.phoenixd_fee_base_msat,
+                    self.phoenixd_fee_ppm,
+                ),
+                (
+                    lower.phoenixd_fee_schedule_version.take(),
+                    lower.phoenixd_fee_base_msat,
+                    lower.phoenixd_fee_ppm,
+                ),
+            );
         RawConfig {
             data_dir: self.data_dir.or(lower.data_dir),
             relays: self.relays.or(lower.relays),
@@ -513,6 +688,14 @@ impl RawConfig {
             fedimint_gateway_fallbacks: self
                 .fedimint_gateway_fallbacks
                 .or(lower.fedimint_gateway_fallbacks),
+            phoenixd_url: self.phoenixd_url.or(lower.phoenixd_url),
+            phoenixd_api_password,
+            phoenixd_fee_schedule_version,
+            phoenixd_fee_base_msat,
+            phoenixd_fee_ppm,
+            // Every source layer was canonicalized by `sanitized`, so nested blocks never survive
+            // into the merged value.
+            phoenixd: None,
             mnemonic,
             min_holdings_warn_msat: self
                 .min_holdings_warn_msat
@@ -527,6 +710,27 @@ fn sanitize_secret_string(value: Option<String>) -> Option<String> {
         s.zeroize();
         cleaned
     })
+}
+
+/// Overlay the phoenixd trampoline fee schedule as ONE value: `(version, base_msat, ppm)`.
+///
+/// The three knobs are not independent — the version is what says which release the numbers were
+/// verified against (ADR-0019), which is why a partial schedule is rejected outright in
+/// [`supplied_phoenixd_fee_schedule`]. Overlaying them field by field would defeat that check across
+/// layers: a source that supplies only a NEW `fee_schedule_version` would silently inherit a lower
+/// source's old base/ppm, producing a complete-looking schedule no source ever verified — and an
+/// under-reserved fee is an INV-1 breach on every refund it prices. So a layer that mentions ANY of
+/// the three owns all three; the lower layer's schedule is used only when the higher one is silent
+/// about the whole schedule (and a partial one still fails validation, loudly).
+fn overlay_fee_schedule(
+    high: (Option<String>, Option<u64>, Option<u64>),
+    low: (Option<String>, Option<u64>, Option<u64>),
+) -> (Option<String>, Option<u64>, Option<u64>) {
+    if high.0.is_some() || high.1.is_some() || high.2.is_some() {
+        high
+    } else {
+        low
+    }
 }
 
 fn overlay_secret_string(high: Option<String>, low: Option<String>) -> Option<String> {
@@ -563,6 +767,15 @@ fn raw_config_from_env(get: impl Fn(&str) -> Option<String>) -> Result<RawConfig
         // silent no-op (an unknown env var never errors), never a brick.
         fedimint_gateway: None,
         fedimint_gateway_fallbacks: None,
+        phoenixd_url: get(ENV_PHOENIXD_URL),
+        phoenixd_api_password: get(ENV_PHOENIXD_API_PASSWORD),
+        // No env var maps to the verified fee schedule (ADR-0019): it is a considered, verified-once
+        // operator statement about their phoenixd release, not a per-start knob, so it lives only on
+        // the config-file/stdin layer.
+        phoenixd_fee_schedule_version: None,
+        phoenixd_fee_base_msat: None,
+        phoenixd_fee_ppm: None,
+        phoenixd: None,
         mnemonic: get(ENV_MNEMONIC),
         min_holdings_warn_msat: parse_min_holdings_warn_msat_env(get(ENV_MIN_HOLDINGS_WARN_MSAT))?,
     })
@@ -775,6 +988,16 @@ fn resolve_config(raw: &RawConfig) -> Result<OperatorConfig, IpcError> {
         // dir — so an explicit `payment_backend=fedimint` re-bootstrap need not re-supply the invite
         // (review P2). Here we just carry a supplied invite through (or `None` when it is absent).
         PaymentMode::Fedimint => supplied_fedimint_config(raw),
+        // phoenixd carries no fedimint config; ignore any stray fedimint_* fields, exactly like mock.
+        PaymentMode::Phoenixd => None,
+    };
+
+    // phoenixd (lnrent-xk3) is validated HERE and only here: unlike the fedimint invite there is no
+    // durable copy to fall back on (see [`PhoenixdConfig`]), so a missing/invalid value is a
+    // structured config error BEFORE anything is persisted.
+    let phoenixd = match payment_backend {
+        PaymentMode::Mock | PaymentMode::Fedimint => None,
+        PaymentMode::Phoenixd => Some(supplied_phoenixd_config(raw)?),
     };
 
     let relays = match &raw.relays {
@@ -835,6 +1058,7 @@ fn resolve_config(raw: &RawConfig) -> Result<OperatorConfig, IpcError> {
         payment_backend,
         compute_backend,
         fedimint,
+        phoenixd,
         // Widen the config-file/env `u64` floor to the `u128` the `ledger::expected_msat` compare
         // uses; absent ⇒ the default (`0`, disabled). This runtime knob is NOT reconciled against the
         // persisted operator row (unlike relays/compute/backend) — it is retunable by restart.
@@ -1008,7 +1232,8 @@ fn resolve_durable_fedimint_config(
     payment_backend: PaymentMode,
     raw: &RawConfig,
 ) -> Result<Option<FedimintConfig>, IpcError> {
-    if payment_backend == PaymentMode::Mock {
+    // Only `fedimint` has (or requires) a durable federation config; `mock` and `phoenixd` have none.
+    if payment_backend != PaymentMode::Fedimint {
         return Ok(None);
     }
 
@@ -1028,6 +1253,138 @@ fn resolve_durable_fedimint_config(
 /// so a present-but-blank invite is `None` and any value carries straight through.
 fn supplied_fedimint_config(raw: &RawConfig) -> Option<FedimintConfig> {
     non_empty(raw.fedimint_invite.as_deref()).map(|invite| FedimintConfig { invite })
+}
+
+/// The phoenixd config supplied in this run (flags/env/file/stdin). Both fields are REQUIRED —
+/// lnrent cannot reach an external phoenixd without a url, and cannot authenticate without the
+/// password — and the url is transport-validated ([`validate_phoenixd_url`]).
+fn supplied_phoenixd_config(raw: &RawConfig) -> Result<PhoenixdConfig, IpcError> {
+    let url = non_empty(raw.phoenixd_url.as_deref())
+        .or_else(|| raw.phoenixd.as_ref().and_then(|p| non_empty(p.url.as_deref())))
+        .ok_or_else(|| {
+            config_err(
+                "payment_backend=phoenixd requires `phoenixd_url` (the phoenixd HTTP base URL)",
+            )
+        })?;
+    // Every FALLIBLE step runs BEFORE the password is copied out of `raw`. Both `RawConfig` and
+    // `PhoenixdConfig` wipe their own copy of this §13 secret on drop, so the owned `String` below is
+    // the one gap in that chain: a `?` return taken while it is live would drop it unwiped. Ordering
+    // it last means it exists only on the straight-line path into the zeroize-on-drop config.
+    let url = validate_phoenixd_url(&url)?;
+    let fee_schedule = supplied_phoenixd_fee_schedule(raw)?;
+    let api_password = non_empty(raw.phoenixd_api_password.as_deref())
+        .or_else(|| {
+            raw.phoenixd
+                .as_ref()
+                .and_then(|p| non_empty(p.api_password.as_deref()))
+        })
+        .ok_or_else(|| {
+            config_err(
+                "payment_backend=phoenixd requires `phoenixd_api_password` (phoenixd's full-access \
+                 http-password; supply it via LNRENT_PHOENIXD_API_PASSWORD, a config file, or stdin \
+                 — never on the command line)",
+            )
+        })?;
+    Ok(PhoenixdConfig {
+        url,
+        api_password,
+        fee_schedule,
+    })
+}
+
+/// The operator's OWN verified phoenixd trampoline fee schedule, if they configured one (ADR-0019).
+///
+/// All three fields go together and are rejected as a set when partial: a version without numbers
+/// would silently keep the build's default schedule while claiming a different release was verified,
+/// and numbers without a version could not be checked against the running node at all. Absent = the
+/// build's version-verified default.
+fn supplied_phoenixd_fee_schedule(raw: &RawConfig) -> Result<Option<PhoenixdFeeSchedule>, IpcError> {
+    let block = raw.phoenixd.as_ref();
+    let version = non_empty(raw.phoenixd_fee_schedule_version.as_deref()).or_else(|| {
+        block.and_then(|p| non_empty(p.fee_schedule_version.as_deref()))
+    });
+    let base_msat = raw
+        .phoenixd_fee_base_msat
+        .or_else(|| block.and_then(|p| p.fee_base_msat));
+    let ppm = raw
+        .phoenixd_fee_ppm
+        .or_else(|| block.and_then(|p| p.fee_ppm));
+    match (version, base_msat, ppm) {
+        (None, None, None) => Ok(None),
+        (Some(version), Some(base_msat), Some(ppm)) => Ok(Some(PhoenixdFeeSchedule {
+            version,
+            base_msat,
+            ppm,
+        })),
+        _ => Err(config_err(
+            "an operator-verified phoenixd fee schedule needs all three of \
+             `phoenixd_fee_schedule_version`, `phoenixd_fee_base_msat` and `phoenixd_fee_ppm` \
+             (a partial schedule cannot bound an outbound fee); omit all three to use the built-in \
+             version-verified default",
+        )),
+    }
+}
+
+/// Validate + normalize the phoenixd base URL. lnrent authenticates to phoenixd with HTTP BASIC over
+/// this URL, so the full-access api password crosses the wire on every call: plaintext `http://` is
+/// accepted ONLY to a LOOPBACK host (the co-located deployment phoenixd is designed for), and any
+/// other host MUST be `https://` — a remote operator fronts phoenixd with TLS. A hostname is judged
+/// syntactically (`localhost` / `*.localhost` / an IP literal in 127.0.0.0/8 / `::1`), never by DNS:
+/// a name that merely RESOLVES to loopback today can be repointed tomorrow, so it fails closed.
+///
+/// Returns the url normalized to end in `/` so the backend's relative endpoint joins preserve any
+/// reverse-proxy sub-path (`https://host/phoenixd/` + `createinvoice`).
+fn validate_phoenixd_url(raw: &str) -> Result<String, IpcError> {
+    let url = url::Url::parse(raw)
+        .map_err(|e| config_err(format!("invalid `phoenixd_url` (must be an absolute URL): {e}")))?;
+    let host = url.host().ok_or_else(|| {
+        config_err("invalid `phoenixd_url`: no host (expected http(s)://host[:port][/path])")
+    })?;
+    // Credentials belong in `phoenixd_api_password`, never in the URL: a url-embedded secret would
+    // be echoed by any HTTP client error that prints the target (breaking the §13 "never in error
+    // text" contract) and by every request log.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(config_err(
+            "`phoenixd_url` must not embed credentials; supply the api password in \
+             `phoenixd_api_password` so it can never appear in a URL, log line, or error message",
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(config_err(
+            "`phoenixd_url` must not contain a query or fragment; configure only the HTTP(S) base \
+             path so endpoint joins cannot discard or corrupt URL components",
+        ));
+    }
+    let loopback = match &host {
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+        url::Host::Domain(name) => {
+            let name = name.to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost")
+        }
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        "http" => {
+            return Err(config_err(format!(
+                "`phoenixd_url` uses plaintext http:// to non-loopback host `{host}`; the phoenixd \
+                 api password is sent as an HTTP Basic header on every request, so a remote \
+                 phoenixd MUST be reached over https:// (front it with a TLS proxy)"
+            )))
+        }
+        other => {
+            return Err(config_err(format!(
+                "`phoenixd_url` scheme `{other}` is not supported (expected https://, or http:// to \
+                 a loopback host)"
+            )))
+        }
+    }
+    let mut normalized = url.to_string();
+    if !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    Ok(normalized)
 }
 
 fn read_fedimint_config(data_dir: &Path) -> Result<FedimintConfig, IpcError> {
@@ -1176,6 +1533,31 @@ async fn validate_inherited_fedimint_config_before_store(
         == Some("fedimint")
     {
         validate_fedimint_config_available(&config.data_dir, raw)?;
+    }
+    Ok(())
+}
+
+/// Validate an omitted-but-inherited phoenixd selection before mutable operator fields are written.
+/// Unlike Fedimint there is no durable connection config to recover: every restart must supply the
+/// URL and API password. This guard keeps a failed reload atomic (for example, new relays are not
+/// committed before the missing credential error is returned).
+async fn validate_inherited_phoenixd_config_before_store(
+    store: &Store,
+    identity: &OperatorIdentity,
+    config: &OperatorConfig,
+    raw: &RawConfig,
+) -> Result<(), IpcError> {
+    if non_empty(raw.payment_backend.as_deref()).is_some()
+        || config.payment_backend == PaymentMode::Phoenixd
+    {
+        return Ok(());
+    }
+    if stored_payment_backend_for_identity(store, identity)
+        .await?
+        .as_deref()
+        == Some("phoenixd")
+    {
+        let _validated = supplied_phoenixd_config(raw)?;
     }
     Ok(())
 }
@@ -1968,7 +2350,10 @@ async fn persist_operator_row(
                     } else {
                         stored_payment
                     };
-                    if payment != "mock" && payment != "fedimint" {
+                    // Refuse to carry forward a stored backend this build cannot parse (a
+                    // hand-edited or future-version row): `PaymentMode::parse` is the single
+                    // allowlist, so adding a backend never leaves a stale literal list behind.
+                    if PaymentMode::parse(&payment).is_err() {
                         return Ok(RowOutcome::PaymentConflict {
                             stored: payment,
                         });
@@ -3284,6 +3669,335 @@ mod tests {
         assert_eq!(cfg.relays, DEFAULT_RELAYS);
     }
 
+    // ---- phoenixd (lnrent-xk3) ---------------------------------------------------------------
+
+    fn phoenixd_raw(url: &str) -> RawConfig {
+        RawConfig {
+            payment_backend: Some("phoenixd".into()),
+            phoenixd_url: Some(url.into()),
+            phoenixd_api_password: Some("hunter2".into()),
+            ..Default::default()
+        }
+    }
+
+    // TRANSPORT CONTRACT: the api password rides an HTTP Basic header on every call, so plaintext
+    // http:// is accepted ONLY to loopback; any other host must be https://.
+    #[test]
+    fn phoenixd_rejects_plaintext_http_to_a_non_loopback_host() {
+        for url in [
+            "http://phoenixd.example.com:9740",
+            "http://10.0.0.5:9740",
+            "http://[2001:db8::1]:9740",
+        ] {
+            let err = resolve_config(&phoenixd_raw(url))
+                .expect_err("plaintext http to a remote host must be rejected");
+            assert!(
+                err.message.contains("plaintext http://"),
+                "unexpected error for {url}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn phoenixd_accepts_loopback_http_and_remote_https() {
+        for (url, expected) in [
+            ("http://127.0.0.1:9740", "http://127.0.0.1:9740/"),
+            ("http://localhost:9740/", "http://localhost:9740/"),
+            ("http://[::1]:9740", "http://[::1]:9740/"),
+            (
+                "https://phoenixd.example.com",
+                "https://phoenixd.example.com/",
+            ),
+            // A reverse-proxy sub-path is preserved (and gains its trailing slash) so relative
+            // endpoint joins stay inside it.
+            ("https://ops.example.com/phoenixd", "https://ops.example.com/phoenixd/"),
+        ] {
+            let cfg = resolve_config(&phoenixd_raw(url))
+                .unwrap_or_else(|e| panic!("{url} must resolve: {}", e.message));
+            let phoenixd = cfg.phoenixd.as_ref().expect("phoenixd config present");
+            assert_eq!(phoenixd.url, expected);
+            assert_eq!(phoenixd.api_password, "hunter2");
+            assert!(cfg.fedimint.is_none(), "phoenixd needs no federation config");
+        }
+    }
+
+    #[test]
+    fn phoenixd_toml_block_resolves_url_and_password() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+                payment_backend = "phoenixd"
+
+                [phoenixd]
+                url = "http://127.0.0.1:9740"
+                api_password = "block-secret"
+            "#,
+        )
+        .expect("[phoenixd] is the documented config-file shape");
+        let cfg = resolve_config(&raw).expect("nested phoenixd config resolves");
+        let phoenixd = cfg.phoenixd.expect("phoenixd config");
+        assert_eq!(phoenixd.url, "http://127.0.0.1:9740/");
+        assert_eq!(phoenixd.api_password, "block-secret");
+    }
+
+    // ADR-0019: INV-1 on phoenixd rests on a fee schedule lnrent can only KNOW, so the built-in one is
+    // a version-verified DEFAULT and the operator can supply the schedule they verified for their own
+    // release. All three fields go together: a version without numbers would keep reserving the old
+    // fee while claiming a new release was verified, and numbers without a version could not be
+    // checked against the running node at all.
+    #[test]
+    fn phoenixd_takes_a_complete_operator_verified_fee_schedule_or_none() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+                payment_backend = "phoenixd"
+
+                [phoenixd]
+                url = "http://127.0.0.1:9740"
+                api_password = "block-secret"
+                fee_schedule_version = "0.9.1"
+                fee_base_msat = 5000
+                fee_ppm = 6000
+            "#,
+        )
+        .expect("the fee schedule is part of the documented [phoenixd] block");
+        let cfg = resolve_config(&raw).expect("a complete schedule resolves");
+        assert_eq!(
+            cfg.phoenixd.as_ref().unwrap().fee_schedule,
+            Some(PhoenixdFeeSchedule {
+                version: "0.9.1".into(),
+                base_msat: 5_000,
+                ppm: 6_000,
+            })
+        );
+
+        // The bootstrap path folds the block into the flat fields BEFORE precedence is applied, so
+        // assert the schedule survives that fold — dropping it there would silently keep reserving
+        // the default fee on a node the operator verified something else for.
+        assert_eq!(
+            resolve_config(&raw.clone().sanitized())
+                .expect("the folded layer resolves")
+                .phoenixd
+                .unwrap()
+                .fee_schedule,
+            Some(PhoenixdFeeSchedule {
+                version: "0.9.1".into(),
+                base_msat: 5_000,
+                ppm: 6_000,
+            })
+        );
+
+        // Omitted entirely = the build's version-verified default.
+        assert_eq!(
+            resolve_config(&phoenixd_raw("http://127.0.0.1:9740"))
+                .unwrap()
+                .phoenixd
+                .unwrap()
+                .fee_schedule,
+            None
+        );
+
+        for partial in [
+            "fee_schedule_version = \"0.9.1\"",
+            "fee_base_msat = 5000",
+            "fee_schedule_version = \"0.9.1\"\n                fee_ppm = 6000",
+        ] {
+            let raw: RawConfig = toml::from_str(&format!(
+                r#"
+                payment_backend = "phoenixd"
+
+                [phoenixd]
+                url = "http://127.0.0.1:9740"
+                api_password = "block-secret"
+                {partial}
+            "#
+            ))
+            .expect("parses");
+            let err = resolve_config(&raw)
+                .expect_err("a partial schedule cannot bound an outbound fee: {partial}");
+            assert!(
+                err.message.contains("all three"),
+                "unexpected error: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn phoenixd_rejects_query_and_fragment_in_the_base_url() {
+        for url in [
+            "https://ops.example.com/phoenixd?token=abc",
+            "https://ops.example.com/phoenixd#admin",
+        ] {
+            let err = resolve_config(&phoenixd_raw(url))
+                .expect_err("query/fragment would be dropped or mis-joined by endpoint resolution");
+            assert!(
+                err.message.contains("query or fragment"),
+                "unexpected error for {url}: {}",
+                err.message
+            );
+        }
+    }
+
+    // A hostname that merely RESOLVES to loopback is NOT loopback: DNS can be repointed, so the
+    // check is syntactic and fails closed.
+    #[test]
+    fn phoenixd_does_not_trust_dns_for_the_loopback_exemption() {
+        let err = resolve_config(&phoenixd_raw("http://localtest.me:9740"))
+            .expect_err("a resolves-to-127.0.0.1 name is still remote");
+        assert!(err.message.contains("plaintext http://"));
+    }
+
+    #[test]
+    fn phoenixd_requires_both_url_and_api_password() {
+        let mut raw = phoenixd_raw("http://127.0.0.1:9740");
+        raw.phoenixd_url = None;
+        let err = resolve_config(&raw).expect_err("url is required");
+        assert!(err.message.contains("requires `phoenixd_url`"));
+
+        let mut raw = phoenixd_raw("http://127.0.0.1:9740");
+        raw.phoenixd_api_password = None;
+        let err = resolve_config(&raw).expect_err("password is required");
+        assert!(err.message.contains("requires `phoenixd_api_password`"));
+
+        let mut raw = phoenixd_raw("not a url");
+        raw.phoenixd_url = Some("not a url".into());
+        let err = resolve_config(&raw).expect_err("a malformed url is rejected");
+        assert!(err.message.contains("invalid `phoenixd_url`"));
+    }
+
+    // A url-embedded credential would be echoed by every HTTP client error that prints its target.
+    #[test]
+    fn phoenixd_rejects_credentials_embedded_in_the_url() {
+        for url in [
+            "https://:hunter2@phoenixd.example.com",
+            "https://user:hunter2@phoenixd.example.com",
+            "http://user@127.0.0.1:9740",
+        ] {
+            let err = resolve_config(&phoenixd_raw(url))
+                .expect_err("a url-embedded credential must be rejected");
+            assert!(
+                err.message.contains("must not embed credentials"),
+                "unexpected error for {url}: {}",
+                err.message
+            );
+        }
+    }
+
+    // §13: the api password must never render in a Debug line (which is what lands in logs / panics).
+    #[test]
+    fn config_debug_redacts_the_phoenixd_api_password() {
+        let cfg = resolve_config(&phoenixd_raw("http://127.0.0.1:9740")).expect("resolves");
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("hunter2"),
+            "Debug leaked the phoenixd api password: {debug}"
+        );
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn phoenixd_bootstraps_and_is_pinned_against_a_silent_backend_change() {
+        let dir = temp_data_dir();
+        let store = mem_store();
+        let mut raw = phoenixd_raw("http://127.0.0.1:9740");
+        raw.data_dir = Some(dir.to_string_lossy().into_owned());
+        raw.mnemonic = Some(TEST_MNEMONIC.into());
+        let op = bootstrap(raw, &store).await.expect("phoenixd bootstraps");
+        assert_eq!(op.config.payment_backend, PaymentMode::Phoenixd);
+        assert_eq!(op.config.phoenixd.as_ref().unwrap().url, "http://127.0.0.1:9740/");
+        assert!(
+            !dir.join(FEDIMINT_CONFIG_FILE).exists(),
+            "phoenixd writes no fedimint config"
+        );
+
+        // The money-routing backend is fixed at bootstrap, exactly like fedimint's.
+        let mut switch = phoenixd_raw("http://127.0.0.1:9740");
+        switch.data_dir = Some(dir.to_string_lossy().into_owned());
+        switch.payment_backend = Some("mock".into());
+        let err = match bootstrap(switch, &store).await {
+            Ok(_) => panic!("switching away from phoenixd must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, "config_conflict");
+    }
+
+    // A re-bootstrap that OMITS payment_backend inherits the stored `phoenixd`, so the phoenixd
+    // credentials must be re-resolved against the PERSISTED backend (nothing durable to fall back on).
+    #[tokio::test]
+    async fn rebootstrap_inheriting_phoenixd_still_requires_its_config() {
+        let dir = temp_data_dir();
+        let store = mem_store();
+        let mut raw = phoenixd_raw("http://127.0.0.1:9740");
+        raw.data_dir = Some(dir.to_string_lossy().into_owned());
+        raw.mnemonic = Some(TEST_MNEMONIC.into());
+        bootstrap(raw, &store).await.expect("first bootstrap");
+
+        let bare = RawConfig {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let err = match bootstrap(bare, &store).await {
+            Ok(_) => panic!("an inherited phoenixd backend still needs its url/password"),
+            Err(e) => e,
+        };
+        assert!(err.message.contains("requires `phoenixd_url`"));
+
+        let inherited = RawConfig {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            phoenixd_url: Some("http://127.0.0.1:9740".into()),
+            phoenixd_api_password: Some("hunter2".into()),
+            ..Default::default()
+        };
+        let op = bootstrap(inherited, &store).await.expect("re-bootstrap");
+        assert_eq!(op.config.payment_backend, PaymentMode::Phoenixd);
+        assert!(op.config.phoenixd.is_some());
+    }
+
+    #[tokio::test]
+    async fn inherited_phoenixd_config_is_validated_before_mutating_relays() {
+        let dir = temp_data_dir();
+        let store = mem_store();
+        let original_relays = vec!["wss://original.example".to_string()];
+        let mut first = phoenixd_raw("http://127.0.0.1:9740");
+        first.data_dir = Some(dir.to_string_lossy().into_owned());
+        first.mnemonic = Some(TEST_MNEMONIC.into());
+        first.relays = Some(original_relays.clone());
+        bootstrap(first, &store).await.expect("first bootstrap");
+
+        let invalid_reload = RawConfig {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            relays: Some(vec!["wss://must-not-commit.example".into()]),
+            ..Default::default()
+        };
+        let err = match bootstrap(invalid_reload, &store).await {
+            Ok(_) => panic!("inherited phoenixd still requires credentials"),
+            Err(err) => err,
+        };
+        assert!(err.message.contains("requires `phoenixd_url`"));
+
+        let (_c, _m, _o, _b, _p, relays) = read_operator_row(&store).await;
+        let relays: Vec<String> = serde_json::from_str(&relays).unwrap();
+        assert_eq!(
+            relays, original_relays,
+            "a failed config reload must not partially persist new relays"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // The alert sink defaults ON for every REAL money backend — a stranded refund on phoenixd must
+    // reach the operator just as it does on fedimint.
+    #[test]
+    fn alerts_default_on_for_every_real_money_backend() {
+        // These read the process env; the test asserts the DEFAULT arm, so only run it when the
+        // override is unset (it is, in a normal test run).
+        if std::env::var("LNRENT_ALERTS_ENABLED").is_ok() {
+            return;
+        }
+        assert!(alerts_enabled(PaymentMode::Fedimint));
+        assert!(alerts_enabled(PaymentMode::Phoenixd));
+        assert!(!alerts_enabled(PaymentMode::Mock));
+    }
+
     // Review P2: a re-bootstrap that OMITS relays inherits the stored relays rather than silently
     // resetting them to the default set.
     #[tokio::test]
@@ -3398,6 +4112,7 @@ mod tests {
             fedimint: Some(FedimintConfig {
                 invite: "fed11SECRET".into(),
             }),
+            phoenixd: None,
             min_holdings_warn_msat: 0,
         };
         let debug = format!("{cfg:?}");
@@ -3529,6 +4244,70 @@ mod tests {
             merged.relays,
             Some(vec!["wss://stdin.example".to_string()]),
             "stdin fills what no higher source set"
+        );
+    }
+
+    // ADR-0019: the trampoline fee schedule is ONE value across sources, not three independent
+    // knobs. A field-by-field merge would let a source that names only a NEW verified version
+    // inherit another source's OLD base/ppm, passing the "all three" check with a schedule nobody
+    // verified — and an under-reserved fee is an INV-1 breach on every refund it prices.
+    #[test]
+    fn a_fee_schedule_is_overlaid_as_one_value_never_field_by_field() {
+        let file = RawConfig {
+            phoenixd_fee_schedule_version: Some("0.9.2".into()),
+            ..Default::default()
+        };
+        let stdin = RawConfig {
+            phoenixd_fee_schedule_version: Some("0.9.1".into()),
+            phoenixd_fee_base_msat: Some(5_000),
+            phoenixd_fee_ppm: Some(6_000),
+            ..Default::default()
+        };
+        let merged = RawConfig::from_sources(
+            RawConfig::default(),
+            RawConfig::default(),
+            file,
+            stdin.clone(),
+        );
+        assert_eq!(
+            merged.phoenixd_fee_schedule_version.as_deref(),
+            Some("0.9.2")
+        );
+        assert_eq!(
+            (merged.phoenixd_fee_base_msat, merged.phoenixd_fee_ppm),
+            (None, None),
+            "the higher layer owns the WHOLE schedule; the lower one's numbers do not leak into it"
+        );
+        let raw = RawConfig {
+            phoenixd_url: Some("http://127.0.0.1:9740".into()),
+            phoenixd_api_password: Some("pw".into()),
+            payment_backend: Some("phoenixd".into()),
+            ..merged
+        };
+        assert!(
+            resolve_config(&raw)
+                .expect_err("the surviving partial schedule is rejected, not silently completed")
+                .message
+                .contains("all three"),
+        );
+
+        // …and a layer that says nothing about the schedule still inherits the lower one intact.
+        let merged = RawConfig::from_sources(
+            RawConfig::default(),
+            RawConfig::default(),
+            RawConfig {
+                data_dir: Some("/file/dir".into()),
+                ..Default::default()
+            },
+            stdin,
+        );
+        assert_eq!(
+            (
+                merged.phoenixd_fee_schedule_version.as_deref(),
+                merged.phoenixd_fee_base_msat,
+                merged.phoenixd_fee_ppm
+            ),
+            (Some("0.9.1"), Some(5_000), Some(6_000))
         );
     }
 
