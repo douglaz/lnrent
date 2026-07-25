@@ -1286,6 +1286,36 @@ impl PaymentBackend for PhoenixdPayment {
                 created.amount_sat
             );
         }
+        // The JSON side-fields are NOT authoritative on their own — the buyer pays the `serialized`
+        // BOLT11, and everything downstream keys on `paymentHash`. A phoenixd (or a terminating
+        // TLS proxy, which the remote deployment shape explicitly allows) returning a bolt11 that
+        // encodes a DIFFERENT hash would have lnrent index a hash nobody can ever pay: the buyer's
+        // payment would settle against the bolt11's real hash while `lookup_settlement` searched for
+        // the indexed one, so the settlement is permanently unobservable — buyer paid, no service,
+        // no refund. A different encoded AMOUNT misbills the buyer. Parse the invoice lnrent is
+        // about to hand out and require it to agree with the fields lnrent is about to persist.
+        let parsed = lightning_invoice::Bolt11Invoice::from_str(&created.bolt11)
+            .context("parsing the bolt11 phoenixd returned from createinvoice")?;
+        if !parsed
+            .payment_hash()
+            .to_string()
+            .eq_ignore_ascii_case(&created.payment_hash)
+        {
+            bail!(
+                "phoenixd createinvoice returned paymentHash {} but a bolt11 encoding {}; refusing \
+                 to persist an invoice whose settlement lnrent could never observe",
+                created.payment_hash,
+                parsed.payment_hash()
+            );
+        }
+        match parsed.amount_milli_satoshis() {
+            Some(msat) if msat == amount_sat.saturating_mul(1000) => {}
+            other => bail!(
+                "phoenixd createinvoice returned a bolt11 encoding {:?} msat, but lnrent requested \
+                 {amount_sat} sat; refusing to bill the buyer a mismatched amount",
+                other
+            ),
+        }
         let inv = Invoice {
             id: invoice_id_for(&created.payment_hash),
             external_id: external_id.to_string(),

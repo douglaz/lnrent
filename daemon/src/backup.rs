@@ -449,6 +449,21 @@ pub fn restore(
             BACKUP_FORMAT_VERSION
         );
     }
+    // The format defines v2 IFF `phoenixd_index.db` is captured, so the pair must agree. A manifest
+    // that violates it (hand-edited, corrupted, or downgraded) is REFUSED rather than accepted as
+    // "compatible": an older v1 restorer ignores the unknown `phoenixd_index` field entirely and
+    // would restore the commitment-bearing sqlite WITHOUT lnrent's phoenixd payment/idempotency map,
+    // so already-completed refunds could be re-adopted under fresh keys and paid twice. Checking the
+    // range alone cannot catch that, because the lie is in the pairing, not in either field.
+    if manifest.phoenixd_index != (manifest.version >= BACKUP_FORMAT_VERSION) {
+        bail!(
+            "backup manifest is inconsistent: version {} with phoenixd_index={} (the format is \
+             version {BACKUP_FORMAT_VERSION} if and only if {PHOENIXD_INDEX_FILE} is captured); \
+             refusing to restore a manifest whose version and index disagree",
+            manifest.version,
+            manifest.phoenixd_index
+        );
+    }
 
     // 2. Verify the backup set is COMPLETE before mutating the target — never silently drop a file
     //    the manifest says was captured. In encrypted mode the sensitive files live inside

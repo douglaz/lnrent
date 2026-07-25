@@ -40,6 +40,8 @@ struct FakeState {
     node_id: String,
     next_id: u64,
     create_amount_override: Option<u64>,
+    /// Force createinvoice to return a bolt11 that DISAGREES with its own paymentHash side-field.
+    create_bolt11_hash_mismatch: bool,
 }
 
 struct FakePhoenixdOps {
@@ -109,6 +111,10 @@ impl FakePhoenixdOps {
         self.st.lock().unwrap().create_amount_override = Some(amount_sat);
     }
 
+    fn set_create_bolt11_hash_mismatch(&self) {
+        self.st.lock().unwrap().create_bolt11_hash_mismatch = true;
+    }
+
     fn set_node_version(&self, version: &str) {
         self.st.lock().unwrap().node_version = version.to_string();
     }
@@ -139,10 +145,20 @@ impl PhoenixdOps for FakePhoenixdOps {
         let n = st.next_id;
         st.next_id += 1;
         let response_amount_sat = st.create_amount_override.unwrap_or(amount_sat);
-        let payment_hash = format!("{n:064x}");
+        // A REAL signed bolt11 whose encoded hash+amount agree with the JSON side-fields, because
+        // `create_invoice` now refuses a response where they disagree (a proxy/phoenixd returning a
+        // bolt11 for a different hash would make the settlement permanently unobservable). Tests
+        // that WANT the mismatch drive it through `create_amount_override`.
+        let bolt11 = mint_bolt11(response_amount_sat.saturating_mul(1000), n as u8);
+        let payment_hash = if st.create_bolt11_hash_mismatch {
+            // A bolt11 for one hash advertised under another — the proxy/compromised-node shape.
+            hash_of(&mint_bolt11(response_amount_sat.saturating_mul(1000), n.wrapping_add(200) as u8))
+        } else {
+            hash_of(&bolt11)
+        };
         let record = PhoenixdIncoming {
             payment_hash: payment_hash.clone(),
-            bolt11: format!("lnbcfake{n}"),
+            bolt11,
             is_paid: false,
             is_expired: false,
             requested_sat: response_amount_sat,
@@ -1842,4 +1858,27 @@ fn a_build_suffixed_version_still_matches_the_verified_release() {
         "an operator may pin one exact build"
     );
     assert!(!pinned_build.matches_running_version("0.9.0-other"));
+}
+
+// codex PR-61 P2 regression: the JSON side-fields are not authoritative — the buyer pays the
+// `serialized` bolt11. A phoenixd (or a terminating TLS proxy, which the remote deployment shape
+// allows) that returns a bolt11 encoding a DIFFERENT payment hash than the advertised `paymentHash`
+// must be REFUSED, not persisted: lnrent would index a hash nobody can pay, so the buyer's
+// settlement would be permanently unobservable — paid, no service, no refund.
+#[tokio::test]
+async fn create_invoice_refuses_a_bolt11_whose_hash_disagrees_with_the_response() {
+    let ops = FakePhoenixdOps::new();
+    ops.set_create_bolt11_hash_mismatch();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+
+    let err = be
+        .create_invoice(25_000, "memo", 600, "ext:hash-mismatch")
+        .await
+        .expect_err("a bolt11 whose encoded hash disagrees with paymentHash must be refused");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("bolt11 encoding"),
+        "the error must name the hash disagreement, got: {msg}"
+    );
 }
