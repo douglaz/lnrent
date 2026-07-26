@@ -1826,6 +1826,62 @@ async fn real_ops_errors_never_contain_the_api_password() {
     }
 }
 
+// Readiness reporting consumes the typed error from `require_supported_version`, not the full doctor
+// probe. Prove the typed path applies the real ops layer's credential-aware version projection before
+// the error can reach a log.
+#[tokio::test]
+async fn readiness_version_error_never_contains_the_api_password() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf).await.unwrap();
+        let body = format!(
+            r#"{{"nodeId":"027e48node","version":"9.9.9-{TEST_PASSWORD}"}}"#
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        sock.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let ops = super::real::RealPhoenixdOps::new(&format!("http://{addr}/"), TEST_PASSWORD)
+        .expect("loopback ops build");
+    let index = Connection::open_in_memory().unwrap();
+    index.execute_batch(INDEX_SCHEMA).unwrap();
+    let be = PhoenixdPayment::with_ops(
+        Arc::new(ops),
+        index,
+        Arc::new(TestClock::new(1_000)),
+        FeeSchedule::default(),
+    );
+
+    let error = be
+        .backend_ready()
+        .await
+        .expect_err("the unverified release must fail readiness");
+    let failure = error
+        .downcast_ref::<PhoenixdReadinessError>()
+        .expect("readiness failure keeps its typed phoenixd classification");
+    let detail = crate::preflight::phoenixd_check_from_probe(failure.probe().clone())
+        .expect("the failure renders a preflight check")
+        .detail;
+
+    for rendered in [format!("{error:#}"), detail] {
+        assert!(
+            !rendered.contains(TEST_PASSWORD),
+            "readiness output leaked the api password: {rendered}"
+        );
+        assert!(
+            rendered.contains(REDACTED_PHOENIXD_VERSION),
+            "unsafe remote version was not visibly redacted: {rendered}"
+        );
+    }
+}
+
 // A preflight report is OPERATOR-FACING output that gets pasted into issues, so the api password must
 // not survive into any check the doctor prints. This drives the REAL HTTP layer (the only component
 // that ever holds the credential) through the REAL rendering: a node that refuses to connect, one

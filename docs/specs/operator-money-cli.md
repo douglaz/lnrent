@@ -79,6 +79,12 @@ and refund-liability coverage"). It sends `Request::Money`. Under `--json` it em
 required), parked count, and a bold `READY` / `NOT READY (<warning>)`. Exit codes follow the shared
 IPC/`not_found`/error taxonomy (0 on ok).
 
+*Backend-correct readiness revision (lnrent-p2e):* the historical `federation_ok`, `gateway_ok`, and
+warning strings remain the stable machine contract. When a phoenixd readiness seam fails, the reply
+additionally carries `readiness_failure_backend=phoenixd` and preflight's sanitized
+`readiness_failure_detail`; human mode uses those presentation fields to print phoenixd node/refund-pay
+labels and the same remedy as `lnrent preflight`. Fedimint replies and human wording are unchanged.
+
 ## 5. Tests (mandatory)
 
 - MONEY-covered: a daemon with zero liabilities (fresh store) → `money` returns `ready: true`, `warning:

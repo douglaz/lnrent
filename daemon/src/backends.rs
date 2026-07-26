@@ -176,10 +176,13 @@ pub trait PaymentBackend: Send + Sync {
     async fn refund_gateway_ready(&self) -> Result<bool> {
         Ok(true)
     }
-    /// LIVENESS: whether the backend's federation is reachable — a cheap authenticated round-trip
-    /// that actually hits the guardians (NOT a local-DB read), so an offline/no-consensus federation
-    /// is distinguishable from a down gateway or a low balance (lnrent-urw.4). Default `Ok(true)` for
-    /// backends with no federation (the mock).
+    /// LIVENESS: whether the backend's ROOT money dependency is usable — a cheap authenticated
+    /// round-trip that actually hits the remote service (NOT a local-DB read), so a dead root is
+    /// distinguishable from a down refund-pay seam or a low balance (lnrent-urw.4). On Fedimint that
+    /// root is the guardians; on phoenixd it is the operator's node (authenticated `getinfo` on a
+    /// fee-verified release), and an `Err` there carries a sanitized [`PhoenixdReadinessError`] so
+    /// shared reporting can speak the configured backend's vocabulary (lnrent-p2e). Default
+    /// `Ok(true)` for backends with no such dependency (the mock).
     async fn backend_ready(&self) -> Result<bool> {
         Ok(true)
     }
@@ -308,6 +311,54 @@ pub enum PhoenixdProbe {
     /// and refuses automated refunds.
     VersionMismatch { running: String, verified: String },
 }
+
+/// A sanitized phoenixd readiness failure carried through the existing
+/// [`PaymentBackend::backend_ready`] / [`PaymentBackend::refund_gateway_ready`] seams.
+///
+/// This wraps only probe states that can fail those seams. It lets shared reporting reuse the
+/// operator wording from the phoenixd doctor without re-running the full doctor probe (whose
+/// successful path reads `getbalance`, forbidden on automatic readiness paths by ADR-0016).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PhoenixdReadinessError {
+    probe: PhoenixdProbe,
+}
+
+impl PhoenixdReadinessError {
+    pub(crate) fn new(probe: PhoenixdProbe) -> Self {
+        assert!(
+            matches!(
+                probe,
+                PhoenixdProbe::Unreachable(_)
+                    | PhoenixdProbe::AuthRejected { .. }
+                    | PhoenixdProbe::VersionMismatch { .. }
+            ),
+            "a phoenixd readiness error must carry a getinfo/version failure"
+        );
+        Self { probe }
+    }
+
+    pub(crate) fn probe(&self) -> &PhoenixdProbe {
+        &self.probe
+    }
+}
+
+impl std::fmt::Display for PhoenixdReadinessError {
+    /// ONE operator text per condition. This error escapes the readiness path — the money path logs
+    /// it as `error = %e` when a refund pay hits the same failing seam (`refund.rs`) — so rendering
+    /// it here by hand gave the SAME condition two stories, and they had already drifted (the local
+    /// copy dropped "every automated refund fails closed" and applied neither the remote-version nor
+    /// the configured-version report hygiene). Delegating to the one probe→text function keeps
+    /// `lnrent preflight`, the readiness report and the money-path log in agreement by construction.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `NotApplicable` is the only probe state with no rendering, and the constructor rejects it
+        // along with every other non-failure state.
+        let check = crate::preflight::phoenixd_check_from_probe(self.probe.clone())
+            .expect("constructor rejects non-readiness phoenixd probe states");
+        f.write_str(&check.detail)
+    }
+}
+
+impl std::error::Error for PhoenixdReadinessError {}
 
 /// Constant replacement for a remote-controlled phoenixd version that is unsafe to paste into an
 /// operator report.

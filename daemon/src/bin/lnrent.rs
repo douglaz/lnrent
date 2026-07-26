@@ -215,6 +215,10 @@ fn render(reply: Reply, as_json: bool, human_render: HumanRender) -> ExitCode {
 }
 
 fn render_money_human(v: &serde_json::Value) {
+    println!("{}", money_human_text(v));
+}
+
+fn money_human_text(v: &serde_json::Value) -> String {
     // §E: the balance operand is the LEDGER lower bound (`expected_msat`), not a live wallet read.
     // Wallet-vs-books drift is the `reconcile` command's job.
     let expected = v
@@ -252,28 +256,54 @@ fn render_money_human(v: &serde_json::Value) {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let warning = v.get("warning").and_then(serde_json::Value::as_str);
+    // lnrent-p2e: these optional fields exist only when the already-run readiness seams carried a
+    // typed phoenixd failure. Stable machine keys retain their historical names; the human view must
+    // not send a phoenixd operator looking for a federation or gateway their deployment does not
+    // have. `readiness_failure_detail` is preflight's sanitized diagnostic and remedy verbatim.
+    let phoenixd_detail = match (
+        v.get("readiness_failure_backend")
+            .and_then(serde_json::Value::as_str),
+        v.get("readiness_failure_detail")
+            .and_then(serde_json::Value::as_str),
+    ) {
+        (Some("phoenixd"), Some(detail)) => Some(detail),
+        _ => None,
+    };
 
-    println!("Expected holdings (ledger): {expected}");
-    println!("Federation: {federation}");
-    println!("Gateway: {gateway}");
-    println!("Outstanding liabilities: {gross} sat gross, {required} msat required");
-    println!("Parked count: {parked}");
+    let mut lines = vec![format!("Expected holdings (ledger): {expected}")];
+    if phoenixd_detail.is_some() {
+        lines.push(format!("Phoenixd node: {federation}"));
+        lines.push(format!("Refund pay: {gateway}"));
+    } else {
+        lines.push(format!("Federation: {federation}"));
+        lines.push(format!("Gateway: {gateway}"));
+    }
+    lines.push(format!(
+        "Outstanding liabilities: {gross} sat gross, {required} msat required"
+    ));
+    lines.push(format!("Parked count: {parked}"));
     // The degraded/read-only latch (lnrent-y4m.3) takes precedence over reserve readiness: the daemon
     // is refusing money writes after a fatal DB error, so a human operator must see it here — not only
     // in the daemon log — regardless of whether reserves are sufficient.
     if degraded {
-        println!(
+        lines.push(
             "Status: \x1b[1;31mDEGRADED (read-only)\x1b[0m — money writes refused after a fatal DB \
              error; restore the state DB from backup and restart"
+                .to_string(),
         );
     } else if ready {
-        println!("Status: \x1b[1mREADY\x1b[0m");
+        lines.push("Status: \x1b[1mREADY\x1b[0m".to_string());
+    } else if let Some(detail) = phoenixd_detail {
+        lines.push(format!(
+            "Status: \x1b[1mNOT READY (phoenixd)\x1b[0m — {detail}"
+        ));
     } else {
-        println!(
+        lines.push(format!(
             "Status: \x1b[1mNOT READY ({})\x1b[0m",
             warning.unwrap_or("unknown")
-        );
+        ));
     }
+    lines.join("\n")
 }
 
 /// Human render for `lnrent reconcile` (lnrent-urw.10 §F): the live wallet vs the ledger books and
@@ -583,6 +613,65 @@ fn render_relays_human(v: &serde_json::Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn money_human_uses_phoenixd_failure_terms_and_preflight_remedy() {
+        let detail = "phoenixd 0.9.1 is not the 0.9.0 release its trampoline fee schedule was \
+                      verified against — verify this release's schedule and configure it ([phoenixd] \
+                      fee_schedule_version/fee_base_msat/fee_ppm)";
+        let rendered = money_human_text(&json!({
+            "expected_msat": 0,
+            "gateway_ok": false,
+            "federation_ok": false,
+            "gross_liability_sat": 0,
+            "required_msat": 0,
+            "parked_count": 0,
+            "ready": false,
+            "warning": "FederationDown",
+            "degraded_read_only": false,
+            "readiness_failure_backend": "phoenixd",
+            "readiness_failure_detail": detail,
+        }));
+
+        assert!(rendered.contains("Phoenixd node: not ok"), "{rendered}");
+        assert!(rendered.contains("Refund pay: not ok"), "{rendered}");
+        assert!(rendered.contains(detail), "{rendered}");
+        assert!(
+            rendered.contains("[phoenixd] fee_schedule_version/fee_base_msat/fee_ppm"),
+            "{rendered}"
+        );
+        for wrong_subsystem in ["federation", "guardian", "gateway"] {
+            assert!(
+                !rendered.to_lowercase().contains(wrong_subsystem),
+                "phoenixd money output named {wrong_subsystem}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn money_human_fedimint_wording_is_unchanged() {
+        let rendered = money_human_text(&json!({
+            "expected_msat": 1000,
+            "gateway_ok": true,
+            "federation_ok": false,
+            "gross_liability_sat": 2,
+            "required_msat": 2000,
+            "parked_count": 0,
+            "ready": false,
+            "warning": "FederationDown",
+            "degraded_read_only": false,
+        }));
+
+        assert_eq!(
+            rendered,
+            "Expected holdings (ledger): 1000 msat\n\
+             Federation: not ok\n\
+             Gateway: ok\n\
+             Outstanding liabilities: 2 sat gross, 2000 msat required\n\
+             Parked count: 0\n\
+             Status: \u{1b}[1mNOT READY (FederationDown)\u{1b}[0m"
+        );
+    }
 
     // lnrent-y4m.9: the aggregate→exit mapping is pure and STRUCTURAL (adversarial review) —
     // exit 0 only for a well-formed passing report with every required check present and passing;

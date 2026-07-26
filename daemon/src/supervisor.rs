@@ -30,7 +30,9 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::backends::{PayStatus, PaymentBackend, PaymentStatus, Settlement};
+use crate::backends::{
+    PayStatus, PaymentBackend, PaymentStatus, PhoenixdProbe, PhoenixdReadinessError, Settlement,
+};
 use crate::capture::{capture, Capture};
 use crate::clock::Clock;
 use crate::ipc;
@@ -1362,14 +1364,24 @@ pub(crate) struct RefundReadinessReport {
     /// the balance operand the readiness compare now uses instead of a live federation query (§E).
     expected_msat: u128,
     gateway_ok: bool,
-    /// LIVENESS: whether the federation guardians are reachable (lnrent-urw.4). Distinct from
-    /// `gateway_ok` — a down federation is a different failure than a down gateway.
+    /// LIVENESS of the CONFIGURED backend's root dependency (`backend_ready`, lnrent-urw.4): on
+    /// Fedimint, whether the guardians are reachable; on phoenixd, whether the node answers an
+    /// authenticated `getinfo` on a fee-verified release. Distinct from `gateway_ok` — a down root is
+    /// a different failure than a down gateway. Named for Fedimint because the wire token is kept
+    /// for compatibility (lnrent-p2e; see [`RefundReadinessWarning::as_str`]).
     federation_ok: bool,
     parked_count: usize,
     /// PENDING liabilities that could not be priced this pass (transient quote/gateway error). Their
     /// cost is absent from `required_msat`, so coverage cannot be confirmed — forces a warning.
     unpriceable_count: usize,
     warning: Option<RefundReadinessWarning>,
+    /// Which vocabulary this pass's FAILURE reporting must speak (lnrent-p2e) — carried over from
+    /// the probe exactly as `gateway_ok`/`federation_ok` are, since [`log_refund_readiness`] and the
+    /// human `lnrent money` view render the report, not the probe. NOT money data:
+    /// [`Self::to_money_value`] uses it only to append phoenixd failure presentation metadata; the
+    /// existing `federation_ok`/`warning` machine contract remains unchanged (see
+    /// [`RefundReadinessWarning::as_str`]).
+    voice: ReadinessVoice,
 }
 
 impl Default for RefundReadinessReport {
@@ -1384,13 +1396,14 @@ impl Default for RefundReadinessReport {
             parked_count: 0,
             unpriceable_count: 0,
             warning: None,
+            voice: ReadinessVoice::Federation,
         }
     }
 }
 
 impl RefundReadinessReport {
     pub(crate) fn to_money_value(&self, gateway_ok: bool, federation_ok: bool) -> Value {
-        json!({
+        let mut money = json!({
             "expected_msat": self.expected_msat,
             "gateway_ok": gateway_ok,
             "federation_ok": federation_ok,
@@ -1400,32 +1413,62 @@ impl RefundReadinessReport {
             "parked_count": self.parked_count,
             "ready": self.warning.is_none(),
             "warning": self.warning.map(RefundReadinessWarning::as_str),
-        })
+        });
+        // The existing fields above are stable machine tokens, including their historical Fedimint
+        // names. A failing phoenixd probe also carries presentation-only metadata so the HUMAN
+        // `lnrent money` renderer can name the configured backend and reuse preflight's remedy
+        // instead of showing `FederationDown`. Omit it for Fedimint so that backend's reply and
+        // wording remain byte-identical (lnrent-p2e).
+        let phoenixd_detail = match &self.voice {
+            ReadinessVoice::Federation => None,
+            ReadinessVoice::PhoenixdNodeUnavailable { detail }
+            | ReadinessVoice::PhoenixdRefundsBlocked { detail } => Some(detail),
+        };
+        if let (Some(detail), Some(fields)) = (phoenixd_detail, money.as_object_mut()) {
+            fields.insert("readiness_failure_backend".to_string(), json!("phoenixd"));
+            fields.insert("readiness_failure_detail".to_string(), json!(detail));
+        }
+        money
     }
 }
 
 /// The two LIVENESS probes the readiness path still makes (§E): the refund gateway and the
-/// federation guardians. NO balance read — that is retired from every automatic path (ledger
-/// `expected_msat` is the balance operand now); the wallet is read solely by `reconcile` (§F).
-#[derive(Debug, Clone)]
+/// configured backend's root dependency (the federation guardians on Fedimint; the operator's node
+/// on phoenixd). NO balance read — that is retired from every automatic path (ledger
+/// `expected_msat` is the balance operand now); the wallet is read solely by explicit `reconcile`
+/// (§F, ADR-0016). Phoenixd carries a sanitized, typed failure through these existing seams, so
+/// reporting needs no follow-up doctor probe.
+#[derive(Debug)]
 pub(crate) struct RefundReadinessProbe {
     gateway_ok: bool,
-    gateway_error: Option<String>,
+    gateway_error: Option<anyhow::Error>,
     federation_ok: bool,
-    federation_error: Option<String>,
+    federation_error: Option<anyhow::Error>,
+    /// Which vocabulary a FAILURE above must be reported in (lnrent-p2e). Classified only when
+    /// something already failed, from the existing seam errors and with no additional I/O.
+    voice: ReadinessVoice,
 }
 
 impl RefundReadinessProbe {
     pub(crate) async fn query(payment: &Arc<dyn PaymentBackend>) -> Self {
         let (gateway_ok, gateway_error) = match payment.refund_gateway_ready().await {
             Ok(ok) => (ok, None),
-            Err(e) => (false, Some(format!("{e:#}"))),
+            Err(e) => (false, Some(e)),
         };
-        // Federation LIVENESS (lnrent-urw.4): a guardian round-trip, distinct from the gateway read.
-        // An error OR an explicit `false` means the federation is not reachable.
+        // Root LIVENESS (lnrent-urw.4): a guardian round-trip on Fedimint, an authenticated
+        // `getinfo` + fee-schedule version check on phoenixd — distinct from the gateway read either
+        // way. An error OR an explicit `false` means that root dependency is not usable.
         let (federation_ok, federation_error) = match payment.backend_ready().await {
             Ok(ok) => (ok, None),
-            Err(e) => (false, Some(format!("{e:#}"))),
+            Err(e) => (false, Some(e)),
+        };
+        // REPORTING only: the verdict above is untouched. Phoenixd's implementation attaches a
+        // sanitized typed cause to these same errors; Fedimint does not, so its established wording
+        // remains the fallback. No identity switch or follow-up probe is needed.
+        let voice = if gateway_ok && federation_ok {
+            ReadinessVoice::Federation
+        } else {
+            ReadinessVoice::from_errors(&gateway_error, &federation_error)
         };
 
         Self {
@@ -1433,6 +1476,7 @@ impl RefundReadinessProbe {
             gateway_error,
             federation_ok,
             federation_error,
+            voice,
         }
     }
 
@@ -1445,19 +1489,114 @@ impl RefundReadinessProbe {
     }
 
     fn log_failures(&self) {
-        if let Some(e) = &self.gateway_error {
-            tracing::warn!(error = %e, "refund readiness: gateway readiness query failed");
+        match &self.voice {
+            // Fedimint (and the mock): BYTE-IDENTICAL to what this path has always logged.
+            // lnrent-p2e must be invisible to an lnv2 operator.
+            ReadinessVoice::Federation => {
+                if let Some(e) = &self.gateway_error {
+                    tracing::warn!(error = %format!("{e:#}"), "refund readiness: gateway readiness query failed");
+                }
+                if let Some(e) = &self.federation_error {
+                    tracing::warn!(error = %format!("{e:#}"), "refund readiness: federation liveness probe failed (guardians unreachable)");
+                }
+            }
+            // ONE line, not two: on phoenixd BOTH readiness seams evaluate the same predicate — an
+            // authenticated `getinfo` plus the verified-release check (`require_supported_version`,
+            // phoenixd_backend.rs `refund_gateway_ready`/`backend_ready`) — so two errors are two
+            // observations of ONE node and one remedy. The detail is the sanitized typed seam error,
+            // carrying the original HTTP/transport cause when there was one.
+            //
+            // If the two calls DISAGREE (the node changed between two back-to-back requests) the
+            // later `backend_ready` observation wins — see `ReadinessVoice::from_errors`. The earlier
+            // reading is already stale by the time it would be printed, and stacking both would hand
+            // a stranger operator two conflicting remedies for one node; a cause that persists is
+            // reported by the next tick.
+            //
+            // No `if` guard: a `Phoenixd*` voice is only produced by downcasting one of these two
+            // errors, so at least one is `Some` here by construction.
+            ReadinessVoice::PhoenixdNodeUnavailable { detail }
+            | ReadinessVoice::PhoenixdRefundsBlocked { detail } => {
+                // No "the phoenixd node is …" preamble: every 5mi detail already opens by naming
+                // phoenixd, and stacking a second clause in front of it reads as two sentences
+                // fighting over the same subject.
+                tracing::warn!("refund readiness probe failed: {detail}");
+            }
         }
-        if let Some(e) = &self.federation_error {
-            tracing::warn!(error = %e, "refund readiness: federation liveness probe failed (guardians unreachable)");
+    }
+}
+
+/// Which vocabulary the operator-facing readiness REPORT must speak (lnrent-p2e).
+///
+/// The readiness path probes two backend-NEUTRAL seams (`backend_ready` / `refund_gateway_ready`),
+/// but its report was written in Fedimint's words: a phoenixd operator whose node is down, whose api
+/// password is wrong, or whose release was never fee-verified was told "federation liveness probe
+/// failed (guardians unreachable)" about a node that has no guardians — pointing a STRANGER operator
+/// (CONTEXT.md) at a system their deployment does not contain.
+///
+/// Phoenixd carries the same sanitized [`PhoenixdProbe`] failure classification that `lnrent
+/// preflight` renders through the existing readiness seams. That reuses the backend's authoritative
+/// getinfo/version check without a second identity switch or a follow-up doctor call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadinessVoice {
+    /// No backend-specific doctor probe applies (Fedimint/lnv2, and the mock): report in the
+    /// federation terms this path has always used, unchanged.
+    Federation,
+    /// lnrent cannot use the node API (unreachable or authentication rejected).
+    PhoenixdNodeUnavailable { detail: String },
+    /// The configured backend is the operator's own phoenixd node, and its unverified release blocks
+    /// outbound refunds. `detail` is exactly [`crate::preflight::phoenixd_check_from_probe`]'s
+    /// failure text, including the `[phoenixd] fee_schedule_*` remedy (ADR-0019).
+    PhoenixdRefundsBlocked { detail: String },
+}
+
+impl ReadinessVoice {
+    fn from_errors(
+        gateway_error: &Option<anyhow::Error>,
+        federation_error: &Option<anyhow::Error>,
+    ) -> Self {
+        // Prefer the root/backend error because it owns FederationDown. If it passed, the remaining
+        // GatewayUnavailable recovery-race arm uses the earlier refund-pay error.
+        let failure = federation_error
+            .as_ref()
+            .and_then(|e| e.downcast_ref::<PhoenixdReadinessError>())
+            .or_else(|| {
+                gateway_error
+                    .as_ref()
+                    .and_then(|e| e.downcast_ref::<PhoenixdReadinessError>())
+            });
+        let Some(failure) = failure else {
+            return Self::Federation;
+        };
+        let probe = failure.probe().clone();
+        let refunds_blocked = matches!(probe, PhoenixdProbe::VersionMismatch { .. });
+        // PhoenixdReadinessError's constructor permits only the three failing probe variants, and
+        // preflight renders all three. Keeping that invariant explicit prevents a silent fallback
+        // from giving the same failure two operator stories.
+        let detail = crate::preflight::phoenixd_check_from_probe(probe)
+            .expect("a typed phoenixd readiness failure must render a preflight check")
+            .detail;
+        if refunds_blocked {
+            Self::PhoenixdRefundsBlocked { detail }
+        } else {
+            Self::PhoenixdNodeUnavailable { detail }
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefundReadinessWarning {
-    /// The federation guardians are unreachable (lnrent-urw.4): the root infra failure — nothing can
-    /// be invoiced, paid, or reconciled. Distinct from (and higher priority than) a down gateway.
+    /// The configured backend's LIVENESS seam (`backend_ready`) says the money path's root dependency
+    /// is not usable (lnrent-urw.4). Distinct from (and higher priority than) a down gateway.
+    /// Consequences are backend-specific: a Fedimint outage stops the whole money path; a phoenixd
+    /// version mismatch blocks outbound refunds but does not stop invoice creation or inbound
+    /// settlement lookup.
+    ///
+    /// The CONDITION is backend-neutral even though the name is Fedimint's (kept for wire
+    /// compatibility — see [`RefundReadinessWarning::as_str`]): on Fedimint it means the guardians are
+    /// unreachable; on phoenixd it means the operator's node is unreachable, rejected the api
+    /// password, or runs a release whose trampoline fee schedule was never verified — the same
+    /// authenticated-getinfo and version predicate the phoenixd readiness seams enforce (ADR-0019).
+    /// Which of those an operator is TOLD is decided by [`ReadinessVoice`], not by this variant.
     FederationDown,
     GatewayUnavailable,
     /// The ledger's expected holdings (`expected_msat`, §D) are below the required refund outlay: the
@@ -1470,6 +1609,25 @@ pub(crate) enum RefundReadinessWarning {
 }
 
 impl RefundReadinessWarning {
+    /// The STABLE machine-readable token for this warning: published as `warning` in
+    /// `Request::Money`'s reply (see [`RefundReadinessReport::to_money_value`]) and documented in
+    /// `docs/go-live.md` as the reason an operator's machine gate reads. The Fedimint human view
+    /// renders it as `NOT READY (<token>)`; a phoenixd failure instead uses the additive
+    /// presentation metadata so a human never sees this Fedimint-named token.
+    ///
+    /// **lnrent-p2e durable-kind decision — option (a): keep the kind, fix only the human text.**
+    /// The bead asked whether `FederationDown` should be renamed for backend-neutrality, and whether
+    /// old rows would need a migration. Two facts settle it:
+    /// - There is nothing persisted to migrate, and no cooldown to double-fire. This is NOT an
+    ///   [`crate::alerts::AlertKind`] — that enum is CLOSED and has no readiness kind (`alerts.rs`),
+    ///   and the readiness path is log-only ([`log_refund_readiness`] never dispatches), so no
+    ///   `operator.alert` row has ever carried this string and the dispatcher's per-`(kind, subject)`
+    ///   6h cooldown is untouched by this bead.
+    /// - It IS a wire token. Renaming it would break an operator's launch-gating script (and
+    ///   go-live.md) to fix a HUMAN-text bug — strictly worse than fixing the text.
+    ///
+    /// So the token is byte-identical for BOTH backends and the operator-facing WORDS are fixed at the
+    /// render sites instead ([`ReadinessVoice`]), which is where the defect actually was.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             RefundReadinessWarning::FederationDown => "FederationDown",
@@ -1489,32 +1647,95 @@ async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) 
             return;
         }
     };
-    // FederationDown is a ROOT infra failure (guardians unreachable) — it must alarm even at zero
-    // liabilities (the idle/pre-go-live case codex flagged); every other warning is a refund-coverage
-    // condition that only matters when something is owed.
+    // FederationDown is a ROOT infra failure of the configured backend (Fedimint: guardians
+    // unreachable; phoenixd: the node is unreachable / rejected the api password / runs an unverified
+    // release) — it must alarm even at zero liabilities (the idle/pre-go-live case codex flagged);
+    // every other warning is a refund-coverage condition that only matters when something is owed.
     if report.liability_count == 0 && report.warning != Some(RefundReadinessWarning::FederationDown) {
         return;
     }
 
     match report.warning {
-        Some(RefundReadinessWarning::FederationDown) => tracing::error!(
-            liabilities = report.liability_count,
-            gross_liability_sat = %report.gross_liability_sat,
-            required_outlay_msat = %report.required_msat,
-            federation_ok = report.federation_ok,
-            gateway_ok = report.gateway_ok,
-            parked_count = report.parked_count,
-            "refund readiness ALARM: the FEDERATION is unreachable (guardians down / no consensus) — no invoices, payments, or refunds can settle; investigate the federation"
-        ),
-        Some(RefundReadinessWarning::GatewayUnavailable) => tracing::warn!(
-            liabilities = report.liability_count,
-            gross_liability_sat = %report.gross_liability_sat,
-            required_outlay_msat = %report.required_msat,
-            expected_msat = %report.expected_msat,
-            gateway_ok = report.gateway_ok,
-            parked_count = report.parked_count,
-            "refund readiness warning: gateway unreachable: cannot create invoices or pay refunds"
-        ),
+        // lnrent-p2e: ONE condition, reported in the CONFIGURED backend's words. The Fedimint arm —
+        // message AND field names — is byte-identical to what this alarm always said.
+        Some(RefundReadinessWarning::FederationDown) => match &report.voice {
+            ReadinessVoice::Federation => tracing::error!(
+                liabilities = report.liability_count,
+                gross_liability_sat = %report.gross_liability_sat,
+                required_outlay_msat = %report.required_msat,
+                federation_ok = report.federation_ok,
+                gateway_ok = report.gateway_ok,
+                parked_count = report.parked_count,
+                "refund readiness ALARM: the FEDERATION is unreachable (guardians down / no consensus) — no invoices, payments, or refunds can settle; investigate the federation"
+            ),
+            // The Fedimint arm's TWO booleans, renamed for a deployment that has neither a federation
+            // nor a gateway: a log FIELD named after a subsystem this operator does not run is the
+            // same defect as the message text. `node_ok` is the `backend_ready` seam, `refund_pay_ok`
+            // the `refund_gateway_ready` one (phoenixd's refund-pay check IS the same node check).
+            // Reported SEPARATELY, never AND-ed: an AND is a constant `false` in an arm selected by
+            // one of them failing, and it would hide WHICH call failed when the two disagree during
+            // recovery. `detail` carries the remedy, including `[phoenixd] fee_schedule_*` for an
+            // unverified release.
+            ReadinessVoice::PhoenixdNodeUnavailable { detail } => tracing::error!(
+                liabilities = report.liability_count,
+                gross_liability_sat = %report.gross_liability_sat,
+                required_outlay_msat = %report.required_msat,
+                node_ok = report.federation_ok,
+                refund_pay_ok = report.gateway_ok,
+                parked_count = report.parked_count,
+                "refund readiness ALARM: the PHOENIXD API is not usable — lnrent cannot create invoices, observe settlements, or pay refunds; {detail}"
+            ),
+            ReadinessVoice::PhoenixdRefundsBlocked { detail } => tracing::error!(
+                liabilities = report.liability_count,
+                gross_liability_sat = %report.gross_liability_sat,
+                required_outlay_msat = %report.required_msat,
+                node_ok = report.federation_ok,
+                refund_pay_ok = report.gateway_ok,
+                parked_count = report.parked_count,
+                "refund readiness ALARM: automated PHOENIXD refunds are blocked by an unverified fee schedule; {detail}"
+            ),
+        },
+        // The OTHER warning whose text names a Fedimint subsystem, and it IS reachable on phoenixd:
+        // `refund_gateway_ready` is probed before `backend_ready`, so a node that fails the first call
+        // and answers the second lands here rather than in FederationDown. phoenixd has no gateway at
+        // all (its refund-pay seam is the same node check), so the Fedimint arm's words would send that
+        // operator looking for a component their deployment does not have. The remaining warnings
+        // (InsufficientBalance / Unpriceable / ParkedManual) are ledger conditions whose text is
+        // already backend-neutral, and they arise only when BOTH probes passed — so there is no
+        // backend failure to word and no reason to spend a classification round-trip on them.
+        Some(RefundReadinessWarning::GatewayUnavailable) => match &report.voice {
+            ReadinessVoice::Federation => tracing::warn!(
+                liabilities = report.liability_count,
+                gross_liability_sat = %report.gross_liability_sat,
+                required_outlay_msat = %report.required_msat,
+                expected_msat = %report.expected_msat,
+                gateway_ok = report.gateway_ok,
+                parked_count = report.parked_count,
+                "refund readiness warning: gateway unreachable: cannot create invoices or pay refunds"
+            ),
+            ReadinessVoice::PhoenixdNodeUnavailable { detail } => tracing::warn!(
+                liabilities = report.liability_count,
+                gross_liability_sat = %report.gross_liability_sat,
+                required_outlay_msat = %report.required_msat,
+                expected_msat = %report.expected_msat,
+                // Same per-seam pair as the ALARM arm above, and here it is the informative one: this
+                // arm is reached with `refund_pay_ok=false` while `node_ok=true`.
+                node_ok = report.federation_ok,
+                refund_pay_ok = report.gateway_ok,
+                parked_count = report.parked_count,
+                "refund readiness warning: cannot create invoices or pay refunds — {detail}"
+            ),
+            ReadinessVoice::PhoenixdRefundsBlocked { detail } => tracing::warn!(
+                liabilities = report.liability_count,
+                gross_liability_sat = %report.gross_liability_sat,
+                required_outlay_msat = %report.required_msat,
+                expected_msat = %report.expected_msat,
+                node_ok = report.federation_ok,
+                refund_pay_ok = report.gateway_ok,
+                parked_count = report.parked_count,
+                "refund readiness warning: automated PHOENIXD refunds are blocked by an unverified fee schedule; {detail}"
+            ),
+        },
         Some(RefundReadinessWarning::InsufficientBalance) => tracing::warn!(
             liabilities = report.liability_count,
             gross_liability_sat = %report.gross_liability_sat,
@@ -1579,17 +1800,18 @@ pub(crate) async fn refund_readiness_report_with_probe(
     let expected_msat = crate::ledger::expected_msat(store, payment).await?;
     let liabilities = store.refund_readiness_liabilities().await?;
     if liabilities.is_empty() {
-        // Even with NO refund liabilities, a down federation must still surface (codex): it is a
-        // fundamental infra failure (no invoices/payments can settle), not a refund-coverage
-        // question — otherwise an idle/pre-go-live operator sees READY and announces a listing while
-        // guardians are unreachable. Refund-coverage warnings (balance/parked/unpriceable) rightly
-        // stay silent with nothing owed.
+        // Even with NO refund liabilities, a root-backend readiness failure must still surface
+        // (codex): otherwise an idle/pre-go-live operator sees READY despite unreachable Fedimint
+        // guardians or a phoenixd release that cannot safely pay a future refund. The renderer states
+        // the backend-specific consequence; refund-coverage warnings (balance/parked/unpriceable)
+        // rightly stay silent with nothing owed.
         probe.log_failures();
         return Ok(RefundReadinessReport {
             expected_msat,
             gateway_ok: probe.gateway_ok,
             federation_ok: probe.federation_ok,
             warning: (!probe.federation_ok).then_some(RefundReadinessWarning::FederationDown),
+            voice: probe.voice.clone(),
             ..Default::default()
         });
     }
@@ -1615,6 +1837,7 @@ async fn refund_readiness_report_from_liabilities(
         parked_count: 0,
         unpriceable_count: 0,
         warning: None,
+        voice: probe.voice.clone(),
     };
 
     for liability in &liabilities {
@@ -1951,7 +2174,7 @@ fn duration_secs(s: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::Invoice;
+    use crate::backends::{Invoice, REDACTED_PHOENIXD_VERSION};
     use crate::store::migrate;
     use nostr_relay_builder::MockRelay;
     use nostr_sdk::Keys;
@@ -1961,7 +2184,14 @@ mod tests {
 
     // §E: readiness is ledger-derived — the balance operand is `ledger::expected_msat` (seeded via
     // the store), NOT a backend balance call. So this double has NO balance and its
-    // `available_balance_msat` PANICS: every readiness test proves the path never reads the wallet.
+    // `available_balance_msat` and `phoenixd_probe` PANIC: every readiness test proves the path
+    // neither reads the wallet directly nor reaches the doctor's `getbalance` leg.
+    #[derive(Clone)]
+    enum ReadinessFailure {
+        Generic(String),
+        Phoenixd(PhoenixdProbe),
+    }
+
     #[derive(Default)]
     struct ReadinessPayment {
         gateway_ok: StdMutex<bool>,
@@ -1970,6 +2200,8 @@ mod tests {
         started: StdMutex<HashSet<String>>,
         required_by_gross: StdMutex<HashMap<u64, u128>>,
         fail_pricing: StdMutex<bool>,
+        gateway_failure: StdMutex<Option<ReadinessFailure>>,
+        federation_failure: StdMutex<Option<ReadinessFailure>>,
     }
 
     impl ReadinessPayment {
@@ -1981,11 +2213,40 @@ mod tests {
                 started: StdMutex::new(HashSet::new()),
                 required_by_gross: StdMutex::new(HashMap::new()),
                 fail_pricing: StdMutex::new(false),
+                gateway_failure: StdMutex::new(None),
+                federation_failure: StdMutex::new(None),
             }
         }
 
         fn set_federation_ok(&self, ok: bool) {
             *self.federation_ok.lock().unwrap() = ok;
+        }
+
+        fn set_readiness_error(&self, error: &str) {
+            let failure = ReadinessFailure::Generic(error.to_string());
+            *self.gateway_failure.lock().unwrap() = Some(failure.clone());
+            *self.federation_failure.lock().unwrap() = Some(failure);
+        }
+
+        fn set_phoenixd_failure(&self, probe: PhoenixdProbe) {
+            let failure = ReadinessFailure::Phoenixd(probe);
+            *self.gateway_failure.lock().unwrap() = Some(failure.clone());
+            *self.federation_failure.lock().unwrap() = Some(failure);
+        }
+
+        fn set_gateway_phoenixd_failure(&self, probe: PhoenixdProbe) {
+            *self.gateway_failure.lock().unwrap() = Some(ReadinessFailure::Phoenixd(probe));
+        }
+
+        fn set_phoenixd_failures(
+            &self,
+            gateway_probe: PhoenixdProbe,
+            federation_probe: PhoenixdProbe,
+        ) {
+            *self.gateway_failure.lock().unwrap() =
+                Some(ReadinessFailure::Phoenixd(gateway_probe));
+            *self.federation_failure.lock().unwrap() =
+                Some(ReadinessFailure::Phoenixd(federation_probe));
         }
 
         fn set_pricing_fails(&self, fails: bool) {
@@ -2068,11 +2329,29 @@ mod tests {
         }
 
         async fn refund_gateway_ready(&self) -> Result<bool> {
+            match self.gateway_failure.lock().unwrap().clone() {
+                Some(ReadinessFailure::Generic(e)) => anyhow::bail!("{e}"),
+                Some(ReadinessFailure::Phoenixd(probe)) => {
+                    return Err(PhoenixdReadinessError::new(probe).into())
+                }
+                None => {}
+            }
             Ok(*self.gateway_ok.lock().unwrap())
         }
 
         async fn backend_ready(&self) -> Result<bool> {
+            match self.federation_failure.lock().unwrap().clone() {
+                Some(ReadinessFailure::Generic(e)) => anyhow::bail!("{e}"),
+                Some(ReadinessFailure::Phoenixd(probe)) => {
+                    return Err(PhoenixdReadinessError::new(probe).into())
+                }
+                None => {}
+            }
             Ok(*self.federation_ok.lock().unwrap())
+        }
+
+        async fn phoenixd_probe(&self) -> Result<PhoenixdProbe> {
+            panic!("readiness reporting must not call the doctor probe or read getbalance")
         }
 
         async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
@@ -2088,6 +2367,66 @@ mod tests {
 
     fn readiness_payment(gateway_ok: bool) -> Arc<dyn PaymentBackend> {
         Arc::new(ReadinessPayment::new(gateway_ok))
+    }
+
+    /// Collect what the daemon's `tracing` output ACTUALLY says, so lnrent-p2e's operator-facing
+    /// wording can be asserted the way an operator reads it — message AND field names, since a field
+    /// literally called `federation_ok` is Fedimint vocabulary too.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<StdMutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).expect("log output is utf8")
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Install a capturing subscriber for as long as the returned guard lives. THREAD-LOCAL
+    /// (`set_default`, not `set_global_default`), and `#[tokio::test]` runs a current-thread runtime,
+    /// so the capture cannot leak into tests running in parallel.
+    fn capture_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+        let sink = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        (sink, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// A phoenixd-backed readiness double whose node is failing: BOTH readiness seams fail closed
+    /// with the sanitized typed failure `require_supported_version` carries.
+    fn failing_phoenixd(probe: PhoenixdProbe) -> Arc<ReadinessPayment> {
+        let p = ReadinessPayment::new(true);
+        p.set_phoenixd_failure(probe);
+        Arc::new(p)
+    }
+
+    /// The message plus fields of every readiness line in `logged` — the operator-facing text this
+    /// bead is about.
+    fn readiness_lines(logged: &str) -> String {
+        logged
+            .lines()
+            .filter(|l| l.contains("refund readiness"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Create the urw.3-owned `sweep_attempt` table locally and insert an in-flight (SENT/PENDING)
@@ -2834,6 +3173,380 @@ mod tests {
         let ok_report = readiness(&store, &readiness_payment(true)).await;
         assert_eq!(ok_report.warning, None, "a healthy idle daemon is READY");
         assert!(ok_report.federation_ok);
+    }
+
+    // lnrent-p2e: a phoenixd operator has no guardians, so a readiness failure must NOT hand them
+    // Fedimint's vocabulary — it points a stranger operator (CONTEXT.md) at a system their deployment
+    // does not contain. Drives the REAL log path and asserts what the operator actually reads,
+    // including field names.
+    #[tokio::test]
+    async fn phoenixd_readiness_failure_is_reported_in_phoenixd_terms() {
+        let store = mem_store(); // zero liabilities: a root backend failure must alarm anyway
+        let payment: Arc<dyn PaymentBackend> =
+            failing_phoenixd(PhoenixdProbe::Unreachable("connection refused".to_string()));
+
+        let (sink, guard) = capture_logs();
+        log_refund_readiness(&store, &payment).await;
+        drop(guard);
+        let lines = readiness_lines(&sink.text());
+
+        // BOTH readiness surfaces must be covered: the per-seam failure line (`log_failures`) and the
+        // root-failure ALARM — the alarm fires even at zero liabilities (urw.4).
+        assert!(
+            lines.contains(
+                "refund readiness probe failed: phoenixd returned no usable answer to an \
+                 authenticated getinfo"
+            ),
+            "the seam-failure line must name phoenixd: {lines}"
+        );
+        assert!(
+            lines.contains("refund readiness ALARM: the PHOENIXD API is not usable"),
+            "the root-failure ALARM must name phoenixd: {lines}"
+        );
+        for fedimint_word in ["federation", "guardian"] {
+            assert!(
+                !lines.to_lowercase().contains(fedimint_word),
+                "readiness spoke Fedimint ({fedimint_word}) to a phoenixd operator: {lines}"
+            );
+        }
+        // The remedy an unreachable node actually needs — and it is lnrent-5mi's own sentence, so
+        // `lnrent preflight` and this log cannot tell two different stories.
+        assert!(
+            lines.contains("`[phoenixd] url`"),
+            "the failure must name the remedy: {lines}"
+        );
+    }
+
+    // lnrent-p2e: FederationDown is not the only wrong-subsystem arm. `refund_gateway_ready` is probed
+    // BEFORE `backend_ready`, so a phoenixd node that fails the first call and answers the second is
+    // reported as GatewayUnavailable — and phoenixd has no gateway to go looking for. (The double
+    // reaches the real backend's recovery-race state directly: first seam returns the saved typed
+    // error, second seam succeeds.)
+    #[tokio::test]
+    async fn phoenixd_gateway_unavailable_is_reported_in_phoenixd_terms() {
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "PROVISIONING").await;
+        seed_invoice(&store, "sub-1", "order:sub-1", "order", 1, "PAID", Some(10), Some(10)).await;
+        let p = ReadinessPayment::new(true);
+        p.set_gateway_phoenixd_failure(PhoenixdProbe::AuthRejected { status: 401 });
+        let payment: Arc<dyn PaymentBackend> = Arc::new(p);
+
+        let report = readiness(&store, &payment).await;
+        assert_eq!(
+            report.warning,
+            Some(RefundReadinessWarning::GatewayUnavailable),
+            "precondition: this is the gateway arm, not FederationDown"
+        );
+
+        let (sink, guard) = capture_logs();
+        log_refund_readiness(&store, &payment).await;
+        drop(guard);
+        let lines = readiness_lines(&sink.text());
+
+        assert!(
+            lines.contains(
+                "refund readiness warning: cannot create invoices or pay refunds — phoenixd REJECTED \
+                 the api password"
+            ),
+            "the gateway arm must keep the consequence and let phoenixd name the cause: {lines}"
+        );
+        // The structured pair must say WHICH seam failed — the reason it is two fields and not one
+        // AND-ed `backend_ok`, which would read `false` in every arm this warning can be selected by.
+        assert!(
+            lines.contains("node_ok=true") && lines.contains("refund_pay_ok=false"),
+            "the per-seam fields must distinguish the failing call: {lines}"
+        );
+        // lnrent-5mi's remedy for a rejected credential, verbatim.
+        assert!(
+            lines.contains("`[phoenixd] api_password`"),
+            "the failure must name the remedy: {lines}"
+        );
+        for fedimint_word in ["federation", "guardian"] {
+            assert!(
+                !lines.to_lowercase().contains(fedimint_word),
+                "readiness spoke Fedimint ({fedimint_word}) to a phoenixd operator: {lines}"
+            );
+        }
+    }
+
+    // lnrent-p2e: an unverified release is the failure an operator CANNOT guess the fix for, so the
+    // report must carry the ADR-0019 remedy verbatim — and byte-identically to lnrent-5mi's preflight
+    // check, which is the other surface an operator reads for the same condition.
+    #[tokio::test]
+    async fn phoenixd_version_mismatch_readiness_carries_the_fee_schedule_remedy() {
+        let store = mem_store();
+        let probe = PhoenixdProbe::VersionMismatch {
+            running: "0.9.1".to_string(),
+            verified: "0.9.0".to_string(),
+        };
+        let preflight_detail = crate::preflight::phoenixd_check_from_probe(probe.clone())
+            .expect("a phoenixd probe renders a preflight check")
+            .detail;
+        let payment: Arc<dyn PaymentBackend> = failing_phoenixd(probe);
+
+        let (sink, guard) = capture_logs();
+        log_refund_readiness(&store, &payment).await;
+        drop(guard);
+        let lines = readiness_lines(&sink.text());
+
+        assert!(
+            lines.contains("[phoenixd] fee_schedule_version/fee_base_msat/fee_ppm"),
+            "the version-mismatch report must carry its fee-schedule remedy: {lines}"
+        );
+        assert!(
+            lines.contains(&preflight_detail),
+            "the readiness report and `lnrent preflight` must tell ONE story\n  readiness: \
+            {lines}\n  preflight: {preflight_detail}"
+        );
+        assert!(
+            lines.contains(
+                "refund readiness ALARM: automated PHOENIXD refunds are blocked by an unverified \
+                 fee schedule"
+            ),
+            "version mismatch must report its actual outbound-refund consequence: {lines}"
+        );
+        for false_consequence in ["no invoices", "payments can settle", "observe settlements"] {
+            assert!(
+                !lines.contains(false_consequence),
+                "version mismatch overstated its consequence ({false_consequence}): {lines}"
+            );
+        }
+    }
+
+    // A node can flap between the two sequential readiness calls. Keep the original credential-free
+    // HTTP cause from the failing seam instead of replacing it with a generic "may have recovered".
+    #[tokio::test]
+    async fn phoenixd_recovery_race_keeps_the_original_http_cause() {
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "PROVISIONING").await;
+        seed_invoice(&store, "sub-1", "order:sub-1", "order", 1, "PAID", Some(10), Some(10)).await;
+        let p = ReadinessPayment::new(true);
+        p.set_gateway_phoenixd_failure(PhoenixdProbe::Unreachable(
+            "phoenixd getinfo returned HTTP 502 Bad Gateway".to_string(),
+        ));
+        let payment: Arc<dyn PaymentBackend> = Arc::new(p);
+
+        let (sink, guard) = capture_logs();
+        log_refund_readiness(&store, &payment).await;
+        drop(guard);
+        let lines = readiness_lines(&sink.text());
+
+        assert!(lines.contains("HTTP 502 Bad Gateway"), "{lines}");
+        assert!(!lines.contains("may have recovered"), "{lines}");
+    }
+
+    // The probes are sequential, so a node can fail differently between calls. FederationDown is
+    // selected by the root/backend call and must describe THAT failure: otherwise a gateway-call
+    // version mismatch can make an unreachable node sound usable, or vice versa.
+    #[tokio::test]
+    async fn phoenixd_disagreeing_failures_report_the_root_backend_cause() {
+        for (gateway_probe, federation_probe, expected, rejected) in [
+            (
+                PhoenixdProbe::VersionMismatch {
+                    running: "0.9.1".to_string(),
+                    verified: "0.9.0".to_string(),
+                },
+                PhoenixdProbe::Unreachable("root getinfo connection refused".to_string()),
+                "root getinfo connection refused",
+                "automated PHOENIXD refunds are blocked",
+            ),
+            (
+                PhoenixdProbe::Unreachable("gateway getinfo connection refused".to_string()),
+                PhoenixdProbe::VersionMismatch {
+                    running: "0.9.2".to_string(),
+                    verified: "0.9.0".to_string(),
+                },
+                "phoenixd 0.9.2 is not",
+                "the PHOENIXD API is not usable",
+            ),
+        ] {
+            let store = mem_store();
+            let p = ReadinessPayment::new(true);
+            p.set_phoenixd_failures(gateway_probe, federation_probe);
+            let payment: Arc<dyn PaymentBackend> = Arc::new(p);
+
+            let (sink, guard) = capture_logs();
+            log_refund_readiness(&store, &payment).await;
+            drop(guard);
+            let lines = readiness_lines(&sink.text());
+
+            assert!(lines.contains(expected), "missing root cause in: {lines}");
+            assert!(
+                !lines.contains(rejected),
+                "gateway failure selected the wrong root impact: {lines}"
+            );
+        }
+    }
+
+    // lnrent-p2e HARD requirement: this bead is invisible to an lnv2 operator. Asserted against the
+    // literal strings (and field names) the Fedimint path logged before it.
+    #[tokio::test]
+    async fn fedimint_readiness_failure_wording_is_unchanged() {
+        let store = mem_store();
+        let p = ReadinessPayment::new(true);
+        // A Fedimint backend carries no phoenixd-typed seam failure, so it keeps the federation voice.
+        p.set_readiness_error("querying the federation session count");
+        let payment: Arc<dyn PaymentBackend> = Arc::new(p);
+
+        let (sink, guard) = capture_logs();
+        log_refund_readiness(&store, &payment).await;
+        drop(guard);
+        let logged = sink.text();
+
+        for unchanged in [
+            "refund readiness: gateway readiness query failed",
+            "refund readiness: federation liveness probe failed (guardians unreachable)",
+            "refund readiness ALARM: the FEDERATION is unreachable (guardians down / no consensus) \
+             — no invoices, payments, or refunds can settle; investigate the federation",
+            // The structured fields are part of the wording an operator/log pipeline reads.
+            "federation_ok=false",
+            "gateway_ok=false",
+            "error=querying the federation session count",
+        ] {
+            assert!(
+                logged.contains(unchanged),
+                "Fedimint readiness wording changed; missing {unchanged:?} in: {logged}"
+            );
+        }
+        assert!(
+            !logged.contains("phoenixd"),
+            "a Fedimint operator must never be told about phoenixd: {logged}"
+        );
+    }
+
+    // §13 / lnrent-5mi: the api password never reaches operator-facing output. That invariant has two
+    // halves and this test owns the SECOND one:
+    //   1. the backend projects the remote-controlled `getinfo.version` through its credential-aware
+    //      sanitizer before constructing the typed seam error — driven with a REAL password over real
+    //      HTTP by `phoenixd_backend/tests.rs::readiness_version_error_never_contains_the_api_password`
+    //      (a supervisor test cannot prove that: its double holds no credential);
+    //   2. readiness RENDERS through the same probe→text function preflight uses, which re-applies the
+    //      version grammar — so a probe whose `running` is not a measured release (the shape leaked
+    //      credential material would take) is redacted at the log, not pasted into it.
+    // The sentinel is therefore injected AS the untrusted version: if this arm ever printed the probe
+    // field directly instead of rendering it, the log would contain it and this test would fail.
+    #[tokio::test]
+    async fn phoenixd_readiness_reporting_redacts_an_untrusted_version() {
+        const SENTINEL: &str = "sup3r-secret-http-password";
+        let store = mem_store();
+        let payment: Arc<dyn PaymentBackend> =
+            failing_phoenixd(PhoenixdProbe::VersionMismatch {
+                running: format!("9.9.9-{SENTINEL}"),
+                verified: "0.9.0".to_string(),
+            });
+
+        let (sink, guard) = capture_logs();
+        log_refund_readiness(&store, &payment).await;
+        drop(guard);
+        let logged = sink.text();
+
+        assert!(
+            !logged.contains(SENTINEL),
+            "readiness reporting printed an unsanitized remote version: {logged}"
+        );
+        assert!(
+            logged.contains(REDACTED_PHOENIXD_VERSION),
+            "the redacted version must still be reported: {logged}"
+        );
+        // The operator still gets the actionable half of the sentence, not just a redaction.
+        assert!(
+            logged.contains("[phoenixd] fee_schedule_version/fee_base_msat/fee_ppm"),
+            "redaction must not cost the remedy: {logged}"
+        );
+
+        // `lnrent money` carries the same sanitized detail into its human renderer. The new
+        // presentation field must not reopen the credential leak that the log path closes.
+        let probe = RefundReadinessProbe::query(&payment).await;
+        let report = refund_readiness_report_with_probe(&store, &payment, &probe)
+            .await
+            .expect("readiness report");
+        let money = report.to_money_value(probe.gateway_ok(), probe.federation_ok());
+        let detail = money["readiness_failure_detail"]
+            .as_str()
+            .expect("phoenixd failures carry human presentation detail");
+        assert!(!detail.contains(SENTINEL), "{detail}");
+        assert!(detail.contains(REDACTED_PHOENIXD_VERSION), "{detail}");
+        assert!(
+            detail.contains("[phoenixd] fee_schedule_version/fee_base_msat/fee_ppm"),
+            "{detail}"
+        );
+    }
+
+    // lnrent-p2e durable-kind decision, option (a): the machine-readable token is UNCHANGED for BOTH
+    // backends, so an operator's `lnrent money --json` launch gate (and go-live.md) keeps reading the
+    // same value while the human wording is fixed. What THIS test asserts is exactly that: the
+    // warning token and the money-view token, on a Fedimint and a phoenixd failure alike. The
+    // "no rows to migrate, no cooldown to double-fire" half of the decision is a structural fact, not
+    // an assertion here — `alerts::AlertKind` is a closed enum with no readiness kind and
+    // `log_refund_readiness` only calls `tracing`, so no `operator.alert` row can carry this string
+    // (see `RefundReadinessWarning::as_str`). Adding a readiness alert kind later is what would need
+    // its own migration test.
+    #[tokio::test]
+    async fn readiness_warning_token_is_stable_across_backends() {
+        for (backend, phoenixd) in [
+            ("fedimint", None),
+            (
+                "phoenixd",
+                Some(PhoenixdProbe::AuthRejected { status: 401 }),
+            ),
+        ] {
+            let store = mem_store();
+            let p = ReadinessPayment::new(true);
+            if let Some(probe) = phoenixd {
+                p.set_phoenixd_failure(probe);
+            } else {
+                p.set_readiness_error("backend unusable");
+            }
+            let payment: Arc<dyn PaymentBackend> = Arc::new(p);
+
+            let probe = RefundReadinessProbe::query(&payment).await;
+            let report = refund_readiness_report_with_probe(&store, &payment, &probe)
+                .await
+                .expect("readiness report");
+
+            assert_eq!(
+                report.warning.map(RefundReadinessWarning::as_str),
+                Some("FederationDown"),
+                "the {backend} kind token must not drift"
+            );
+            let money = report.to_money_value(probe.gateway_ok(), probe.federation_ok());
+            assert_eq!(
+                money["warning"],
+                json!("FederationDown"),
+                "the {backend} money-view token must not drift"
+            );
+            if backend == "phoenixd" {
+                assert_eq!(money["readiness_failure_backend"], json!("phoenixd"));
+                assert!(
+                    money["readiness_failure_detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("`[phoenixd] api_password`")),
+                    "phoenixd human metadata reuses preflight's diagnostic and remedy: {money}"
+                );
+            } else {
+                assert!(
+                    money.get("readiness_failure_backend").is_none()
+                        && money.get("readiness_failure_detail").is_none(),
+                    "Fedimint's money reply must remain byte-identical: {money}"
+                );
+            }
+        }
+    }
+
+    // lnrent-p2e changes REPORTING, not detection: even a failing pass makes only the two readiness
+    // calls it always made. The test double's `phoenixd_probe` panics, so this also proves reporting
+    // cannot reach the doctor's `getbalance` leg.
+    #[tokio::test]
+    async fn readiness_reporting_never_calls_the_phoenixd_doctor_probe() {
+        let healthy = ReadinessPayment::new(true);
+        let payment: Arc<dyn PaymentBackend> = Arc::new(healthy);
+        let probe = RefundReadinessProbe::query(&payment).await;
+        assert!(probe.gateway_ok() && probe.federation_ok());
+
+        let down = ReadinessPayment::new(true);
+        down.set_phoenixd_failure(PhoenixdProbe::AuthRejected { status: 401 });
+        let payment: Arc<dyn PaymentBackend> = Arc::new(down);
+        let _ = RefundReadinessProbe::query(&payment).await;
     }
 
     #[tokio::test]
