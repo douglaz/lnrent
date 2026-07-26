@@ -232,6 +232,10 @@ pub struct RawPhoenixdConfig {
     pub fee_schedule_version: Option<String>,
     pub fee_base_msat: Option<u64>,
     pub fee_ppm: Option<u64>,
+    /// The explicit "I accept an UNSUPPORTED money backend" opt-in phoenixd currently REQUIRES
+    /// (lnrent-9gi). Not a feature toggle: see [`require_phoenixd_unsupported_opt_in`], which also
+    /// says when this knob is removed.
+    pub accept_unsupported: Option<bool>,
 }
 
 /// The raw, unresolved bootstrap input — exactly what a config file / flags / env / stdin provide
@@ -272,6 +276,13 @@ pub struct RawConfig {
     pub phoenixd_fee_schedule_version: Option<String>,
     pub phoenixd_fee_base_msat: Option<u64>,
     pub phoenixd_fee_ppm: Option<u64>,
+    /// The explicit opt-in `payment_backend=phoenixd` currently REQUIRES (lnrent-9gi): phoenixd is an
+    /// UNSUPPORTED, un-launch-gated money backend that nonetheless ships in every build, so without
+    /// `true` here bootstrap REFUSES to resolve a phoenixd config. Flat spelling of `[phoenixd]
+    /// accept_unsupported`; also settable from the env (`LNRENT_PHOENIXD_ACCEPT_UNSUPPORTED`), because
+    /// the operator who accepts this risk is the one running the unit, not the one writing the file.
+    /// See [`require_phoenixd_unsupported_opt_in`] for what it attests to and when it is removed.
+    pub phoenixd_accept_unsupported: Option<bool>,
     /// Documented config-file/stdin shape: `[phoenixd] url=... api_password=...` (plus the optional
     /// `fee_schedule_version`/`fee_base_msat`/`fee_ppm`). The flat fields above are the canonical
     /// merged representation used by env/CLI layers; sanitization folds this block into them before
@@ -425,6 +436,8 @@ const ENV_FEDIMINT_INVITE: &str = "LNRENT_FEDIMINT_INVITE";
 /// scrubbed from the process env after the config load consumes it (`main.rs SECRET_ENV_VARS`).
 const ENV_PHOENIXD_URL: &str = "LNRENT_PHOENIXD_URL";
 const ENV_PHOENIXD_API_PASSWORD: &str = "LNRENT_PHOENIXD_API_PASSWORD";
+/// The unsupported-backend opt-in (lnrent-9gi), the env spelling of `[phoenixd] accept_unsupported`.
+const ENV_PHOENIXD_ACCEPT_UNSUPPORTED: &str = "LNRENT_PHOENIXD_ACCEPT_UNSUPPORTED";
 const ENV_MNEMONIC: &str = "LNRENT_MNEMONIC";
 /// Optional path to a config file, an alternative to the `--config` flag.
 const ENV_CONFIG: &str = "LNRENT_CONFIG";
@@ -529,6 +542,32 @@ fn parse_min_holdings_warn_msat_env(raw: Option<String>) -> Result<Option<u64>, 
     }
 }
 
+/// Parse `LNRENT_PHOENIXD_ACCEPT_UNSUPPORTED` (lnrent-9gi) into the env layer's opt-in answer: unset
+/// or blank is `None` (this layer says nothing), and the usual boolean spellings map either way.
+///
+/// An UNRECOGNIZED value is a structured error, not a warn-and-default the way
+/// [`alerts_enabled`]'s override is: that knob only tunes whether a DM is sent, while this one gates a
+/// real money path, so an operator who typo'd `ture` must be told rather than left to discover which
+/// answer we picked for them. The value itself is never echoed (§13 habit: env values reach logs).
+fn parse_phoenixd_accept_unsupported_env(raw: Option<String>) -> Result<Option<bool>, IpcError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(Some(true)),
+        "false" | "0" | "no" | "off" => Ok(Some(false)),
+        _ => Err(config_err(format!(
+            "{ENV_PHOENIXD_ACCEPT_UNSUPPORTED} must be a boolean (`true` or `false`); it is the \
+             explicit opt-in to an UNSUPPORTED payment backend, so an unrecognized value is refused \
+             rather than read as either answer"
+        ))),
+    }
+}
+
 /// The per-pubkey inbound token-bucket capacity, from `LNRENT_INBOUND_RATE_CAPACITY` (default
 /// [`DEFAULT_INBOUND_RATE_CAPACITY`]). Read at daemon start and handed to the Nostr engine.
 pub fn inbound_rate_capacity() -> u32 {
@@ -621,6 +660,12 @@ impl RawConfig {
                     phoenixd.fee_ppm,
                 ),
             );
+        // The unsupported-backend opt-in (lnrent-9gi) is an independent boolean, not part of the
+        // fee-schedule set, so the flat spelling simply wins over the block within one layer — same
+        // shape as `phoenixd_url` / `phoenixd_api_password` above.
+        let phoenixd_accept_unsupported = self
+            .phoenixd_accept_unsupported
+            .or(phoenixd.accept_unsupported);
         let mnemonic = match self.mnemonic.take() {
             Some(mut mnemonic) if mnemonic.trim().is_empty() => {
                 mnemonic.zeroize();
@@ -647,6 +692,7 @@ impl RawConfig {
             phoenixd_fee_schedule_version,
             phoenixd_fee_base_msat,
             phoenixd_fee_ppm,
+            phoenixd_accept_unsupported,
             phoenixd: None,
             mnemonic,
             // A numeric knob has no blank/whitespace form to strip; carry it through unchanged.
@@ -693,6 +739,13 @@ impl RawConfig {
             phoenixd_fee_schedule_version,
             phoenixd_fee_base_msat,
             phoenixd_fee_ppm,
+            // lnrent-9gi: a layer that says nothing about the opt-in inherits the lower layer's
+            // answer, so an operator can keep the acceptance in their config file and still restart
+            // from env alone — but NO layer saying `true` means refuse (`unwrap_or(false)` in the
+            // guard), which is the direction that fails closed.
+            phoenixd_accept_unsupported: self
+                .phoenixd_accept_unsupported
+                .or(lower.phoenixd_accept_unsupported),
             // Every source layer was canonicalized by `sanitized`, so nested blocks never survive
             // into the merged value.
             phoenixd: None,
@@ -775,6 +828,12 @@ fn raw_config_from_env(get: impl Fn(&str) -> Option<String>) -> Result<RawConfig
         phoenixd_fee_schedule_version: None,
         phoenixd_fee_base_msat: None,
         phoenixd_fee_ppm: None,
+        // The unsupported-backend opt-in DOES have an env spelling (lnrent-9gi): unlike the verified
+        // fee schedule it is a statement about accepting risk on THIS run, which is exactly the kind
+        // of thing an operator sets in the unit file that starts the daemon.
+        phoenixd_accept_unsupported: parse_phoenixd_accept_unsupported_env(get(
+            ENV_PHOENIXD_ACCEPT_UNSUPPORTED,
+        ))?,
         phoenixd: None,
         mnemonic: get(ENV_MNEMONIC),
         min_holdings_warn_msat: parse_min_holdings_warn_msat_env(get(ENV_MIN_HOLDINGS_WARN_MSAT))?,
@@ -1255,10 +1314,58 @@ fn supplied_fedimint_config(raw: &RawConfig) -> Option<FedimintConfig> {
     non_empty(raw.fedimint_invite.as_deref()).map(|invite| FedimintConfig { invite })
 }
 
+/// TEMPORARY launch guard (lnrent-9gi): refuse a phoenixd money path unless the operator EXPLICITLY
+/// accepted that it is unsupported.
+///
+/// phoenixd has no cargo feature and is compiled into every build (`main.rs`), so a build flag keeps
+/// no real money off it: without this refusal the only thing between a stranger-operator and a live
+/// phoenixd money path is a paragraph in `docs/go-live.md`, which a stranger may never read or may
+/// read stale. The knob (`[phoenixd] accept_unsupported = true`, its flat spelling, or
+/// [`ENV_PHOENIXD_ACCEPT_UNSUPPORTED`]) is deliberately NOT named like a feature switch: it attests
+/// "I accept an UNSUPPORTED, un-launch-gated money backend", never "enable phoenixd".
+///
+/// Called from [`supplied_phoenixd_config`] — the ONE place a [`PhoenixdConfig`] is constructed — so
+/// every route to a phoenixd money path is covered, including a re-bootstrap that omits
+/// `payment_backend` and INHERITS the stored `phoenixd` row (that route bypasses `resolve_config`'s
+/// phoenixd arm entirely). It is also why the refusal lands before anything is persisted: the operator
+/// row is committed later in [`bootstrap`], so a refused start leaves no durable
+/// `payment_backend='phoenixd'` to `config_conflict` a subsequent `mock`/`fedimint` retry — the same
+/// reasoning as `main.rs`'s pre-bootstrap refusal of `fedimint` in a no-feature build.
+///
+/// REMOVAL: this guard, its knob, and the `main.rs` start-time warning come out in lnrent-ehu's
+/// documentation pass, AFTER lnrent-tof's full-daemon phoenixd staging acceptance passes and the
+/// go-live runbook covers phoenixd for real. It is a launch gate with an expiry date, NOT a permanent
+/// feature flag: do not delete it early, and do not build behavior on top of it.
+fn require_phoenixd_unsupported_opt_in(raw: &RawConfig) -> Result<(), IpcError> {
+    let opted_in = raw
+        .phoenixd_accept_unsupported
+        .or_else(|| raw.phoenixd.as_ref().and_then(|p| p.accept_unsupported))
+        .unwrap_or(false);
+    if opted_in {
+        return Ok(());
+    }
+    // Names the open gates by bead id so the refusal is actionable without the runbook, and echoes
+    // NOTHING the operator supplied (the api password is one field over; §13).
+    Err(config_err(format!(
+        "payment_backend=phoenixd is NOT a supported go-live backend yet — its launch gates are \
+         still open: lnrent-kr1 (the phoenixd wallet lives under phoenixd's OWN seed; a seed-only \
+         restore is UNPROVEN and `lnrentd backup` does not back those funds up), lnrent-itw (the \
+         fee-credit liability exclusion is measured only at wallet level, so booked liability can \
+         exceed spendable funds), lnrent-5mi (no phoenixd preflight/doctor probe: an unreachable node \
+         or an unverified release surfaces only when a payment stalls). Full-daemon staging acceptance \
+         is lnrent-tof; read docs/go-live.md before going further. To run phoenixd anyway — a staging \
+         acceptance, or accepting those risks as your own — opt in explicitly with `[phoenixd] \
+         accept_unsupported = true` (or {ENV_PHOENIXD_ACCEPT_UNSUPPORTED}=true)"
+    )))
+}
+
 /// The phoenixd config supplied in this run (flags/env/file/stdin). Both fields are REQUIRED —
 /// lnrent cannot reach an external phoenixd without a url, and cannot authenticate without the
 /// password — and the url is transport-validated ([`validate_phoenixd_url`]).
 fn supplied_phoenixd_config(raw: &RawConfig) -> Result<PhoenixdConfig, IpcError> {
+    // FAIL CLOSED FIRST (lnrent-9gi): an operator who has not accepted the unsupported backend hears
+    // that, not a lecture about a missing url — and no phoenixd credential is read at all.
+    require_phoenixd_unsupported_opt_in(raw)?;
     let url = non_empty(raw.phoenixd_url.as_deref())
         .or_else(|| raw.phoenixd.as_ref().and_then(|p| non_empty(p.url.as_deref())))
         .ok_or_else(|| {
@@ -3671,11 +3778,14 @@ mod tests {
 
     // ---- phoenixd (lnrent-xk3) ---------------------------------------------------------------
 
+    // Every phoenixd fixture carries the unsupported-backend opt-in (lnrent-9gi) because WITHOUT it
+    // nothing about phoenixd resolves at all — that refusal is the subject of its own tests below.
     fn phoenixd_raw(url: &str) -> RawConfig {
         RawConfig {
             payment_backend: Some("phoenixd".into()),
             phoenixd_url: Some(url.into()),
             phoenixd_api_password: Some("hunter2".into()),
+            phoenixd_accept_unsupported: Some(true),
             ..Default::default()
         }
     }
@@ -3731,6 +3841,7 @@ mod tests {
                 [phoenixd]
                 url = "http://127.0.0.1:9740"
                 api_password = "block-secret"
+                accept_unsupported = true
             "#,
         )
         .expect("[phoenixd] is the documented config-file shape");
@@ -3754,6 +3865,7 @@ mod tests {
                 [phoenixd]
                 url = "http://127.0.0.1:9740"
                 api_password = "block-secret"
+                accept_unsupported = true
                 fee_schedule_version = "0.9.1"
                 fee_base_msat = 5000
                 fee_ppm = 6000
@@ -3808,6 +3920,7 @@ mod tests {
                 [phoenixd]
                 url = "http://127.0.0.1:9740"
                 api_password = "block-secret"
+                accept_unsupported = true
                 {partial}
             "#
             ))
@@ -3895,6 +4008,261 @@ mod tests {
         assert!(debug.contains("<redacted>"));
     }
 
+    // ---- the unsupported-backend launch guard (lnrent-9gi) -------------------------------------
+    //
+    // phoenixd ships in EVERY build (no cargo feature), so this refusal — not a paragraph in
+    // docs/go-live.md — is what keeps a stranger-operator's real money off an un-launch-gated
+    // backend. Removed with the guard by lnrent-ehu, after lnrent-tof passes.
+
+    // The refusal must be ACTIONABLE without the runbook: it names each open gate by bead id so an
+    // operator can look up exactly what they would be accepting, and names the opt-in to clear it.
+    #[test]
+    fn phoenixd_without_the_unsupported_opt_in_is_refused_naming_the_open_gates() {
+        for (label, opt_in) in [("an absent", None), ("an explicitly false", Some(false))] {
+            let mut raw = phoenixd_raw("https://phoenixd.example.com");
+            raw.phoenixd_accept_unsupported = opt_in;
+            let err = match resolve_config(&raw) {
+                Ok(_) => panic!("{label} opt-in must refuse a phoenixd money path"),
+                Err(e) => e,
+            };
+            assert_eq!(err.code, "config_invalid");
+            assert!(!err.retryable);
+            for expected in [
+                "lnrent-kr1",
+                "lnrent-itw",
+                "lnrent-5mi",
+                "lnrent-tof",
+                "docs/go-live.md",
+                "accept_unsupported",
+                ENV_PHOENIXD_ACCEPT_UNSUPPORTED,
+            ] {
+                assert!(
+                    err.message.contains(expected),
+                    "{label} refusal must mention `{expected}`: {}",
+                    err.message
+                );
+            }
+        }
+    }
+
+    // The `[phoenixd]` block spelling of the opt-in is the documented one, and a block that says
+    // `false` is refused just like silence — the guard reads BOTH spellings on the raw layer (which is
+    // what `resolve_config` sees before sanitization folds the block into the flat fields).
+    #[test]
+    fn phoenixd_block_opt_in_is_honored_in_both_directions() {
+        let doc = |accept: bool| {
+            format!(
+                r#"
+                payment_backend = "phoenixd"
+
+                [phoenixd]
+                url = "http://127.0.0.1:9740"
+                api_password = "block-secret"
+                accept_unsupported = {accept}
+            "#
+            )
+        };
+        let accepted: RawConfig = toml::from_str(&doc(true)).expect("parses");
+        assert!(resolve_config(&accepted)
+            .expect("an explicit block opt-in starts")
+            .phoenixd
+            .is_some());
+        // ...and it survives the fold into the flat fields the bootstrap path actually merges.
+        assert!(resolve_config(&accepted.clone().sanitized())
+            .expect("the folded layer resolves")
+            .phoenixd
+            .is_some());
+
+        let refused: RawConfig = toml::from_str(&doc(false)).expect("parses");
+        for raw in [refused.clone(), refused.sanitized()] {
+            let err = resolve_config(&raw).expect_err("`accept_unsupported = false` is a refusal");
+            assert!(err.message.contains("lnrent-tof"), "{}", err.message);
+        }
+    }
+
+    // §13: the refusal fires while the api password is one field away, so assert it never lands in the
+    // error text — the same contract the `Debug` redaction test above holds the ready config to.
+    #[test]
+    fn phoenixd_refusal_never_echoes_the_api_password() {
+        let mut flat = phoenixd_raw("https://phoenixd.example.com");
+        flat.phoenixd_accept_unsupported = None;
+        let block: RawConfig = toml::from_str(
+            r#"
+                payment_backend = "phoenixd"
+
+                [phoenixd]
+                url = "http://127.0.0.1:9740"
+                api_password = "hunter2"
+            "#,
+        )
+        .expect("parses");
+        for raw in [flat, block] {
+            let err = resolve_config(&raw).expect_err("no opt-in => refused");
+            assert!(
+                !err.message.contains("hunter2"),
+                "the refusal leaked the phoenixd api password: {}",
+                err.message
+            );
+        }
+        // The env-layer parse error is on the same footing: it reports the VAR, never the value.
+        // (`RawConfig` has no `Debug` — it holds secrets — so `expect_err` won't compile here.)
+        let err = match raw_config_from_env(|k| match k {
+            ENV_PHOENIXD_ACCEPT_UNSUPPORTED => Some("hunter2".into()),
+            _ => None,
+        }) {
+            Ok(_) => panic!("a non-boolean opt-in must be refused, not guessed"),
+            Err(e) => e,
+        };
+        assert!(!err.message.contains("hunter2"), "{}", err.message);
+        assert!(err.message.contains(ENV_PHOENIXD_ACCEPT_UNSUPPORTED));
+    }
+
+    // The env spelling exists because the operator who accepts this risk is the one running the unit.
+    #[test]
+    fn phoenixd_opt_in_env_var_parses_booleans() {
+        for (value, expected) in [
+            ("true", Some(true)),
+            ("YES", Some(true)),
+            ("1", Some(true)),
+            ("false", Some(false)),
+            ("off", Some(false)),
+            ("   ", None),
+        ] {
+            let env = raw_config_from_env(|k| match k {
+                ENV_PHOENIXD_ACCEPT_UNSUPPORTED => Some(value.into()),
+                _ => None,
+            })
+            .unwrap_or_else(|e| panic!("`{value}` must parse: {}", e.message));
+            assert_eq!(env.phoenixd_accept_unsupported, expected, "value `{value}`");
+        }
+
+        // env-only opt-in + file-supplied credentials is the documented split (secret out of argv,
+        // acceptance in the unit) — it must resolve through the real merge.
+        let env = raw_config_from_env(|k| match k {
+            ENV_PHOENIXD_ACCEPT_UNSUPPORTED => Some("true".into()),
+            _ => None,
+        })
+        .unwrap();
+        let file = parse_raw_config_doc(
+            r#"
+                payment_backend = "phoenixd"
+
+                [phoenixd]
+                url = "http://127.0.0.1:9740"
+                api_password = "block-secret"
+            "#,
+            "test file",
+        )
+        .unwrap();
+        let merged = RawConfig::from_sources(RawConfig::default(), env, file, RawConfig::default());
+        assert!(resolve_config(&merged)
+            .expect("env opt-in + file credentials resolve")
+            .phoenixd
+            .is_some());
+    }
+
+    // Fail closed BEFORE anything durable is written: a refused phoenixd start must leave no
+    // `payment_backend='phoenixd'` operator row, or the operator who reads the refusal and falls back
+    // to `mock` would hit a `config_conflict` on a data dir they cannot un-pin (the same brick
+    // `main.rs` avoids by rejecting `fedimint` ahead of bootstrap in a no-feature build).
+    #[tokio::test]
+    async fn refused_phoenixd_persists_nothing_and_leaves_mock_bootstrappable() {
+        let dir = temp_data_dir();
+        let store = mem_store();
+        let mut raw = phoenixd_raw("https://phoenixd.example.com");
+        raw.phoenixd_accept_unsupported = None;
+        raw.data_dir = Some(dir.to_string_lossy().into_owned());
+        raw.mnemonic = Some(TEST_MNEMONIC.into());
+        let err = err_of(bootstrap(raw, &store).await);
+        assert!(err.message.contains("lnrent-kr1"), "{}", err.message);
+
+        let rows: i64 = store
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM operator", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "a refused phoenixd start must persist no operator row"
+        );
+
+        let op = bootstrap(raw_mock(&dir), &store)
+            .await
+            .expect("falling back to mock after the refusal must not be bricked");
+        assert_eq!(op.config.payment_backend, PaymentMode::Mock);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // The guard sits at the ONE place a `PhoenixdConfig` is built, so it also covers the route that
+    // never reaches `resolve_config`'s phoenixd arm: a re-bootstrap that omits `payment_backend` and
+    // INHERITS the stored `phoenixd` row. The acceptance must be in force on EVERY start, exactly like
+    // the url/password (neither is durable), not just the one that first bootstrapped.
+    #[tokio::test]
+    async fn inherited_phoenixd_still_requires_the_opt_in_on_every_start() {
+        let dir = temp_data_dir();
+        let store = mem_store();
+        let mut first = phoenixd_raw("http://127.0.0.1:9740");
+        first.data_dir = Some(dir.to_string_lossy().into_owned());
+        first.mnemonic = Some(TEST_MNEMONIC.into());
+        bootstrap(first, &store).await.expect("first bootstrap");
+
+        // Credentials supplied, acceptance dropped (e.g. the env var missing from a new unit file).
+        let restart = RawConfig {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            phoenixd_url: Some("http://127.0.0.1:9740".into()),
+            phoenixd_api_password: Some("hunter2".into()),
+            ..Default::default()
+        };
+        let err = err_of(bootstrap(restart, &store).await);
+        assert!(
+            err.message.contains("lnrent-kr1") && err.message.contains("accept_unsupported"),
+            "an inherited phoenixd backend must re-refuse without the opt-in: {}",
+            err.message
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // REGRESSION: the guard is the phoenixd arm ONLY. `mock` (the default) and `fedimint` must resolve
+    // with no opt-in anywhere — including when a stale `accept_unsupported` is left in the config.
+    #[test]
+    fn mock_and_fedimint_are_unaffected_by_the_phoenixd_guard() {
+        let mock = RawConfig::default();
+        assert_eq!(
+            resolve_config(&mock)
+                .expect("mock is the default")
+                .payment_backend,
+            PaymentMode::Mock
+        );
+
+        let fedimint = RawConfig {
+            payment_backend: Some("fedimint".into()),
+            fedimint_invite: Some("fed11invite".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_config(&fedimint)
+                .expect("fedimint needs no phoenixd opt-in")
+                .payment_backend,
+            PaymentMode::Fedimint
+        );
+
+        // A leftover phoenixd block on a non-phoenixd backend is ignored, like every other stray
+        // backend field (`resolve_config`'s mock/fedimint arms).
+        let stale: RawConfig = toml::from_str(
+            r#"
+                payment_backend = "mock"
+
+                [phoenixd]
+                url = "http://127.0.0.1:9740"
+                api_password = "block-secret"
+                accept_unsupported = false
+            "#,
+        )
+        .expect("parses");
+        let cfg = resolve_config(&stale).expect("a stray phoenixd block never gates mock");
+        assert_eq!(cfg.payment_backend, PaymentMode::Mock);
+        assert!(cfg.phoenixd.is_none());
+    }
+
     #[tokio::test]
     async fn phoenixd_bootstraps_and_is_pinned_against_a_silent_backend_change() {
         let dir = temp_data_dir();
@@ -3932,8 +4300,11 @@ mod tests {
         raw.mnemonic = Some(TEST_MNEMONIC.into());
         bootstrap(raw, &store).await.expect("first bootstrap");
 
+        // Still opted in (lnrent-9gi) but supplying no credentials: the url/password requirement is
+        // what this test is about, and it must survive the opt-in guard sitting in front of it.
         let bare = RawConfig {
             data_dir: Some(dir.to_string_lossy().into_owned()),
+            phoenixd_accept_unsupported: Some(true),
             ..Default::default()
         };
         let err = match bootstrap(bare, &store).await {
@@ -3946,6 +4317,7 @@ mod tests {
             data_dir: Some(dir.to_string_lossy().into_owned()),
             phoenixd_url: Some("http://127.0.0.1:9740".into()),
             phoenixd_api_password: Some("hunter2".into()),
+            phoenixd_accept_unsupported: Some(true),
             ..Default::default()
         };
         let op = bootstrap(inherited, &store).await.expect("re-bootstrap");
@@ -3967,6 +4339,7 @@ mod tests {
         let invalid_reload = RawConfig {
             data_dir: Some(dir.to_string_lossy().into_owned()),
             relays: Some(vec!["wss://must-not-commit.example".into()]),
+            phoenixd_accept_unsupported: Some(true),
             ..Default::default()
         };
         let err = match bootstrap(invalid_reload, &store).await {
@@ -4282,6 +4655,9 @@ mod tests {
             phoenixd_url: Some("http://127.0.0.1:9740".into()),
             phoenixd_api_password: Some("pw".into()),
             payment_backend: Some("phoenixd".into()),
+            // The unsupported-backend opt-in (lnrent-9gi) is upstream of every phoenixd validation, so
+            // a fee-schedule assertion has to clear it to reach the schedule check at all.
+            phoenixd_accept_unsupported: Some(true),
             ..merged
         };
         assert!(
