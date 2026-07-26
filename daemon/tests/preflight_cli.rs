@@ -7,7 +7,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use lnrentd::backends::{
-    Invoice, Lnv2Probe, MockPayment, PayStatus, PaymentBackend, PaymentStatus, Settlement,
+    Invoice, Lnv2Probe, MockPayment, PayStatus, PaymentBackend, PaymentStatus, PhoenixdProbe,
+    Settlement,
 };
 use lnrentd::clock::{Clock, TestClock};
 use lnrentd::ipc;
@@ -123,6 +124,47 @@ impl PaymentBackend for Lnv2ProbePayment {
     }
 }
 
+/// A phoenixd operator's backend: only the phoenixd doctor probe applies. The Fedimint-only seams
+/// panic so this fixture also proves preflight neither calls them nor reports them as real probes.
+struct PhoenixdProbePayment(PhoenixdProbe);
+
+#[async_trait]
+impl PaymentBackend for PhoenixdProbePayment {
+    async fn create_invoice(&self, _: u64, _: &str, _: u32, _: &str) -> Result<Invoice> {
+        panic!("preflight must not create invoices")
+    }
+    async fn lookup(&self, _: &str) -> Result<PaymentStatus> {
+        panic!("preflight must not look up invoices")
+    }
+    async fn lookup_settlement(&self, _: &str) -> Result<(PaymentStatus, Option<i64>)> {
+        panic!("preflight must not look up settlements")
+    }
+    async fn pay(&self, _: &str, _: u64, _: &str) -> Result<String> {
+        panic!("preflight must not pay")
+    }
+    async fn payment_status(&self, _: &str) -> Result<PayStatus> {
+        panic!("preflight must not check payment status")
+    }
+    async fn payment_status_by_key(&self, _: &str) -> Result<PayStatus> {
+        panic!("preflight must not check payment status by key")
+    }
+    async fn refund_gateway_ready(&self) -> Result<bool> {
+        panic!("phoenixd has no refund gateway probe")
+    }
+    async fn backend_ready(&self) -> Result<bool> {
+        panic!("phoenixd has no federation guardians")
+    }
+    async fn lnv2_functional_probe(&self) -> Result<Lnv2Probe> {
+        panic!("phoenixd has no lnv2 money path")
+    }
+    async fn phoenixd_probe(&self) -> Result<PhoenixdProbe> {
+        Ok(self.0.clone())
+    }
+    async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+        panic!("preflight must not watch settlements")
+    }
+}
+
 /// Serve a real IPC socket over `payment`, run `lnrent <args...>` against it, and return the
 /// process output (the money-test pattern, parameterized on the backend).
 async fn run_cli(
@@ -223,11 +265,21 @@ async fn json_preflight_all_ok_round_trips_with_stable_shape() {
         assert_eq!(c["ok"], serde_json::json!(true));
     }
     assert!(
-        checks[2]["detail"].as_str().unwrap().contains("skipped"),
+        find_check(&v["data"], "lnv2")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("skipped"),
         "MockPayment has no lnv2 money path, so the lnv2 check is SKIPPED"
     );
     assert!(
-        checks[3]["detail"].as_str().unwrap().contains("skipped"),
+        checks.iter().all(|check| check["name"] != "phoenixd"),
+        "MockPayment omits the backend-conditional phoenixd check"
+    );
+    assert!(
+        find_check(&v["data"], "provider_token")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("skipped"),
         "no recipe declares DO_TOKEN here, so the provider-token check is SKIPPED"
     );
 }
@@ -356,4 +408,77 @@ async fn lnv2_probe_matrix_has_human_json_diagnostics_and_exit_codes() {
             "{name} JSON diagnostic: {lnv2}"
         );
     }
+}
+
+// The phoenixd operator's doctor through the REAL executable boundary (lnrent-5mi): a rejected api
+// password FAILS the launch gate (exit 1) with its own remedy, and a healthy node PASSES while still
+// surfacing a non-zero `feeCreditSat` — money `receivedSat` counted that `balanceSat` cannot spend.
+#[tokio::test]
+async fn phoenixd_probe_gates_the_exit_code_and_surfaces_fee_credit() {
+    let rejected = run_cli(
+        "px-auth",
+        Arc::new(PhoenixdProbePayment(PhoenixdProbe::AuthRejected {
+            status: 401,
+        })),
+        &["--json", "doctor"],
+    )
+    .await;
+    assert_eq!(
+        rejected.status.code(),
+        Some(1),
+        "a rejected api password must fail the gate: stderr={}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let v: Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    let check = find_check(&v["data"], "phoenixd");
+    assert_eq!(check["ok"], serde_json::json!(false));
+    let detail = check["detail"].as_str().unwrap();
+    assert!(detail.contains("REJECTED the api password"), "{detail}");
+    assert!(detail.contains("401"), "{detail}");
+    for name in ["gateway", "federation", "lnv2"] {
+        let skipped = find_check(&v["data"], name);
+        assert_eq!(skipped["ok"], serde_json::json!(true));
+        assert!(
+            skipped["detail"].as_str().unwrap().contains("skipped"),
+            "phoenixd must not run the Fedimint-only {name} probe: {skipped}"
+        );
+    }
+
+    let healthy = run_cli(
+        "px-ok",
+        Arc::new(PhoenixdProbePayment(PhoenixdProbe::Ready {
+            version: "0.9.0-a1b2c3d".into(),
+            verified_version: "0.9.0".into(),
+            balance_sat: 50_000,
+            fee_credit_sat: 2_723,
+        })),
+        &["--json", "doctor"],
+    )
+    .await;
+    assert!(
+        healthy.status.success(),
+        "a healthy phoenixd node passes the gate, fee credit and all: stderr={}",
+        String::from_utf8_lossy(&healthy.stderr)
+    );
+    let v: Value = serde_json::from_slice(&healthy.stdout).unwrap();
+    let check = find_check(&v["data"], "phoenixd");
+    assert_eq!(check["ok"], serde_json::json!(true));
+    let detail = check["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("0.9.0-a1b2c3d"),
+        "names the version: {detail}"
+    );
+    assert!(
+        detail.contains("2723") && detail.contains("NOT spendable"),
+        "the non-spendable fee credit is surfaced: {detail}"
+    );
+}
+
+fn find_check<'a>(data: &'a Value, name: &str) -> &'a Value {
+    data["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|check| check["name"] == name)
+        .unwrap_or_else(|| panic!("{name} check present"))
 }

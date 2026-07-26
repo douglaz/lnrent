@@ -323,6 +323,11 @@ async fn run_preflight(sock: &str, as_json: bool) -> ExitCode {
 /// (forward-compatible) but must each pass. `recipe_preflight` is required (lnrent-1sr): a current
 /// daemon always emits it once a recipe is loaded (SKIP when the recipe declares no preflight hook),
 /// so an older daemon that omits it — silently dropping the provisioning-param guard — must fail here.
+///
+/// `phoenixd` is deliberately NOT listed (lnrent-5mi): that check is emitted only for a phoenixd
+/// backend, so globally requiring it would make every matching mock/Fedimint daemon fail. When it is
+/// present, `every_check_passes` below still gates it; version-skew cannot be detected from a report
+/// that intentionally carries no backend discriminator.
 const PREFLIGHT_REQUIRED_CHECKS: [&str; 5] = [
     "gateway",
     "federation",
@@ -611,20 +616,60 @@ mod tests {
             }))
         };
         assert!(!preflight_checks_failed(&full_pass(&[
-            "gateway", "federation", "lnv2", "provider_token", "recipe_preflight",
+            "gateway",
+            "federation",
+            "lnv2",
+            "provider_token",
+            "recipe_preflight",
         ])));
         // A report MISSING a required check (here: lnv2) fails closed, even all-passing.
         assert!(preflight_checks_failed(&full_pass(&[
-            "gateway", "federation", "provider_token", "recipe_preflight",
+            "gateway",
+            "federation",
+            "provider_token",
+            "recipe_preflight",
         ])));
         // lnrent-1sr: a report missing recipe_preflight (a version-skewed pre-1sr daemon) fails
         // closed — the provisioning-param guard must not silently vanish.
         assert!(preflight_checks_failed(&full_pass(&[
-            "gateway", "federation", "lnv2", "provider_token",
+            "gateway",
+            "federation",
+            "lnv2",
+            "provider_token",
         ])));
+        // lnrent-5mi: `phoenixd` is backend-conditional, so a mock/Fedimint report that OMITS it is
+        // structurally valid — that is the first assertion above, and it is why the name cannot join
+        // PREFLIGHT_REQUIRED_CHECKS. A phoenixd operator's report carries it as an extra passing check.
+        assert!(!preflight_checks_failed(&full_pass(&[
+            "gateway",
+            "federation",
+            "lnv2",
+            "provider_token",
+            "recipe_preflight",
+            "phoenixd",
+        ])));
+        // …and when it is PRESENT and failing, the every-check gate must trip even though the name is
+        // not required — including against a daemon that contradicts itself with `ok: true`, since
+        // that is the whole reason the CLI re-derives the verdict from the checks.
+        assert!(preflight_checks_failed(&Reply::ok(json!({
+            "ok": true,
+            "checks": [
+                {"name": "gateway", "ok": true, "detail": "skipped (phoenixd backend)"},
+                {"name": "federation", "ok": true, "detail": "skipped (phoenixd backend)"},
+                {"name": "lnv2", "ok": true, "detail": "skipped (phoenixd backend)"},
+                {"name": "phoenixd", "ok": false, "detail": "REJECTED the api password"},
+                {"name": "provider_token", "ok": true, "detail": "ok"},
+                {"name": "recipe_preflight", "ok": true, "detail": "ok"},
+            ],
+        }))));
         // Forward-compatible: an EXTRA (unknown) passing check is accepted.
         assert!(!preflight_checks_failed(&full_pass(&[
-            "gateway", "federation", "lnv2", "provider_token", "recipe_preflight", "future_check",
+            "gateway",
+            "federation",
+            "lnv2",
+            "provider_token",
+            "recipe_preflight",
+            "future_check",
         ])));
 
         let fail = Reply::ok(json!({

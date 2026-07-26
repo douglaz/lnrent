@@ -38,6 +38,11 @@ struct FakeState {
     node_version: String,
     /// `getinfo.nodeId` — the WALLET identity a `PREPARED` attempt is pinned to.
     node_id: String,
+    /// Scripted non-2xx statuses for `GET /getinfo` / `GET /getbalance`, delivered as the TYPED error
+    /// the real HTTP layer returns — so the doctor probe's status classification is exercised with no
+    /// socket (`node_ok = false` remains the transport-failure shape).
+    node_info_status: Option<u16>,
+    balance_status: Option<u16>,
     next_id: u64,
     create_amount_override: Option<u64>,
     /// Force createinvoice to return a bolt11 that DISAGREES with its own paymentHash side-field.
@@ -117,6 +122,14 @@ impl FakePhoenixdOps {
 
     fn set_node_version(&self, version: &str) {
         self.st.lock().unwrap().node_version = version.to_string();
+    }
+
+    fn fail_node_info_with_status(&self, status: u16) {
+        self.st.lock().unwrap().node_info_status = Some(status);
+    }
+
+    fn fail_balance_with_status(&self, status: u16) {
+        self.st.lock().unwrap().balance_status = Some(status);
     }
 
     /// Model the operator repointing `phoenixd_url` at a DIFFERENT phoenixd wallet (or restoring
@@ -227,7 +240,11 @@ impl PhoenixdOps for FakePhoenixdOps {
     }
 
     async fn balance(&self) -> Result<PhoenixdBalance> {
-        let (balance_sat, fee_credit_sat) = self.st.lock().unwrap().balance;
+        let st = self.st.lock().unwrap();
+        if let Some(status) = st.balance_status {
+            return Err(scripted_http_error("getbalance", status));
+        }
+        let (balance_sat, fee_credit_sat) = st.balance;
         Ok(PhoenixdBalance {
             balance_sat,
             fee_credit_sat,
@@ -236,6 +253,9 @@ impl PhoenixdOps for FakePhoenixdOps {
 
     async fn node_info(&self) -> Result<PhoenixdNodeInfo> {
         let st = self.st.lock().unwrap();
+        if let Some(status) = st.node_info_status {
+            return Err(scripted_http_error("getinfo", status));
+        }
         if st.node_ok {
             Ok(PhoenixdNodeInfo {
                 node_id: st.node_id.clone(),
@@ -245,6 +265,15 @@ impl PhoenixdOps for FakePhoenixdOps {
             Err(anyhow!("phoenixd unreachable"))
         }
     }
+}
+
+/// The EXACT error the real HTTP layer returns for a non-2xx answer (same type, same rendered text),
+/// so a fake-driven test proves the same classification a live node's response would.
+fn scripted_http_error(what: &str, status: u16) -> anyhow::Error {
+    let status_text = reqwest::StatusCode::from_u16(status)
+        .expect("a valid HTTP status")
+        .to_string();
+    PhoenixdHttpError::new(what, status, status_text).into()
 }
 
 // --------------------------------------------------------------------------------------------------
@@ -1617,10 +1646,141 @@ async fn incompatible_version_refuses_a_new_pay_before_prepared_or_post() {
 }
 
 // --------------------------------------------------------------------------------------------------
+// Operator doctor probe (lnrent-5mi)
+// --------------------------------------------------------------------------------------------------
+
+// The probe answers the two conditions the money path fails CLOSED on, as SEPARATE operator states
+// instead of one Err string: reachable+authenticated, and running the verified release. Healthy node
+// -> Ready, carrying the version the doctor prints and phoenixd's `feeCreditSat`.
+#[tokio::test]
+async fn the_probe_reports_a_healthy_node_ready_with_its_version_and_fee_credit() {
+    let ops = FakePhoenixdOps::new();
+    ops.set_balance(50_000, 2_723);
+    let be = backend(ops.clone(), TestClock::new(1_000));
+
+    let probe = be.phoenixd_probe().await.unwrap();
+    assert_eq!(
+        probe,
+        PhoenixdProbe::Ready {
+            version: FeeSchedule::default().verified_version.clone(),
+            verified_version: FeeSchedule::default().verified_version.clone(),
+            balance_sat: 50_000,
+            fee_credit_sat: 2_723,
+        }
+    );
+}
+
+// MEASURED 2026-07-25: a live node reports `getinfo.version` WITH a build suffix
+// ("0.9.0-b072567") while the schedule pins the RELEASE ("0.9.0"). The suffix is the git hash
+// directly, so its leading `b` is not a marker and another build can start with any hex digit. The
+// probe must reuse the money path's predicate, not an exact-equality compare — which would fail the
+// doctor on the very node the schedule was verified against (and disagree with a money path that
+// pays happily) — and must preserve either hash shape for the operator report.
+#[tokio::test]
+async fn the_probe_accepts_the_build_suffixed_version_the_money_path_accepts() {
+    for running_version in ["0.9.0-b072567", "0.9.0-a1b2c3d"] {
+        let ops = FakePhoenixdOps::new();
+        ops.set_node_version(running_version);
+        let be = backend(ops.clone(), TestClock::new(1_000));
+
+        assert!(
+            matches!(
+                be.phoenixd_probe().await.unwrap(),
+                PhoenixdProbe::Ready { ref version, .. } if version == running_version
+            ),
+            "a build-suffixed 0.9.0 node is the verified release and its git hash stays visible"
+        );
+        assert!(
+            be.backend_ready().await.unwrap(),
+            "…and the money path agrees, which is the point of sharing the predicate"
+        );
+    }
+}
+
+// An unverified release: the doctor reports the MISMATCH (both versions) rather than an unreachable
+// node, and the money path refuses the same node — one predicate, two surfaces.
+#[tokio::test]
+async fn the_probe_reports_an_unverified_release_as_a_version_mismatch() {
+    let ops = FakePhoenixdOps::new();
+    ops.set_node_version("0.10.0-bdeadbee");
+    let be = backend(ops.clone(), TestClock::new(1_000));
+
+    assert_eq!(
+        be.phoenixd_probe().await.unwrap(),
+        PhoenixdProbe::VersionMismatch {
+            running: "0.10.0-bdeadbee".to_string(),
+            verified: FeeSchedule::default().verified_version.clone(),
+        }
+    );
+    assert!(be.backend_ready().await.is_err());
+}
+
+// A node that never answers is UNREACHABLE, carrying the diagnostic — distinct from a node that
+// answered and rejected the credentials.
+#[tokio::test]
+async fn the_probe_reports_a_dead_node_as_unreachable() {
+    let ops = FakePhoenixdOps::new();
+    ops.st.lock().unwrap().node_ok = false;
+    let be = backend(ops.clone(), TestClock::new(1_000));
+
+    match be.phoenixd_probe().await.unwrap() {
+        PhoenixdProbe::Unreachable(e) => assert!(e.contains("phoenixd unreachable"), "{e}"),
+        other => panic!("expected Unreachable, got {other:?}"),
+    }
+}
+
+// A REJECTED api password is its own operator remedy, so the probe reads the STATUS CODE (401 from
+// phoenixd itself, 403 from a fronting proxy on the https deployment shape) rather than guessing from
+// the message. Any other non-2xx stays unreachable-shaped: it is not an authentication answer.
+#[tokio::test]
+async fn the_probe_distinguishes_a_rejected_password_from_an_unreachable_node() {
+    for (status, expected) in [
+        (401u16, Some(401u16)),
+        (403, Some(403)),
+        (500, None),
+        (404, None),
+    ] {
+        let ops = FakePhoenixdOps::new();
+        ops.fail_node_info_with_status(status);
+        let be = backend(ops.clone(), TestClock::new(1_000));
+        match (be.phoenixd_probe().await.unwrap(), expected) {
+            (PhoenixdProbe::AuthRejected { status: got }, Some(want)) => assert_eq!(got, want),
+            (PhoenixdProbe::Unreachable(e), None) => {
+                assert!(e.contains(&status.to_string()), "carries the status: {e}")
+            }
+            (other, _) => panic!("HTTP {status} classified as {other:?}"),
+        }
+    }
+}
+
+// `getbalance` runs only AFTER `getinfo` already authenticated with the same credential, so NO
+// status it returns — 401/403 included — may be rendered as a rejected api password: that would send
+// the operator to fix a password the previous call demonstrably accepted. Every failure here is
+// endpoint-accurate instead, naming getbalance and carrying the status (a path-restricting proxy in
+// front of the node is the realistic cause of a 401 on one endpoint but not the other).
+#[tokio::test]
+async fn a_failing_getbalance_never_blames_the_password_getinfo_just_accepted() {
+    for status in [401u16, 403, 502] {
+        let ops = FakePhoenixdOps::new();
+        ops.fail_balance_with_status(status);
+        let be = backend(ops.clone(), TestClock::new(1_000));
+        match be.phoenixd_probe().await.unwrap() {
+            PhoenixdProbe::BalanceUnavailable(e) => {
+                assert!(e.contains("getbalance"), "names the failing endpoint: {e}");
+                assert!(e.contains(&status.to_string()), "carries the status: {e}");
+            }
+            other => panic!("HTTP {status} on getbalance classified as {other:?}"),
+        }
+    }
+}
+
+// --------------------------------------------------------------------------------------------------
 // Secret hygiene: the api password must never reach a log line, a Debug render, or an error string.
 // --------------------------------------------------------------------------------------------------
 
-const TEST_PASSWORD: &str = "phoenixd-api-password-must-never-appear-9f3a";
+// Deliberately shaped like a valid phoenixd build id: generic syntax validation would accept
+// `0.9.0-{TEST_PASSWORD}`, so the real ops layer must use the actual credential to redact it.
+const TEST_PASSWORD: &str = "b9f3a77";
 
 #[test]
 fn real_ops_debug_redacts_the_api_password() {
@@ -1662,6 +1822,184 @@ async fn real_ops_errors_never_contain_the_api_password() {
         assert!(
             !e.contains(TEST_PASSWORD),
             "an error string leaked the api password: {e}"
+        );
+    }
+}
+
+// A preflight report is OPERATOR-FACING output that gets pasted into issues, so the api password must
+// not survive into any check the doctor prints. This drives the REAL HTTP layer (the only component
+// that ever holds the credential) through the REAL rendering: a node that refuses to connect, one
+// that answers 401, and one whose getinfo succeeds before getbalance fails. Error bodies echo the
+// password to prove none of these operator-facing states carry them.
+#[tokio::test]
+async fn the_doctor_probe_never_prints_the_api_password() {
+    let mut rendered = Vec::new();
+
+    // Unreachable: port 1 on loopback refuses instantly, so the detail carries a REAL transport error.
+    let dead = super::real::RealPhoenixdOps::new("http://127.0.0.1:1/", TEST_PASSWORD)
+        .expect("loopback ops build");
+    let index = Connection::open_in_memory().unwrap();
+    index.execute_batch(INDEX_SCHEMA).unwrap();
+    let be = PhoenixdPayment::with_ops(
+        Arc::new(dead),
+        index,
+        Arc::new(TestClock::new(1_000)),
+        FeeSchedule::default(),
+    );
+    let probe = be.phoenixd_probe().await.unwrap();
+    assert!(
+        matches!(probe, PhoenixdProbe::Unreachable(_)),
+        "expected Unreachable, got {probe:?}"
+    );
+    rendered.push(format!("{probe:?}"));
+    rendered.push(
+        crate::preflight::phoenixd_check_from_probe(probe)
+            .expect("an applicable probe renders a check")
+            .detail,
+    );
+
+    // Auth rejected by a server whose error body echoes the credential back at us.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let body = format!("rejected password {TEST_PASSWORD}");
+            let resp = format!(
+                "HTTP/1.1 401 Unauthorized\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        }
+    });
+    let rejecting = super::real::RealPhoenixdOps::new(&format!("http://{addr}/"), TEST_PASSWORD)
+        .expect("loopback ops build");
+    let index = Connection::open_in_memory().unwrap();
+    index.execute_batch(INDEX_SCHEMA).unwrap();
+    let be = PhoenixdPayment::with_ops(
+        Arc::new(rejecting),
+        index,
+        Arc::new(TestClock::new(1_000)),
+        FeeSchedule::default(),
+    );
+    let probe = be.phoenixd_probe().await.unwrap();
+    assert_eq!(
+        probe,
+        PhoenixdProbe::AuthRejected { status: 401 },
+        "a live 401 is classified from the STATUS, not the body"
+    );
+    rendered.push(format!("{probe:?}"));
+    rendered.push(
+        crate::preflight::phoenixd_check_from_probe(probe)
+            .expect("an applicable probe renders a check")
+            .detail,
+    );
+
+    // getinfo succeeds, then getbalance returns a non-auth failure whose body echoes the password.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for _ in 0..2 {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let (status, body) = if request.starts_with("GET /getinfo ") {
+                (
+                    "200 OK",
+                    r#"{"nodeId":"027e48node","version":"0.9.0-b072567"}"#.to_string(),
+                )
+            } else {
+                (
+                    "502 Bad Gateway",
+                    format!("upstream echoed password {TEST_PASSWORD}"),
+                )
+            };
+            let resp = format!(
+                "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        }
+    });
+    let balance_failing =
+        super::real::RealPhoenixdOps::new(&format!("http://{addr}/"), TEST_PASSWORD)
+            .expect("loopback ops build");
+    let index = Connection::open_in_memory().unwrap();
+    index.execute_batch(INDEX_SCHEMA).unwrap();
+    let be = PhoenixdPayment::with_ops(
+        Arc::new(balance_failing),
+        index,
+        Arc::new(TestClock::new(1_000)),
+        FeeSchedule::default(),
+    );
+    let probe = be.phoenixd_probe().await.unwrap();
+    assert!(
+        matches!(probe, PhoenixdProbe::BalanceUnavailable(_)),
+        "expected BalanceUnavailable, got {probe:?}"
+    );
+    rendered.push(format!("{probe:?}"));
+    rendered.push(
+        crate::preflight::phoenixd_check_from_probe(probe)
+            .expect("an applicable probe renders a check")
+            .detail,
+    );
+
+    // A successful response is remote-controlled too. A malicious endpoint/proxy receives the Basic
+    // header and can echo the password through `version`; release-prefix matching accepts this shape,
+    // so the preflight-specific projection must redact it without changing the money-path predicate.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for _ in 0..2 {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let body = if request.starts_with("GET /getinfo ") {
+                format!(
+                    r#"{{"nodeId":"027e48node","version":"0.9.0-{TEST_PASSWORD}"}}"#
+                )
+            } else {
+                r#"{"balanceSat":50000,"feeCreditSat":0}"#.to_string()
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        }
+    });
+    let echoing = super::real::RealPhoenixdOps::new(&format!("http://{addr}/"), TEST_PASSWORD)
+        .expect("loopback ops build");
+    let index = Connection::open_in_memory().unwrap();
+    index.execute_batch(INDEX_SCHEMA).unwrap();
+    let be = PhoenixdPayment::with_ops(
+        Arc::new(echoing),
+        index,
+        Arc::new(TestClock::new(1_000)),
+        FeeSchedule::default(),
+    );
+    let probe = be.phoenixd_probe().await.unwrap();
+    assert!(
+        matches!(probe, PhoenixdProbe::Ready { .. }),
+        "the compatible release remains ready, got {probe:?}"
+    );
+    rendered.push(format!("{probe:?}"));
+    rendered.push(
+        crate::preflight::phoenixd_check_from_probe(probe)
+            .expect("an applicable probe renders a check")
+            .detail,
+    );
+
+    for s in &rendered {
+        assert!(
+            !s.contains(TEST_PASSWORD),
+            "the doctor leaked the api password: {s}"
         );
     }
 }

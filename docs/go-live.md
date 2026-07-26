@@ -10,12 +10,13 @@ every build, so a build flag is not what keeps real money off.
 
 > **phoenixd is NOT a supported go-live option yet.** It is named here only so the sentence above is
 > true about what a build can move; this runbook is the Fedimint path. The phoenixd backend has not
-> been through its full-daemon staging acceptance (`lnrent-tof`), and two operator obligations it
-> creates are still open beads: `lnrent-kr1` (deriving phoenixd's wallet seed from your operator seed,
-> and proving a seed-only restore) and `lnrent-5mi` (the phoenixd preflight probe). **`lnrentd backup`
-> does not back up a phoenixd wallet** — those funds live under phoenixd's own `seed.dat` on the
-> phoenixd host, and backing that up is yours to do. Do not take real money on phoenixd until
-> `lnrent-tof` closes and this section is replaced with a real runbook.
+> been through its full-daemon staging acceptance (`lnrent-tof`), and one operator obligation it
+> creates is still an open bead: `lnrent-kr1` (deriving phoenixd's wallet seed from your operator
+> seed, and proving a seed-only restore). `lnrent preflight` now probes phoenixd reachability,
+> authentication, and fee-schedule compatibility, but **`lnrentd backup` does not back up a phoenixd
+> wallet** — those funds live under phoenixd's own `seed.dat` on the phoenixd host, and backing that
+> up is yours to do. Do not take real money on phoenixd until `lnrent-tof` closes and this section is
+> replaced with a real runbook.
 >
 > This paragraph is no longer the only guard (`lnrent-9gi`): `payment_backend=phoenixd` REFUSES to
 > start — naming those open gates — unless you explicitly opt in with `[phoenixd]
@@ -121,10 +122,13 @@ technically possible from the moment the daemon started):
   `published … listing` · `ipc serving`. No `refund readiness warning:` / `refund readiness ALARM:`
   lines (the daemon's actual not-ready markers).
 - `LNRENT_DATA_DIR=/srv/lnrent/data ./target/release/lnrent money` → `Gateway: ok` and `READY`.
-- `LNRENT_DATA_DIR=/srv/lnrent/data ./target/release/lnrent preflight` (alias `doctor`) → all three
-  external checks pass: the refund gateway, the federation guardians, and the DO token (the daemon
-  probes `GET /v2/account` itself — the old hand-run curl). Exits nonzero on any failure, `--json`
-  for machine output, so an agent can gate subsequent launch promotion on it. This is a post-start
+- `LNRENT_DATA_DIR=/srv/lnrent/data ./target/release/lnrent preflight` (alias `doctor`) → every
+  emitted check passes: the refund gateway, federation guardians, lnv2 money path, DO token (the
+  daemon probes `GET /v2/account` itself — the old hand-run curl), and recipe preflight. There is no
+  `phoenixd` line on this Fedimint path — unlike the checks above, which report themselves as
+  `skipped` when they do not apply, that one is emitted ONLY for `payment_backend=phoenixd`, so do not
+  go looking for it here. Exits nonzero on any failure, `--json` for
+  machine output, so an agent can gate subsequent launch promotion on it. This is a post-start
   health gate, not a publication interlock: as noted above, starting the daemon already published
   the listing.
 - ONE real end-to-end order at a SMALL price first: a buyer discovers the listing → orders → pays →

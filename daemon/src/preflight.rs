@@ -1,6 +1,7 @@
-//! `lnrent preflight` / `doctor` (lnrent-y4m.9, PR-14): probe the three EXTERNAL dependencies
-//! bootstrap validation never touches — the refund gateway, the federation guardians, and the
-//! provider API token — and report per-check `{name, ok, detail}` plus an aggregate `ok`.
+//! `lnrent preflight` / `doctor` (lnrent-y4m.9, PR-14): probe the EXTERNAL dependencies bootstrap
+//! validation never touches — the configured payment backend (Fedimint's refund gateway, guardians,
+//! and lnv2 money path, or the operator's own phoenixd node), the provider API token, and the loaded
+//! recipe's provisioning params — and report per-check `{name, ok, detail}` plus an aggregate `ok`.
 //! Durable-state validation is strong at bootstrap, but a well-formed-but-WRONG gateway or
 //! federation invite passes it and only fails at runtime; `DO_TOKEN` validity used to be a
 //! hand-run curl in go-live.md §4 a stranger-operator can skip. This is the machine-readable
@@ -8,18 +9,23 @@
 //! nonzero on any failed check). The daemon publishes its listing before starting IPC, so this is a
 //! post-start health gate, not a publication interlock.
 //!
-//! REUSED seams only — no new probes: gateway = [`PaymentBackend::refund_gateway_ready`] (the
+//! REUSED seams only — no new probes: on a non-phoenixd backend, gateway =
+//! [`PaymentBackend::refund_gateway_ready`] (the
 //! money-path gateway-readiness probe; fails closed, the Err carries the
 //! diagnostic), federation = [`PaymentBackend::backend_ready`] (the
 //! urw.4 `session_count()` guardian round-trip, distinct from gateway/balance — it proves the
 //! JOINED federation answers now; a bad invite fails `join_or_open` at daemon startup, so
 //! preflight surfaces it as a daemon-unreachable nonzero exit, not as this labeled check),
-//! provider token = the authenticated
+//! phoenixd = [`PaymentBackend::phoenixd_probe`] (lnrent-5mi: the SAME authenticated `getinfo` +
+//! verified-release predicate the phoenixd money path already fails closed on, classified into the
+//! distinct operator remedies), provider token = the authenticated
 //! `GET /v2/account` go-live.md §4 did by hand, with the token resolved from the daemon env
 //! exactly as `runner::hook_env` forwards it to the do-vps hooks. Read-only end to end: the only
-//! network I/O is the three probes themselves; no store write, no money call.
+//! network I/O is the probes themselves; no store write, no money call.
 
-use crate::backends::{Lnv2Probe, PaymentBackend};
+use crate::backends::{
+    safe_phoenixd_version, Lnv2Probe, PaymentBackend, PhoenixdProbe, REDACTED_PHOENIXD_VERSION,
+};
 use crate::recipe::Recipe;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -153,12 +159,29 @@ pub async fn preflight_report(
 ) -> Value {
     static SERIALIZE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _one_at_a_time = SERIALIZE.lock().await;
-    let mut checks = vec![
-        gateway_check(payment).await,
-        federation_check(payment).await,
-        lnv2_check(payment).await,
-        provider_token_check(recipes, token, probe).await,
-    ];
+    // Ask the backend-specific seam first. `NotApplicable` is immediate for mock/Fedimint. For
+    // phoenixd, its classified result is also the authority that the Fedimint-only probes do not
+    // apply; render those required structural slots as explicit skips instead of making two more
+    // identical getinfo calls and claiming nonexistent gateways/guardians are reachable.
+    let phoenixd = phoenixd_check(payment).await;
+    let mut checks = if let Some(phoenixd) = phoenixd {
+        vec![
+            PreflightCheck::pass("gateway", "skipped (phoenixd backend has no refund gateway)"),
+            PreflightCheck::pass(
+                "federation",
+                "skipped (phoenixd backend has no federation guardians)",
+            ),
+            PreflightCheck::pass("lnv2", "skipped (phoenixd backend has no lnv2 money path)"),
+            phoenixd,
+        ]
+    } else {
+        vec![
+            gateway_check(payment).await,
+            federation_check(payment).await,
+            lnv2_check(payment).await,
+        ]
+    };
+    checks.push(provider_token_check(recipes, token, probe).await);
     if let Some(check) = recipe_preflight_check(recipes).await {
         checks.push(check);
     }
@@ -276,6 +299,172 @@ async fn lnv2_check_with_timeout(
         }
         Ok(Err(e)) => PreflightCheck::fail(NAME, format!("lnv2 probe failed: {e:#}")),
         Err(_) => PreflightCheck::fail(NAME, format!("lnv2 probe timed out after {timeout:?}")),
+    }
+}
+
+const PHOENIXD_CHECK: &str = "phoenixd";
+
+/// FUNCTIONAL phoenixd probe (ADR-0019, lnrent-5mi): for an operator whose `payment_backend` is
+/// phoenixd, is that EXTERNAL node reachable, is the api password accepted, and is the running
+/// release the one its trampoline fee schedule was verified against? Those are exactly the two
+/// conditions the phoenixd money path fails CLOSED on, so until this check existed an operator first
+/// met them as a stalled refund. A backend with no phoenixd money path reports `NotApplicable`, and
+/// the check is OMITTED so a mock/Fedimint operator's report remains unchanged. Consequently
+/// `PREFLIGHT_REQUIRED_CHECKS` cannot require this backend-conditional name; when it is present, the
+/// CLI's every-check gate still requires it to pass.
+///
+/// Bounded by the same [`READINESS_PROBE_TIMEOUT`] as the other readiness probes, and that ONE bound
+/// deliberately covers BOTH of the probe's round-trips (`getinfo` then `getbalance`): the bound
+/// exists to keep the operator's command from hanging, not to give each HTTP call its own budget. A
+/// phoenixd node that cannot answer two trivial reads inside it is not a node an operator should be
+/// promoting to launch.
+///
+/// That bound is SHORTER than the phoenixd client's own per-call HTTP timeout (30s), so a node whose
+/// packets are DROPped — the ordinary firewall/wedged case — trips THIS timeout before reqwest can
+/// produce a transport error, i.e. it lands in the timeout verdict rather than in
+/// [`PhoenixdProbe::Unreachable`]. The timeout verdict therefore has to carry its own remedy, not
+/// just the elapsed bound.
+async fn phoenixd_check(payment: &Arc<dyn PaymentBackend>) -> Option<PreflightCheck> {
+    phoenixd_check_with_timeout(payment, READINESS_PROBE_TIMEOUT).await
+}
+
+async fn phoenixd_check_with_timeout(
+    payment: &Arc<dyn PaymentBackend>,
+    timeout: Duration,
+) -> Option<PreflightCheck> {
+    match tokio::time::timeout(timeout, payment.phoenixd_probe()).await {
+        Ok(Ok(probe)) => phoenixd_check_from_probe(probe),
+        Ok(Err(e)) => Some(PreflightCheck::fail(
+            PHOENIXD_CHECK,
+            format!("phoenixd probe failed: {e:#}"),
+        )),
+        Err(_) => Some(PreflightCheck::fail(
+            PHOENIXD_CHECK,
+            format!(
+                "phoenixd probe timed out after {timeout:?} — a node that is unroutable, firewalled \
+                 (packets DROPped) or wedged lands here instead of in a transport error, so check \
+                 that `[phoenixd] url` reaches the node, that the node is running and responsive, \
+                 and retry"
+            ),
+        )),
+    }
+}
+
+/// PURE probe -> operator verdict rendering for [`phoenixd_check`]. Every failure names its own
+/// REMEDY, because the operator reading this is a stranger to the money path.
+///
+/// A non-zero `feeCreditSat` is reported PROMINENTLY but does NOT fail the check: it is money
+/// phoenixd's `receivedSat` counted that `balanceSat` cannot spend (ADR-0019, lnrent-itw), and a
+/// perfectly healthy funded node can legitimately hold some. Failing on it would make preflight
+/// unpassable for a node that is working exactly as designed; the operator still needs to SEE it,
+/// because that much of the receipts cannot fund a refund. The SPENDABLE `balanceSat` is printed
+/// beside it for the same reason — the credit is only interpretable next to the balance it is
+/// excluded from — but neither figure is judged here: a "is the wallet funded enough" rule is
+/// lnrent-itw / lnrent-tof, and this check deliberately does not invent one.
+///
+/// §13: the RUNNING version is remote-controlled operator output, so even the backend's
+/// credential-aware sanitization is enforced again here with the strict public version shape before
+/// rendering. The VERIFIED version is local config and is rendered through
+/// [`configured_version`] instead — see there for why the remote grammar must not be applied to it.
+pub(crate) fn phoenixd_check_from_probe(probe: PhoenixdProbe) -> Option<PreflightCheck> {
+    const NAME: &str = PHOENIXD_CHECK;
+    let check = match probe {
+        // `NotApplicable` has NO rendering: a backend with no phoenixd money path must produce no
+        // phoenixd line AT ALL, not a passing "skipped" one — unlike `lnv2`, which does report itself
+        // skipped, so that a mock/Fedimint operator's report is left exactly as this bead found it.
+        // The omit decision lives here, in the one function that turns a probe into report text; a
+        // "skipped" arm in this match would be unreachable text describing behaviour no report has.
+        PhoenixdProbe::NotApplicable => return None,
+        PhoenixdProbe::Ready {
+            version,
+            verified_version,
+            balance_sat,
+            fee_credit_sat,
+        } => {
+            let version =
+                safe_phoenixd_version(&version, None).unwrap_or(REDACTED_PHOENIXD_VERSION);
+            let verified_version = configured_version(&verified_version);
+            let mut detail = format!(
+                "phoenixd {version} reachable and the api password was accepted; its trampoline fee \
+                 schedule is verified for {verified_version}; spendable balance {balance_sat} sat"
+            );
+            if fee_credit_sat > 0 {
+                detail.push_str(&format!(
+                    "; NOTE fee credit {fee_credit_sat} sat is NOT spendable — phoenixd counted it \
+                     in receivedSat but balanceSat cannot pay it out, so that much of what was \
+                     received cannot fund a refund (not a failure)"
+                ));
+            }
+            PreflightCheck::pass(NAME, detail)
+        }
+        PhoenixdProbe::AuthRejected { status } => PreflightCheck::fail(
+            NAME,
+            format!(
+                "phoenixd REJECTED the api password (HTTP {status}) — set `[phoenixd] api_password` \
+                 to that node's `http-password` (phoenixd.conf) and restart the daemon"
+            ),
+        ),
+        // Every non-401/403 failure lands here, INCLUDING an HTTP answer the probe cannot use (a
+        // proxy's 502, a 404 from a wrong sub-path), so the lead sentence says "no usable answer"
+        // rather than "did not answer" — the appended diagnostic carries the status when there was
+        // one, and naming the url's PATH is what a 404 actually needs.
+        PhoenixdProbe::Unreachable(e) => PreflightCheck::fail(
+            NAME,
+            format!(
+                "phoenixd returned no usable answer to an authenticated getinfo — check that the \
+                 node is running and that `[phoenixd] url` (including its path) points at it: {e}"
+            ),
+        ),
+        PhoenixdProbe::BalanceUnavailable(e) => PreflightCheck::fail(
+            NAME,
+            format!(
+                "phoenixd answered authenticated getinfo, but getbalance failed while reading \
+                 feeCreditSat — check the node or its fronting proxy and retry: {e}"
+            ),
+        ),
+        PhoenixdProbe::VersionMismatch { running, verified } => {
+            let running =
+                safe_phoenixd_version(&running, None).unwrap_or(REDACTED_PHOENIXD_VERSION);
+            let verified = configured_version(&verified);
+            PreflightCheck::fail(
+                NAME,
+                format!(
+                    "phoenixd {running} is not the {verified} release its trampoline fee schedule was \
+                     verified against, so lnrent cannot bound an outbound fee on it and every automated \
+                     refund fails closed — verify this release's schedule and configure it ([phoenixd] \
+                     fee_schedule_version/fee_base_msat/fee_ppm)"
+                ),
+            )
+        }
+    };
+    Some(check)
+}
+
+/// Replacement for operator-configured version text that cannot be printed into a report as-is.
+const UNPRINTABLE_CONFIGURED_VERSION: &str = "<unprintable configured version>";
+
+/// Render the VERIFIED version — `[phoenixd] fee_schedule_version`, or the build's default schedule.
+///
+/// This is LOCAL operator config, not remote input, so it deliberately does NOT go through
+/// [`safe_phoenixd_version`]'s measured `MAJOR.MINOR.PATCH[-<hex>]` grammar. `matches_running_version`
+/// accepts a WHOLE-STRING pin, so an operator can legitimately be verified against a build whose id
+/// is not that shape (`0.9.0-rc1`, a self-built `-SNAPSHOT`); redacting it would make the passing
+/// detail name no release at all, and — worse — would leave the MISMATCH remedy unable to say which
+/// release the schedule was configured for, which is the one sentence that operator needs.
+///
+/// Only report hygiene is enforced (printable single-token ASCII, length-bounded), so config text can
+/// neither inject control characters into a pasted report nor swamp it. There is no credential to
+/// redact here: this string is the fee schedule's, and the api password is never copied into it
+/// ([`PhoenixdProbe`]). Filtering it for password CONTAINMENT would also invert the property it
+/// claims to protect — the schedule version is otherwise the same public constant for every operator
+/// on the default schedule, so a `<redacted>` in its place would itself signal what the password is.
+fn configured_version(version: &str) -> &str {
+    let printable =
+        !version.is_empty() && version.len() <= 64 && version.bytes().all(|b| b.is_ascii_graphic());
+    if printable {
+        version
+    } else {
+        UNPRINTABLE_CONFIGURED_VERSION
     }
 }
 
@@ -419,16 +608,17 @@ mod tests {
         gateway: Seam,
         federation: Seam,
         lnv2: Lnv2Probe,
+        phoenixd: PhoenixdProbe,
     }
 
-    /// The common two-seam backend: the lnv2 probe reports `NotApplicable` (a skipped, passing check),
-    /// as a non-lnv2 backend does — so the existing gateway/federation tests are unaffected by the added
-    /// check.
+    /// The common two-seam backend: the lnv2 and phoenixd probes report `NotApplicable`, as a backend
+    /// with neither money path does — so the existing gateway/federation tests are unaffected.
     fn seam_payment(gateway: Seam, federation: Seam) -> Arc<dyn PaymentBackend> {
         Arc::new(SeamPayment {
             gateway,
             federation,
             lnv2: Lnv2Probe::NotApplicable,
+            phoenixd: PhoenixdProbe::NotApplicable,
         })
     }
 
@@ -439,6 +629,18 @@ mod tests {
             gateway: Seam::Ready,
             federation: Seam::Ready,
             lnv2,
+            phoenixd: PhoenixdProbe::NotApplicable,
+        })
+    }
+
+    /// A phoenixd operator's backend: the Fedimint-only readiness seams are deliberately BROKEN, so a
+    /// passing phoenixd test also proves preflight did not call or render them as real probes.
+    fn seam_payment_phoenixd(phoenixd: PhoenixdProbe) -> Arc<dyn PaymentBackend> {
+        Arc::new(SeamPayment {
+            gateway: Seam::Broken,
+            federation: Seam::Broken,
+            lnv2: Lnv2Probe::NotApplicable,
+            phoenixd,
         })
     }
 
@@ -483,6 +685,9 @@ mod tests {
         }
         async fn lnv2_functional_probe(&self) -> Result<Lnv2Probe> {
             Ok(self.lnv2.clone())
+        }
+        async fn phoenixd_probe(&self) -> Result<PhoenixdProbe> {
+            Ok(self.phoenixd.clone())
         }
         async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
             panic!("preflight must not watch settlements")
@@ -557,11 +762,25 @@ mod tests {
         r
     }
 
-    fn recipe_preflight(v: &Value) -> &Value {
+    /// Look a check up BY NAME, so a test asserting on one check does not encode the position of
+    /// every other check in the report.
+    fn named<'a>(v: &'a Value, name: &str) -> &'a Value {
         checks(v)
             .iter()
-            .find(|c| c["name"] == json!("recipe_preflight"))
-            .expect("recipe_preflight check present")
+            .find(|c| c["name"] == json!(name))
+            .unwrap_or_else(|| panic!("{name} check present"))
+    }
+
+    fn recipe_preflight(v: &Value) -> &Value {
+        named(v, "recipe_preflight")
+    }
+
+    fn provider_token(v: &Value) -> &Value {
+        named(v, "provider_token")
+    }
+
+    fn phoenixd(v: &Value) -> &Value {
+        named(v, "phoenixd")
     }
 
     fn token(s: &str) -> Option<Zeroizing<String>> {
@@ -603,11 +822,18 @@ mod tests {
         );
         assert!(checks(&v).iter().all(|c| c["ok"] == json!(true)));
         assert!(
-            checks(&v)[2]["detail"].as_str().unwrap().contains("skipped"),
+            named(&v, "lnv2")["detail"]
+                .as_str()
+                .unwrap()
+                .contains("skipped"),
             "a non-lnv2 backend reports the lnv2 check skipped"
         );
         assert!(
-            checks(&v)[3]["detail"]
+            checks(&v).iter().all(|check| check["name"] != "phoenixd"),
+            "a non-phoenixd backend omits the backend-conditional phoenixd check"
+        );
+        assert!(
+            provider_token(&v)["detail"]
                 .as_str()
                 .unwrap()
                 .contains("skipped"),
@@ -669,6 +895,319 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("gateway attached but unreachable"));
+    }
+
+    // The phoenixd operator's happy path (lnrent-5mi): the check PASSES and its detail NAMES the
+    // running version, so the report itself records which release the fee schedule was accepted for.
+    #[tokio::test]
+    async fn phoenixd_ready_passes_and_names_the_version() {
+        let payment = seam_payment_phoenixd(PhoenixdProbe::Ready {
+            version: "0.9.0-a1b2c3d".into(),
+            verified_version: "0.9.0".into(),
+            balance_sat: 50_000,
+            fee_credit_sat: 0,
+        });
+        let v = preflight_report(&payment, &[], None, &PanicProbe).await;
+
+        assert_eq!(v["ok"], json!(true));
+        let check = phoenixd(&v);
+        assert_eq!(check["ok"], json!(true));
+        let detail = check["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("0.9.0-a1b2c3d"),
+            "names the version: {detail}"
+        );
+        assert!(
+            detail.contains("50000"),
+            "the spendable balance is reported: {detail}"
+        );
+        assert!(
+            !detail.contains("fee credit"),
+            "no fee credit, no note: {detail}"
+        );
+    }
+
+    // A non-zero `feeCreditSat` is money `receivedSat` counted that `balanceSat` cannot spend
+    // (ADR-0019 / lnrent-itw). It is surfaced PROMINENTLY but does NOT fail the check: a funded node
+    // can legitimately hold fee credit, and failing on it would make preflight unpassable for a node
+    // working as designed.
+    #[tokio::test]
+    async fn non_zero_fee_credit_is_surfaced_without_failing() {
+        let payment = seam_payment_phoenixd(PhoenixdProbe::Ready {
+            version: "0.9.0-b072567".into(),
+            verified_version: "0.9.0".into(),
+            balance_sat: 411,
+            fee_credit_sat: 2_277,
+        });
+        let v = preflight_report(&payment, &[], None, &PanicProbe).await;
+
+        assert_eq!(v["ok"], json!(true), "fee credit is not a failure");
+        let check = phoenixd(&v);
+        assert_eq!(check["ok"], json!(true));
+        let detail = check["detail"].as_str().unwrap();
+        assert!(detail.contains("2277"), "the amount is surfaced: {detail}");
+        assert!(
+            detail.contains("NOT spendable"),
+            "what it MEANS is surfaced, not just a number: {detail}"
+        );
+        // The credit is only interpretable NEXT TO the balance it is excluded from: 2277 sat of
+        // unspendable credit reads very differently against 411 sat than against 500k. Reported,
+        // never judged — a thin balance is not a failure here (lnrent-itw / lnrent-tof own that).
+        assert!(
+            detail.contains("411"),
+            "the spendable balance is reported beside it: {detail}"
+        );
+    }
+
+    // A successful getinfo response is still remote-controlled and the endpoint sees the Basic
+    // header. Credential/header echoes and control characters must be replaced before the report is
+    // pasted into an issue, on both the compatible and mismatch render paths.
+    #[test]
+    fn remote_controlled_version_text_is_redacted() {
+        for probe in [
+            PhoenixdProbe::Ready {
+                version: "0.9.0-Basic OnNlY3JldA==\r\nX-Echo: credential".into(),
+                verified_version: "0.9.0".into(),
+                balance_sat: 50_000,
+                fee_credit_sat: 0,
+            },
+            PhoenixdProbe::VersionMismatch {
+                running: "0.10.0-Basic OnNlY3JldA==\r\nX-Echo: credential".into(),
+                verified: "0.9.0".into(),
+            },
+        ] {
+            let detail = rendered(probe).detail;
+            assert!(
+                detail.contains(REDACTED_PHOENIXD_VERSION),
+                "unsafe remote version must be visibly redacted: {detail}"
+            );
+            for secret_fragment in ["Basic", "OnNlY3JldA", "X-Echo", "\r", "\n"] {
+                assert!(
+                    !detail.contains(secret_fragment),
+                    "remote version fragment leaked into detail: {detail}"
+                );
+            }
+        }
+    }
+
+    /// Render an APPLICABLE probe. `NotApplicable` is the one state with no rendering at all (the
+    /// check is omitted), so a test that reaches the renderer is asserting on a real verdict.
+    fn rendered(probe: PhoenixdProbe) -> PreflightCheck {
+        phoenixd_check_from_probe(probe).expect("an applicable probe renders a check")
+    }
+
+    // `verified_version` is the operator's OWN config (`[phoenixd] fee_schedule_version`, or the
+    // build's default schedule), NOT remote input, and `matches_running_version` accepts a
+    // whole-string pin — so an operator can be verified against a build id that is not the measured
+    // `MAJOR.MINOR.PATCH[-<hex>]` shape. Applying the remote grammar to it would redact the
+    // operator's own pin, leaving the passing detail naming no release and the MISMATCH remedy unable
+    // to say which release the schedule was configured for. It is rendered as configured.
+    #[test]
+    fn a_configured_version_is_rendered_as_configured_not_as_remote_input() {
+        let detail = rendered(PhoenixdProbe::Ready {
+            version: "0.9.0-b072567".into(),
+            verified_version: "0.9.0-rc1".into(),
+            balance_sat: 50_000,
+            fee_credit_sat: 0,
+        })
+        .detail;
+        assert!(
+            detail.contains("verified for 0.9.0-rc1"),
+            "a pre-release pin names itself: {detail}"
+        );
+
+        let detail = rendered(PhoenixdProbe::VersionMismatch {
+            running: "0.9.1-a1b2c3d".into(),
+            verified: "0.9.0-SNAPSHOT".into(),
+        })
+        .detail;
+        assert!(
+            detail.contains("0.9.1-a1b2c3d") && detail.contains("0.9.0-SNAPSHOT"),
+            "the remedy names BOTH releases — which one runs and which one was verified: {detail}"
+        );
+
+        // Report hygiene is still enforced: config text may not inject control characters into a
+        // report that gets pasted into an issue, nor swamp it.
+        for junk in ["0.9.0\r\nX-Injected: 1", "", &"9".repeat(65)] {
+            let detail = rendered(PhoenixdProbe::VersionMismatch {
+                running: "0.9.1-b072567".into(),
+                verified: junk.into(),
+            })
+            .detail;
+            assert!(
+                detail.contains(UNPRINTABLE_CONFIGURED_VERSION),
+                "unprintable config text is replaced: {detail}"
+            );
+            assert!(
+                !detail.contains("X-Injected") && !detail.contains('\r'),
+                "no control characters survive: {detail}"
+            );
+        }
+    }
+
+    // The three phoenixd failure states are DISTINCT verdicts, each naming its own remedy — an
+    // unreachable node, a rejected api password, and a release whose fee schedule nobody verified are
+    // three different things for the operator to go fix.
+    #[tokio::test]
+    async fn phoenixd_failures_are_distinct_and_actionable() {
+        // Unreachable: an actionable sentence FIRST, with the transport diagnostic after it.
+        let v = preflight_report(
+            &seam_payment_phoenixd(PhoenixdProbe::Unreachable(
+                "phoenixd getinfo request failed: connection refused".into(),
+            )),
+            &[],
+            None,
+            &PanicProbe,
+        )
+        .await;
+        assert_eq!(v["ok"], json!(false));
+        let detail = phoenixd(&v)["detail"].as_str().unwrap();
+        assert_eq!(phoenixd(&v)["ok"], json!(false));
+        assert!(
+            detail.contains("no usable answer to an authenticated getinfo")
+                && detail.contains("`[phoenixd] url`"),
+            "an actionable diagnostic, not a bare transport dump: {detail}"
+        );
+        assert!(
+            detail.contains("connection refused"),
+            "the underlying cause is still carried: {detail}"
+        );
+
+        // The same variant also carries a node that DID answer with an unusable status (a wrong
+        // reverse-proxy sub-path 404s), so the lead sentence must not claim nothing answered — and
+        // the remedy must point at the url's PATH, which is what a 404 needs.
+        let v = preflight_report(
+            &seam_payment_phoenixd(PhoenixdProbe::Unreachable(
+                "phoenixd getinfo returned HTTP 404 Not Found".into(),
+            )),
+            &[],
+            None,
+            &PanicProbe,
+        )
+        .await;
+        let detail = phoenixd(&v)["detail"].as_str().unwrap();
+        assert!(
+            !detail.contains("did not answer") && detail.contains("including its path"),
+            "a 404 answered — the remedy is the url's path, not 'nothing answered': {detail}"
+        );
+
+        // A later getbalance failure must not claim the successful getinfo call was unreachable.
+        let v = preflight_report(
+            &seam_payment_phoenixd(PhoenixdProbe::BalanceUnavailable(
+                "phoenixd getbalance returned HTTP 502 Bad Gateway".into(),
+            )),
+            &[],
+            None,
+            &PanicProbe,
+        )
+        .await;
+        assert_eq!(v["ok"], json!(false));
+        let detail = phoenixd(&v)["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("answered authenticated getinfo")
+                && detail.contains("getbalance failed")
+                && detail.contains("fronting proxy"),
+            "the failing endpoint and remedy are accurate: {detail}"
+        );
+        assert!(
+            !detail.contains("did not answer"),
+            "a successful getinfo must not be rendered as unreachable: {detail}"
+        );
+
+        // Auth rejected: a DIFFERENT remedy (the api password), never conflated with unreachable.
+        for status in [401u16, 403] {
+            let v = preflight_report(
+                &seam_payment_phoenixd(PhoenixdProbe::AuthRejected { status }),
+                &[],
+                None,
+                &PanicProbe,
+            )
+            .await;
+            assert_eq!(v["ok"], json!(false));
+            let detail = phoenixd(&v)["detail"].as_str().unwrap();
+            assert!(detail.contains("REJECTED the api password"), "{detail}");
+            assert!(detail.contains(&status.to_string()), "{detail}");
+            assert!(
+                !detail.contains("did not answer"),
+                "an authenticated rejection is not an unreachable node: {detail}"
+            );
+        }
+
+        // Version mismatch: the detail states the REMEDY (configure a verified fee schedule), which
+        // is the only way an operator clears the money path's fail-closed refusal.
+        let v = preflight_report(
+            &seam_payment_phoenixd(PhoenixdProbe::VersionMismatch {
+                running: "0.10.0-bdeadbee".into(),
+                verified: "0.9.0".into(),
+            }),
+            &[],
+            None,
+            &PanicProbe,
+        )
+        .await;
+        assert_eq!(v["ok"], json!(false));
+        let detail = phoenixd(&v)["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("0.10.0-bdeadbee") && detail.contains("0.9.0"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("fee_schedule_version")
+                && detail.contains("fee_base_msat")
+                && detail.contains("fee_ppm"),
+            "the remedy is named: {detail}"
+        );
+    }
+
+    // A probe that never answers must become a labeled failure, exactly like the other readiness
+    // probes: phoenixd is reached over the network, so a black-holed node cannot be allowed to hang
+    // the operator's command. This bound is SHORTER than the phoenixd client's own 30s HTTP timeout,
+    // so a DROP-firewalled node lands HERE rather than in the remedy-bearing `Unreachable` render —
+    // which is why this verdict has to name a remedy too, not just the elapsed bound.
+    #[tokio::test]
+    async fn phoenixd_timeout_fails_with_a_diagnostic() {
+        struct PendingPhoenixd;
+        #[async_trait]
+        impl PaymentBackend for PendingPhoenixd {
+            async fn create_invoice(&self, _: u64, _: &str, _: u32, _: &str) -> Result<Invoice> {
+                panic!("preflight must not create invoices")
+            }
+            async fn lookup(&self, _: &str) -> Result<PaymentStatus> {
+                panic!("preflight must not look up invoices")
+            }
+            async fn lookup_settlement(&self, _: &str) -> Result<(PaymentStatus, Option<i64>)> {
+                panic!("preflight must not look up settlements")
+            }
+            async fn pay(&self, _: &str, _: u64, _: &str) -> Result<String> {
+                panic!("preflight must not pay")
+            }
+            async fn payment_status(&self, _: &str) -> Result<PayStatus> {
+                panic!("preflight must not check payment status")
+            }
+            async fn payment_status_by_key(&self, _: &str) -> Result<PayStatus> {
+                panic!("preflight must not check payment status by key")
+            }
+            async fn phoenixd_probe(&self) -> Result<PhoenixdProbe> {
+                std::future::pending().await
+            }
+            async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+                panic!("preflight must not watch settlements")
+            }
+        }
+
+        let payment: Arc<dyn PaymentBackend> = Arc::new(PendingPhoenixd);
+        let check = phoenixd_check_with_timeout(&payment, Duration::from_millis(10))
+            .await
+            .expect("a backend whose phoenixd probe times out is applicable");
+
+        assert!(!check.ok);
+        assert_eq!(check.name, "phoenixd");
+        assert!(check.detail.contains("timed out after 10ms"));
+        assert!(
+            check.detail.contains("`[phoenixd] url`") && check.detail.contains("firewalled"),
+            "the verdict a black-holed node actually lands in names its remedy: {}",
+            check.detail
+        );
     }
 
     // Gateway `Ok(false)` fails closed with the no-reachable-gateway diagnostic.
@@ -761,8 +1300,8 @@ mod tests {
         for tok in [None, token(""), token("  \n")] {
             let v = preflight_report(&payment, &recipes, tok, &PanicProbe).await;
             assert_eq!(v["ok"], json!(false));
-            assert_eq!(checks(&v)[3]["ok"], json!(false));
-            assert!(checks(&v)[3]["detail"]
+            assert_eq!(provider_token(&v)["ok"], json!(false));
+            assert!(provider_token(&v)["detail"]
                 .as_str()
                 .unwrap()
                 .contains("not set"));
@@ -780,7 +1319,7 @@ mod tests {
         for tok in [token("dop_v1\nsecret"), token("dop v1 secret"), token("dop_v1_\u{7f}")] {
             let v = preflight_report(&payment, &recipes, tok, &PanicProbe).await;
             assert_eq!(v["ok"], json!(false));
-            let detail = checks(&v)[3]["detail"].as_str().unwrap();
+            let detail = provider_token(&v)["detail"].as_str().unwrap();
             assert!(detail.contains("MALFORMED"), "distinct diagnostic: {detail}");
             assert!(
                 !detail.contains("dop") && !detail.contains("secret"),
@@ -804,7 +1343,7 @@ mod tests {
             )
             .await;
             assert_eq!(v["ok"], json!(false));
-            let detail = checks(&v)[3]["detail"].as_str().unwrap();
+            let detail = provider_token(&v)["detail"].as_str().unwrap();
             assert!(detail.contains("REJECTED"));
             assert!(detail.contains(&status.to_string()));
             assert!(
@@ -827,7 +1366,7 @@ mod tests {
         .await;
 
         assert_eq!(v["ok"], json!(false));
-        let detail = checks(&v)[3]["detail"].as_str().unwrap();
+        let detail = provider_token(&v)["detail"].as_str().unwrap();
         assert!(detail.contains("unexpected provider API response"));
         assert!(detail.contains("500"));
     }
@@ -846,7 +1385,7 @@ mod tests {
         .await;
 
         assert_eq!(v["ok"], json!(false));
-        let detail = checks(&v)[3]["detail"].as_str().unwrap();
+        let detail = provider_token(&v)["detail"].as_str().unwrap();
         assert!(detail.contains("provider API unreachable"));
         assert!(detail.contains("dns lookup failed"));
     }
@@ -864,8 +1403,8 @@ mod tests {
         .await;
 
         assert_eq!(v["ok"], json!(true));
-        assert_eq!(checks(&v)[3]["ok"], json!(true));
-        assert!(checks(&v)[3]["detail"]
+        assert_eq!(provider_token(&v)["ok"], json!(true));
+        assert!(provider_token(&v)["detail"]
             .as_str()
             .unwrap()
             .contains("accepted"));
