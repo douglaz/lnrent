@@ -568,8 +568,9 @@ fn build_phoenixd_backend(
         "phoenixd is an UNSUPPORTED backend and is active only because `accept_unsupported` is set \
          (lnrent-9gi): open launch gates are lnrent-kr1 (seed-only wallet restore UNPROVEN; \
          `lnrentd backup` does not cover phoenixd funds), lnrent-itw (fee-credit liability measured \
-         only wallet-wide), lnrent-5mi (no phoenixd preflight/doctor probe). Staging acceptance is \
-         lnrent-tof; see docs/go-live.md"
+         only wallet-wide). `lnrent preflight` probes THIS node's reachability, credentials, and \
+         fee-schedule compatibility (lnrent-5mi). Staging acceptance is lnrent-tof; see \
+         docs/go-live.md"
     );
     let phoenixd = operator.config.phoenixd.as_ref().context(
         "payment_backend=phoenixd requires a phoenixd config (phoenixd_url + phoenixd_api_password)",

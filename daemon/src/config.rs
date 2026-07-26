@@ -1351,9 +1351,8 @@ fn require_phoenixd_unsupported_opt_in(raw: &RawConfig) -> Result<(), IpcError> 
          still open: lnrent-kr1 (the phoenixd wallet lives under phoenixd's OWN seed; a seed-only \
          restore is UNPROVEN and `lnrentd backup` does not back those funds up), lnrent-itw (the \
          fee-credit liability exclusion is measured only at wallet level, so booked liability can \
-         exceed spendable funds), lnrent-5mi (no phoenixd preflight/doctor probe: an unreachable node \
-         or an unverified release surfaces only when a payment stalls). Full-daemon staging acceptance \
-         is lnrent-tof; read docs/go-live.md before going further. To run phoenixd anyway — a staging \
+         exceed spendable funds). Full-daemon staging acceptance is lnrent-tof; read \
+         docs/go-live.md before going further. To run phoenixd anyway — a staging \
          acceptance, or accepting those risks as your own — opt in explicitly with `[phoenixd] \
          accept_unsupported = true` (or {ENV_PHOENIXD_ACCEPT_UNSUPPORTED}=true)"
     )))
@@ -4030,7 +4029,6 @@ mod tests {
             for expected in [
                 "lnrent-kr1",
                 "lnrent-itw",
-                "lnrent-5mi",
                 "lnrent-tof",
                 "docs/go-live.md",
                 "accept_unsupported",

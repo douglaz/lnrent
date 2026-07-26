@@ -284,7 +284,7 @@ fn phoenixd_needs_the_unsupported_opt_in_to_bootstrap() {
     let stderr: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
     assert_eq!(stderr["error"]["code"], "config_invalid");
     let message = stderr["error"]["message"].as_str().unwrap();
-    for gate in ["lnrent-kr1", "lnrent-itw", "lnrent-5mi", "docs/go-live.md"] {
+    for gate in ["lnrent-kr1", "lnrent-itw", "docs/go-live.md"] {
         assert!(
             message.contains(gate),
             "refusal must name {gate}: {message}"

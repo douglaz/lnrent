@@ -198,6 +198,16 @@ pub trait PaymentBackend: Send + Sync {
     async fn lnv2_functional_probe(&self) -> Result<Lnv2Probe> {
         Ok(Lnv2Probe::NotApplicable)
     }
+    /// FUNCTIONAL phoenixd doctor probe (ADR-0019, lnrent-5mi): is the operator's EXTERNAL phoenixd
+    /// node answering an AUTHENTICATED `getinfo` right now, and is the release it reports the one its
+    /// trampoline fee schedule was verified against? Those are the two conditions the phoenixd money
+    /// path already fails CLOSED on, so without this probe an operator first learns about them from a
+    /// stalled refund. A backend with NO phoenixd money path (the mock, lnv2) returns
+    /// [`PhoenixdProbe::NotApplicable`], which makes `lnrent preflight` omit the backend-conditional
+    /// check. Read-only: no invoice, no pay.
+    async fn phoenixd_probe(&self) -> Result<PhoenixdProbe> {
+        Ok(PhoenixdProbe::NotApplicable)
+    }
     /// Stream of settled payments (push). `Settlement.external_id` carries the order id
     /// (SPEC §6.1). M1a wires this to the Fedimint client settlement stream.
     async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>>;
@@ -247,6 +257,96 @@ pub enum Lnv2Probe {
     GatewayAbsent,
     /// An lnv2 gateway is advertised but none is reachable (routing-info round-trip failed).
     GatewayUnreachable(String),
+}
+
+/// Result of the FUNCTIONAL phoenixd doctor probe ([`PaymentBackend::phoenixd_probe`], ADR-0019,
+/// lnrent-5mi). phoenixd is an operator-managed EXTERNAL service reached over authenticated HTTP, so
+/// "configured" says nothing about usable: the node can be down, the api password can be wrong, and
+/// the running release can be one whose trampoline fee schedule nobody verified (on which the money
+/// path refuses every automated refund). Each variant carries what the doctor needs to print a
+/// state-specific diagnostic AND its remedy.
+///
+/// SECRETS (§13): no variant carries the api password, and none may ever be constructed from one.
+/// [`Unreachable`](Self::Unreachable) and [`BalanceUnavailable`](Self::BalanceUnavailable) carry
+/// transport/HTTP diagnostics, which the phoenixd ops layer already keeps credential-free (the
+/// password travels only in an `Authorization` header, and `phoenixd_url` may not embed credentials).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhoenixdProbe {
+    /// The backend has no phoenixd money path at all (mock / lnv2). The doctor omits the check.
+    NotApplicable,
+    /// The node answered an AUTHENTICATED `getinfo` and runs a release whose fee schedule is verified.
+    /// `fee_credit_sat` is phoenixd's `feeCreditSat`: money `receivedSat` counted that `balanceSat`
+    /// cannot spend. Non-zero is reported prominently but is NOT a failure — a funded node can
+    /// legitimately hold fee credit.
+    Ready {
+        /// The operator-safe `getinfo.version`, including a valid build suffix (a live node reports
+        /// e.g. `0.9.0-b072567`). Remote-controlled or credential-bearing values are redacted before
+        /// this variant is constructed.
+        version: String,
+        /// The release the ACTIVE trampoline fee schedule was verified against.
+        verified_version: String,
+        /// `getbalance.balanceSat` — the SPENDABLE balance, reported alongside `fee_credit_sat`
+        /// because the fee credit is only interpretable next to the balance it is excluded from
+        /// ("2723 sat unspendable" reads very differently at balance 0 than at balance 500k). The
+        /// doctor prints both and judges NEITHER: whether the node holds enough to fund refunds is
+        /// lnrent-itw / lnrent-tof, not this probe.
+        balance_sat: u64,
+        fee_credit_sat: u64,
+    },
+    /// The node did not answer a usable `getinfo` (connect refused, TLS failure, timeout, a proxy's
+    /// 5xx …). Carries the underlying diagnostic.
+    Unreachable(String),
+    /// The node answered, but REJECTED the credentials (HTTP 401/403) — a distinct operator remedy
+    /// from an unreachable node, so it is a distinct variant.
+    AuthRejected { status: u16 },
+    /// `getinfo` succeeded and the version is compatible, but `getbalance` failed, so the doctor
+    /// could not read `feeCreditSat`. The node has already proved reachable; this needs a distinct
+    /// diagnostic from [`Unreachable`](Self::Unreachable).
+    BalanceUnavailable(String),
+    /// Reachable and authenticated, but the running release is not the one the active trampoline fee
+    /// schedule was verified against, so the money path cannot bound an outbound fee on it (ADR-0019)
+    /// and refuses automated refunds.
+    VersionMismatch { running: String, verified: String },
+}
+
+/// Constant replacement for a remote-controlled phoenixd version that is unsafe to paste into an
+/// operator report.
+pub(crate) const REDACTED_PHOENIXD_VERSION: &str = "<redacted untrusted version>";
+
+/// Accept only the measured phoenixd release/build shapes for operator-facing output:
+/// `MAJOR.MINOR.PATCH` or `MAJOR.MINOR.PATCH-<hex>`. The authenticated endpoint is still
+/// remote-controlled and sees the Basic header, so arbitrary text (including whitespace/control
+/// injection or an echoed Authorization header) must never be rendered as a version. The real ops
+/// layer additionally supplies `api_password`, closing the valid-looking-suffix case too.
+///
+/// This is DISPLAY sanitization only. The money-path compatibility predicate continues to evaluate
+/// the original `getinfo.version`.
+pub(crate) fn safe_phoenixd_version<'a>(
+    version: &'a str,
+    api_password: Option<&str>,
+) -> Option<&'a str> {
+    if version.is_empty()
+        || version.len() > 64
+        || api_password.is_some_and(|secret| !secret.is_empty() && version.contains(secret))
+    {
+        return None;
+    }
+
+    let (release, build) = match version.split_once('-') {
+        Some((release, build)) => (release, Some(build)),
+        None => (version, None),
+    };
+    let mut release_parts = release.split('.');
+    let valid_release = (0..3).all(|_| {
+        release_parts.next().is_some_and(|part| {
+            !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    }) && release_parts.next().is_none();
+    let valid_build = build.is_none_or(|hash| {
+        (6..=40).contains(&hash.len()) && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+
+    (valid_release && valid_build).then_some(version)
 }
 
 /// Status of one of OUR inbound invoices (receiving). SPEC.md §6.1.

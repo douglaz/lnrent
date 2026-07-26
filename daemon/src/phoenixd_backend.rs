@@ -127,9 +127,9 @@
 //!
 //! ## Deliberately NOT here (scoped to follow-up beads)
 //! The `lnrent phoenixd-seed` helper + the phoenixd wallet's own backup/restore story (lnrent-kr1),
-//! the phoenixd doctor/preflight probe (lnrent-5mi), the exact per-receipt fee-credit exclusion
-//! (lnrent-itw), and the staging dogfood that gates operator-facing exposure and the go-live
-//! runbook (lnrent-tof) are separate beads — all filed, none silently dropped. Index GC is also deferred: `phoenixd_invoice` grows one
+//! the exact per-receipt fee-credit exclusion (lnrent-itw), and the staging dogfood that gates
+//! operator-facing exposure and the go-live runbook (lnrent-tof) are separate beads — all filed,
+//! none silently dropped. Index GC is also deferred: `phoenixd_invoice` grows one
 //! row per created invoice, the same unpaid-order flood surface lnv2 grew a throttled reaper for
 //! (lnrent-y4m.15/y4m.19). The poll reads only rows whose bolt11 can still be paid (an indexed
 //! `expires_at` range, not a table scan) and retires within that set, so the steady-state poll cost
@@ -149,7 +149,10 @@ use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::mpsc;
 
-use crate::backends::{Invoice, PayStatus, PaymentBackend, PaymentStatus, Settlement};
+use crate::backends::{
+    safe_phoenixd_version, Invoice, PayStatus, PaymentBackend, PaymentStatus, PhoenixdProbe,
+    Settlement, REDACTED_PHOENIXD_VERSION,
+};
 use crate::clock::Clock;
 
 /// The lnrent-owned sqlite index beside the operator state DB: the create-once
@@ -356,6 +359,58 @@ pub(crate) struct PhoenixdNodeInfo {
     pub(crate) version: String,
 }
 
+/// A non-2xx answer from phoenixd, carrying the status as DATA rather than only as text.
+///
+/// The money path only ever renders this (the status alone is what a refund's `last_error` needs),
+/// so its `Display` is byte-identical to the ad-hoc error it replaced. The operator probe
+/// ([`PhoenixdPayment::phoenixd_probe`]) additionally needs to tell "phoenixd rejected the api
+/// password" from "phoenixd did not answer", and matching on English error text to do that would be
+/// a guess; [`is_auth_rejection`](Self::is_auth_rejection) reads the code instead.
+///
+/// §13: constructed from a status line ONLY — never from a request, header, URL, or body — so it can
+/// carry no credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PhoenixdHttpError {
+    /// The endpoint label (`getinfo`, `getbalance`, …), as the message has always named it.
+    what: String,
+    status: u16,
+    /// The status line as the HTTP client renders it (`401 Unauthorized`).
+    status_text: String,
+}
+
+impl PhoenixdHttpError {
+    pub(crate) fn new(what: &str, status: u16, status_text: String) -> Self {
+        Self {
+            what: what.to_string(),
+            status,
+            status_text,
+        }
+    }
+
+    pub(crate) fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Did phoenixd REJECT the credentials, as opposed to failing for some other reason? 401 is
+    /// phoenixd's own answer to a wrong `http-password`; 403 is what a fronting proxy on the remote
+    /// (https) deployment shape answers, and it is the same operator remedy.
+    pub(crate) fn is_auth_rejection(&self) -> bool {
+        matches!(self.status, 401 | 403)
+    }
+}
+
+impl std::fmt::Display for PhoenixdHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "phoenixd {} returned HTTP {}",
+            self.what, self.status_text
+        )
+    }
+}
+
+impl std::error::Error for PhoenixdHttpError {}
+
 /// Normalized outcome of `POST /payinvoice` when phoenixd answered with a 2xx body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PayAttempt {
@@ -396,6 +451,12 @@ pub(crate) trait PhoenixdOps: Send + Sync {
     async fn balance(&self) -> Result<PhoenixdBalance>;
     /// `GET /getinfo` — an authenticated liveness and fee-schedule compatibility round-trip.
     async fn node_info(&self) -> Result<PhoenixdNodeInfo>;
+    /// Project a remote-controlled `getinfo.version` into operator-safe text. Production overrides
+    /// this with the api password so even a syntactically valid build suffix that contains the
+    /// credential is redacted; fakes still get strict public-shape validation.
+    fn operator_safe_version<'a>(&self, version: &'a str) -> Option<&'a str> {
+        safe_phoenixd_version(version, None)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -638,6 +699,27 @@ struct ParsedDest {
     expires_at: i64,
 }
 
+/// Which operator remedy a failed `getinfo` points at (lnrent-5mi). A 401/403 means the node
+/// ANSWERED and refused the credentials — a different fix (the api password) from a node that could
+/// not be reached at all — so the STATUS CODE decides, read from the typed [`PhoenixdHttpError`]
+/// anywhere in the error chain rather than guessed from English message text.
+///
+/// Deliberately applied to `getinfo` ONLY. The probe's `getbalance` call runs after `getinfo` has
+/// already authenticated with the SAME credential, so rendering its 401/403 as a rejected api
+/// password would send the operator to fix a password that demonstrably works; that call keeps its
+/// own endpoint-accurate [`PhoenixdProbe::BalanceUnavailable`] verdict, whose remedy already names
+/// the realistic cause (a path-restricting proxy in front of the node) and carries the status.
+///
+/// §13 holds because that text is the ops layer's own, which never contains the credential.
+fn classify_node_info_failure(e: &anyhow::Error) -> PhoenixdProbe {
+    match e.downcast_ref::<PhoenixdHttpError>() {
+        Some(http) if http.is_auth_rejection() => PhoenixdProbe::AuthRejected {
+            status: http.status(),
+        },
+        _ => PhoenixdProbe::Unreachable(format!("{e:#}")),
+    }
+}
+
 fn parse_dest(bolt11: &str) -> Result<ParsedDest> {
     let invoice = lightning_invoice::Bolt11Invoice::from_str(bolt11)
         .context("parsing the phoenixd refund destination bolt11")?;
@@ -723,7 +805,9 @@ impl PhoenixdPayment {
     }
 
     /// Fail closed unless the running node is the release whose trampoline fee schedule was verified
-    /// (ADR-0019). This is a money-path preflight, independent of the out-of-scope doctor CLI.
+    /// (ADR-0019). This is the MONEY PATH's own gate, enforced per payment; the operator doctor
+    /// ([`PaymentBackend::phoenixd_probe`], lnrent-5mi) reports the same predicate but never gates a
+    /// payment on it.
     /// Returns the `getinfo` answer so a caller that also needs the node's IDENTITY (the `PREPARED`
     /// witness) does not pay for a second round-trip.
     async fn require_supported_version(&self) -> Result<PhoenixdNodeInfo> {
@@ -1515,6 +1599,50 @@ impl PaymentBackend for PhoenixdPayment {
         self.require_supported_version().await.map(|_info| true)
     }
 
+    /// The operator-facing (lnrent-5mi) view of the SAME two conditions
+    /// [`require_supported_version`](Self::require_supported_version) fails the money path closed on
+    /// — an authenticated `getinfo` and [`FeeSchedule::matches_running_version`] — classified into
+    /// the distinct operator remedies instead of folded into one `Err` string, plus phoenixd's
+    /// `feeCreditSat` and the `balanceSat` it is excluded from, for the doctor to surface (reported,
+    /// never judged). It reuses that exact predicate rather than a second
+    /// version rule, so a passing doctor and a paying refund can never disagree.
+    ///
+    /// Read-only and additive: nothing here changes what the money path accepts.
+    async fn phoenixd_probe(&self) -> Result<PhoenixdProbe> {
+        let info = match self.ops.node_info().await {
+            Ok(info) => info,
+            Err(e) => return Ok(classify_node_info_failure(&e)),
+        };
+        // Compatibility is deliberately checked against the ORIGINAL response, exactly like the
+        // money path. Sanitization controls only what reaches the operator-facing report.
+        let operator_version = self
+            .ops
+            .operator_safe_version(&info.version)
+            .unwrap_or(REDACTED_PHOENIXD_VERSION)
+            .to_string();
+        if !self.fee_schedule.matches_running_version(&info.version) {
+            return Ok(PhoenixdProbe::VersionMismatch {
+                running: operator_version,
+                verified: self.fee_schedule.verified_version.clone(),
+            });
+        }
+        // Both figures are REPORTED, never judged: `feeCreditSat` is only interpretable next to the
+        // spendable `balanceSat` it is excluded from. Whether that balance is ENOUGH is lnrent-itw /
+        // lnrent-tof, not this probe — no funding rule is applied here.
+        let balance = match self.ops.balance().await {
+            Ok(balance) => balance,
+            // NOT classified as an auth rejection even on a 401/403: `getinfo` above already
+            // authenticated with this same credential, so the api password is not the remedy.
+            Err(e) => return Ok(PhoenixdProbe::BalanceUnavailable(format!("{e:#}"))),
+        };
+        Ok(PhoenixdProbe::Ready {
+            version: operator_version,
+            verified_version: self.fee_schedule.verified_version.clone(),
+            balance_sat: balance.balance_sat,
+            fee_credit_sat: balance.fee_credit_sat,
+        })
+    }
+
     async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
         let (tx, rx) = mpsc::channel(64);
         let ops = self.ops.clone();
@@ -1948,8 +2076,8 @@ mod real {
     use zeroize::Zeroizing;
 
     use super::{
-        PayAttempt, PhoenixdBalance, PhoenixdIncoming, PhoenixdNewInvoice, PhoenixdNodeInfo,
-        PhoenixdOps, PhoenixdOutgoing, HTTP_TIMEOUT, PAY_TIMEOUT,
+        safe_phoenixd_version, PayAttempt, PhoenixdBalance, PhoenixdIncoming, PhoenixdNewInvoice,
+        PhoenixdNodeInfo, PhoenixdOps, PhoenixdOutgoing, HTTP_TIMEOUT, PAY_TIMEOUT,
     };
 
     /// The live phoenixd HTTP client. Auth is HTTP BASIC with an EMPTY username and the api password
@@ -2020,7 +2148,14 @@ mod real {
             let status = resp.status();
             if !status.is_success() {
                 log_error_body(what, status, resp, self.api_password.as_str()).await;
-                return Err(anyhow!("phoenixd {what} returned HTTP {status}"));
+                // Typed (same rendered text as before) so the operator probe can read the CODE
+                // instead of guessing from the message — see `PhoenixdHttpError`.
+                return Err(super::PhoenixdHttpError::new(
+                    what,
+                    status.as_u16(),
+                    status.to_string(),
+                )
+                .into());
             }
             resp.json::<T>()
                 .await
@@ -2178,6 +2313,10 @@ mod real {
 
     #[async_trait]
     impl PhoenixdOps for RealPhoenixdOps {
+        fn operator_safe_version<'a>(&self, version: &'a str) -> Option<&'a str> {
+            safe_phoenixd_version(version, Some(self.api_password.as_str()))
+        }
+
         async fn create_invoice(
             &self,
             amount_sat: u64,
