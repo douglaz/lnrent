@@ -2,9 +2,20 @@
 
 How an operator takes lnrent from "works on a test federation" to "taking real money on mainnet and
 renting real VMs." Every step below is the OPERATOR's own action with the OPERATOR's credentials —
-**lnrent moves no money and publishes nothing on its own.** Real payments are opt-in at runtime: the Fedimint backend
-is compiled in by default, but without `payment_backend=fedimint` AND a `[fedimint]` config nothing moves
-(and a `--no-default-features` build drops the backend entirely).
+**lnrent moves no money and publishes nothing on its own.** Real payments are opt-in at runtime: the runtime
+default is `mock`, and nothing moves until you bootstrap a real backend — `payment_backend=fedimint` AND a
+`[fedimint]` config, or `payment_backend=phoenixd` AND a `[phoenixd]` config. That opt-in is a RUNTIME one:
+`--no-default-features` drops the Fedimint backend from the binary, but the phoenixd backend is compiled into
+every build, so a build flag is not what keeps real money off.
+
+> **phoenixd is NOT a supported go-live option yet.** It is named here only so the sentence above is
+> true about what a build can move; this runbook is the Fedimint path. The phoenixd backend has not
+> been through its full-daemon staging acceptance (`lnrent-tof`), and two operator obligations it
+> creates are still open beads: `lnrent-kr1` (deriving phoenixd's wallet seed from your operator seed,
+> and proving a seed-only restore) and `lnrent-5mi` (the phoenixd preflight probe). **`lnrentd backup`
+> does not back up a phoenixd wallet** — those funds live under phoenixd's own `seed.dat` on the
+> phoenixd host, and backing that up is yours to do. Do not take real money on phoenixd until
+> `lnrent-tof` closes and this section is replaced with a real runbook.
 
 The code is go-live-ready for an **attended, operator-watched launch** (real Fedimint backend wired,
 refund path hardened, provisioning + the buyer and operator CLIs proven live end to end on a real
@@ -178,4 +189,7 @@ Share the listing coordinate / operator npub.
 - Keep it opt-in until you're ready: the default BUILD includes the fedimint backend
   (`default = ["fedimint"]`), but it moves no money until you bootstrap with
   `payment_backend=fedimint` + a `[fedimint]` config (the runtime default is `mock`).
-  `--no-default-features` drops the real backend from the binary entirely.
+  `--no-default-features` drops the *Fedimint* backend from the binary — it is NOT a "no real money in
+  this build" switch: the phoenixd backend (lnrent-xk3) has no cargo feature and ships in every build,
+  so `payment_backend` + its config block is the gate that matters. (phoenixd itself is not go-live
+  approved — see the caveat at the top; and its wallet is outside `lnrentd backup`.)

@@ -13,6 +13,8 @@
 //!   invoices / paid_through / reservations / the refund ledger / outbox / op_invocation.
 //! - `<data_dir>/fedimint.json`             — the federation invite/config (iff fedimint configured).
 //! - `<data_dir>/operator.seed`             — the BIP39 seed (iff present).
+//! - `<data_dir>/phoenixd_index.db`         — lnrent's phoenixd receive/pay idempotency map (iff
+//!   phoenixd configured).
 //! - `<data_dir>/fedimint/<federation_id>/` — the fedimint client RocksDB (`client.db/`) AND the
 //!   lnrent-owned `lnv2_index.db` (the `lnv2_invoice` / `lnv2_pay` idempotency index).
 //!
@@ -21,6 +23,15 @@
 //! are copied as opaque bytes (cold copy is safe since the daemon is stopped). A `MANIFEST.json`
 //! records exactly which files were present, so restore can sanity-check the set and surface a clear
 //! error if it is incomplete/corrupt rather than silently dropping a commitment-bearing file.
+//!
+//! **The phoenixd WALLET is NOT in this backup.** For fedimint, seed + `fedimint/` make a restored
+//! backup fund-restoring. phoenixd is different: it is an EXTERNAL service the operator runs, its
+//! funds live under phoenixd's OWN seed on the phoenixd host, and lnrent never holds that seed —
+//! `phoenixd_index.db` above is only lnrent's correlation/idempotency map (which invoice belongs to
+//! which order, which refund key already paid). So restoring this backup restores lnrent's
+//! COMMITMENTS without the wallet behind them: a phoenixd operator must back up phoenixd's own
+//! `seed.dat` separately, and `docs/go-live.md` says so. Deriving that seed from the operator seed
+//! and proving a seed-only restore is lnrent-kr1.
 //!
 //! ## Optional passphrase-encrypted mode (lnrent-y4m.6)
 //!
@@ -62,6 +73,8 @@ const STATE_DB_FILE: &str = "lnrent.sqlite";
 const SEED_FILE: &str = "operator.seed";
 /// The Fedimint join config (matches `config.rs`'s `FEDIMINT_CONFIG_FILE`).
 const FEDIMINT_CONFIG_FILE: &str = "fedimint.json";
+/// The lnrent-owned phoenixd receive/pay correlation index.
+const PHOENIXD_INDEX_FILE: &str = "phoenixd_index.db";
 /// The per-federation fedimint subtree (matches `fedimint_paths.rs`'s `data_dir/fedimint/<id>/`).
 const FEDIMINT_DIR: &str = "fedimint";
 /// The daemon's IPC socket (matches `main.rs`'s `data_dir.join("lnrent.sock")`); a *live* socket is
@@ -70,14 +83,18 @@ const IPC_SOCK_FILE: &str = "lnrent.sock";
 /// The backup self-description, written/read by [`backup`]/[`restore`].
 const MANIFEST_FILE: &str = "MANIFEST.json";
 /// The single age-encrypted `tar` artifact in an ENCRYPTED backup dir (lnrent-y4m.6): it holds the
-/// sqlite snapshot + `operator.seed` + `fedimint.json` + the `fedimint/` subtree. In encrypted mode
-/// `dest/` contains ONLY this file plus the plaintext [`MANIFEST_FILE`]; the secret files never touch
-/// disk in `dest`.
+/// sqlite snapshot + `operator.seed` + `fedimint.json` + `phoenixd_index.db` + the `fedimint/`
+/// subtree. In encrypted mode `dest/` contains ONLY this file plus the plaintext
+/// [`MANIFEST_FILE`]; the secret files never touch disk in `dest`.
 const BACKUP_AGE_FILE: &str = "backup.age";
 /// The manifest `schema` stamp — restore refuses anything that is not an lnrent backup.
 const BACKUP_SCHEMA: &str = "lnrent-backup";
-/// The backup-format version this build writes and understands. Bump on a breaking layout change.
-const BACKUP_FORMAT_VERSION: u32 = 1;
+/// The newest backup-format version this build writes and understands. Version 2 adds the
+/// commitment-bearing `phoenixd_index.db`; backups without that artifact remain version 1 so older
+/// restorers can still read them.
+const BACKUP_FORMAT_VERSION: u32 = 2;
+/// Old plaintext/encrypted v1 backups remain readable by this build.
+const MIN_SUPPORTED_BACKUP_FORMAT_VERSION: u32 = 1;
 
 /// The backup self-description (`MANIFEST.json`). Restore reads this FIRST and uses it to verify the
 /// set is complete — every artifact recorded `true` here MUST be present in the backup dir, else the
@@ -87,7 +104,7 @@ const BACKUP_FORMAT_VERSION: u32 = 1;
 pub struct Manifest {
     /// Always [`BACKUP_SCHEMA`]; restore rejects a foreign/corrupt manifest.
     pub schema: String,
-    /// The backup-format version ([`BACKUP_FORMAT_VERSION`]); restore rejects an unknown version.
+    /// The backup-format version; v2 iff `phoenixd_index.db` is captured, otherwise v1.
     pub version: u32,
     /// Wall-clock seconds since the unix epoch when the backup was taken (audit only).
     pub created_unix: u64,
@@ -97,16 +114,19 @@ pub struct Manifest {
     pub fedimint_config: bool,
     /// `operator.seed` was present and captured.
     pub operator_seed: bool,
+    /// `phoenixd_index.db` was present and captured. Defaulted so pre-phoenixd v1 manifests remain
+    /// restorable by this v2 reader; backups carrying it use v2 so a v1 reader fails closed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub phoenixd_index: bool,
     /// The `fedimint/` subtree was present and captured.
     pub fedimint_dir: bool,
     /// The federation ids (the `fedimint/<id>/` subdir names) captured, sorted for determinism.
     pub federations: Vec<String>,
     /// `true` iff the sensitive set was written to [`BACKUP_AGE_FILE`] under a passphrase instead of
     /// as plaintext files (lnrent-y4m.6). `#[serde(default)]` keeps OLD v1 plaintext manifests (which
-    /// lack the field) deserializing as `false`, so the format version stays 1 — the manifest itself
-    /// carries NO secret bytes either way, only this descriptive flag. `skip_serializing_if` OMITS the
-    /// field when `false`, so a PLAINTEXT manifest is byte-for-byte identical to a pre-y4m.6 one
-    /// (adversarial codex — the plaintext path must be unchanged); only an encrypted backup writes it.
+    /// lack the field) deserializing as `false`. The manifest itself carries NO secret bytes either
+    /// way, only this descriptive flag. `skip_serializing_if` OMITS the field when `false`; only an
+    /// encrypted backup writes it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub encrypted: bool,
 }
@@ -224,12 +244,16 @@ fn backup_plaintext(data_dir: &Path, dest: &Path, src_db: &Path) -> Result<Manif
         federations = list_subdirs(&dest_fed)?;
     }
 
-    // 3. The federation config + the seed — absent (not an error) when fedimint isn't configured.
+    // 3. Optional root artifacts — absent is not an error when that backend is not configured.
     let fedimint_config = copy_if_present(
         &data_dir.join(FEDIMINT_CONFIG_FILE),
         &dest.join(FEDIMINT_CONFIG_FILE),
     )?;
     let operator_seed = copy_if_present(&data_dir.join(SEED_FILE), &dest.join(SEED_FILE))?;
+    let phoenixd_index = vacuum_if_present(
+        &data_dir.join(PHOENIXD_INDEX_FILE),
+        &dest.join(PHOENIXD_INDEX_FILE),
+    )?;
 
     // 4. Make every DATA file's directory entry durable BEFORE the manifest. With this fsync ordering
     //    the manifest is the last entry to hit disk, so its presence on recovery truly implies a
@@ -239,11 +263,16 @@ fn backup_plaintext(data_dir: &Path, dest: &Path, src_db: &Path) -> Result<Manif
     // 5. The manifest — written + fsynced LAST, so its presence also marks the backup as complete.
     let manifest = Manifest {
         schema: BACKUP_SCHEMA.to_string(),
-        version: BACKUP_FORMAT_VERSION,
+        version: if phoenixd_index {
+            BACKUP_FORMAT_VERSION
+        } else {
+            MIN_SUPPORTED_BACKUP_FORMAT_VERSION
+        },
         created_unix: now_unix(),
         state_db: true,
         fedimint_config,
         operator_seed,
+        phoenixd_index,
         fedimint_dir,
         federations,
         encrypted: false,
@@ -279,13 +308,25 @@ fn backup_encrypted(
     };
     let fedimint_config = present_regular_or_reject(&data_dir.join(FEDIMINT_CONFIG_FILE))?;
     let operator_seed = present_regular_or_reject(&data_dir.join(SEED_FILE))?;
+    let phoenixd_index = present_regular_or_reject(&data_dir.join(PHOENIXD_INDEX_FILE))?;
+    let artifacts = EncryptedArtifacts {
+        fedimint_dir,
+        fedimint_config,
+        operator_seed,
+        phoenixd_index,
+    };
 
     // VACUUM the state DB into a PRIVATE scratch file on the already-trusted SOURCE filesystem,
     // tar+encrypt it with the rest, then delete it — win OR lose. It must never touch the portable
     // destination: unlinking a plaintext file there would still leave recoverable blocks and gives
     // sync tooling/crashes a window to observe it (review round 1 P1).
     let vacuum_tmp = data_dir.join(format!(
-        ".lnrent-backup-vacuum-{}-{}.tmp",
+        ".lnrent-backup-vacuum-state-{}-{}.tmp",
+        std::process::id(),
+        now_nanos()
+    ));
+    let phoenixd_vacuum_tmp = data_dir.join(format!(
+        ".lnrent-backup-vacuum-phoenixd-{}-{}.tmp",
         std::process::id(),
         now_nanos()
     ));
@@ -293,13 +334,22 @@ fn backup_encrypted(
     let bundled = (|| -> Result<()> {
         vacuum_into(src_db, &vacuum_tmp)?;
         harden_file_0600(&vacuum_tmp)?;
+        let phoenixd_snapshot = if artifacts.phoenixd_index {
+            vacuum_into(
+                &data_dir.join(PHOENIXD_INDEX_FILE),
+                &phoenixd_vacuum_tmp,
+            )?;
+            harden_file_0600(&phoenixd_vacuum_tmp)?;
+            Some(phoenixd_vacuum_tmp.as_path())
+        } else {
+            None
+        };
         write_encrypted_bundle(
             &age_path,
             &vacuum_tmp,
+            phoenixd_snapshot,
             data_dir,
-            fedimint_dir,
-            fedimint_config,
-            operator_seed,
+            artifacts,
             passphrase,
         )
     })();
@@ -307,6 +357,8 @@ fn backup_encrypted(
     // unlink durable. A cleanup failure is a backup failure: reporting success while a fund-bearing
     // plaintext scratch file remains would violate encrypted-at-rest mode.
     remove_file_if_exists(&vacuum_tmp).context("removing plaintext encrypted-backup scratch file")?;
+    remove_file_if_exists(&phoenixd_vacuum_tmp)
+        .context("removing plaintext phoenixd-index backup scratch file")?;
     fsync_dir(data_dir).context("making encrypted-backup scratch cleanup durable")?;
     bundled?;
 
@@ -318,11 +370,16 @@ fn backup_encrypted(
 
     let manifest = Manifest {
         schema: BACKUP_SCHEMA.to_string(),
-        version: BACKUP_FORMAT_VERSION,
+        version: if phoenixd_index {
+            BACKUP_FORMAT_VERSION
+        } else {
+            MIN_SUPPORTED_BACKUP_FORMAT_VERSION
+        },
         created_unix: now_unix(),
         state_db: true,
         fedimint_config,
         operator_seed,
+        phoenixd_index,
         fedimint_dir,
         federations,
         encrypted: true,
@@ -384,11 +441,27 @@ pub fn restore(
             manifest.schema
         );
     }
-    if manifest.version != BACKUP_FORMAT_VERSION {
+    if !(MIN_SUPPORTED_BACKUP_FORMAT_VERSION..=BACKUP_FORMAT_VERSION).contains(&manifest.version) {
         bail!(
-            "unsupported backup format version {} (this build understands version {})",
+            "unsupported backup format version {} (this build understands versions {} through {})",
             manifest.version,
+            MIN_SUPPORTED_BACKUP_FORMAT_VERSION,
             BACKUP_FORMAT_VERSION
+        );
+    }
+    // The format defines v2 IFF `phoenixd_index.db` is captured, so the pair must agree. A manifest
+    // that violates it (hand-edited, corrupted, or downgraded) is REFUSED rather than accepted as
+    // "compatible": an older v1 restorer ignores the unknown `phoenixd_index` field entirely and
+    // would restore the commitment-bearing sqlite WITHOUT lnrent's phoenixd payment/idempotency map,
+    // so already-completed refunds could be re-adopted under fresh keys and paid twice. Checking the
+    // range alone cannot catch that, because the lie is in the pairing, not in either field.
+    if manifest.phoenixd_index != (manifest.version >= BACKUP_FORMAT_VERSION) {
+        bail!(
+            "backup manifest is inconsistent: version {} with phoenixd_index={} (the format is \
+             version {BACKUP_FORMAT_VERSION} if and only if {PHOENIXD_INDEX_FILE} is captured); \
+             refusing to restore a manifest whose version and index disagree",
+            manifest.version,
+            manifest.phoenixd_index
         );
     }
 
@@ -439,6 +512,11 @@ pub fn restore(
         }
         if manifest.operator_seed && !is_regular_file(&src.join(SEED_FILE)) {
             bail!("backup is incomplete/corrupt: manifest records {SEED_FILE} but it is missing");
+        }
+        if manifest.phoenixd_index && !is_regular_file(&src.join(PHOENIXD_INDEX_FILE)) {
+            bail!(
+                "backup is incomplete/corrupt: manifest records {PHOENIXD_INDEX_FILE} but it is missing"
+            );
         }
         if manifest.fedimint_dir {
             let src_fed = src.join(FEDIMINT_DIR);
@@ -512,6 +590,12 @@ pub fn restore(
             if manifest.operator_seed {
                 restore_secret_file(&src.join(SEED_FILE), &stage.join(SEED_FILE))?;
             }
+            if manifest.phoenixd_index {
+                restore_secret_file(
+                    &src.join(PHOENIXD_INDEX_FILE),
+                    &stage.join(PHOENIXD_INDEX_FILE),
+                )?;
+            }
         }
         // Make the staged set's own directory entries durable before the swap.
         fsync_dir(stage)
@@ -523,16 +607,16 @@ pub fn restore(
 
 // ===== helpers ===================================================================================
 
-/// `VACUUM INTO` the source state DB to `dest_db`. Opened read-WRITE (the daemon is stopped, so there
-/// is no racing writer) so SQLite recovers an uncheckpointed WAL and the produced file reflects the
-/// latest committed state EXACTLY — critical for the money path. The target must not pre-exist
-/// (guaranteed by [`prepare_empty_dest`]); VACUUM INTO refuses to overwrite.
+/// `VACUUM INTO` a source SQLite DB to `dest_db`. Opened read-WRITE (the daemon is stopped, so there
+/// is no racing writer) so SQLite recovers an uncheckpointed journal/WAL and the produced file
+/// reflects the latest committed state EXACTLY — critical for the money path. The target must not
+/// pre-exist; VACUUM INTO refuses to overwrite.
 fn vacuum_into(src_db: &Path, dest_db: &Path) -> Result<()> {
     let dest_str = dest_db
         .to_str()
         .ok_or_else(|| anyhow!("backup dest path is not valid UTF-8: {}", dest_db.display()))?;
-    let conn = Connection::open(src_db)
-        .with_context(|| format!("opening state DB {}", src_db.display()))?;
+    let conn =
+        Connection::open(src_db).with_context(|| format!("opening SQLite DB {}", src_db.display()))?;
     conn.execute("VACUUM INTO ?1", [dest_str])
         .with_context(|| format!("VACUUM INTO {}", dest_db.display()))?;
     Ok(())
@@ -607,6 +691,27 @@ fn copy_if_present(src: &Path, dst: &Path) -> Result<bool> {
     }
 }
 
+/// Snapshot an optional SQLite DB with `VACUUM INTO`, refusing symlinks/non-regular files. A raw
+/// file copy can omit a hot journal and lose the Phoenixd correlation/payment witness rows that make
+/// crash recovery safe.
+fn vacuum_if_present(src: &Path, dst: &Path) -> Result<bool> {
+    match fs::symlink_metadata(src) {
+        Ok(meta) if meta.file_type().is_file() => {
+            vacuum_into(src, dst)?;
+            harden_file_0600(dst)?;
+            fsync_file(dst)?;
+            Ok(true)
+        }
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "{} is a symlink; refusing to back up a sqlite index via a symlink",
+            src.display()
+        ),
+        Ok(_) => bail!("{} is not a regular file", src.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow!("stat {}: {e}", src.display())),
+    }
+}
+
 // ===== encrypted-mode helpers (lnrent-y4m.6) =====================================================
 
 /// Report whether the fedimint subtree ROOT at `src` is a present REAL directory to archive, refusing
@@ -651,20 +756,27 @@ fn passphrase_secret(passphrase: &Zeroizing<String>) -> age::secrecy::SecretStri
     age::secrecy::SecretString::from(passphrase.as_str().to_owned())
 }
 
-/// Stream {`sqlite_snapshot` as `lnrent.sqlite`, `operator.seed`, `fedimint.json`, the `fedimint/`
-/// subtree} through a `tar` builder wrapped in the `age` passphrase writer, producing `age_path`. The
-/// output file is tightened to 0600 the instant it exists — BEFORE any encrypted payload is written —
-/// then the sensitive bytes are STREAMED (the ecash `client.db` is never buffered whole in memory).
-/// age's default scrypt work factor + ChaCha20-Poly1305 AEAD are used as-is (no hand-tuning). The
-/// `finish()` calls are load-bearing: skipping the age `finish` truncates the file and makes it
-/// undecryptable.
-fn write_encrypted_bundle(
-    age_path: &Path,
-    sqlite_snapshot: &Path,
-    data_dir: &Path,
+#[derive(Clone, Copy)]
+struct EncryptedArtifacts {
     fedimint_dir: bool,
     fedimint_config: bool,
     operator_seed: bool,
+    phoenixd_index: bool,
+}
+
+/// Stream {`sqlite_snapshot` as `lnrent.sqlite`, `operator.seed`, `fedimint.json`,
+/// `phoenixd_index.db`, the `fedimint/` subtree} through a `tar` builder wrapped in the `age`
+/// passphrase writer, producing `age_path`. The output file is tightened to 0600 the instant it
+/// exists — BEFORE any encrypted payload is written — then the sensitive bytes are STREAMED (the
+/// ecash `client.db` is never buffered whole in memory). age's default scrypt work factor +
+/// ChaCha20-Poly1305 AEAD are used as-is (no hand-tuning). The `finish()` calls are load-bearing:
+/// skipping the age `finish` truncates the file and makes it undecryptable.
+fn write_encrypted_bundle(
+    age_path: &Path,
+    sqlite_snapshot: &Path,
+    phoenixd_snapshot: Option<&Path>,
+    data_dir: &Path,
+    artifacts: EncryptedArtifacts,
     passphrase: &Zeroizing<String>,
 ) -> Result<()> {
     let file =
@@ -679,17 +791,27 @@ fn write_encrypted_bundle(
     {
         let mut tar = tar::Builder::new(&mut age_writer);
         tar_append_file(&mut tar, sqlite_snapshot, Path::new(STATE_DB_FILE))?;
-        if operator_seed {
+        if artifacts.operator_seed {
             tar_append_file(&mut tar, &data_dir.join(SEED_FILE), Path::new(SEED_FILE))?;
         }
-        if fedimint_config {
+        if artifacts.fedimint_config {
             tar_append_file(
                 &mut tar,
                 &data_dir.join(FEDIMINT_CONFIG_FILE),
                 Path::new(FEDIMINT_CONFIG_FILE),
             )?;
         }
-        if fedimint_dir {
+        if artifacts.phoenixd_index {
+            let phoenixd_snapshot = phoenixd_snapshot.context(
+                "phoenixd index is present but its coherent backup snapshot is missing",
+            )?;
+            tar_append_file(
+                &mut tar,
+                phoenixd_snapshot,
+                Path::new(PHOENIXD_INDEX_FILE),
+            )?;
+        }
+        if artifacts.fedimint_dir {
             tar_append_dir_recursive(
                 &mut tar,
                 &data_dir.join(FEDIMINT_DIR),
@@ -800,6 +922,11 @@ fn finalize_decrypted_staging(stage: &Path, manifest: &Manifest) -> Result<()> {
     }
     if manifest.fedimint_config && !is_regular_file(&stage.join(FEDIMINT_CONFIG_FILE)) {
         bail!("decrypted backup is incomplete/corrupt: manifest records {FEDIMINT_CONFIG_FILE} but it is missing");
+    }
+    if manifest.phoenixd_index && !is_regular_file(&stage.join(PHOENIXD_INDEX_FILE)) {
+        bail!(
+            "decrypted backup is incomplete/corrupt: manifest records {PHOENIXD_INDEX_FILE} but it is missing"
+        );
     }
     if manifest.fedimint_dir {
         let fed = stage.join(FEDIMINT_DIR);

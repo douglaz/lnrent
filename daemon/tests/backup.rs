@@ -121,6 +121,27 @@ fn populate_fedimint_dir(data_dir: &std::path::Path) {
     .unwrap();
 }
 
+fn populate_phoenixd_index(data_dir: &std::path::Path, marker: &str) {
+    let idx = Connection::open(data_dir.join("phoenixd_index.db")).unwrap();
+    idx.execute_batch(
+        "CREATE TABLE backup_test_marker (
+             value TEXT NOT NULL
+         );",
+    )
+    .unwrap();
+    idx.execute(
+        "INSERT INTO backup_test_marker (value) VALUES (?1)",
+        [marker],
+    )
+    .unwrap();
+}
+
+fn phoenixd_index_marker(path: &std::path::Path) -> String {
+    let idx = Connection::open(path).unwrap();
+    idx.query_row("SELECT value FROM backup_test_marker", [], |r| r.get(0))
+        .unwrap()
+}
+
 #[test]
 fn backup_restore_round_trip_reproduces_state_and_fedimint() {
     let base = temp_dir("roundtrip");
@@ -139,14 +160,20 @@ fn backup_restore_round_trip_reproduces_state_and_fedimint() {
         "leader monkey parrot ring guide accident before fence cannon height naive bean\n",
     )
     .unwrap();
+    populate_phoenixd_index(&data_dir, "phoenixd-index-plaintext");
 
     // --- backup ---
     let dest = base.join("backup");
     let manifest = backup(&data_dir, &dest, None).unwrap();
+    assert_eq!(
+        manifest.version, 2,
+        "a backup carrying phoenixd_index.db must not be accepted by a legacy v1 restorer"
+    );
     assert!(manifest.state_db);
     assert!(manifest.fedimint_dir);
     assert!(manifest.fedimint_config);
     assert!(manifest.operator_seed);
+    assert!(manifest.phoenixd_index);
     assert_eq!(manifest.federations, vec![FED_ID.to_string()]);
     assert!(dest.join("lnrent.sqlite").is_file());
     assert!(
@@ -238,6 +265,10 @@ fn backup_restore_round_trip_reproduces_state_and_fedimint() {
         r#"{"invite":"fed11invite"}"#
     );
     assert!(restored.join("operator.seed").is_file());
+    assert_eq!(
+        phoenixd_index_marker(&restored.join("phoenixd_index.db")),
+        "phoenixd-index-plaintext"
+    );
 
     // --- restore REFUSES a non-empty data dir without --force ---
     let err = restore(&dest, &restored, false, None).unwrap_err();
@@ -274,15 +305,18 @@ fn encrypted_backup_restore_round_trip_reproduces_state_and_fedimint() {
     )
     .unwrap();
     fs::write(data_dir.join("operator.seed"), SEED_WORDS).unwrap();
+    populate_phoenixd_index(&data_dir, "phoenixd-index-encrypted");
 
     // --- encrypted backup ---
     let dest = base.join("backup");
     let manifest = backup(&data_dir, &dest, pass("correct horse battery staple")).unwrap();
+    assert_eq!(manifest.version, 2);
     assert!(manifest.encrypted, "manifest must record encrypted:true");
     assert!(manifest.state_db);
     assert!(manifest.fedimint_dir);
     assert!(manifest.fedimint_config);
     assert!(manifest.operator_seed);
+    assert!(manifest.phoenixd_index);
     assert_eq!(manifest.federations, vec![FED_ID.to_string()]);
 
     // The dest holds ONLY the plaintext manifest + the single age artifact — NO plaintext secrets.
@@ -304,6 +338,10 @@ fn encrypted_backup_restore_round_trip_reproduces_state_and_fedimint() {
     assert!(
         !dest.join("fedimint.json").exists() && !dest.join("fedimint").exists(),
         "no plaintext fedimint config/dir may sit in an encrypted backup dir"
+    );
+    assert!(
+        !dest.join("phoenixd_index.db").exists(),
+        "no plaintext phoenixd index may sit in an encrypted backup dir"
     );
     // No leftover VACUUM scratch file leaked into dest.
     let scratch: Vec<_> = fs::read_dir(&dest)
@@ -347,6 +385,10 @@ fn encrypted_backup_restore_round_trip_reproduces_state_and_fedimint() {
     )
     .unwrap();
     assert!(rm.encrypted);
+    assert_eq!(
+        phoenixd_index_marker(&restored.join("phoenixd_index.db")),
+        "phoenixd-index-encrypted"
+    );
 
     // --- the lnrent state rows reproduce EXACTLY ---
     let conn = store::open(restored.join("lnrent.sqlite")).unwrap();
@@ -710,6 +752,35 @@ fn plaintext_backup_layout_is_unchanged_by_the_encrypted_feature() {
 }
 
 #[test]
+fn backups_without_phoenixd_index_keep_v1_manifest_in_both_modes() {
+    let base = temp_dir("no-phoenixd-version");
+    let data_dir = base.join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    populate_state_db(&data_dir);
+
+    let plaintext = backup(&data_dir, &base.join("plaintext"), None).unwrap();
+    assert_eq!(
+        plaintext.version, 1,
+        "a backup without phoenixd_index.db must remain readable by a v1 restorer"
+    );
+    assert!(!plaintext.phoenixd_index);
+
+    let encrypted = backup(
+        &data_dir,
+        &base.join("encrypted"),
+        pass("correct horse battery staple"),
+    )
+    .unwrap();
+    assert_eq!(
+        encrypted.version, 1,
+        "encryption alone must not require the phoenixd-aware v2 format"
+    );
+    assert!(!encrypted.phoenixd_index);
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
 fn old_v1_manifest_without_encrypted_field_still_restores() {
     // A backup written by a pre-y4m.6 build has a v1 manifest with NO `encrypted` field. The
     // `#[serde(default)]` must let it deserialize (as plaintext) so those backups stay restorable —
@@ -727,6 +798,8 @@ fn old_v1_manifest_without_encrypted_field_still_restores() {
     let mut v: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
     v.as_object_mut().unwrap().remove("encrypted");
+    v.as_object_mut().unwrap().remove("phoenixd_index");
+    v["version"] = serde_json::json!(1);
     assert!(
         v.get("encrypted").is_none(),
         "the test fixture must have no encrypted field"
@@ -737,6 +810,10 @@ fn old_v1_manifest_without_encrypted_field_still_restores() {
     let restored = base.join("restored");
     let m = restore(&dest, &restored, false, None).unwrap();
     assert!(!m.encrypted, "a field-less manifest defaults to plaintext");
+    assert!(
+        !m.phoenixd_index,
+        "an old manifest defaults the additive phoenixd artifact to absent"
+    );
     let conn = store::open(restored.join("lnrent.sqlite")).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM subscription", [], |r| r.get(0))

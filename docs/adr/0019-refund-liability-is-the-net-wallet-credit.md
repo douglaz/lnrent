@@ -137,6 +137,35 @@ baseline must therefore **exclude fee credit** (or reject a fee-credit-only rece
 "baseline on the measured *spendable* credit" rule the Decision states for lnv2 (tracked on the
 phoenixd design, lnrent-b2f).
 
+**How lnrent-xk3 discharged that (2026-07-25).** The *exclude* form is not implementable against
+phoenixd 0.9.0: the full live incoming record was measured and carries no `parts` / fee-credit
+component (`type, subType, paymentHash, preimage, externalId, description, invoice, isPaid,
+isExpired, requestedSat, receivedSat, fees, expiresAt, completedAt, createdAt`), so there is nothing
+per-receipt to subtract — the only fee-credit signal the node exposes is the wallet-level
+`getbalance`. xk3 therefore implements the **reject** form on that snapshot
+(`phoenixd_backend::spendable_credit_msat`): a paid receipt is refused rather than booked when the
+wallet's fee credit could account for it in FULL *and* the spendable balance cannot cover it once
+(`feeCreditSat >= receivedSat && balanceSat < receivedSat`) — the caller retries, so it surfaces as a
+repeating explicit reason instead of a silent unbacked liability. Any other receipt with a fee credit
+present is booked with a warning, the over-book being bounded by `feeCreditSat`.
+
+The balance condition is part of the rule, not a softening of it. A wallet-level fee-credit figure
+cannot *attribute* credit, so `feeCreditSat >= receivedSat` alone fires for receipts that provably
+reached the channel — any paid order smaller than a standing fee credit — and a refusal on this path
+has no downstream escape: capture never runs, `settlement_catch_up` leaves the invoice OPEN, and
+reconcile will not expire an invoice the backend reports `Paid`. Refusing on that signal alone would
+therefore strand *buyer* money indefinitely in its common false-positive case, to avoid an operator-
+side over-book bounded by one receipt. Requiring `balanceSat < receivedSat` confines the refusal to
+the case where booking would promise a refund the wallet cannot pay at all — and even there the
+refusal is not the only guard: a refund that outruns the spendable balance fails at `payinvoice` and
+raises the existing `RefundStuck` operator alert.
+
+Accepted residual: a fee-credit receive whose credit was already consumed by a channel open *before*
+lnrent observed the settlement reads as fully backed, and a funded wallet books a receipt that may
+have been fee credit (over-booking by at most that receipt). Closing that needs the per-payment
+attribution phoenixd does not have; measuring a live fee-credit receive and, if it exists, excluding
+it exactly is **lnrent-itw**.
+
 Two consequences lnv2 does not have. The trampoline fee is **exact in msat, not a ceiling**: a
 successful trampoline-routed payment pays the full msat tier fee regardless of the real route cost, so
 `actual_fee == max_fee` in msat. `max_fee` is computed in msat (below), but the **payout is floored to

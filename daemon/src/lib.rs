@@ -10,8 +10,9 @@ pub mod capture;
 pub mod clock;
 pub mod config;
 pub mod domain;
-/// Shared hardened data-dir path prep for the fedimint backend (lnrent-3d5).
-#[cfg(feature = "fedimint")]
+/// Shared hardened data-dir path prep for the fedimint backend (lnrent-3d5). NOT feature-gated: its
+/// `prepare_private_file` is also what lays down the phoenixd index (lnrent-xk3), which builds in
+/// both cargo feature configurations. Pure std/libc — it pulls no fedimint dependency in either.
 pub mod fedimint_paths;
 /// The lnv2 Fedimint backend (lnrent-3d5, ADR-0018): the backend `payment_backend=fedimint`
 /// constructs — the live ecash money path. Only when the `fedimint` feature is on (default ON;
@@ -27,6 +28,10 @@ pub mod ledger;
 pub mod nostr_engine;
 pub mod op_dispatch;
 pub mod order_intake;
+/// The phoenixd backend (lnrent-xk3, ADR-0018): the backend `payment_backend=phoenixd` constructs —
+/// an HTTP client of the operator's own external phoenixd node, the co-equal non-federation money
+/// path. Unlike [`lnv2_backend`] it is NOT feature-gated (it depends on nothing fedimint-owned).
+pub mod phoenixd_backend;
 /// `lnrent preflight`/`doctor` (lnrent-y4m.9): probe the three EXTERNAL go-live dependencies
 /// (gateway, federation, provider token) via the existing readiness seams — per-check pass/fail.
 pub mod preflight;
