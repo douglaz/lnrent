@@ -270,8 +270,16 @@ fn money_human_text(v: &serde_json::Value) -> String {
         _ => None,
     };
 
+    // Label on the CONFIGURED backend, which the daemon reports in every readiness state — NOT on
+    // the presence of a failure detail, which exists only when something failed (codex on PR #66).
+    let is_phoenixd = v
+        .get("readiness_backend")
+        .and_then(serde_json::Value::as_str)
+        == Some("phoenixd")
+        || phoenixd_detail.is_some();
+
     let mut lines = vec![format!("Expected holdings (ledger): {expected}")];
-    if phoenixd_detail.is_some() {
+    if is_phoenixd {
         lines.push(format!("Phoenixd node: {federation}"));
         lines.push(format!("Refund pay: {gateway}"));
     } else {
@@ -613,6 +621,36 @@ fn render_relays_human(v: &serde_json::Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // codex on PR #66: the backend-correct labels must apply in EVERY readiness state, not only
+    // when something failed. A HEALTHY phoenixd carries no failure detail, so labelling off that
+    // detail fell back to "Federation:"/"Gateway:" — i.e. the operator with no guardians was told
+    // about guardians precisely when everything was working, which is the common case.
+    #[test]
+    fn money_human_uses_phoenixd_terms_when_the_node_is_healthy() {
+        let rendered = money_human_text(&json!({
+            "expected_msat": 0,
+            "gateway_ok": true,
+            "federation_ok": true,
+            "gross_liability_sat": 0,
+            "required_msat": 0,
+            "parked_count": 0,
+            "ready": true,
+            "warning": null,
+            "degraded_read_only": false,
+            // Identity is present in every state; no failure detail exists because nothing failed.
+            "readiness_backend": "phoenixd",
+        }));
+
+        assert!(rendered.contains("Phoenixd node: ok"), "{rendered}");
+        assert!(rendered.contains("Refund pay: ok"), "{rendered}");
+        for wrong_subsystem in ["federation", "guardian", "gateway"] {
+            assert!(
+                !rendered.to_lowercase().contains(wrong_subsystem),
+                "healthy phoenixd money output named {wrong_subsystem}: {rendered}"
+            );
+        }
+    }
 
     #[test]
     fn money_human_uses_phoenixd_failure_terms_and_preflight_remedy() {

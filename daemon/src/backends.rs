@@ -211,6 +211,17 @@ pub trait PaymentBackend: Send + Sync {
     async fn phoenixd_probe(&self) -> Result<PhoenixdProbe> {
         Ok(PhoenixdProbe::NotApplicable)
     }
+    /// The configured backend's IDENTITY — cheap, synchronous, and network-free ON PURPOSE.
+    ///
+    /// Readiness reporting needs to label its output for the operator's actual backend in EVERY
+    /// state, including the healthy one; deriving that from an error's content only works when
+    /// something FAILED (codex on PR #66: a healthy phoenixd fell back to printing "Federation:").
+    /// It must not be answered by [`Self::phoenixd_probe`], which is a network doctor probe that
+    /// readiness is forbidden to call (ADR-0016 — the ledger authorizes, and only explicit
+    /// `reconcile` reads the wallet).
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::Federation
+    }
     /// Stream of settled payments (push). `Settlement.external_id` carries the order id
     /// (SPEC §6.1). M1a wires this to the Fedimint client settlement stream.
     async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>>;
@@ -273,6 +284,16 @@ pub enum Lnv2Probe {
 /// [`Unreachable`](Self::Unreachable) and [`BalanceUnavailable`](Self::BalanceUnavailable) carry
 /// transport/HTTP diagnostics, which the phoenixd ops layer already keeps credential-free (the
 /// password travels only in an `Authorization` header, and `phoenixd_url` may not embed credentials).
+/// Which money backend the daemon is configured with, for OPERATOR-FACING labelling only. Never a
+/// control-flow switch on the money path — the trait's own methods carry backend behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    /// Fedimint/lnv2 and the mock: report in the federation terms these paths have always used.
+    Federation,
+    /// The operator runs their own phoenixd node — there are no guardians to name.
+    Phoenixd,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhoenixdProbe {
     /// The backend has no phoenixd money path at all (mock / lnv2). The doctor omits the check.

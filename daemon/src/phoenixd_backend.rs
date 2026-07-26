@@ -149,7 +149,7 @@ use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::mpsc;
 
-use crate::backends::{
+use crate::backends::{BackendKind, 
     safe_phoenixd_version, Invoice, PayStatus, PaymentBackend, PaymentStatus, PhoenixdProbe,
     PhoenixdReadinessError, Settlement, REDACTED_PHOENIXD_VERSION,
 };
@@ -1614,6 +1614,10 @@ impl PaymentBackend for PhoenixdPayment {
     /// version rule, so a passing doctor and a paying refund can never disagree.
     ///
     /// Read-only and additive: nothing here changes what the money path accepts.
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::Phoenixd
+    }
+
     async fn phoenixd_probe(&self) -> Result<PhoenixdProbe> {
         let info = match self.ops.node_info().await {
             Ok(info) => info,

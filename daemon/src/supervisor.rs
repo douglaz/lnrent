@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::backends::{
+use crate::backends::{BackendKind, 
     PayStatus, PaymentBackend, PaymentStatus, PhoenixdProbe, PhoenixdReadinessError, Settlement,
 };
 use crate::capture::{capture, Capture};
@@ -1382,6 +1382,8 @@ pub(crate) struct RefundReadinessReport {
     /// existing `federation_ok`/`warning` machine contract remains unchanged (see
     /// [`RefundReadinessWarning::as_str`]).
     voice: ReadinessVoice,
+    /// The CONFIGURED backend (see [`RefundReadinessProbe::backend`]).
+    backend: BackendKind,
 }
 
 impl Default for RefundReadinessReport {
@@ -1397,6 +1399,7 @@ impl Default for RefundReadinessReport {
             unpriceable_count: 0,
             warning: None,
             voice: ReadinessVoice::Federation,
+            backend: BackendKind::Federation,
         }
     }
 }
@@ -1424,9 +1427,17 @@ impl RefundReadinessReport {
             ReadinessVoice::PhoenixdNodeUnavailable { detail }
             | ReadinessVoice::PhoenixdRefundsBlocked { detail } => Some(detail),
         };
-        if let (Some(detail), Some(fields)) = (phoenixd_detail, money.as_object_mut()) {
-            fields.insert("readiness_failure_backend".to_string(), json!("phoenixd"));
-            fields.insert("readiness_failure_detail".to_string(), json!(detail));
+        if let Some(fields) = money.as_object_mut() {
+            // Identity is emitted in EVERY state (healthy included) so the human renderer labels the
+            // operator's actual backend; the DETAIL stays failure-only. Fedimint emits neither, so
+            // its reply and wording remain byte-identical (lnrent-p2e).
+            if self.backend == BackendKind::Phoenixd {
+                fields.insert("readiness_backend".to_string(), json!("phoenixd"));
+            }
+            if let Some(detail) = phoenixd_detail {
+                fields.insert("readiness_failure_backend".to_string(), json!("phoenixd"));
+                fields.insert("readiness_failure_detail".to_string(), json!(detail));
+            }
         }
         money
     }
@@ -1447,6 +1458,9 @@ pub(crate) struct RefundReadinessProbe {
     /// Which vocabulary a FAILURE above must be reported in (lnrent-p2e). Classified only when
     /// something already failed, from the existing seam errors and with no additional I/O.
     voice: ReadinessVoice,
+    /// The CONFIGURED backend, carried independently of `voice` so operator-facing labels are right
+    /// in EVERY readiness state — including healthy, where no error exists to classify.
+    backend: BackendKind,
 }
 
 impl RefundReadinessProbe {
@@ -1470,6 +1484,12 @@ impl RefundReadinessProbe {
         } else {
             ReadinessVoice::from_errors(&gateway_error, &federation_error)
         };
+        // Identity is carried INDEPENDENTLY of the failure detail: `voice` can only speak for a
+        // backend that produced an error, so a HEALTHY phoenixd (or a ledger-only warning such as
+        // InsufficientBalance) would otherwise fall back to federation labels (codex on PR #66).
+        // `backend_kind` is a cheap, network-free accessor — readiness must not call the doctor
+        // probe (ADR-0016).
+        let backend = payment.backend_kind();
 
         Self {
             gateway_ok,
@@ -1477,6 +1497,7 @@ impl RefundReadinessProbe {
             federation_ok,
             federation_error,
             voice,
+            backend,
         }
     }
 
@@ -1838,6 +1859,7 @@ async fn refund_readiness_report_from_liabilities(
         unpriceable_count: 0,
         warning: None,
         voice: probe.voice.clone(),
+        backend: probe.backend,
     };
 
     for liability in &liabilities {
