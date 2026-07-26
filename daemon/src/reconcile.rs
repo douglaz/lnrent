@@ -749,6 +749,20 @@ impl Reconciler {
         }
     }
 
+    /// Whether this reconciler may run lifecycle hooks for a row owned by `row_recipe` (lnrent-yjl).
+    ///
+    /// Skips ONLY an EXPLICITLY foreign owner — `Some(id)` that is not ours. A NULL/absent owner
+    /// keeps the PRE-yjl behaviour and is allowed through, which is where this deliberately diverges
+    /// from `provision.rs`/`resume.rs`: there, skipping an unowned row merely defers provisioning
+    /// (harmless, recoverable). Here the operation is destructive but OWED — skipping a legacy row
+    /// with no `recipe_id`, or a dead-letter whose subscription row is already gone, would leave the
+    /// provider resource permanently uncleaned and BILLING. A single-recipe M1a operator's rows are
+    /// exactly that NULL case, so treating unproven ownership as foreign would silently stop every
+    /// teardown they have (coderabbit Major + codex P2 on PR #63).
+    fn owns_recipe(&self, row_recipe: Option<&str>) -> bool {
+        !matches!(row_recipe, Some(id) if id != self.recipe.service.id)
+    }
+
     /// Retry every OPEN teardown dead-letter whose backoff has elapsed (lnrent-urw.2): re-run its
     /// hook with the persisted handles (§7.2 idempotent, so re-running is safe). Success resolves the
     /// row; a repeat failure bumps attempts + re-alerts. Best-effort — never fails the tick. Returns
@@ -757,7 +771,7 @@ impl Reconciler {
         let mut resolved = 0;
         for row in teardown::open_due_rows(&self.store, now).await? {
             let row_recipe = self.sub_recipe_id(&row.subscription_id).await?;
-            if row_recipe.as_deref() != Some(self.recipe.service.id.as_str()) {
+            if !self.owns_recipe(row_recipe.as_deref()) {
                 tracing::warn!(
                     sub = %row.subscription_id,
                     hook = %row.hook,
@@ -1075,11 +1089,11 @@ impl Reconciler {
         now: i64,
     ) -> Result<bool> {
         // lnrent-yjl ownership gate: only the recipe a sub was ORDERED under may run its lifecycle
-        // hooks (mirrors provision.rs / resume.rs, NULL owner included — unproven ownership is not
-        // ownership). Nothing moves: state, cursor and reservation all stay put, so the row is still
+        // hooks. An EXPLICITLY foreign owner is skipped; a NULL owner is allowed through (see
+        // `owns_recipe` — skipping it here would strand a legacy row's teardown forever). Nothing moves: state, cursor and reservation all stay put, so the row is still
         // due whenever a daemon serving that recipe next runs against this data dir. The recurring
         // warn is the intended signal — do NOT "quiet" it by advancing the cursor.
-        if row_recipe != Some(self.recipe.service.id.as_str()) {
+        if !self.owns_recipe(row_recipe) {
             tracing::warn!(
                 sub = %sub_id,
                 row_recipe = row_recipe.unwrap_or(""),
@@ -1177,7 +1191,7 @@ impl Reconciler {
         // FOREIGN recipe's `destroy` would no-op, exit 0, and let this reconciler mark the sub
         // TERMINATED and release its capacity while the real provider box kept billing. Skipping
         // leaves the row due and its hold held — capacity a live box genuinely still occupies.
-        if row_recipe != Some(self.recipe.service.id.as_str()) {
+        if !self.owns_recipe(row_recipe) {
             tracing::warn!(
                 sub = %sub_id,
                 row_recipe = row_recipe.unwrap_or(""),
@@ -2254,7 +2268,7 @@ mod tests {
     // rather than guessed. Unreachable in production (recipe_id is in the v1 SCHEMA baseline with no
     // ALTER TABLE adding it, and order_intake always stamps the serving recipe's id).
     #[tokio::test]
-    async fn teardowns_skip_a_subscription_with_no_recipe_id() {
+    async fn teardowns_still_run_for_a_legacy_subscription_with_no_recipe_id() {
         let store = mem_store();
         let (recipe, suspend_marker, destroy_marker) = marker_recipe();
         seed_sub(
@@ -2283,28 +2297,31 @@ mod tests {
         let r = reconciler(store.clone(), recipe);
 
         let rep = r.reconcile_tick(1500).await.unwrap();
-        assert_eq!(rep.suspended, 0);
-        assert_eq!(rep.terminated, 0);
-        assert_eq!(rep.noops, 2, "both due rows fall through untouched");
+        // lnrent-yjl (coderabbit Major on PR #63): a NULL `recipe_id` is the LEGACY/single-recipe
+        // case, so it keeps the pre-yjl behaviour and is still torn down. Skipping it would leave a
+        // legacy operator's rows permanently due and their provider resources BILLING forever.
+        assert_eq!(rep.suspended, 1);
+        assert_eq!(rep.terminated, 1);
         assert!(
-            !suspend_marker.exists(),
-            "no suspend hook for an unowned row"
+            suspend_marker.exists(),
+            "a legacy NULL-owner row is still suspended"
         );
         assert!(
-            !destroy_marker.exists(),
-            "no destroy hook for an unowned row"
+            destroy_marker.exists(),
+            "a legacy NULL-owner row is still destroyed"
         );
-        assert_eq!(sub_state(&store, "a1").await, "ACTIVE");
-        assert_eq!(sub_state(&store, "s1").await, "SUSPENDED");
-        assert_eq!(sub_next_deadline(&store, "a1").await, Some(1000));
-        assert_eq!(sub_next_deadline(&store, "s1").await, Some(1500));
+        // The legacy rows advanced exactly as they did before lnrent-yjl: ACTIVE -> SUSPENDED and
+        // SUSPENDED -> TERMINATED, with the terminated row's reservation released.
+        assert_eq!(sub_state(&store, "a1").await, "SUSPENDED");
+        assert_eq!(sub_state(&store, "s1").await, "TERMINATED");
         assert_eq!(
             count(
                 &store,
                 "SELECT count(*) FROM reservation WHERE order_id='s1' AND state='HELD'"
             )
             .await,
-            1
+            0,
+            "the destroyed legacy row released its reservation"
         );
     }
 
@@ -2402,7 +2419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn teardown_retry_skips_subscriptions_not_owned_by_recipe() {
+    async fn teardown_retry_skips_only_explicitly_foreign_subscriptions() {
         let store = mem_store();
         let (recipe, _suspend_marker, destroy_marker) = marker_recipe();
         for (sub_id, recipe_id) in [("foreign", Some("other-recipe")), ("missing", None)] {
@@ -2425,15 +2442,19 @@ mod tests {
 
         r.reconcile_tick(1000).await.unwrap();
 
-        assert!(!destroy_marker.exists(), "the destroy hook did NOT run");
-        for sub_id in ["foreign", "missing"] {
-            let row = crate::teardown::open_row(&store, sub_id, "destroy")
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(row.attempts, 1, "the dead-letter was left untouched");
-            assert_eq!(row.last_attempt_at, 0, "the retry remains due");
-        }
+        // Only the EXPLICITLY foreign row is skipped. The NULL-owner row is retried: its dead-letter
+        // is an OWED provider cleanup, and stranding it would leave a resource billing forever
+        // (codex P2 on PR #63 — the pre-yjl guard treated an absent/unowned row as safe to proceed).
+        let foreign = crate::teardown::open_row(&store, "foreign", "destroy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(foreign.attempts, 1, "the foreign dead-letter was left untouched");
+        assert_eq!(foreign.last_attempt_at, 0, "the foreign retry remains due");
+        assert!(
+            destroy_marker.exists(),
+            "the NULL-owner dead-letter WAS retried (its cleanup is owed)"
+        );
     }
 
     // urw.2 (codex P1 defense): the retry loop must NEVER re-run a destructive hook against a sub
