@@ -149,9 +149,9 @@ use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::mpsc;
 
-use crate::backends::{
+use crate::backends::{BackendKind, 
     safe_phoenixd_version, Invoice, PayStatus, PaymentBackend, PaymentStatus, PhoenixdProbe,
-    Settlement, REDACTED_PHOENIXD_VERSION,
+    PhoenixdReadinessError, Settlement, REDACTED_PHOENIXD_VERSION,
 };
 use crate::clock::Clock;
 
@@ -811,19 +811,25 @@ impl PhoenixdPayment {
     /// Returns the `getinfo` answer so a caller that also needs the node's IDENTITY (the `PREPARED`
     /// witness) does not pay for a second round-trip.
     async fn require_supported_version(&self) -> Result<PhoenixdNodeInfo> {
-        let info = self
-            .ops
-            .node_info()
-            .await
-            .context("checking the phoenixd version against the verified trampoline fee schedule")?;
+        let info = match self.ops.node_info().await {
+            Ok(info) => info,
+            Err(e) => {
+                return Err(
+                    PhoenixdReadinessError::new(classify_node_info_failure(&e)).into(),
+                )
+            }
+        };
         if !self.fee_schedule.matches_running_version(&info.version) {
-            bail!(
-                "phoenixd version {} is not the {} release its trampoline fee schedule was verified \
-                 against, so lnrent cannot bound an outbound fee on it; verify the schedule for this \
-                 release and configure it ([phoenixd] fee_schedule_version/fee_base_msat/fee_ppm)",
-                info.version,
-                self.fee_schedule.verified_version
-            );
+            let running = self
+                .ops
+                .operator_safe_version(&info.version)
+                .unwrap_or(REDACTED_PHOENIXD_VERSION)
+                .to_string();
+            return Err(PhoenixdReadinessError::new(PhoenixdProbe::VersionMismatch {
+                running,
+                verified: self.fee_schedule.verified_version.clone(),
+            })
+            .into());
         }
         Ok(info)
     }
@@ -1608,6 +1614,10 @@ impl PaymentBackend for PhoenixdPayment {
     /// version rule, so a passing doctor and a paying refund can never disagree.
     ///
     /// Read-only and additive: nothing here changes what the money path accepts.
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::Phoenixd
+    }
+
     async fn phoenixd_probe(&self) -> Result<PhoenixdProbe> {
         let info = match self.ops.node_info().await {
             Ok(info) => info,

@@ -145,11 +145,21 @@ Share the listing coordinate / operator npub.
 
 ## 6. Operate
 
-- **Monitor money:** `lnrent money` — balance, gateway, **federation liveness**, and refund-liability
-  coverage (`READY` / `NOT READY (<reason>)`). The `<reason>` distinguishes `FederationDown` (guardians
-  unreachable — nothing settles; the root failure), `GatewayUnavailable`, an uncovered liability, and a
-  failed local balance query; `federation_ok`/`gateway_ok` are separate fields in `--json`. Also watch
-  the daemon's WARN/ERROR logs (`refund readiness ALARM`).
+- **Monitor money:** `lnrent money` — ledger-expected holdings, the two stable readiness-seam fields,
+  and refund-liability coverage (`READY` / `NOT READY (<reason>)`). `<reason>` is one of the two
+  LIVENESS failures below, `InsufficientBalance` (the ledger says holdings cannot cover what is
+  owed), `Unpriceable` (a real liability could not be priced this pass, so coverage cannot be
+  confirmed — treat as not-covered), or `ParkedManual` (a refund is parked and needs you). The
+  `federation_ok`, `gateway_ok`, `FederationDown`, and `GatewayUnavailable` wire names are retained
+  for compatibility. On Fedimint they keep their literal guardian/gateway meanings. On phoenixd,
+  `FederationDown` means the node is unreachable, rejected the api password, or runs a release whose
+  trampoline fee schedule was never verified; `GatewayUnavailable` can mean the first phoenixd
+  readiness call failed before the second recovered — it does not imply that phoenixd has a gateway.
+  Those CLI/`--json` tokens remain stable across backends. On a phoenixd failure, the human
+  `lnrent money` view instead names the node/refund-pay seams and prints `lnrent preflight`'s
+  diagnostic and remedy. The daemon's liveness-failure WARN/ERROR lines do the same and report
+  `node_ok`/`refund_pay_ok` rather than `federation_ok`/`gateway_ok`; other coverage warnings keep
+  their existing fields. Gate log-scraping rules on the stable `--json` keys, not on log fields.
 - **Alert DMs (GATE-1 PR-5):** with `LNRENT_ALERT_NPUB` set, the daemon DMs you when a refund parks
   FAILED or sits stuck — no need to tail logs 24/7. The alert is a NIP-17 DM riding the durable
   outbox (edge-triggered, at most one per condition per 6h). One honest caveat: a total relay
