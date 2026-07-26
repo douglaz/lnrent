@@ -16,6 +16,11 @@ every build, so a build flag is not what keeps real money off.
 > does not back up a phoenixd wallet** — those funds live under phoenixd's own `seed.dat` on the
 > phoenixd host, and backing that up is yours to do. Do not take real money on phoenixd until
 > `lnrent-tof` closes and this section is replaced with a real runbook.
+>
+> This paragraph is no longer the only guard (`lnrent-9gi`): `payment_backend=phoenixd` REFUSES to
+> start — naming those open gates — unless you explicitly opt in with `[phoenixd]
+> accept_unsupported = true` (or `LNRENT_PHOENIXD_ACCEPT_UNSUPPORTED=true`), which attests that you
+> accept an unsupported backend, and which the daemon warns about on every start.
 
 The code is go-live-ready for an **attended, operator-watched launch** (real Fedimint backend wired,
 refund path hardened, provisioning + the buyer and operator CLIs proven live end to end on a real

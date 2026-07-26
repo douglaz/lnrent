@@ -316,6 +316,10 @@ fn bootstrap_input(args: BootstrapArgs) -> BootstrapInput {
         phoenixd_fee_schedule_version: None,
         phoenixd_fee_base_msat: None,
         phoenixd_fee_ppm: None,
+        // No CLI flag for the unsupported-backend opt-in either (lnrent-9gi): accepting that phoenixd
+        // is un-launch-gated is a deliberate operator statement that belongs in the config document or
+        // the unit's environment, not in a shell line that is easy to copy from a stale README.
+        phoenixd_accept_unsupported: None,
         phoenixd: None,
         mnemonic: args.mnemonic,
         // No bootstrap CLI flag for the draining-holdings floor (lnrent-urw.7); it is a runtime
@@ -431,6 +435,11 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
                 let backend = build_fedimint_backend(&operator, clock.clone()).await?;
                 (backend, None)
             }
+            // `phoenixd` (lnrent-xk3) is reachable here ONLY when the operator explicitly accepted an
+            // unsupported backend: bootstrap above refuses to resolve a phoenixd config without
+            // `accept_unsupported` (lnrent-9gi, `config::require_phoenixd_unsupported_opt_in`), which
+            // is where the refusal lives so nothing is persisted before it fires. It uses real time ->
+            // NO clock-sync.
             PaymentMode::Phoenixd => {
                 let backend = build_phoenixd_backend(&operator, clock.clone())?;
                 (backend, None)
@@ -551,6 +560,17 @@ fn build_phoenixd_backend(
     operator: &config::Operator,
     clock: Arc<dyn Clock>,
 ) -> Result<Arc<dyn PaymentBackend>> {
+    // Reaching this function AT ALL means `accept_unsupported` was in force (bootstrap refuses to
+    // resolve a phoenixd config otherwise — lnrent-9gi), so say so on EVERY start at warn level: an
+    // opt-in that is invisible after the first boot is ambient state, and the operator who inherits
+    // this daemon never typed it. Removed with the guard by lnrent-ehu, after lnrent-tof passes.
+    tracing::warn!(
+        "phoenixd is an UNSUPPORTED backend and is active only because `accept_unsupported` is set \
+         (lnrent-9gi): open launch gates are lnrent-kr1 (seed-only wallet restore UNPROVEN; \
+         `lnrentd backup` does not cover phoenixd funds), lnrent-itw (fee-credit liability measured \
+         only wallet-wide), lnrent-5mi (no phoenixd preflight/doctor probe). Staging acceptance is \
+         lnrent-tof; see docs/go-live.md"
+    );
     let phoenixd = operator.config.phoenixd.as_ref().context(
         "payment_backend=phoenixd requires a phoenixd config (phoenixd_url + phoenixd_api_password)",
     )?;
