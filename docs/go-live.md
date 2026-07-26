@@ -10,9 +10,11 @@ every build, so a build flag is not what keeps real money off.
 
 > **phoenixd is NOT a supported go-live option yet.** It is named here only so the sentence above is
 > true about what a build can move; this runbook is the Fedimint path. The phoenixd backend has not
-> been through its full-daemon staging acceptance (`lnrent-tof`), and one operator obligation it
-> creates is still an open bead: `lnrent-kr1` (deriving phoenixd's wallet seed from your operator
-> seed, and proving a seed-only restore). `lnrent preflight` now probes phoenixd reachability,
+> been through its full-daemon staging acceptance (`lnrent-tof`), and the operator obligations it
+> creates are still open beads: `lnrent-kr1` (deriving phoenixd's wallet seed from your operator
+> seed, and proving a seed-only restore) and `lnrent-itw` (its fee-credit liability is measured only
+> wallet-wide, not per receipt). Those are exactly the gates the daemon names when it refuses to
+> start, so this list and that refusal stay in step. `lnrent preflight` now probes phoenixd reachability,
 > authentication, and fee-schedule compatibility, but **`lnrentd backup` does not back up a phoenixd
 > wallet** — those funds live under phoenixd's own `seed.dat` on the phoenixd host, and backing that
 > up is yours to do. Do not take real money on phoenixd until `lnrent-tof` closes and this section is
