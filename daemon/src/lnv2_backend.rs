@@ -26,15 +26,15 @@
 //! ## Idempotency / index decision (bead INDEX DECISION, audit DURABLE IDEMPOTENCY DESIGN)
 //! lnv2 op ids are deterministic from the invoice, so the lnv1-style op-mapping shrinks — but it does
 //! not disappear, because two lnrent-owned facts are NOT reconstructible from the federation alone:
-//!  - **Receive: a create-once `external_id -> invoice` map** (`lnv2_invoice`). Each `receive()` call
+//!  - **Receive: a status-aware `external_id -> invoice` map** (`lnv2_invoice`). Each `receive()` call
 //!    draws a FRESH ephemeral tweak, so it is NOT idempotent on any external key — calling twice mints
-//!    two invoices. lnrent's `create_invoice` idempotency (same `external_id` -> same invoice) is
-//!    enforced by this local row, written BEFORE `create_invoice` returns. The crash window (receive
-//!    committed the contract, the row not yet persisted) needs **no oplog scan**: `order_intake` only
-//!    persists (and only ever shows the buyer) a bolt11 AFTER `create_invoice` returns, so a crash
-//!    inside `create_invoice` leaves an orphaned, never-transmitted incoming contract that no one can
-//!    pay — it simply expires. On the deterministic-`external_id` retry we mint a fresh invoice; the
-//!    orphan is harmless. This is the lnv2 simplification the ADR promises.
+//!    two invoices. The local row, written BEFORE `create_invoice` returns, reuses OPEN and paid rows;
+//!    only a CANCELED row (whose receive contract is terminally unpayable) is atomically replaced. The
+//!    crash window (receive committed the contract, the row not yet persisted) needs **no oplog scan**:
+//!    `order_intake` only persists (and only ever shows the buyer) a bolt11 AFTER `create_invoice`
+//!    returns, so a crash inside `create_invoice` leaves an orphaned, never-transmitted incoming
+//!    contract that no one can pay — it simply expires. On the deterministic-`external_id` retry we
+//!    mint a fresh invoice; the orphan is harmless. This is the lnv2 simplification the ADR promises.
 //!  - **Pay: a durable `idempotency_key -> (bolt11, operation)` map** (`lnv2_pay`) with the commit
 //!    ordering + crash story documented on [`Lnv2Payment::pay_inner`]. It is what makes `pay(key)`
 //!    idempotent AND prevents lnv2's own `send()` from silently advancing to a fresh payment attempt on
@@ -124,7 +124,7 @@ use crate::clock::Clock;
 /// semantics unchanged) whether reached through the lnv1 or lnv2 client.
 const ROOT_SECRET_SALT: &[u8] = b"lnrent:fedimint:client:v1";
 
-/// The lnv2-owned sqlite index (per federation data-dir): the create-once `external_id -> invoice`
+/// The lnv2-owned sqlite index (per federation data-dir): the status-aware `external_id -> invoice`
 /// receive map + the `idempotency_key -> operation` pay map. Distinct filename from lnv1's
 /// `lnrent_index.db` so a stale lnv1 index can never be mistaken for the lnv2 one.
 const INDEX_DB_FILE: &str = "lnv2_index.db";
@@ -1007,9 +1007,11 @@ impl PaymentBackend for Lnv2Payment {
     ) -> Result<Invoice> {
         // Serialize check->mint->insert so two concurrent same-external_id callers can't both mint.
         let create_guard = self.create_lock.lock().await;
-        // Idempotent on external_id: a repeat (or crash-retry) returns the stored invoice.
-        if let Some(inv) = idx_get_by_external(&self.index, external_id)? {
-            return Ok(inv);
+        // Reuse OPEN and paid rows. A CANCELED receive contract is unpayable, so mint a replacement;
+        // `idx_insert` swaps it atomically without overwriting any other state.
+        match idx_get_by_external(&self.index, external_id)? {
+            Some((inv, status)) if status != "CANCELED" => return Ok(inv),
+            Some(_) | None => {}
         }
 
         let minted = self
@@ -1033,8 +1035,8 @@ impl PaymentBackend for Lnv2Payment {
             // Absolute expiry from our clock at creation (matches the field's contract + MockPayment).
             expires_at: self.clock.now() + i64::from(expiry_s),
         };
-        // The create-once anchor: persist BEFORE returning, so the buyer never sees a bolt11 whose row
-        // is not durable (module header: this is why no oplog scan is needed).
+        // The durable receive anchor: persist BEFORE returning, so the buyer never sees a bolt11 whose
+        // row is not durable (module header: this is why no oplog scan is needed).
         idx_insert(&self.index, &inv, &minted.op)?;
 
         // If a watcher is registered, drive this fresh (live) invoice's settlement now; otherwise the
@@ -1461,22 +1463,27 @@ where
 // sqlite index helpers (std::sync::Mutex; the lock never crosses an `.await`)
 // ---------------------------------------------------------------------------------------------------
 
-fn idx_get_by_external(index: &Mutex<Connection>, ext: &str) -> Result<Option<Invoice>> {
+/// The stored row for `ext` and its status. Keep terminal/paid rows visible to callers.
+fn idx_get_by_external(index: &Mutex<Connection>, ext: &str) -> Result<Option<(Invoice, String)>> {
     let conn = index.lock().unwrap();
     conn.query_row(
-        "SELECT external_id, operation_id, invoice_id, bolt11, payment_hash, amount_sat, expires_at
+        "SELECT external_id, operation_id, invoice_id, bolt11, payment_hash, amount_sat, expires_at,
+                status
          FROM lnv2_invoice WHERE external_id = ?1",
         params![ext],
         |r| {
-            Ok(Invoice {
-                external_id: r.get(0)?,
-                backend_invoice_id: r.get(1)?,
-                id: r.get(2)?,
-                bolt11: r.get(3)?,
-                payment_hash: r.get(4)?,
-                amount_sat: r.get::<_, i64>(5)? as u64,
-                expires_at: r.get(6)?,
-            })
+            Ok((
+                Invoice {
+                    external_id: r.get(0)?,
+                    backend_invoice_id: r.get(1)?,
+                    id: r.get(2)?,
+                    bolt11: r.get(3)?,
+                    payment_hash: r.get(4)?,
+                    amount_sat: r.get::<_, i64>(5)? as u64,
+                    expires_at: r.get(6)?,
+                },
+                r.get(7)?,
+            ))
         },
     )
     .optional()
@@ -1487,12 +1494,24 @@ fn idx_insert(index: &Mutex<Connection>, inv: &Invoice, op: &str) -> Result<()> 
     let conn = index.lock().unwrap();
     // OPEN rows have no trustworthy wallet credit yet: the contract face value excludes claim-time
     // consensus fees. Claimed atomically replaces this placeholder with the decoded wallet delta.
-    conn.execute(
+    //
+    // The single statement atomically replaces only CANCELED rows. OPEN and paid rows are untouched.
+    let rows = conn.execute(
         "INSERT INTO lnv2_invoice
             (external_id, operation_id, invoice_id, bolt11, payment_hash, amount_sat, credited_msat,
              expires_at, status)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'OPEN')
-         ON CONFLICT(external_id) DO NOTHING",
+         ON CONFLICT(external_id) DO UPDATE SET
+             operation_id  = excluded.operation_id,
+             invoice_id    = excluded.invoice_id,
+             bolt11        = excluded.bolt11,
+             payment_hash  = excluded.payment_hash,
+             amount_sat    = excluded.amount_sat,
+             credited_msat = excluded.credited_msat,
+             expires_at    = excluded.expires_at,
+             status        = 'OPEN',
+             settled_at    = NULL
+           WHERE lnv2_invoice.status = 'CANCELED'",
         params![
             inv.external_id,
             op,
@@ -1505,6 +1524,18 @@ fn idx_insert(index: &Mutex<Connection>, inv: &Invoice, op: &str) -> Result<()> 
         ],
     )
     .context("inserting lnv2_invoice")?;
+    // The caller only reaches here for an absent or CANCELED row (`create_lock` holds across
+    // check->mint->insert, and the mark helpers all CAS on `status='OPEN'`, so CANCELED is terminal
+    // until the GC deletes it). A miss would therefore mean the row moved under us — fail loudly
+    // rather than return a bolt11 whose row is not durable: an un-indexed op is never re-subscribed
+    // after a restart, so a payment to it would be received and never credited.
+    if rows == 0 {
+        bail!(
+            "lnv2_invoice row for external_id {} changed under create_invoice; not returning an \
+             un-indexed invoice",
+            inv.external_id
+        );
+    }
     Ok(())
 }
 

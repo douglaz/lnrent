@@ -1174,10 +1174,98 @@ async fn create_invoice_is_idempotent_on_external_id() {
         .unwrap();
     assert_eq!(a.id, b.id, "same external_id -> same invoice");
     assert_eq!(
+        a.bolt11, b.bolt11,
+        "an OPEN row is reused verbatim, never re-minted (create-once)"
+    );
+    assert_eq!(
         b.amount_sat, 1000,
         "the original amount is returned unchanged"
     );
     assert_eq!(a.expires_at, 1000 + 3600);
+}
+
+#[tokio::test]
+async fn canceled_invoice_is_replaced_by_a_fresh_payable_one() {
+    let ext = "renew:auto:sub1:42";
+    let fake = FakeLnv2Ops::new();
+    let backend = backend_with(fake.clone(), clock(1_000));
+    let dead = backend.create_invoice(1000, "m", 3600, ext).await.unwrap();
+    backend
+        .index
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE lnv2_invoice SET status = 'CANCELED' WHERE external_id = ?1",
+            params![ext],
+        )
+        .unwrap();
+
+    let fresh = backend.create_invoice(1000, "m", 3600, ext).await.unwrap();
+    assert_ne!(
+        fresh.bolt11, dead.bolt11,
+        "the expired bolt11 must never be handed back as payable"
+    );
+    assert_ne!(
+        fresh.backend_invoice_id, dead.backend_invoice_id,
+        "a fresh receive operation backs the replacement"
+    );
+    let (stored, status) = idx_get_by_external(&backend.index, ext).unwrap().unwrap();
+    assert_eq!(status, "OPEN");
+    assert_eq!(
+        stored.backend_invoice_id, fresh.backend_invoice_id,
+        "the canceled row is atomically replaced by the fresh operation"
+    );
+    assert_eq!(
+        backend.lookup_settlement(&fresh.id).await.unwrap(),
+        (PaymentStatus::Open, None),
+        "the replacement is returned as payable"
+    );
+    // The daemon store can still hold the retired id; it must never look payable again.
+    assert_eq!(
+        backend.lookup_settlement(&dead.id).await.unwrap(),
+        (PaymentStatus::Expired, None),
+        "the replaced-away invoice id never reports Open/Paid"
+    );
+}
+
+#[tokio::test]
+async fn paid_and_unrecovered_rows_are_still_reused_by_create_invoice() {
+    let fake = FakeLnv2Ops::new();
+    let backend = backend_with(fake, clock(2_000));
+
+    for status in ["PAID", "PAID_UNRECOVERED"] {
+        let ext = format!("ext{status}");
+        let original = backend
+            .create_invoice(1000, "m", 3600, &ext)
+            .await
+            .unwrap();
+        backend
+            .index
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE lnv2_invoice SET status = ?1 WHERE external_id = ?2",
+                params![status, ext],
+            )
+            .unwrap();
+
+        let repeated = backend
+            .create_invoice(9999, "other", 60, &ext)
+            .await
+            .unwrap();
+        assert_eq!(
+            (repeated.id, repeated.bolt11),
+            (original.id, original.bolt11),
+            "{status} settlement provenance must be reused, not replaced"
+        );
+        assert_eq!(
+            idx_get_by_external(&backend.index, &ext)
+                .unwrap()
+                .unwrap()
+                .1,
+            status
+        );
+    }
 }
 
 #[tokio::test]
