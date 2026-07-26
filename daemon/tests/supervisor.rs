@@ -963,6 +963,17 @@ async fn maintenance_retries_and_resolves_a_teardown_dead_letter() {
 
     // Seed a dead-letter as if a prior `destroy` failed. last_attempt_at=0, so by START the backoff
     // (attempts=1 → 120s) has long elapsed → it is due on the first maintenance tick.
+    store
+        .transaction(|tx| {
+            tx.execute(
+                "INSERT INTO subscription (id, recipe_id, state, created_at, updated_at)
+                 VALUES ('sub-1', 'dummy', 'TERMINATED', 0, 0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
     lnrentd::teardown::record_failure(&store, "sub-1", "destroy", None, "boom", 0)
         .await
         .unwrap();

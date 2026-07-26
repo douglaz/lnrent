@@ -80,7 +80,8 @@ pub struct TickReport {
     pub terminated: usize,
     /// OPEN renewal invoices expired (sub state unchanged).
     pub invoices_expired: usize,
-    /// Due rows with no transition (stale/replayed CAS, or a state the machine does not act on).
+    /// Due rows with no transition (stale/replayed CAS, a state the machine does not act on, or a row
+    /// owned by a different recipe — lnrent-yjl).
     pub noops: usize,
 }
 
@@ -109,6 +110,8 @@ struct DueSub {
     next_deadline: i64,
     /// The downtime-credit suspend FLOOR (§6.5); NULL when no outage was credited.
     suspend_not_before: Option<i64>,
+    /// The recipe this subscription was ordered under.
+    recipe_id: Option<String>,
 }
 
 /// An ACTIVE subscription read while applying restart downtime credit (§6.5): its timers + the current
@@ -256,6 +259,7 @@ impl Reconciler {
                             .fire_suspend(
                                 &d.id,
                                 &d.buyer_pubkey,
+                                d.recipe_id.as_deref(),
                                 d.next_deadline,
                                 effective_suspend_at,
                                 effective_suspend_at + d.retention_s,
@@ -276,7 +280,13 @@ impl Reconciler {
                 },
                 "SUSPENDED" | "CANCELLED" => {
                     if self
-                        .fire_destroy(&d.id, &d.buyer_pubkey, d.next_deadline, now)
+                        .fire_destroy(
+                            &d.id,
+                            &d.buyer_pubkey,
+                            d.recipe_id.as_deref(),
+                            d.next_deadline,
+                            now,
+                        )
                         .await?
                     {
                         report.terminated += 1;
@@ -566,7 +576,7 @@ impl Reconciler {
             .read(move |c| {
                 let mut stmt = c.prepare(
                     "SELECT id, state, buyer_pubkey, paid_through, retention_s, next_deadline,
-                            suspend_not_before
+                            suspend_not_before, recipe_id
                      FROM subscription
                      WHERE next_deadline IS NOT NULL AND next_deadline <= ?1
                      ORDER BY next_deadline",
@@ -581,6 +591,7 @@ impl Reconciler {
                             retention_s: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
                             next_deadline: r.get(5)?,
                             suspend_not_before: r.get(6)?,
+                            recipe_id: r.get(7)?,
                         })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -738,6 +749,20 @@ impl Reconciler {
         }
     }
 
+    /// Whether this reconciler may run lifecycle hooks for a row owned by `row_recipe` (lnrent-yjl).
+    ///
+    /// Skips ONLY an EXPLICITLY foreign owner — `Some(id)` that is not ours. A NULL/absent owner
+    /// keeps the PRE-yjl behaviour and is allowed through, which is where this deliberately diverges
+    /// from `provision.rs`/`resume.rs`: there, skipping an unowned row merely defers provisioning
+    /// (harmless, recoverable). Here the operation is destructive but OWED — skipping a legacy row
+    /// with no `recipe_id`, or a dead-letter whose subscription row is already gone, would leave the
+    /// provider resource permanently uncleaned and BILLING. A single-recipe M1a operator's rows are
+    /// exactly that NULL case, so treating unproven ownership as foreign would silently stop every
+    /// teardown they have (coderabbit Major + codex P2 on PR #63).
+    fn owns_recipe(&self, row_recipe: Option<&str>) -> bool {
+        !matches!(row_recipe, Some(id) if id != self.recipe.service.id)
+    }
+
     /// Retry every OPEN teardown dead-letter whose backoff has elapsed (lnrent-urw.2): re-run its
     /// hook with the persisted handles (§7.2 idempotent, so re-running is safe). Success resolves the
     /// row; a repeat failure bumps attempts + re-alerts. Best-effort — never fails the tick. Returns
@@ -745,6 +770,17 @@ impl Reconciler {
     async fn retry_teardowns(&self, now: i64) -> Result<usize> {
         let mut resolved = 0;
         for row in teardown::open_due_rows(&self.store, now).await? {
+            let row_recipe = self.sub_recipe_id(&row.subscription_id).await?;
+            if !self.owns_recipe(row_recipe.as_deref()) {
+                tracing::warn!(
+                    sub = %row.subscription_id,
+                    hook = %row.hook,
+                    row_recipe = row_recipe.as_deref().unwrap_or(""),
+                    reconciler_recipe = %self.recipe.service.id,
+                    "skipping teardown retry for a different recipe"
+                );
+                continue;
+            }
             // Defense-in-depth (codex P1): never re-run a destructive hook against a sub that is
             // currently ALIVE. A dead-letter is only ever recorded for a terminated sub (the atomic
             // record-iff-CAS-wins in `fire_destroy`), so this should never trip — but if a stale row
@@ -813,6 +849,23 @@ impl Reconciler {
                     |r| r.get(0),
                 )
                 .optional()?)
+            })
+            .await
+    }
+
+    /// Re-read a subscription's recipe ownership. `None` deliberately covers either a NULL owner or
+    /// an absent row: neither proves that this reconciler owns the destructive retry.
+    async fn sub_recipe_id(&self, sub_id: &str) -> Result<Option<String>> {
+        let id = sub_id.to_string();
+        self.store
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT recipe_id FROM subscription WHERE id=?1",
+                    params![id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten())
             })
             .await
     }
@@ -1024,15 +1077,31 @@ impl Reconciler {
     /// ACTIVE `-> SUSPENDED`, cursor `-> retention_end`, and a `billing.notice` enqueued in one txn.
     /// `retention_end` is `effective_suspend_at + retention_s` (retention runs from the CREDITED
     /// suspension, §6.5), so a long-credited sub is never suspended-then-instantly-destroyed.
+    #[allow(clippy::too_many_arguments)]
     async fn fire_suspend(
         &self,
         sub_id: &str,
         buyer_hex: &str,
+        row_recipe: Option<&str>,
         nd: i64,
         effective_suspend_at: i64,
         retention_end: i64,
         now: i64,
     ) -> Result<bool> {
+        // lnrent-yjl ownership gate: only the recipe a sub was ORDERED under may run its lifecycle
+        // hooks. An EXPLICITLY foreign owner is skipped; a NULL owner is allowed through (see
+        // `owns_recipe` — skipping it here would strand a legacy row's teardown forever). Nothing moves: state, cursor and reservation all stay put, so the row is still
+        // due whenever a daemon serving that recipe next runs against this data dir. The recurring
+        // warn is the intended signal — do NOT "quiet" it by advancing the cursor.
+        if !self.owns_recipe(row_recipe) {
+            tracing::warn!(
+                sub = %sub_id,
+                row_recipe = row_recipe.unwrap_or(""),
+                reconciler_recipe = %self.recipe.service.id,
+                "skipping due subscription for a different recipe"
+            );
+            return Ok(false);
+        }
         // Downtime credit (§6.5): a credited outage pushed the suspend FLOOR past `now` — do not
         // suspend the buyer for the operator's downtime. The cursor stays put; a later tick fires.
         if now < effective_suspend_at {
@@ -1110,7 +1179,27 @@ impl Reconciler {
     /// reservation in the SAME txn (the order id IS the subscription id, lnrent-7fp.17), cursor
     /// cleared. The `destroy` hook runs best-effort before that txn, so a crash before capacity is
     /// released leaves the retention cursor due for a retry. Hook failure is logged and non-fatal.
-    async fn fire_destroy(&self, sub_id: &str, buyer_hex: &str, nd: i64, now: i64) -> Result<bool> {
+    async fn fire_destroy(
+        &self,
+        sub_id: &str,
+        buyer_hex: &str,
+        row_recipe: Option<&str>,
+        nd: i64,
+        now: i64,
+    ) -> Result<bool> {
+        // lnrent-yjl ownership gate (same rule as `fire_suspend`, and the reason the bead exists): a
+        // FOREIGN recipe's `destroy` would no-op, exit 0, and let this reconciler mark the sub
+        // TERMINATED and release its capacity while the real provider box kept billing. Skipping
+        // leaves the row due and its hold held — capacity a live box genuinely still occupies.
+        if !self.owns_recipe(row_recipe) {
+            tracing::warn!(
+                sub = %sub_id,
+                row_recipe = row_recipe.unwrap_or(""),
+                reconciler_recipe = %self.recipe.service.id,
+                "skipping due subscription for a different recipe"
+            );
+            return Ok(false);
+        }
         if !self.subscription_matches_destroy(sub_id, nd).await? {
             return Ok(false);
         }
@@ -1602,11 +1691,15 @@ mod tests {
         let (id, state, buyer) = (id.to_string(), state.to_string(), buyer.to_string());
         store
             .transaction(move |tx| {
+                // recipe_id='dummy' == the service.id of every recipe this module's tests serve
+                // (`dummy_recipe` / `marker_recipe`), so a seeded sub is OWNED by the reconciler under
+                // test — production always stamps the serving recipe's id (order_intake.rs). Tests for
+                // the lnrent-yjl ownership gate override it via `set_recipe_id`.
                 tx.execute(
                     "INSERT INTO subscription
-                        (id, state, buyer_pubkey, period_s, renew_lead_s, retention_s,
+                        (id, recipe_id, state, buyer_pubkey, period_s, renew_lead_s, retention_s,
                          paid_through, next_deadline, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, 100, 10, ?4, ?5, ?6, 0, 0)",
+                     VALUES (?1, 'dummy', ?2, ?3, 100, 10, ?4, ?5, ?6, 0, 0)",
                     params![id, state, buyer, retention_s, paid_through, next_deadline],
                 )?;
                 Ok(())
@@ -1732,9 +1825,9 @@ mod tests {
             .transaction(move |tx| {
                 tx.execute(
                     "INSERT INTO subscription
-                        (id, state, buyer_pubkey, period_s, renew_lead_s, retention_s,
+                        (id, recipe_id, state, buyer_pubkey, period_s, renew_lead_s, retention_s,
                          paid_through, soft_date, next_deadline, created_at, updated_at)
-                     VALUES (?1, 'ACTIVE', ?2, 100, ?3, ?4, ?5, ?6, ?7, 0, 0)",
+                     VALUES (?1, 'dummy', 'ACTIVE', ?2, 100, ?3, ?4, ?5, ?6, ?7, 0, 0)",
                     params![
                         id,
                         buyer,
@@ -1800,6 +1893,22 @@ mod tests {
                 tx.execute(
                     "UPDATE subscription SET suspend_not_before=?2 WHERE id=?1",
                     params![id, floor],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Re-stamp a seeded sub's `recipe_id` (lnrent-yjl): `Some(other)` models a multi-recipe fleet
+    /// where this row belongs to a different daemon, `None` a row with no recorded owner.
+    async fn set_recipe_id(store: &Store, id: &str, recipe_id: Option<&str>) {
+        let (id, recipe_id) = (id.to_string(), recipe_id.map(str::to_string));
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "UPDATE subscription SET recipe_id=?2 WHERE id=?1",
+                    params![id, recipe_id],
                 )?;
                 Ok(())
             })
@@ -2028,6 +2137,194 @@ mod tests {
         assert_eq!(inv_status(&store, "renew:auto:s1:1000").await, "OPEN");
     }
 
+    // lnrent-yjl: a due ACTIVE sub ordered under ANOTHER recipe must not get THIS recipe's `suspend`
+    // hook. Nothing moves — no hook, no state change, no notice, cursor untouched — and the row stays
+    // DUE, proven by re-stamping it to this recipe and re-ticking at the SAME `now`: it suspends.
+    #[tokio::test]
+    async fn suspend_skips_a_subscription_from_a_different_recipe() {
+        let store = mem_store();
+        let (recipe, suspend_marker, _destroy_marker) = marker_recipe();
+        seed_sub(
+            &store,
+            "s1",
+            "ACTIVE",
+            "buyerhex",
+            Some(1000),
+            500,
+            Some(1000),
+        )
+        .await;
+        seed_reservation(&store, "s1").await;
+        set_recipe_id(&store, "s1", Some("other-recipe")).await;
+        let r = reconciler(store.clone(), recipe);
+
+        let rep = r.reconcile_tick(1000).await.unwrap();
+        assert_eq!(rep.suspended, 0, "a foreign recipe's sub is not suspended");
+        assert_eq!(
+            rep.noops, 1,
+            "it is counted as a due row with no transition"
+        );
+        assert!(!suspend_marker.exists(), "the suspend hook did NOT run");
+        assert_eq!(sub_state(&store, "s1").await, "ACTIVE");
+        assert_eq!(
+            sub_next_deadline(&store, "s1").await,
+            Some(1000),
+            "cursor untouched, so the row is still due when its recipe is served again"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM outbox WHERE msg_type='billing.notice'"
+            )
+            .await,
+            0,
+            "no SUSPENDED notice for a sub we did not suspend"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM reservation WHERE order_id='s1' AND state='HELD'"
+            )
+            .await,
+            1,
+            "the capacity hold is NOT released"
+        );
+
+        // Still due: re-stamping the row to the served recipe models the recovery — the operator
+        // pointing this data dir's daemon back at the owning recipe (the single-instance flock,
+        // main.rs, means no CONCURRENT sibling daemon ever shares these rows). The next tick, at the
+        // SAME `now`, suspends it.
+        set_recipe_id(&store, "s1", Some("dummy")).await;
+        assert_eq!(r.reconcile_tick(1000).await.unwrap().suspended, 1);
+        assert_eq!(sub_state(&store, "s1").await, "SUSPENDED");
+        assert!(suspend_marker.exists(), "the hook ran once the recipe matched");
+    }
+
+    // lnrent-yjl (the money-relevant half): a due SUSPENDED sub ordered under ANOTHER recipe must not
+    // get THIS recipe's `destroy`. A foreign no-op hook exits 0, so without the gate the sub would be
+    // TERMINATED and its reservation RELEASED while the real provider resource kept billing.
+    #[tokio::test]
+    async fn destroy_skips_a_subscription_from_a_different_recipe() {
+        let store = mem_store();
+        let (recipe, _suspend_marker, destroy_marker) = marker_recipe();
+        seed_sub(
+            &store,
+            "s1",
+            "SUSPENDED",
+            "buyerhex",
+            Some(1000),
+            500,
+            Some(1500),
+        )
+        .await;
+        seed_reservation(&store, "s1").await; // order_id == subscription id (M1a)
+        set_recipe_id(&store, "s1", Some("other-recipe")).await;
+        let r = reconciler(store.clone(), recipe);
+
+        let rep = r.reconcile_tick(1500).await.unwrap();
+        assert_eq!(
+            rep.terminated, 0,
+            "a foreign recipe's sub is not terminated"
+        );
+        assert_eq!(
+            rep.noops, 1,
+            "it is counted as a due row with no transition"
+        );
+        assert!(!destroy_marker.exists(), "the destroy hook did NOT run");
+        assert_eq!(sub_state(&store, "s1").await, "SUSPENDED");
+        assert_eq!(
+            sub_next_deadline(&store, "s1").await,
+            Some(1500),
+            "retention cursor untouched, so the row is still due when its recipe is served again"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM reservation WHERE order_id='s1' AND state='HELD'"
+            )
+            .await,
+            1,
+            "the capacity hold is NOT released for a box we did not tear down"
+        );
+
+        // Still due: once this data dir is served by the owning recipe again, the SAME retention
+        // deadline really tears it down — the skip deferred the teardown, it did not lose it.
+        set_recipe_id(&store, "s1", Some("dummy")).await;
+        assert_eq!(r.reconcile_tick(1500).await.unwrap().terminated, 1);
+        assert_eq!(sub_state(&store, "s1").await, "TERMINATED");
+        assert!(destroy_marker.exists(), "the hook ran once the recipe matched");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM reservation WHERE order_id='s1' AND state='RELEASED'"
+            )
+            .await,
+            1
+        );
+    }
+
+    // lnrent-yjl: a NULL `recipe_id` is a NON-match for both teardown transitions, EXACTLY as in
+    // provision.rs:127 / resume.rs:92 — ownership is unproven, so the destructive hook is skipped
+    // rather than guessed. Unreachable in production (recipe_id is in the v1 SCHEMA baseline with no
+    // ALTER TABLE adding it, and order_intake always stamps the serving recipe's id).
+    #[tokio::test]
+    async fn teardowns_still_run_for_a_legacy_subscription_with_no_recipe_id() {
+        let store = mem_store();
+        let (recipe, suspend_marker, destroy_marker) = marker_recipe();
+        seed_sub(
+            &store,
+            "a1",
+            "ACTIVE",
+            "buyerhex",
+            Some(1000),
+            500,
+            Some(1000),
+        )
+        .await;
+        seed_sub(
+            &store,
+            "s1",
+            "SUSPENDED",
+            "buyerhex",
+            Some(1000),
+            500,
+            Some(1500),
+        )
+        .await;
+        seed_reservation(&store, "s1").await;
+        set_recipe_id(&store, "a1", None).await;
+        set_recipe_id(&store, "s1", None).await;
+        let r = reconciler(store.clone(), recipe);
+
+        let rep = r.reconcile_tick(1500).await.unwrap();
+        // lnrent-yjl (coderabbit Major on PR #63): a NULL `recipe_id` is the LEGACY/single-recipe
+        // case, so it keeps the pre-yjl behaviour and is still torn down. Skipping it would leave a
+        // legacy operator's rows permanently due and their provider resources BILLING forever.
+        assert_eq!(rep.suspended, 1);
+        assert_eq!(rep.terminated, 1);
+        assert!(
+            suspend_marker.exists(),
+            "a legacy NULL-owner row is still suspended"
+        );
+        assert!(
+            destroy_marker.exists(),
+            "a legacy NULL-owner row is still destroyed"
+        );
+        // The legacy rows advanced exactly as they did before lnrent-yjl: ACTIVE -> SUSPENDED and
+        // SUSPENDED -> TERMINATED, with the terminated row's reservation released.
+        assert_eq!(sub_state(&store, "a1").await, "SUSPENDED");
+        assert_eq!(sub_state(&store, "s1").await, "TERMINATED");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM reservation WHERE order_id='s1' AND state='HELD'"
+            )
+            .await,
+            0,
+            "the destroyed legacy row released its reservation"
+        );
+    }
+
     // Test 1d: a SUSPENDED sub past its retention end -> TERMINATED, the destroy hook ran, the
     // reservation is RELEASED in the same txn, the cursor is cleared.
     #[tokio::test]
@@ -2121,6 +2418,45 @@ mod tests {
         assert_eq!(crate::teardown::open_count(&store).await.unwrap(), 0, "retry resolved the dead-letter");
     }
 
+    #[tokio::test]
+    async fn teardown_retry_skips_only_explicitly_foreign_subscriptions() {
+        let store = mem_store();
+        let (recipe, _suspend_marker, destroy_marker) = marker_recipe();
+        for (sub_id, recipe_id) in [("foreign", Some("other-recipe")), ("missing", None)] {
+            seed_sub(
+                &store,
+                sub_id,
+                "TERMINATED",
+                "buyerhex",
+                Some(1000),
+                500,
+                None,
+            )
+            .await;
+            set_recipe_id(&store, sub_id, recipe_id).await;
+            crate::teardown::record_failure(&store, sub_id, "destroy", None, "boom", 0)
+                .await
+                .unwrap();
+        }
+        let r = reconciler(store.clone(), recipe);
+
+        r.reconcile_tick(1000).await.unwrap();
+
+        // Only the EXPLICITLY foreign row is skipped. The NULL-owner row is retried: its dead-letter
+        // is an OWED provider cleanup, and stranding it would leave a resource billing forever
+        // (codex P2 on PR #63 — the pre-yjl guard treated an absent/unowned row as safe to proceed).
+        let foreign = crate::teardown::open_row(&store, "foreign", "destroy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(foreign.attempts, 1, "the foreign dead-letter was left untouched");
+        assert_eq!(foreign.last_attempt_at, 0, "the foreign retry remains due");
+        assert!(
+            destroy_marker.exists(),
+            "the NULL-owner dead-letter WAS retried (its cleanup is owed)"
+        );
+    }
+
     // urw.2 (codex P1 defense): the retry loop must NEVER re-run a destructive hook against a sub
     // that is currently ALIVE — even if a stale/racy dead-letter row exists for it. The guard skips
     // it, leaving the box untouched and the row open.
@@ -2132,8 +2468,9 @@ mod tests {
         store
             .transaction(|tx| {
                 tx.execute(
-                    "INSERT INTO subscription (id, state, buyer_pubkey, next_deadline, created_at, updated_at)
-                     VALUES ('s1', 'ACTIVE', 'buyer', 9999999, 0, 0)",
+                    "INSERT INTO subscription
+                        (id, recipe_id, state, buyer_pubkey, next_deadline, created_at, updated_at)
+                     VALUES ('s1', 'dummy', 'ACTIVE', 'buyer', 9999999, 0, 0)",
                     [],
                 )?;
                 Ok(())
