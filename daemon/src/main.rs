@@ -566,11 +566,12 @@ fn build_phoenixd_backend(
     // this daemon never typed it. Removed with the guard by lnrent-ehu, after lnrent-tof passes.
     tracing::warn!(
         "phoenixd is an UNSUPPORTED backend and is active only because `accept_unsupported` is set \
-         (lnrent-9gi): open launch gates are lnrent-kr1 (seed-only wallet restore UNPROVEN; \
-         `lnrentd backup` does not cover phoenixd funds), lnrent-itw (fee-credit liability measured \
-         only wallet-wide). `lnrent preflight` probes THIS node's reachability, credentials, and \
-         fee-schedule compatibility (lnrent-5mi). Staging acceptance is lnrent-tof; see \
-         docs/go-live.md"
+         (lnrent-9gi): open launch gates include lnrent-kr1 (seed-only wallet restore UNPROVEN; \
+         `lnrentd backup` does not cover phoenixd funds). Separately, and NOT a gate: fee-credit \
+         liability is measured only wallet-wide — an ACCEPTED residual with no pending work \
+         (lnrent-itw, measured 2026-07-26; ADR-0019). `lnrent preflight` probes THIS node's \
+         reachability, credentials, and fee-schedule compatibility (lnrent-5mi). Staging \
+         acceptance is lnrent-tof, which carries the full blocker set; see docs/go-live.md"
     );
     let phoenixd = operator.config.phoenixd.as_ref().context(
         "payment_backend=phoenixd requires a phoenixd config (phoenixd_url + phoenixd_api_password)",

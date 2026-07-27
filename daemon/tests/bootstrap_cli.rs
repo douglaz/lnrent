@@ -284,10 +284,13 @@ fn phoenixd_needs_the_unsupported_opt_in_to_bootstrap() {
     let stderr: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
     assert_eq!(stderr["error"]["code"], "config_invalid");
     let message = stderr["error"]["message"].as_str().unwrap();
-    for gate in ["lnrent-kr1", "lnrent-itw", "docs/go-live.md"] {
+    // `lnrent-itw` is here as the ACCEPTED fee-credit residual, not as an open gate (it is settled —
+    // ADR-0019): the refusal must still name it, because the opt-in makes that risk the operator's
+    // own either way.
+    for named in ["lnrent-kr1", "lnrent-itw", "docs/go-live.md"] {
         assert!(
-            message.contains(gate),
-            "refusal must name {gate}: {message}"
+            message.contains(named),
+            "refusal must name {named}: {message}"
         );
     }
     assert!(

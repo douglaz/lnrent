@@ -360,7 +360,7 @@ async fn phoenixd_check_with_timeout(
 /// because that much of the receipts cannot fund a refund. The SPENDABLE `balanceSat` is printed
 /// beside it for the same reason — the credit is only interpretable next to the balance it is
 /// excluded from — but neither figure is judged here: a "is the wallet funded enough" rule is
-/// lnrent-itw / lnrent-tof, and this check deliberately does not invent one.
+/// lnrent-tof, and this check deliberately does not invent one.
 ///
 /// §13: the RUNNING version is remote-controlled operator output, so even the backend's
 /// credential-aware sanitization is enforced again here with the strict public version shape before
@@ -952,7 +952,7 @@ mod tests {
         );
         // The credit is only interpretable NEXT TO the balance it is excluded from: 2277 sat of
         // unspendable credit reads very differently against 411 sat than against 500k. Reported,
-        // never judged — a thin balance is not a failure here (lnrent-itw / lnrent-tof own that).
+        // never judged — a thin balance is not a failure here (lnrent-tof owns that).
         assert!(
             detail.contains("411"),
             "the spendable balance is reported beside it: {detail}"

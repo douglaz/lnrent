@@ -162,9 +162,16 @@ raises the existing `RefundStuck` operator alert.
 
 Accepted residual: a fee-credit receive whose credit was already consumed by a channel open *before*
 lnrent observed the settlement reads as fully backed, and a funded wallet books a receipt that may
-have been fee credit (over-booking by at most that receipt). Closing that needs the per-payment
-attribution phoenixd does not have; measuring a live fee-credit receive and, if it exists, excluding
-it exactly is **lnrent-itw**.
+have been fee credit (over-booking by at most that receipt). **lnrent-itw** induced a real
+fee-credit receive on 2026-07-26 — 1,000 sat paid into a channel-less mainnet phoenixd 0.9.0 landed
+entirely in fee credit and was reported as `receivedSat: 1000` with `fees: 0`, indistinguishable
+from a spendable receive. Nor can a before/after `feeCreditSat` delta stand in for the field the
+record lacks: a settlement is only ever learned about after the fact, while the same wallet moves
+for reasons lnrent never sees — other receives, phoenixd's own credit-spending channel opens,
+payments made outside lnrent entirely — so such a delta around an observed settlement attributes to
+nothing in particular at any observation latency. The residual is therefore **accepted** — the
+wallet-level rejection above is the precision this node admits — rather than deferred to a field
+that might arrive.
 
 Two consequences lnv2 does not have. The trampoline fee is **exact in msat, not a ceiling**: a
 successful trampoline-routed payment pays the full msat tier fee regardless of the real route cost, so

@@ -122,15 +122,17 @@
 //! and the clock backstop that bound the poll to LIVE invoices, and for what still recovers a
 //! settlement whose capture failed. The supervisor's `settlement_catch_up` remains a second,
 //! independent poll for OPEN rows. No timestamp fidelity is lost: phoenixd reports the TRUE
-//! settlement instant in `completedAt`. TODO (follow-up bead): a verified websocket listener could
+//! settlement instant in `completedAt`. TODO (lnrent-rpa): a verified websocket listener could
 //! replace this polling load, but no unverified endpoint is invented here.
 //!
 //! ## Deliberately NOT here (scoped to follow-up beads)
-//! The `lnrent phoenixd-seed` helper + the phoenixd wallet's own backup/restore story (lnrent-kr1),
-//! the exact per-receipt fee-credit exclusion (lnrent-itw), and the staging dogfood that gates
-//! operator-facing exposure and the go-live runbook (lnrent-tof) are separate beads — all filed,
-//! none silently dropped. Index GC is also deferred: `phoenixd_invoice` grows one
-//! row per created invoice, the same unpaid-order flood surface lnv2 grew a throttled reaper for
+//! The `lnrent phoenixd-seed` helper + the phoenixd wallet's own backup/restore story (lnrent-kr1)
+//! and the staging dogfood that gates operator-facing exposure and the go-live runbook (lnrent-tof)
+//! are separate beads — all filed, none silently dropped. The exact per-receipt fee-credit exclusion
+//! is NOT one of them: lnrent-itw measured a live fee-credit receive on 2026-07-26 and found no
+//! per-receipt attribution to exclude, so the wallet-level rule in [`spendable_credit_msat`] is the
+//! whole of it. Index GC is also deferred, to lnrent-rpa: `phoenixd_invoice` grows one row per
+//! created invoice, the same unpaid-order flood surface lnv2 grew a throttled reaper for
 //! (lnrent-y4m.15/y4m.19). The poll reads only rows whose bolt11 can still be paid (an indexed
 //! `expires_at` range, not a table scan) and retires within that set, so the steady-state poll cost
 //! tracks LIVE invoices rather than the table; what GC still buys is disk. It is an operational
@@ -568,9 +570,12 @@ fn credit_backing(received_sat: u64, fee_credit_sat: u64, balance_sat: u64) -> C
 /// LIMIT, stated rather than papered over: this is a wallet-level test, so it cannot ATTRIBUTE
 /// credit in either direction. A fee-credit receive whose credit was already consumed by a channel
 /// open before lnrent observed the settlement reads as `FullyBacked` and is booked; a funded wallet
-/// books a receipt that may have been fee credit, over-booking by at most that receipt. Closing that
-/// needs a per-payment attribution field phoenixd does not have — tracked on lnrent-itw (measure a
-/// live fee-credit receive, then exclude it exactly).
+/// books a receipt that may have been fee credit, over-booking by at most that receipt. That is an
+/// ACCEPTED residual (ADR-0019), not an open question: lnrent-itw measured a real fee-credit receive
+/// on 2026-07-26 — 1_000 sat into a channel-less wallet, reported as `receivedSat: 1000` with
+/// `fees: 0`, indistinguishable from a spendable receive — and confirmed phoenixd 0.9.0 exposes no
+/// per-receipt attribution field to exclude, so this wallet-level rule is the maximal precision
+/// available rather than a stopgap awaiting a better field.
 async fn spendable_credit_msat(
     ops: &Arc<dyn PhoenixdOps>,
     invoice_id: &str,
@@ -1438,9 +1443,9 @@ impl PaymentBackend for PhoenixdPayment {
             // settlement catch-up all treat it as "retry next tick"), so the divergence surfaces in
             // operator logs instead of silently expiring paid money. Same discipline, and the same
             // reason, as lnv2's `PAID_UNRECOVERED` bail (`lnv2_backend.rs:1074`) and
-            // `received_amount_msat` below. NOTE for the deferred index-GC bead: a reaper that
-            // deletes rows must keep any invoice reconcile can still `lookup` (y4m.15's rule), or
-            // it turns this fail-closed arm into a permanent retry.
+            // `received_amount_msat` below. NOTE for lnrent-rpa, the deferred index-GC bead: a
+            // reaper that deletes rows must keep any invoice reconcile can still `lookup`
+            // (y4m.15's rule), or it turns this fail-closed arm into a permanent retry.
             bail!(
                 "phoenixd has no index row for invoice {id}; its payment state is UNKNOWN (the \
                  lnrent index and state DB have diverged), so it must not be treated as expired"
@@ -1637,8 +1642,8 @@ impl PaymentBackend for PhoenixdPayment {
             });
         }
         // Both figures are REPORTED, never judged: `feeCreditSat` is only interpretable next to the
-        // spendable `balanceSat` it is excluded from. Whether that balance is ENOUGH is lnrent-itw /
-        // lnrent-tof, not this probe — no funding rule is applied here.
+        // spendable `balanceSat` it is excluded from. Whether that balance is ENOUGH is lnrent-tof,
+        // not this probe — no funding rule is applied here.
         let balance = match self.ops.balance().await {
             Ok(balance) => balance,
             // NOT classified as an auth rejection even on a 401/403: `getinfo` above already
@@ -2472,7 +2477,60 @@ mod real {
 
     #[cfg(test)]
     mod decode_tests {
-        use super::{IncomingResponse, OutgoingResponse};
+        use super::{BalanceResponse, IncomingResponse, OutgoingResponse};
+
+        /// The 2026-07-26 live fee-credit measurement, as the wire actually delivered it: 1_000 sat
+        /// into a channel-less mainnet phoenixd 0.9.0, landing ENTIRELY in unspendable fee credit.
+        /// `phoenixd_backend::tests` drives the refusal end to end over the [`PhoenixdOps`] seam;
+        /// this pins the two decoders that seam sits behind, since the rule is read off
+        /// `feeCreditSat` and nothing else decodes that field.
+        #[test]
+        fn the_measured_fee_credit_receive_decodes_off_the_wire() {
+            // Verbatim but for the abridged bolt11 and the redacted `paymentHash`/`preimage`: this
+            // repo is public and a settled invoice's preimage is a bearer proof of payment. Both
+            // carry the module's `"00"` placeholder, which costs the fixture nothing — `paymentHash`
+            // must be PRESENT to decode but its value is never asserted. `type`, `subType`,
+            // `preimage`, `externalId`, `description`, `fees` and `createdAt` have no counterpart
+            // here and must be ignored.
+            let measured = r#"{
+                "type":"incoming_payment",
+                "subType":"lightning",
+                "paymentHash":"00",
+                "preimage":"00",
+                "externalId":"itw-feecredit-1785097921",
+                "description":"lnrent-itw fee-credit measurement",
+                "invoice":"lnbc10u1p4xvmkppp5",
+                "isPaid":true,
+                "isExpired":false,
+                "requestedSat":1000,
+                "receivedSat":1000,
+                "fees":0,
+                "expiresAt":1785184321565,
+                "completedAt":1785097938613,
+                "createdAt":1785097921565
+            }"#;
+            let decoded: IncomingResponse = serde_json::from_str(measured).expect("measured shape");
+            // The finding: nothing on this record separates fee credit from spendable credit — the
+            // full amount at `fees: 0`, exactly as a receive that reached the channel would read.
+            assert!(decoded.is_paid);
+            assert_eq!(decoded.received_sat, 1_000);
+            assert_eq!(decoded.requested_sat, 1_000);
+            // The record's two timestamps, pinned because both degrade SILENTLY on a rename rather
+            // than failing: `completedAt` is the settlement instant every booked receipt is dated by
+            // (`lookup_settlement`'s `settled_at`), and `expiresAt` is `#[serde(default)]`, so an
+            // absent one decodes as `None` and loses `create_invoice`'s original-window recovery.
+            assert_eq!(decoded.completed_at, Some(1_785_097_938_613));
+            assert_eq!(decoded.expires_at, Some(1_785_184_321_565));
+
+            // So the wallet-level figure measured in the same instant is the only signal there is.
+            let balance: BalanceResponse =
+                serde_json::from_str(r#"{"balanceSat":0,"feeCreditSat":1000}"#)
+                    .expect("measured shape");
+            assert_eq!((balance.balance_sat, balance.fee_credit_sat), (0, 1_000));
+            // And it must stay REQUIRED: an absent-means-zero `feeCreditSat` would book the receive
+            // above — the one case `spendable_credit_msat` exists to refuse.
+            assert!(serde_json::from_str::<BalanceResponse>(r#"{"balanceSat":0}"#).is_err());
+        }
 
         #[test]
         fn incoming_money_and_status_fields_are_required() {

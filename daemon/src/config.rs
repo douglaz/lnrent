@@ -1344,17 +1344,22 @@ fn require_phoenixd_unsupported_opt_in(raw: &RawConfig) -> Result<(), IpcError> 
     if opted_in {
         return Ok(());
     }
-    // Names the open gates by bead id so the refusal is actionable without the runbook, and echoes
-    // NOTHING the operator supplied (the api password is one field over; §13).
+    // Names open gates — and the accepted residual — by bead id so the refusal is actionable
+    // without the runbook, and echoes NOTHING the operator supplied (the api password is one field
+    // over; §13). It names the ones an operator must weigh, NOT an exhaustive list: lnrent-tof
+    // carries the full blocker set, which is why the message points there.
     Err(config_err(format!(
-        "payment_backend=phoenixd is NOT a supported go-live backend yet — its launch gates are \
-         still open: lnrent-kr1 (the phoenixd wallet lives under phoenixd's OWN seed; a seed-only \
-         restore is UNPROVEN and `lnrentd backup` does not back those funds up), lnrent-itw (the \
-         fee-credit liability exclusion is measured only at wallet level, so booked liability can \
-         exceed spendable funds). Full-daemon staging acceptance is lnrent-tof; read \
-         docs/go-live.md before going further. To run phoenixd anyway — a staging \
-         acceptance, or accepting those risks as your own — opt in explicitly with `[phoenixd] \
-         accept_unsupported = true` (or {ENV_PHOENIXD_ACCEPT_UNSUPPORTED}=true)"
+        "payment_backend=phoenixd is NOT a supported go-live backend yet — launch gates are \
+         still open, among them lnrent-kr1 (the phoenixd wallet lives under phoenixd's OWN seed; a \
+         seed-only restore is UNPROVEN and `lnrentd backup` does not back those funds up). It also \
+         carries an ACCEPTED residual — not an open gate, and no work is pending to close it: \
+         fee-credit liability is measured at wallet level only, never per receipt, so booked \
+         liability can exceed spendable funds (lnrent-itw measured that live on 2026-07-26; \
+         phoenixd 0.9.0 exposes no per-receipt attribution to exclude — ADR-0019). Full-daemon \
+         staging acceptance is lnrent-tof, which carries the rest; read docs/go-live.md before \
+         going further. To run phoenixd anyway — a staging acceptance, or accepting those risks as \
+         your own — opt in explicitly with `[phoenixd] accept_unsupported = true` (or \
+         {ENV_PHOENIXD_ACCEPT_UNSUPPORTED}=true)"
     )))
 }
 
@@ -4013,10 +4018,12 @@ mod tests {
     // docs/go-live.md — is what keeps a stranger-operator's real money off an un-launch-gated
     // backend. Removed with the guard by lnrent-ehu, after lnrent-tof passes.
 
-    // The refusal must be ACTIONABLE without the runbook: it names each open gate by bead id so an
-    // operator can look up exactly what they would be accepting, and names the opt-in to clear it.
+    // The refusal must be ACTIONABLE without the runbook: it names open gates — and the accepted
+    // residual lnrent-itw settled, which no pending work closes — by bead id so an operator can look
+    // up exactly what they would be accepting, points at lnrent-tof for the full blocker set, and
+    // names the opt-in to clear it.
     #[test]
-    fn phoenixd_without_the_unsupported_opt_in_is_refused_naming_the_open_gates() {
+    fn phoenixd_without_the_unsupported_opt_in_is_refused_naming_the_gates_and_the_residual() {
         for (label, opt_in) in [("an absent", None), ("an explicitly false", Some(false))] {
             let mut raw = phoenixd_raw("https://phoenixd.example.com");
             raw.phoenixd_accept_unsupported = opt_in;
