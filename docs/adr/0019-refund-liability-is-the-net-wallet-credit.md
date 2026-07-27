@@ -167,9 +167,9 @@ fee-credit receive on 2026-07-26 — 1,000 sat paid into a channel-less mainnet 
 entirely in fee credit and was reported as `receivedSat: 1000` with `fees: 0`, indistinguishable
 from a spendable receive. Nor can a before/after `feeCreditSat` delta stand in for the field the
 record lacks: a settlement is only ever learned about after the fact, while the same wallet moves
-for reasons lnrent never sees — other receives, phoenixd's own credit-spending channel opens,
-payments made outside lnrent entirely — so such a delta around an observed settlement attributes to
-nothing in particular at any observation latency. The residual is therefore **accepted** — the
+for reasons lnrent never sees — other incoming payments, phoenixd's own credit-spending channel
+opens, payments made outside lnrent entirely — so such a delta around an observed settlement
+attributes to nothing in particular at any observation latency. The residual is therefore **accepted** — the
 wallet-level rejection above is the precision this node admits — rather than deferred to a field
 that might arrive.
 
