@@ -10,18 +10,21 @@ every build, so a build flag is not what keeps real money off.
 
 > **phoenixd is NOT a supported go-live option yet.** It is named here only so the sentence above is
 > true about what a build can move; this runbook is the Fedimint path. The phoenixd backend has not
-> been through its full-daemon staging acceptance (`lnrent-tof`), and the operator obligations it
-> creates are still open beads: `lnrent-kr1` (deriving phoenixd's wallet seed from your operator
-> seed, and proving a seed-only restore) and `lnrent-itw` (its fee-credit liability is measured only
-> wallet-wide, not per receipt). Those are exactly the gates the daemon names when it refuses to
-> start, so this list and that refusal stay in step. `lnrent preflight` now probes phoenixd reachability,
+> been through its full-daemon staging acceptance (`lnrent-tof`, which carries the full blocker set),
+> and the operator obligations it creates are still open beads — among them `lnrent-kr1` (deriving
+> phoenixd's wallet seed from your operator seed, and proving a seed-only restore). One risk is not
+> open work at all but an ACCEPTED residual: its fee-credit liability is measured only wallet-wide,
+> never per receipt — `lnrent-itw` measured a live fee-credit receive on 2026-07-26 and found
+> phoenixd 0.9.0 exposes no per-receipt attribution to exclude (ADR-0019), so there is no exclusion
+> left for lnrent to build. Those are what the daemon names when it refuses to start; neither this
+> list nor that refusal is exhaustive. `lnrent preflight` now probes phoenixd reachability,
 > authentication, and fee-schedule compatibility, but **`lnrentd backup` does not back up a phoenixd
 > wallet** — those funds live under phoenixd's own `seed.dat` on the phoenixd host, and backing that
-> up is yours to do. Do not take real money on phoenixd until `lnrent-tof` closes and this section is
-> replaced with a real runbook.
+> up is yours to do. Do not take real money on phoenixd until `lnrent-tof` closes and this section
+> is replaced with a real runbook.
 >
 > This paragraph is no longer the only guard (`lnrent-9gi`): `payment_backend=phoenixd` REFUSES to
-> start — naming those open gates — unless you explicitly opt in with `[phoenixd]
+> start — naming those gates and that residual — unless you explicitly opt in with `[phoenixd]
 > accept_unsupported = true` (or `LNRENT_PHOENIXD_ACCEPT_UNSUPPORTED=true`), which attests that you
 > accept an unsupported backend, and which the daemon warns about on every start.
 

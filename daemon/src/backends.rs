@@ -313,7 +313,7 @@ pub enum PhoenixdProbe {
         /// because the fee credit is only interpretable next to the balance it is excluded from
         /// ("2723 sat unspendable" reads very differently at balance 0 than at balance 500k). The
         /// doctor prints both and judges NEITHER: whether the node holds enough to fund refunds is
-        /// lnrent-itw / lnrent-tof, not this probe.
+        /// lnrent-tof, not this probe.
         balance_sat: u64,
         fee_credit_sat: u64,
     },

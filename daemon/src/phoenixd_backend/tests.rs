@@ -1012,6 +1012,106 @@ fn fee_credit_backing_is_classified_on_the_wallet_level_signal() {
         },
         "could be fee credit in full AND no spendable funds to refund it"
     );
+    // The 2026-07-26 LIVE measurement: a 1_000-sat receive on a channel-less wallet landed entirely
+    // in fee credit (`{balanceSat: 0, feeCreditSat: 1000}`). Distinct from the row above, which is a
+    // constructed near-miss: here the spendable balance is EXACTLY zero — the real-world boundary,
+    // not one sat below the receipt. It is NOT a distinct CODE boundary: `credit_backing` tests
+    // `balance_sat < received_sat` and treats zero like any other shortfall. What this row pins is
+    // provenance — the triple a real node actually produced lands on the refusing arm.
+    assert_eq!(
+        credit_backing(1_000, 1_000, 0),
+        CreditBacking::UnbackedAndUnpayable {
+            fee_credit_sat: 1_000,
+            balance_sat: 0
+        },
+        "the measured fee-credit-only receive: receivedSat counts it, balanceSat cannot spend it"
+    );
+}
+
+// The same measurement driven END TO END over the record phoenixd actually returned. On 2026-07-26 a
+// 1_000-sat invoice was paid from a real Lightning node to a mainnet phoenixd 0.9.0 with ZERO
+// channels: the wallet went `{balanceSat: 0, feeCreditSat: 0}` -> `{balanceSat: 0, feeCreditSat:
+// 1000}` with NO channel opened, and the incoming record reported `receivedSat: 1000` with `fees: 0`
+// — INDISTINGUISHABLE from a genuinely spendable receive, and carrying no per-receipt attribution
+// field to tell them apart. Confirmed in the same session: an outbound `payinvoice` off that wallet
+// FAILED ("payment could not be sent through existing channels, check individual failures"), so fee
+// credit provably cannot fund a refund. The wallet-level `getbalance` is therefore the ONLY signal,
+// and it must refuse here.
+#[tokio::test]
+async fn the_measured_fee_credit_only_receive_is_refused_end_to_end() {
+    let ops = FakePhoenixdOps::new();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let inv = be
+        .create_invoice(1_000, "lnrent-itw fee-credit measurement", 86_400, "ext:itw")
+        .await
+        .unwrap();
+    // The measured record, in every field `PhoenixdIncoming` carries — this drives the RULE, over
+    // the `PhoenixdOps` seam; the verbatim JSON's trip through the wire decoders is pinned
+    // separately in `real::decode_tests` (those types are private to that module). Its `fees: 0` has
+    // no counterpart here because `receivedSat` is ALREADY net of the incoming `fees` (module header:
+    // `receivedSat=2723` on a 25_000-sat request at `fees=22_277_000` msat), so there is nothing
+    // left to subtract. What the record has NO field for is fee-CREDIT attribution — nothing says
+    // which part of `receivedSat` the wallet cannot spend.
+    ops.set_incoming(
+        "ext:itw",
+        vec![PhoenixdIncoming {
+            payment_hash: inv.payment_hash.clone(),
+            bolt11: inv.bolt11.clone(),
+            is_paid: true,
+            is_expired: false,
+            requested_sat: 1_000,
+            received_sat: 1_000,
+            completed_at_ms: Some(1_785_097_938_613),
+            expires_at_ms: Some(1_785_184_321_565),
+        }],
+    );
+    ops.set_balance(0, 1_000);
+
+    let err = be
+        .received_amount_msat(&inv.id)
+        .await
+        .expect_err("a receipt that landed entirely in fee credit must not become liability");
+    let rendered = format!("{err:#}");
+    // [9A]: pin the `UnbackedAndUnpayable` arm by all three measured figures, not merely "an error"
+    // — the unpaid/unknown-invoice refusals of this same call carry different text.
+    assert!(
+        rendered.contains("received 1000 sat")
+            && rendered.contains("1000 sat of non-spendable fee credit")
+            && rendered.contains("only 0 sat spendable"),
+        "unexpected error: {rendered}"
+    );
+
+    // And the refusal holds on the path that would otherwise book it: nothing reaches capture, and
+    // the row stays watched so funding the wallet retries it.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let ops_dyn: Arc<dyn PhoenixdOps> = ops.clone();
+    let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_000));
+    let mut retired: HashSet<String> = HashSet::new();
+    assert!(poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &tx, &mut retired).await);
+    assert!(
+        rx.try_recv().is_err(),
+        "a receipt the wallet demonstrably cannot refund must not reach capture"
+    );
+    assert!(retired.is_empty(), "the row must stay watched for a re-check");
+
+    // [9A] again, for the negative assertions above: they cannot on their own tell "the fee-credit
+    // rule refused it" from "the poll never reached this row at all". Fund the wallet to exactly the
+    // receipt and the SAME poll delivers it — proving the row was pollable and the refusal was the
+    // only thing holding it. This leg also pins the residual ADR-0019 now permanently accepts, on
+    // the measured figures: once `balanceSat` covers the receipt, a receive that may have been fee
+    // credit in full IS booked (`UnattributedButPayable`), over-booking by at most that receipt.
+    ops.set_balance(1_000, 1_000);
+    assert_eq!(
+        be.received_amount_msat(&inv.id).await.unwrap(),
+        Some(1_000_000)
+    );
+    assert!(poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &tx, &mut retired).await);
+    let delivered = rx.recv().await.expect("now deliverable");
+    assert_eq!(delivered.received_msat, 1_000_000);
+    // Dated by the record's OWN `completedAt`, not the daemon clock (which this test holds at
+    // 1_000): capture sets `paid_through = settled_at + period`, so a settlement dated by the
+    // observing clock would bill from the wrong instant. The measured millisecond figure in secs.
+    assert_eq!(delivered.settled_at, 1_785_097_938);
 }
 
 #[tokio::test]
