@@ -178,11 +178,19 @@ pub(crate) struct PublishSnapshot {
 
 impl PublishSnapshot {
     /// Snapshot the state and epoch a publish is about to be decided against.
+    ///
+    /// Taken under [`TRANSITION`] so the pair is ATOMIC with respect to `withdraw`. Reading them
+    /// unlocked is not enough in either direction, and the second one is not obvious: a withdrawal
+    /// that lands entirely BEFORE the epoch read writes nothing durable when the row is
+    /// `UNPUBLISHED` or already `WITHDRAWN`, so the snapshot would absorb that withdrawal into its
+    /// own baseline — new epoch, unchanged state — and the later compare-and-swap would see nothing
+    /// moved and let an already-started publish bring the listing up after the operator had been
+    /// told it was not live. The lock makes the snapshot a single ordering point, so a withdrawal is
+    /// unambiguously either before this publish (and reflected in what it decided against) or after
+    /// it (and caught by the CAS). Held only for the two reads; the seconds of preflight probes that
+    /// follow still run UNLOCKED.
     async fn take(store: &Store, listing_id: &str) -> Result<Self> {
-        // The epoch FIRST: a withdrawal landing between the two reads is then counted while the
-        // state read already reflects it, and the publish is refused for a change it technically
-        // saw. That direction is the safe one — a spurious refusal costs the operator one re-run,
-        // publishing over a withdrawal costs them orders nobody asked for.
+        let _one_at_a_time = TRANSITION.lock().await;
         let withdraw_epoch = store.listing_withdraw_epoch();
         let state = state(store, listing_id).await?.unwrap_or_default();
         Ok(Self {
