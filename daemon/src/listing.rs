@@ -344,7 +344,7 @@ async fn publish_event(
     recipe: &Recipe,
     listing_id: &str,
     operator_hex: &str,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
     let event_id = match tokio::time::timeout(
         PUBLISH_TIMEOUT,
         relay.publish_listing_for(recipe, &d_tag(recipe), operator_hex),
@@ -355,7 +355,14 @@ async fn publish_event(
         Err(_) => anyhow::bail!("relay publish timed out after {PUBLISH_TIMEOUT:?}"),
     };
     let (id, ev) = (listing_id.to_string(), event_id.clone());
-    store
+    // The relay has ACCEPTED at this point, and that is the fact the operator is told about. A
+    // failure to record the event id locally must NOT be reported as a relay failure: the caller
+    // renders any `Err` from here as `relay_error` ("the 30402 did not reach a relay"), which would
+    // be false — buyers can already discover the listing — and would send the operator chasing
+    // relays over what is really a local storage fault (a degraded store, a full disk). The id is a
+    // diagnostic, so losing it costs `lnrent status` its "discoverable" evidence and nothing more;
+    // it is returned as a separate warning instead of collapsing into the same error.
+    let persist_warning = match store
         .transaction(move |tx| {
             tx.execute(
                 "UPDATE listing SET event_id=?2 WHERE id=?1",
@@ -364,9 +371,23 @@ async fn publish_event(
             Ok(())
         })
         .await
-        .context("recording the published listing event id")?;
+        .context("recording the published listing event id")
+    {
+        Ok(()) => None,
+        Err(e) => {
+            let detail = format!("{e:#}");
+            tracing::warn!(
+                listing = %listing_id,
+                event = %event_id,
+                error = %detail,
+                "a relay ACCEPTED the 30402 but its event id could not be recorded; the listing is \
+                 published and discoverable, and the next publish re-records the id"
+            );
+            Some(detail)
+        }
+    };
     tracing::info!(listing = %listing_id, event = %event_id, "published 30402 listing");
-    Ok(event_id)
+    Ok((event_id, persist_warning))
 }
 
 /// `lnrent listing publish`: run preflight, gate on it, then mark the row `ACTIVE` and broadcast.
@@ -525,7 +546,11 @@ pub(crate) async fn publish_gated(
 
     let broadcast = publish_event(store, relay, recipe, &listing_id, &operator_hex).await;
     let (event_id, relay_error) = match broadcast {
-        Ok(id) => (Some(id), None),
+        // A relay took it. `persist_warning` (the event id could not be recorded locally) is NOT a
+        // relay error: the listing is discoverable either way, so reporting it here would tell the
+        // operator the opposite of what happened. It is already logged at the failure site, and the
+        // absent `event_id` is what `lnrent status` renders.
+        Ok((id, _persist_warning)) => (Some(id), None),
         Err(e) => {
             let detail = format!("{e:#}");
             tracing::warn!(
@@ -571,13 +596,27 @@ pub async fn withdraw(
     let recipe = recipes
         .first()
         .context("no recipe is loaded, so there is nothing to withdraw")?;
-    // Count the ATTEMPT, before the lock and before knowing whether it will write anything: a
-    // publish that is out probing its dependencies right now must be superseded by the operator
-    // asking to come down, including on the branches below that leave the row untouched. Counting
-    // it before the lock also covers a withdrawal queued behind a publish's relay leg — that
-    // publish has already committed, and the next one is the one this must stop.
-    store.note_listing_withdraw();
     let _one_at_a_time = TRANSITION.lock().await;
+    // Count the ATTEMPT, before knowing whether it will write anything: a publish that is out
+    // probing its dependencies right now must be superseded by the operator asking to come down,
+    // including on the branches below that leave the row untouched.
+    //
+    // UNDER the lock, not before it. Incrementing outside made the epoch itself racy on a
+    // multi-threaded runtime: a withdrawal could `fetch_add` and then, before its `lock().await`
+    // enqueued, a publish's `PublishSnapshot::take` could acquire TRANSITION and read the ALREADY
+    // INCREMENTED epoch together with the still-unchanged state — absorbing a withdrawal that had
+    // executed nothing into its own baseline. If that withdrawal then took one of the branches
+    // below that write nothing durable (`AlreadyWithdrawn`, `NotPublished`), the publish's CAS saw
+    // neither the state nor the epoch move and republished on top of the retraction, which is the
+    // precise case the epoch exists to close.
+    //
+    // Inside the lock every interleaving resolves by lock order instead: a withdrawal that gets the
+    // lock first is fully reflected in the snapshot that follows it, and one that gets it second
+    // increments while the publish is probing, so the CAS catches it. The pre-lock increment's
+    // stated purpose — covering a withdrawal queued behind a publish's relay leg — is unaffected:
+    // that publish has already committed, and this increment still lands before any later
+    // snapshot, which cannot read the epoch without first taking this lock.
+    store.note_listing_withdraw();
     let listing_id = coordinate(recipe, &relay.operator_pubkey_hex());
     match state(store, &listing_id).await?.as_deref() {
         // Already withdrawn: the durable state is final, but the RELAY leg is best-effort and may
@@ -1481,5 +1520,54 @@ mod tests {
         assert!(matches!(out, PublishOutcome::Published { .. }), "{out:?}");
         let id = coordinate(&recipes[0], &relay.operator_pubkey_hex());
         assert!(is_published(&store, &id).await.unwrap());
+    }
+
+    // ORDERING AUDIT: the withdrawal epoch must be incremented UNDER `TRANSITION`.
+    //
+    // This is a source audit rather than a behavioral test on purpose. The defect it guards is a
+    // cross-thread window — a `fetch_add` that lands before its own `lock().await` enqueues, letting
+    // a concurrent `PublishSnapshot::take` read the incremented epoch beside the not-yet-changed
+    // state and absorb a withdrawal that has executed nothing. Reproducing that window
+    // deterministically is not possible from a test: the "did not increment yet" assertion passes
+    // vacuously whenever the spawned task has not reached the lock, so the test would be flaky in the
+    // direction that reports success. `a_withdrawal_that_writes_nothing_still_supersedes_an_in_flight_publish`
+    // pins the sequential behaviour; this pins the ordering the concurrent case depends on, the way
+    // `refund.rs`'s `only_known_sites_insert_refund_attempt` pins its writer set.
+    #[test]
+    fn the_withdraw_epoch_is_counted_under_the_transition_lock() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/listing.rs"
+        ))
+        .unwrap();
+        // Production half only — the tests below may mention either symbol freely.
+        let production = src.split("#[cfg(test)]").next().unwrap_or("");
+        let body = production
+            .split_once("pub async fn withdraw(")
+            .expect("withdraw exists")
+            .1
+            .split_once("\n}\n")
+            .expect("withdraw has a body")
+            .0;
+
+        assert_eq!(
+            production.matches("note_listing_withdraw()").count(),
+            1,
+            "one production call site is what makes this audit sufficient; a second one needs its \
+             own ordering argument"
+        );
+        let lock_at = body
+            .find("TRANSITION.lock()")
+            .expect("withdraw takes the transition lock");
+        let bump_at = body
+            .find("note_listing_withdraw()")
+            .expect("withdraw counts the attempt");
+        assert!(
+            lock_at < bump_at,
+            "`note_listing_withdraw()` must come AFTER `TRANSITION.lock()` in `withdraw`: counting \
+             the attempt outside the lock lets a publish snapshot absorb a withdrawal that has not \
+             run yet, and the compare-and-swap then misses it on the branches that write nothing \
+             durable (AlreadyWithdrawn / NotPublished)"
+        );
     }
 }
