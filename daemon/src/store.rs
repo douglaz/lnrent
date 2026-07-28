@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use rusqlite::{Connection, Transaction};
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -253,7 +253,14 @@ CREATE TABLE IF NOT EXISTS listing (  -- one Recipe -> many Listings (CONTEXT gl
   period_s     INTEGER,             -- per-Listing timers (§6.3); copied to the subscription at order time
   renew_lead_s INTEGER,
   retention_s  INTEGER,
-  state        TEXT,                -- ACTIVE | WITHDRAWN
+  -- The PUBLICATION state (lnrent-i23), and the authority order intake matches against: a fresh row
+  -- is born UNPUBLISHED (the daemon starts quiet), only `lnrent listing publish` writes ACTIVE, and
+  -- only `lnrent listing withdraw` writes WITHDRAWN. Boot writes this column only when it CREATES
+  -- the row, and only as UNPUBLISHED; on a row that already exists it never touches it
+  -- (`listing::upsert_row`'s ON CONFLICT leaves `state` out), so boot neither publishes for the
+  -- operator nor resurrects what they withdrew. Pre-i23 rows are already ACTIVE and stay published,
+  -- which is the intended upgrade behaviour.
+  state        TEXT,                -- UNPUBLISHED | ACTIVE | WITHDRAWN
   updated_at   INTEGER
 );
 
@@ -714,6 +721,19 @@ pub struct Store {
     /// operator's restore-then-restart (a restart re-runs `open()`'s `quick_check`) — no auto-clear,
     /// no background retry, no clear-degraded command, by design.
     degraded: Arc<AtomicBool>,
+    /// How many `lnrent listing withdraw` attempts this daemon has served — the publication gate's
+    /// transition epoch (lnrent-i23). `listing::publish` snapshots it before its UNLOCKED preflight
+    /// probes and re-checks it before committing, so a withdrawal that overlapped those probes
+    /// supersedes the publish even when it wrote NOTHING durable (re-asking the relays about an
+    /// already-`WITHDRAWN` listing, or refusing an `UNPUBLISHED` one) and the state comparison alone
+    /// would see no change.
+    ///
+    /// In memory rather than in a column, and on the handle rather than in a `static`, deliberately:
+    /// the window it guards is one in-flight publish inside ONE process (a crash cancels the publish
+    /// outright, so persistence would guard nothing), and a `static` would be shared by every
+    /// daemon/store in a test process. `#[derive(Clone)]` shares the `Arc`, so every handle to the
+    /// same store counts the same withdrawals.
+    listing_withdraws: Arc<AtomicU64>,
 }
 
 impl Store {
@@ -730,7 +750,20 @@ impl Store {
         Store {
             tx,
             degraded: Arc::new(AtomicBool::new(false)),
+            listing_withdraws: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Count one `listing withdraw` ATTEMPT against this store — see [`Store::listing_withdraws`].
+    /// Called for every attempt, including the ones that write nothing, because what supersedes an
+    /// in-flight publish is the operator having asked to come down, not whether the row moved.
+    pub(crate) fn note_listing_withdraw(&self) {
+        self.listing_withdraws.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The current publication-transition epoch — see [`Store::listing_withdraws`].
+    pub(crate) fn listing_withdraw_epoch(&self) -> u64 {
+        self.listing_withdraws.load(Ordering::SeqCst)
     }
 
     /// Open the DB (WAL + schema) and spawn the actor in one step.

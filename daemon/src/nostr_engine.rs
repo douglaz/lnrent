@@ -27,6 +27,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -115,6 +116,12 @@ const NEGATIVE_CACHE_CAPACITY: usize = 4096;
 /// restart the task.
 const INBOUND_SUBSCRIBE_ATTEMPTS: u32 = 5;
 
+/// Ceiling on the wait [`NostrEngine::wait_out_own_listing_deletion`] takes before a relist. The
+/// rule below can never require more than the remainder of the deletion's own second, so the wait is
+/// ~1s (that remainder, plus a small margin for the truncation to whole seconds); this cap only
+/// bounds the operator's command if the wall clock jumped backwards after the retraction.
+const MAX_DELETION_SETTLE_WAIT: Duration = Duration::from_secs(2);
+
 /// Delay between [`INBOUND_SUBSCRIBE_ATTEMPTS`] retries of the inbound subscribe.
 const INBOUND_SUBSCRIBE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
@@ -185,6 +192,10 @@ pub struct NostrEngine {
     /// Engine-owned ownership/drain state for inbound tasks accepted by the live subscription and
     /// retained-set helpers.
     inbound_tasks: Arc<InboundTaskState>,
+    /// `created_at` (unix seconds) of the most recent listing-coordinate DELETION this process
+    /// published, or 0 — see [`NostrEngine::wait_out_own_listing_deletion`]. Shared across clones
+    /// because every clone signs for the same coordinate.
+    last_listing_deletion: Arc<AtomicU64>,
 }
 
 /// Result of a bounded inbound shutdown drain.
@@ -239,6 +250,7 @@ impl NostrEngine {
                 crate::config::DEFAULT_INBOUND_RATE_REFILL_PER_MIN,
             ))),
             inbound_tasks: Arc::new(InboundTaskState::new()),
+            last_listing_deletion: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -288,6 +300,7 @@ impl NostrEngine {
     /// Returns the published event id.
     pub async fn publish_listing(&self, listing: &Listing) -> Result<EventId> {
         let builder = build_listing(listing).map_err(|e| anyhow!("building 30402 listing: {e}"))?;
+        self.wait_out_own_listing_deletion().await;
         // `send_event_builder` signs with the client's signer (= the engine's operator key) and
         // broadcasts to every relay.
         let output = self
@@ -297,6 +310,83 @@ impl NostrEngine {
             .context("publishing 30402 listing")?;
         require_relay_acceptance(&output, "publishing 30402 listing")?;
         Ok(output.val)
+    }
+
+    /// Hold a RELIST until this process's own NIP-09 deletion of the same coordinate has aged out of
+    /// the second it was published in — about a second (the remainder of that second plus a margin),
+    /// and only after a [`Self::retract_listing`] in this process.
+    ///
+    /// Nostr timestamps are whole SECONDS, and a relay that honoured a coordinate deletion refuses
+    /// further addressable events for that coordinate while the deletion is still current — measured
+    /// here (nostr-database compares the retained deletion's `created_at` against the wall clock at
+    /// index time; NIP-09's own wording compares it against the incoming event's `created_at`).
+    /// Either way an event in the SAME second as the deletion loses. So `lnrent listing withdraw`
+    /// followed by `lnrent listing publish` — two commands an operator or their agent runs back to
+    /// back, well inside one second — relisted a durable `ACTIVE` row that EVERY relay rejected
+    /// (`blocked: this event is deleted`), leaving a daemon that takes orders for a listing no buyer
+    /// can fetch. `docs/go-live.md` promises the operator that path works.
+    ///
+    /// Waiting is the whole fix, and it must be a wait rather than a `created_at` bumped into the
+    /// future: a future-stamped event does not age out any sooner under the wall-clock comparison,
+    /// and relays reject far-future events outright. Only this daemon can author these events (it
+    /// holds the key), so remembering the deletion in PROCESS memory is complete: the one gap it
+    /// leaves — a RESTART between the retraction and the relist — cannot fit in the second that
+    /// matters. `listing::republish_on_boot` publishes nothing for a non-`ACTIVE` row, so a relist
+    /// can only come from `listing::publish`, which runs the whole preflight (guardian round-trip,
+    /// gateway selection refresh, an authenticated TLS call to the provider API, a `run_hook`
+    /// process spawn) BEFORE it reaches the broadcast — behind a restart's own join/connect/bind
+    /// costs. Bounded by [`MAX_DELETION_SETTLE_WAIT`] so a backwards clock jump cannot hang the
+    /// operator's command; past it the relay's answer is simply honest.
+    async fn wait_out_own_listing_deletion(&self) {
+        let deleted_at = self.last_listing_deletion.load(Ordering::SeqCst);
+        if deleted_at == 0 {
+            return;
+        }
+        let now = Timestamp::now().as_secs();
+        if now > deleted_at {
+            return;
+        }
+        // +1 second to clear the deletion's own second, plus a margin for the truncation to it.
+        let wait = Duration::from_secs(deleted_at + 1 - now).min(MAX_DELETION_SETTLE_WAIT)
+            + Duration::from_millis(100);
+        tracing::info!(
+            ?wait,
+            "waiting out this operator's own listing retraction before relisting (relays refuse a \
+             30402 published in the same second as the deletion that removed it)"
+        );
+        tokio::time::sleep(wait).await;
+    }
+
+    /// Ask the relays to DROP the operator's 30402 listing at `d` — a NIP-09 deletion request
+    /// (kind 5) naming the addressable coordinate `30402:<operator>:<d>` (lnrent-i23). Signed with
+    /// the same key that authored the listing, which is what makes the request authoritative.
+    ///
+    /// BEST-EFFORT by contract, at both ends: the caller has already written the durable withdrawal
+    /// (that row, not the relay, is the authority order intake reads), and NIP-09 is itself only a
+    /// request — a relay may ignore it, and one that never receives it keeps serving the listing.
+    /// The `Err` is therefore a diagnostic for the operator, never a reason to reverse a withdrawal.
+    pub async fn retract_listing(&self, d: &str) -> Result<()> {
+        let coordinate = Coordinate::new(
+            Kind::Custom(lnrent_wire::LISTING_KIND),
+            self.operator_pubkey(),
+        )
+        .identifier(d);
+        let request = EventDeletionRequest::new()
+            .coordinate(coordinate)
+            .reason("listing withdrawn by the operator");
+        // Stamped explicitly at NOW — never ahead of it — and remembered, because a later relist has
+        // to wait this second out (see [`Self::wait_out_own_listing_deletion`]). The record is
+        // written BEFORE the send so a retraction the relay accepted can never go unremembered; the
+        // only cost of remembering one that failed is a sub-second wait on a relist.
+        let deleted_at = Timestamp::now();
+        self.last_listing_deletion
+            .fetch_max(deleted_at.as_secs(), Ordering::SeqCst);
+        let output = self
+            .client
+            .send_event_builder(EventBuilder::delete(request).custom_created_at(deleted_at))
+            .await
+            .context("publishing the 30402 deletion request")?;
+        require_relay_acceptance(&output, "retracting 30402 listing")
     }
 
     /// The reply/publish primitive: gift-wrap `msg` to `recipient` and publish it to every relay,
@@ -1788,6 +1878,30 @@ fn require_relay_acceptance<T: std::fmt::Debug>(output: &Output<T>, action: &str
         );
     }
     Ok(())
+}
+
+/// The publication seam the listing gate (lnrent-i23) drives: `lnrent listing publish|withdraw`
+/// reaches the relays only through this, so `ipc.rs` depends on publication rather than on the whole
+/// engine, and the gate's own tests need no relay at all.
+#[async_trait]
+impl crate::listing::ListingRelay for NostrEngine {
+    fn operator_pubkey_hex(&self) -> String {
+        self.operator_pubkey().to_hex()
+    }
+
+    async fn publish_listing_for(
+        &self,
+        recipe: &Recipe,
+        d: &str,
+        operator_hex: &str,
+    ) -> Result<String> {
+        let listing = listing_from_recipe(recipe, d, operator_hex);
+        Ok(self.publish_listing(&listing).await?.to_hex())
+    }
+
+    async fn retract_listing_at(&self, d: &str) -> Result<()> {
+        self.retract_listing(d).await
+    }
 }
 
 /// Build a publishable [`Listing`] for `recipe`, priced from its own `[[pricing]]`, for

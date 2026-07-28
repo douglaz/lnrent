@@ -141,12 +141,31 @@ impl OrderIntake {
 
         // 2c. PRICE check: the referenced listing must still be the current, ACTIVE one for this
         //     recipe at the published price — a stale/unknown price is `price_changed` (§5.4).
+        //
+        //     A listing that is not ACTIVE is reported as `unavailable`, NOT `price_changed`
+        //     (lnrent-i23): the Operator has not published it, or has retracted it — the price did
+        //     not move, and telling a Buyer their price is stale invites them to re-quote against
+        //     something that is not being sold at all. Before i23 no code path ever wrote a
+        //     non-ACTIVE state, so this arm was unreachable and the conflation cost nothing; the
+        //     publication gate and the withdraw verb make it the state every install boots into.
         let listing = self.load_listing(&req.listing_id).await?;
+        if let Some(l) = &listing {
+            if l.state != "ACTIVE" {
+                return self
+                    .fail_order(
+                        &sender,
+                        &req.id,
+                        None,
+                        unavailable("this listing is not currently offered"),
+                        out,
+                    )
+                    .await;
+            }
+        }
         let stale = match &listing {
             None => true,
             Some(l) => {
-                l.state != "ACTIVE"
-                    || l.recipe_id.as_deref() != Some(self.recipe.service.id.as_str())
+                l.recipe_id.as_deref() != Some(self.recipe.service.id.as_str())
                     || l.amount_sat != self.recipe.pricing.amount_sat as i64
             }
         };
@@ -1243,14 +1262,27 @@ mod tests {
     }
 
     async fn seed_listing(store: &Store, id: &str, recipe_id: &str, amount_sat: i64) {
-        let (id, recipe_id) = (id.to_string(), recipe_id.to_string());
+        seed_listing_in_state(store, id, recipe_id, amount_sat, "ACTIVE").await
+    }
+
+    /// The publication state is a parameter because it is load-bearing (lnrent-i23): `UNPUBLISHED`
+    /// is what every fresh install is born in, so "a fresh daemon takes no orders" is a claim about
+    /// THIS column meeting the §5.4 gate below.
+    async fn seed_listing_in_state(
+        store: &Store,
+        id: &str,
+        recipe_id: &str,
+        amount_sat: i64,
+        state: &str,
+    ) {
+        let (id, recipe_id, state) = (id.to_string(), recipe_id.to_string(), state.to_string());
         store
             .transaction(move |tx| {
                 tx.execute(
                     "INSERT INTO listing
                         (id, recipe_id, d_tag, amount_sat, period_s, renew_lead_s, retention_s, state, updated_at)
-                     VALUES (?1, ?2, 'd', ?3, 2592000, 604800, 604800, 'ACTIVE', 0)",
-                    params![id, recipe_id, amount_sat],
+                     VALUES (?1, ?2, 'd', ?3, 2592000, 604800, 604800, ?4, 0)",
+                    params![id, recipe_id, amount_sat, state],
                 )?;
                 Ok(())
             })
@@ -1604,6 +1636,72 @@ mod tests {
             assert_eq!(err.error.code, "capacity_full");
             assert!(err.order_id.is_none());
             assert_clean(&store).await;
+        }
+    }
+
+    // lnrent-i23: the publication gate's safety claim — "a fresh daemon takes no orders until the
+    // operator publishes" — is enforced by the `l.state != "ACTIVE"` comparison in the §5.4 price
+    // check above and NOWHERE else. Before that bead the comparison was effectively dead (no code
+    // path ever wrote a non-ACTIVE state); now UNPUBLISHED is the state every install boots into,
+    // so it is the gate. This drives a real `order.request` at both non-ACTIVE states and asserts
+    // the refusal, so relaxing that comparison cannot stay green.
+    #[tokio::test]
+    async fn a_listing_that_is_not_active_takes_no_orders() {
+        for state in ["UNPUBLISHED", "WITHDRAWN"] {
+            let store = mem_store();
+            let recipe = dummy_recipe();
+            let listing_id = "30402:op:dummy-1";
+            seed_listing_in_state(
+                &store,
+                listing_id,
+                "dummy",
+                recipe.pricing.amount_sat as i64,
+                state,
+            )
+            .await;
+            let handler = intake(
+                store.clone(),
+                Arc::new(MockPayment::new()),
+                TestClock::new(1000),
+                recipe,
+                budget_with_room(),
+            );
+
+            let out = RecordingOutbound::default();
+            handler
+                .handle(
+                    Keys::generate().public_key(),
+                    order("q", listing_id, json!({})),
+                    &out,
+                )
+                .await
+                .unwrap();
+
+            let err = expect_order_error(&out);
+            // `unavailable`, not `price_changed`: the Operator is not offering this listing, and
+            // the price did not move. A Buyer told "price_changed" would re-quote against something
+            // that is not for sale.
+            assert_eq!(
+                err.error.code, "unavailable",
+                "a {state} listing is refused as not-offered"
+            );
+            assert!(err.order_id.is_none(), "no order was created for {state}");
+            // The money path is what this protects: no sub, no invoice, no held capacity.
+            assert_eq!(
+                count(&store, "SELECT count(*) FROM subscription").await,
+                0,
+                "{state}: no subscription"
+            );
+            assert_eq!(
+                count(&store, "SELECT count(*) FROM invoice").await,
+                0,
+                "{state}: nothing was minted"
+            );
+            assert_eq!(
+                count(&store, "SELECT count(*) FROM reservation").await,
+                0,
+                "{state}: no capacity reserved"
+            );
         }
     }
 

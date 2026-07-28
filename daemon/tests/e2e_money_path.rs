@@ -129,8 +129,11 @@ async fn engine_for(op_keys: &Keys, url: &str, store: Store) -> NostrEngine {
 }
 
 /// Build + start a supervisor over `store` with `recipe` and FAST intervals (mirrors
-/// daemon/tests/supervisor.rs). The supervisor publishes its listing + runs boot recovery inside
-/// `start()`, so on return the durable listing row exists and any seeded recovery has completed.
+/// daemon/tests/supervisor.rs). The supervisor upserts its listing row + runs boot recovery inside
+/// `start()`, so on return the durable listing row exists and any seeded recovery has completed —
+/// and then this helper marks it published, because every test in this file is about the MONEY PATH
+/// and needs order intake to accept (lnrent-i23 made publication an explicit operator act; the gate
+/// itself lives in daemon/src/listing.rs + daemon/tests/supervisor.rs).
 async fn start_supervisor(
     op_keys: &Keys,
     url: &str,
@@ -154,6 +157,8 @@ async fn start_supervisor_with_sock(
 ) -> (RunningSupervisor, PathBuf) {
     let engine = engine_for(op_keys, url, store.clone()).await;
     let sock = temp_sock();
+    let store_for_publish = store.clone();
+    let listing_id = coord(op_keys);
     let payment_for_sync = payment.clone();
     let alerts = Arc::new(lnrentd::alerts::AlertDispatcher::disabled(
         store.clone(),
@@ -174,7 +179,30 @@ async fn start_supervisor_with_sock(
     .await
     .expect("build supervisor");
     let sup = sup.with_payment_clock_sync(move |now| payment_for_sync.set_now(now));
-    (sup.start().await.expect("start supervisor"), sock)
+    let running = sup.start().await.expect("start supervisor");
+    mark_listing_published(&store_for_publish, &listing_id).await;
+    (running, sock)
+}
+
+/// Stand in for the operator's `lnrent listing publish` (lnrent-i23) by writing the state it writes.
+/// The money-path tests here only need order intake to match an ACTIVE row; the preflight gate, the
+/// relay broadcast, and the withdraw counterpart are covered where they live (daemon/src/listing.rs
+/// and daemon/tests/supervisor.rs, which drives the real IPC verb).
+async fn mark_listing_published(store: &Store, listing_id: &str) {
+    let id = listing_id.to_string();
+    // The rowcount is checked HERE, not inside the closure: that closure runs on the sole-writer
+    // store actor, so a panic in it would take the actor down and this test would hang or fail
+    // opaquely instead of reporting which assertion broke.
+    let updated = store
+        .transaction(move |tx| {
+            Ok(tx.execute(
+                "UPDATE listing SET state='ACTIVE' WHERE id=?1",
+                rusqlite::params![id],
+            )?)
+        })
+        .await
+        .expect("publish the listing row");
+    assert_eq!(updated, 1, "the boot upsert wrote exactly one listing row");
 }
 
 /// A stub [`Outbound`] that records every reply instead of touching a relay — the order/op handlers

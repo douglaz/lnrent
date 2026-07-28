@@ -7,6 +7,7 @@
 
 use crate::backends::{PaymentBackend, DEV_SETTLE_UNSUPPORTED};
 use crate::clock::Clock;
+use crate::listing;
 use crate::provision;
 use crate::recipe::Recipe;
 use crate::refund_resolver::{detect_form, DestForm};
@@ -61,6 +62,15 @@ pub enum Request {
     /// durable PENDING intent, and pay the operator's own `bolt11` capped at the quote. Ledger-only
     /// authorization — the federation balance is never read.
     Sweep { bolt11: String },
+    /// PUBLISH the operator's public 30402 listing (lnrent-i23). The explicit act that takes a
+    /// quiet daemon live: runs preflight, HARD BLOCKS on a structural failure, refuses a
+    /// reachability failure unless `accept_unverified`, then marks the durable row ACTIVE and
+    /// broadcasts. Idempotent — republishing an ACTIVE listing just re-broadcasts.
+    ListingPublish { accept_unverified: bool },
+    /// WITHDRAW the listing (lnrent-i23): write WITHDRAWN — which is what actually stops orders —
+    /// then ask the relays to drop the 30402, best-effort. The ONLY thing that unpublishes; no
+    /// probe, outage, or loop ever does.
+    ListingWithdraw,
     AdminSuspend { id: String },
     AdminResume { id: String },
     DevSettle { subscription_id: String },
@@ -94,12 +104,26 @@ impl Request {
     /// only the READ-ONLY slow-dispatch reopening of the window, not the sweep case. `SweepQuote` is
     /// a DRY-RUN (no writes) → read-only.
     ///
+    /// The listing verbs (lnrent-i23) are MUTATING: each writes the durable `listing` row that order
+    /// intake matches against, and a dropped `ListingWithdraw` between its commit and its reply would
+    /// leave the operator believing they are still live. BOTH can outlast `SHUTDOWN_DRAIN` (3s) —
+    /// `ListingPublish` runs the same bounded probes `Preflight` does and then a bounded broadcast,
+    /// and `ListingWithdraw` awaits a best-effort relay retraction bounded at
+    /// `listing::RETRACT_TIMEOUT` (10s) — so, exactly like `Sweep`, either can force the supervisor
+    /// abort. That is the identical, pre-existing residual `Sweep` documents above (bounded,
+    /// recoverable, re-runnable), not a new class of one. Note the durable write is NOT the last step
+    /// before the reply: each verb commits the row FIRST and then does its relay I/O, so an aborted
+    /// handler loses only the REPLY, never the decision — `lnrent status` reads the same row back and
+    /// settles it, and re-running the verb is idempotent.
+    ///
     /// EXHAUSTIVE by design (no `_` wildcard): a future variant must fail to compile here until it
     /// is classified, so nothing silently defaults into the drain-exempt (cancel-me) bucket.
     fn is_mutating(&self) -> bool {
         match self {
             Request::RefundRetry { .. }
             | Request::Sweep { .. }
+            | Request::ListingPublish { .. }
+            | Request::ListingWithdraw
             | Request::AdminSuspend { .. }
             | Request::AdminResume { .. }
             | Request::DevSettle { .. } => true,
@@ -335,29 +359,43 @@ fn evict_unsafe_final_path(path: &Path, daemon_uid: u32) -> Result<()> {
 /// observable looser than 0600, and a stale socket is replaced with no missing-path window), and
 /// every accepted peer is uid-gated ([`peer_allowed`]) before any request byte is read. This is
 /// the never-shutdown form; the daemon supervisor (lnrent-7fp.21) uses [`serve_with_shutdown`].
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     store: Store,
     recipes: Arc<Vec<Recipe>>,
     clock: Arc<dyn Clock>,
     payment: Arc<dyn PaymentBackend>,
     relays: RelayStatusCell,
+    listing_relay: listing::RelayHandle,
     path: impl AsRef<Path>,
 ) -> Result<()> {
     // A signal that never fires: the loop only ends on a listener error.
     let (_never, rx) = tokio::sync::watch::channel(false);
-    serve_with_shutdown(store, recipes, clock, payment, relays, path, rx).await
+    serve_with_shutdown(
+        store,
+        recipes,
+        clock,
+        payment,
+        relays,
+        listing_relay,
+        path,
+        rx,
+    )
+    .await
 }
 
 /// Like [`serve`] but stops accepting new connections once `shutdown` flips to `true`, returning
 /// `Ok(())` for a graceful stop. In-flight connections each commit on their own spawned task; the
 /// store actor (sole writer, ADR-0001) serializes their writes regardless of this accept loop. The
 /// wire protocol is unchanged — this only adds a cancellation arm to the accept loop.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_with_shutdown(
     store: Store,
     recipes: Arc<Vec<Recipe>>,
     clock: Arc<dyn Clock>,
     payment: Arc<dyn PaymentBackend>,
     relays: RelayStatusCell,
+    listing_relay: listing::RelayHandle,
     path: impl AsRef<Path>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
@@ -399,17 +437,27 @@ pub async fn serve_with_shutdown(
                         continue;
                     }
                 }
-                let (store, recipes, clock, payment, relays) = (
+                let (store, recipes, clock, payment, relays, listing_relay) = (
                     store.clone(),
                     recipes.clone(),
                     clock.clone(),
                     payment.clone(),
                     relays.clone(),
+                    listing_relay.clone(),
                 );
                 let token = shutdown_token.clone();
                 conns.spawn(async move {
-                    if let Err(e) =
-                        handle_conn(stream, store, recipes, clock, payment, relays, token).await
+                    if let Err(e) = handle_conn(
+                        stream,
+                        store,
+                        recipes,
+                        clock,
+                        payment,
+                        relays,
+                        listing_relay,
+                        token,
+                    )
+                    .await
                     {
                         tracing::warn!(error = %e, "ipc connection error");
                     }
@@ -444,6 +492,7 @@ pub async fn serve_with_shutdown(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_conn(
     stream: UnixStream,
     store: Store,
@@ -451,6 +500,7 @@ async fn handle_conn(
     clock: Arc<dyn Clock>,
     payment: Arc<dyn PaymentBackend>,
     relays: RelayStatusCell,
+    listing_relay: listing::RelayHandle,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (rd, mut wr) = stream.into_split();
@@ -494,7 +544,7 @@ async fn handle_conn(
                 // easily fits; the exception is `Sweep`, whose fedimint pay can run to
                 // `PAY_AWAIT_TIMEOUT` (120s) and which we still don't cancel for money safety (see
                 // `Request::is_mutating` for the residual-gap reasoning).
-                dispatch(req, &store, &recipes, &clock, &payment, &relays).await
+                dispatch(req, &store, &recipes, &clock, &payment, &relays, &listing_relay).await
             }
             Ok(req) => {
                 // A READ-ONLY op is drain-EXEMPT (lnrent-j3c): if a graceful shutdown fires while it
@@ -504,7 +554,9 @@ async fn handle_conn(
                 // read / network probe loses nothing). The tiny error reply then goes out the
                 // unchanged write path below, exactly like any other `Reply`.
                 tokio::select! {
-                    r = dispatch(req, &store, &recipes, &clock, &payment, &relays) => r,
+                    r = dispatch(
+                        req, &store, &recipes, &clock, &payment, &relays, &listing_relay,
+                    ) => r,
                     _ = shutdown_token.cancelled() => Reply {
                         ok: false,
                         data: None,
@@ -529,6 +581,7 @@ async fn handle_conn(
 }
 
 /// Route a request to the store actor (reads) / a journaled transaction (admin mutations).
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     req: Request,
     store: &Store,
@@ -536,6 +589,7 @@ pub async fn dispatch(
     clock: &Arc<dyn Clock>,
     payment: &Arc<dyn PaymentBackend>,
     relays: &RelayStatusCell,
+    listing_relay: &listing::RelayHandle,
 ) -> Reply {
     match req {
         Request::Status => {
@@ -561,16 +615,108 @@ pub async fn dispatch(
             // the per-relay detail.
             let relay_rows = relays.get();
             let relays_connected = relay_rows.iter().filter(|r| r.connected).count();
-            match (subs, open_teardowns) {
-                (Ok(n), Ok(t)) => Reply::ok(json!({
+            // Whether this daemon is PUBLICLY LISTED right now (lnrent-i23). It is on `status`
+            // because the failure mode the publication gate creates is an operator who believes they
+            // are live and is not (or the reverse) — `published` is the one field that settles it.
+            let listing_status = listing_view(store, recipes, listing_relay).await;
+            match (subs, open_teardowns, listing_status) {
+                (Ok(n), Ok(t), Ok(listing)) => Reply::ok(json!({
                     "daemon": "ok",
                     "recipes": recipes.len(),
                     "subscriptions": n,
                     "open_teardowns": t,
                     "relays_total": relay_rows.len(),
                     "relays_connected": relays_connected,
+                    "listing": listing,
                 })),
-                (Err(e), _) | (_, Err(e)) => Reply::err("internal", e.to_string()),
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                    Reply::err("internal", e.to_string())
+                }
+            }
+        }
+
+        Request::ListingPublish { accept_unverified } => {
+            let Some(relay) = listing_relay.as_ref() else {
+                return Reply::err(
+                    "unsupported",
+                    "this daemon has no Nostr engine wired, so it cannot publish a listing",
+                );
+            };
+            match listing::publish(
+                store,
+                clock,
+                payment,
+                recipes,
+                relay.as_ref(),
+                accept_unverified,
+            )
+            .await
+            {
+                Ok(outcome) => publish_reply(outcome),
+                Err(e) => Reply::err("internal", format!("{e:#}")),
+            }
+        }
+
+        Request::ListingWithdraw => {
+            let Some(relay) = listing_relay.as_ref() else {
+                return Reply::err(
+                    "unsupported",
+                    "this daemon has no Nostr engine wired, so it has no listing to withdraw",
+                );
+            };
+            match listing::withdraw(store, clock, recipes, relay.as_ref()).await {
+                Ok(listing::WithdrawOutcome::Withdrawn {
+                    listing_id,
+                    retract_error,
+                }) => Reply::ok(json!({
+                    "listing_id": listing_id,
+                    "state": listing::WITHDRAWN,
+                    "published": false,
+                    // The withdrawal itself always succeeded by the time this is reported. This says
+                    // only that the deletion request was ACCEPTED by at least one relay — never
+                    // that the 30402 is gone: NIP-09 is a request a relay may ignore, and one that
+                    // never received it keeps serving the listing. Best-effort buyer-UX, not money;
+                    // the per-relay outcome is in the daemon log
+                    // (`nostr_engine::require_relay_acceptance`).
+                    "retracted_from_relays": retract_error.is_none(),
+                    "retract_error": retract_error,
+                })),
+                Ok(listing::WithdrawOutcome::AlreadyWithdrawn {
+                    listing_id,
+                    retract_error,
+                }) => Reply::ok(json!({
+                    "listing_id": listing_id,
+                    "state": listing::WITHDRAWN,
+                    "published": false,
+                    // Same two fields, with the same meaning as above, carrying THIS run's retry:
+                    // the durable state was already final, but re-running the verb is how an
+                    // operator asks the relays again after the first attempt could not reach them.
+                    "retracted_from_relays": retract_error.is_none(),
+                    "retract_error": retract_error,
+                    "note": "already withdrawn; asked the relays to drop the 30402 again",
+                })),
+                // Carries `published` like every other listing reply (both publish refusals, the
+                // superseded one, and the two successes): a refusal is still the answer to "am I
+                // live?", and an agent driving `--json` must be able to read it out of the reply it
+                // just got rather than issue a second `status` call. No `state` field — this arm
+                // also covers "no row at all", and naming a state for a row that may not exist
+                // would be a claim the daemon has not made.
+                Ok(listing::WithdrawOutcome::NotPublished { listing_id }) => Reply {
+                    ok: false,
+                    data: Some(json!({
+                        "listing_id": listing_id,
+                        "published": false,
+                    })),
+                    error: Some(IpcError {
+                        code: "invalid_state".into(),
+                        message: format!(
+                            "listing `{listing_id}` was never published, so there is nothing to \
+                             withdraw — run `lnrent listing publish` to go live"
+                        ),
+                        retryable: false,
+                    }),
+                },
+                Err(e) => Reply::err("internal", format!("{e:#}")),
             }
         }
 
@@ -992,6 +1138,196 @@ async fn refund_retry(store: &Store, id: &str, now: i64) -> Reply {
     }
 }
 
+/// The `listing` block of `Request::Status` (lnrent-i23): is this daemon publicly listed?
+///
+/// Read from the DURABLE row keyed on the loaded recipe — the same row order intake matches an
+/// `order.request` against — so `published` cannot disagree with whether orders are actually being
+/// accepted. It deliberately does NOT consult a relay: what a relay still serves is not what decides
+/// an order. With no recipe loaded there is no listing to report, and `state` is null.
+///
+/// Keyed on the EXACT coordinate whenever the Nostr engine is wired, because that is the row the
+/// publish/withdraw verbs and order intake use. The `d_tag` fallback is only for the engine-less
+/// [`serve`] form some unit tests use: `d_tag` is not unique across operator keys (the PK is the
+/// full coordinate), so it takes the most recently touched row — deterministic only while the clock
+/// advances, which is exactly why it is not the primary lookup.
+async fn listing_view(
+    store: &Store,
+    recipes: &Arc<Vec<Recipe>>,
+    listing_relay: &listing::RelayHandle,
+) -> Result<Value> {
+    let Some(recipe) = recipes.first() else {
+        return Ok(json!({"published": false, "state": Value::Null}));
+    };
+    let by_coordinate = listing_relay
+        .as_ref()
+        .map(|relay| crate::listing::coordinate(recipe, &relay.operator_pubkey_hex()));
+    let d = crate::listing::d_tag(recipe);
+    let status = store
+        .read(move |c| {
+            let row = match &by_coordinate {
+                Some(id) => c.query_row(
+                    "SELECT id, state, event_id FROM listing WHERE id=?1",
+                    rusqlite::params![id],
+                    listing_row,
+                ),
+                None => c.query_row(
+                    "SELECT id, state, event_id FROM listing WHERE d_tag=?1
+                     ORDER BY updated_at DESC LIMIT 1",
+                    rusqlite::params![d],
+                    listing_row,
+                ),
+            };
+            Ok(rusqlite::OptionalExtension::optional(row)?)
+        })
+        .await?;
+    Ok(match status {
+        Some((id, state, event_id)) => json!({
+            "published": state == crate::listing::ACTIVE,
+            "state": state,
+            "listing_id": id,
+            "event_id": event_id,
+        }),
+        None => json!({"published": false, "state": Value::Null}),
+    })
+}
+
+/// `(id, state, event_id)` for a `listing` row, shared by both lookups above.
+fn listing_row(r: &rusqlite::Row) -> rusqlite::Result<(String, String, Option<String>)> {
+    Ok((
+        r.get::<_, String>(0)?,
+        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+        r.get::<_, Option<String>>(2)?,
+    ))
+}
+
+/// Render a [`listing::PublishOutcome`] as the operator/agent-facing reply. The two refusals get
+/// DISTINCT error codes because they mean different things to an operator agent: `listing_blocked`
+/// is "fix your config, there is no override", `listing_unverified` is "someone else is down, decide
+/// whether to launch anyway".
+fn publish_reply(outcome: listing::PublishOutcome) -> Reply {
+    let checks_json = |checks: &[crate::preflight::PreflightCheck]| json!(checks);
+    match outcome {
+        listing::PublishOutcome::Published {
+            listing_id,
+            event_id,
+            relay_error,
+            warnings,
+        } => Reply::ok(json!({
+            "listing_id": listing_id,
+            "state": listing::ACTIVE,
+            "published": true,
+            "event_id": event_id,
+            "relay_error": relay_error,
+            "warnings": checks_json(&warnings),
+        })),
+        listing::PublishOutcome::AlreadyPublished {
+            listing_id,
+            event_id,
+            relay_error,
+            warnings,
+        } => Reply::ok(json!({
+            "listing_id": listing_id,
+            "state": listing::ACTIVE,
+            "published": true,
+            "event_id": event_id,
+            "relay_error": relay_error,
+            "warnings": checks_json(&warnings),
+            "note": "already published; re-broadcast the 30402",
+        })),
+        listing::PublishOutcome::BlockedStructural {
+            failed,
+            still_published,
+        } => Reply {
+            ok: false,
+            data: Some(json!({
+                "failed": checks_json(&failed),
+                "published": still_published,
+            })),
+            error: Some(IpcError {
+                code: "listing_blocked".into(),
+                message: format!(
+                    "publication refused: {} — fix the configuration and publish again \
+                     (there is no override for a structural failure){}",
+                    name_list(&failed),
+                    still_state(still_published)
+                ),
+                retryable: false,
+            }),
+        },
+        listing::PublishOutcome::BlockedUnverified {
+            failed,
+            still_published,
+        } => Reply {
+            ok: false,
+            data: Some(json!({
+                "failed": checks_json(&failed),
+                "published": still_published,
+            })),
+            error: Some(IpcError {
+                code: "listing_unverified".into(),
+                message: format!(
+                    "publication refused: {} could not be verified — retry once they recover, or \
+                     publish anyway with --accept-unverified (the money path still fails closed at \
+                     order time if they are still down){}",
+                    name_list(&failed),
+                    still_state(still_published)
+                ),
+                // A third party being down IS transient; a machine caller may retry as-is.
+                retryable: true,
+            }),
+        },
+        // The listing moved (in practice: it was withdrawn) while this publish was still probing.
+        // Nothing was written or broadcast. `retryable: false` deliberately — a machine caller that
+        // retried this on its own would republish over an operator's deliberate withdrawal, which is
+        // the very thing abandoning it prevented.
+        listing::PublishOutcome::Superseded { listing_id, state } => {
+            let published = state == listing::ACTIVE;
+            Reply {
+                ok: false,
+                data: Some(json!({
+                    "listing_id": listing_id,
+                    "state": state,
+                    "published": published,
+                })),
+                error: Some(IpcError {
+                    code: "invalid_state".into(),
+                    message: format!(
+                        "publication abandoned: `{listing_id}` changed to {state} while preflight \
+                         was running, so this command published and broadcast NOTHING — check \
+                         `lnrent status` and run `lnrent listing publish` again if that is not \
+                         what you want"
+                    ),
+                    retryable: false,
+                }),
+            }
+        }
+    }
+}
+
+/// The clause a refusal appends about what the listing is doing RIGHT NOW.
+///
+/// A refusal changes nothing, so on an already-`ACTIVE` listing "refused" must not be read as "not
+/// live": the row is untouched and order intake keeps accepting orders (nothing here auto-withdraws
+/// — only `lnrent listing withdraw` does). Saying so is the whole point of reading the durable state
+/// before the gate.
+fn still_state(still_published: bool) -> &'static str {
+    if still_published {
+        ". The listing is UNCHANGED and still LIVE — it keeps taking orders; \
+         run `lnrent listing withdraw` to stop them"
+    } else {
+        ". The listing is NOT live and takes no orders"
+    }
+}
+
+/// `a, b` — the failing check NAMES, so a refusal always says WHICH dependency refused it.
+fn name_list(checks: &[crate::preflight::PreflightCheck]) -> String {
+    checks
+        .iter()
+        .map(|c| c.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn query_subs(c: &rusqlite::Connection) -> Result<Vec<Value>> {
     let mut stmt = c.prepare(
         "SELECT id, recipe_id, state, paid_through, soft_date FROM subscription ORDER BY created_at",
@@ -1063,6 +1399,79 @@ mod tests {
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::mpsc;
+
+    /// No Nostr engine wired: every test below exercises a NON-listing request, and the two listing
+    /// verbs answer `unsupported` under it. The publication gate itself is tested in `listing.rs`
+    /// (durable rules) and `daemon/tests/supervisor.rs` (the real IPC verbs against a live relay).
+    fn no_listing_relay() -> listing::RelayHandle {
+        None
+    }
+
+    // A refused publish must never read as "you are not live". The refusal changes NOTHING, so on an
+    // already-published listing the operator is still taking orders — and the one job of this
+    // surface is that they cannot be wrong about that in either direction.
+    #[test]
+    fn a_refused_publish_reports_whether_the_listing_is_still_live() {
+        let failing = |class| {
+            vec![crate::preflight::PreflightCheck {
+                name: "gateway",
+                ok: false,
+                detail: "probe failed".into(),
+                class: Some(class),
+            }]
+        };
+        for still_published in [true, false] {
+            for reply in [
+                publish_reply(listing::PublishOutcome::BlockedStructural {
+                    failed: failing(crate::preflight::FailureClass::Structural),
+                    still_published,
+                }),
+                publish_reply(listing::PublishOutcome::BlockedUnverified {
+                    failed: failing(crate::preflight::FailureClass::Reachability),
+                    still_published,
+                }),
+            ] {
+                assert!(!reply.ok, "a refusal is a failure reply");
+                let data = reply.data.expect("a refusal carries its diagnostics");
+                assert_eq!(
+                    data["published"],
+                    json!(still_published),
+                    "the durable state is machine-readable on the refusal"
+                );
+                let message = reply.error.expect("a refusal names itself").message;
+                assert!(message.contains("gateway"), "the failing check is named");
+                assert_eq!(
+                    message.contains("still LIVE"),
+                    still_published,
+                    "a refusal on a live listing says so, and one on a quiet listing does not: \
+                     {message}"
+                );
+            }
+        }
+    }
+
+    // A publish abandoned because the listing was withdrawn under it must NOT invite a retry: a
+    // machine caller that retried on its own would republish over the operator's withdrawal, which
+    // is the thing abandoning it prevented. It must also report the state that won.
+    #[test]
+    fn a_superseded_publish_names_the_state_that_won_and_is_not_retryable() {
+        let reply = publish_reply(listing::PublishOutcome::Superseded {
+            listing_id: "30402:op:dummy".into(),
+            state: listing::WITHDRAWN.into(),
+        });
+        assert!(!reply.ok);
+        let data = reply.data.expect("the caller is told what the row says now");
+        assert_eq!(data["state"], json!(listing::WITHDRAWN));
+        assert_eq!(data["published"], json!(false));
+        let err = reply.error.expect("an abandoned publish is a failure reply");
+        assert_eq!(err.code, "invalid_state");
+        assert!(!err.retryable, "a retry would undo the withdrawal");
+        assert!(
+            err.message.contains("NOTHING"),
+            "it says nothing was published or broadcast: {}",
+            err.message
+        );
+    }
 
     #[derive(Default)]
     struct RecordingPayment {
@@ -1246,7 +1655,15 @@ mod tests {
         let recipes = Arc::new(Vec::<Recipe>::new());
         let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
         let reply =
-            dispatch(Request::Money, store, &recipes, &clock, payment, &RelayStatusCell::new())
+            dispatch(
+                Request::Money,
+                store,
+                &recipes,
+                &clock,
+                payment,
+                &RelayStatusCell::new(),
+                &no_listing_relay(),
+            )
                 .await;
         assert!(reply.ok, "money reply should be ok: {:?}", reply.error);
         reply.data.expect("money returns data")
@@ -1262,6 +1679,7 @@ mod tests {
             &clock,
             payment,
             &RelayStatusCell::new(),
+            &no_listing_relay(),
         )
         .await;
         assert!(reply.ok, "reconcile reply should be ok: {:?}", reply.error);
@@ -1375,7 +1793,16 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
         let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
         tokio::spawn(async move {
-            let _ = serve(s2, recipes, clock, payment, RelayStatusCell::new(), &sock2).await;
+            let _ = serve(
+                s2,
+                recipes,
+                clock,
+                payment,
+                RelayStatusCell::new(),
+                no_listing_relay(),
+                &sock2,
+            )
+            .await;
         });
         // wait for bind
         for _ in 0..50 {
@@ -1596,6 +2023,7 @@ mod tests {
                 clock,
                 payment,
                 RelayStatusCell::new(),
+                no_listing_relay(),
                 &sock2,
             )
             .await;
@@ -1748,6 +2176,7 @@ mod tests {
             clock,
             payment,
             RelayStatusCell::new(),
+            no_listing_relay(),
             sock.clone(),
             shutdown_rx,
         ));
@@ -1835,6 +2264,12 @@ mod tests {
         assert!(Request::Sweep { bolt11: "x".into() }.is_mutating());
         assert!(Request::AdminSuspend { id: "x".into() }.is_mutating());
         assert!(Request::AdminResume { id: "x".into() }.is_mutating());
+        // The publication verbs (lnrent-i23) write the durable `listing` row order intake gates on.
+        assert!(Request::ListingPublish {
+            accept_unverified: false
+        }
+        .is_mutating());
+        assert!(Request::ListingWithdraw.is_mutating());
         assert!(Request::DevSettle {
             subscription_id: "x".into()
         }
@@ -1881,6 +2316,7 @@ mod tests {
             clock,
             payment,
             RelayStatusCell::new(),
+            no_listing_relay(),
             sock.clone(),
             shutdown_rx,
         ));
@@ -1970,6 +2406,7 @@ mod tests {
             clock,
             payment,
             RelayStatusCell::new(),
+            no_listing_relay(),
             sock.clone(),
             shutdown_rx,
         ));
@@ -2364,7 +2801,16 @@ mod tests {
             .unwrap();
 
         // List: the two non-terminal rows, with dest_form + fields; the SENT row excluded.
-        let list = dispatch(Request::Refunds, &store, &recipes, &clock, &payment, &RelayStatusCell::new()).await;
+        let list = dispatch(
+            Request::Refunds,
+            &store,
+            &recipes,
+            &clock,
+            &payment,
+            &RelayStatusCell::new(),
+            &no_listing_relay(),
+        )
+        .await;
         let arr = list.data.unwrap();
         let arr = arr.as_array().unwrap();
         assert_eq!(arr.len(), 2, "PENDING + FAILED listed, SENT excluded");
@@ -2382,6 +2828,7 @@ mod tests {
             &clock,
             &payment,
             &RelayStatusCell::new(),
+            &no_listing_relay(),
         )
         .await;
         assert!(retry.ok, "retry of a parked refund succeeds: {:?}", retry.error);
@@ -2405,6 +2852,7 @@ mod tests {
             &clock,
             &payment,
             &RelayStatusCell::new(),
+            &no_listing_relay(),
         )
         .await;
         assert!(!bad.ok);
@@ -2467,6 +2915,7 @@ mod tests {
             &clock,
             &payment,
             &RelayStatusCell::new(),
+            &no_listing_relay(),
         )
         .await;
         assert!(retry.ok, "retry: {:?}", retry.error);
@@ -2486,9 +2935,27 @@ mod tests {
         let payment: Arc<dyn PaymentBackend> = Arc::new(crate::backends::MockPayment::new());
 
         // Empty to start.
-        let td = dispatch(Request::Teardowns, &store, &recipes, &clock, &payment, &RelayStatusCell::new()).await;
+        let td = dispatch(
+            Request::Teardowns,
+            &store,
+            &recipes,
+            &clock,
+            &payment,
+            &RelayStatusCell::new(),
+            &no_listing_relay(),
+        )
+        .await;
         assert_eq!(td.data.unwrap()["open_total"], json!(0));
-        let st = dispatch(Request::Status, &store, &recipes, &clock, &payment, &RelayStatusCell::new()).await;
+        let st = dispatch(
+            Request::Status,
+            &store,
+            &recipes,
+            &clock,
+            &payment,
+            &RelayStatusCell::new(),
+            &no_listing_relay(),
+        )
+        .await;
         assert_eq!(st.data.unwrap()["open_teardowns"], json!(0));
 
         // Record a failed teardown → it surfaces in both.
@@ -2496,13 +2963,31 @@ mod tests {
             .await
             .unwrap();
 
-        let td = dispatch(Request::Teardowns, &store, &recipes, &clock, &payment, &RelayStatusCell::new()).await;
+        let td = dispatch(
+            Request::Teardowns,
+            &store,
+            &recipes,
+            &clock,
+            &payment,
+            &RelayStatusCell::new(),
+            &no_listing_relay(),
+        )
+        .await;
         let d = td.data.unwrap();
         assert_eq!(d["open_total"], json!(1));
         assert_eq!(d["teardown_failures"][0]["subscription_id"], "s1");
         assert_eq!(d["teardown_failures"][0]["hook"], "destroy");
 
-        let st = dispatch(Request::Status, &store, &recipes, &clock, &payment, &RelayStatusCell::new()).await;
+        let st = dispatch(
+            Request::Status,
+            &store,
+            &recipes,
+            &clock,
+            &payment,
+            &RelayStatusCell::new(),
+            &no_listing_relay(),
+        )
+        .await;
         assert_eq!(st.data.unwrap()["open_teardowns"], json!(1));
     }
 
@@ -2531,7 +3016,16 @@ mod tests {
             },
         ]);
 
-        let relays = dispatch(Request::Relays, &store, &recipes, &clock, &payment, &cell).await;
+        let relays = dispatch(
+            Request::Relays,
+            &store,
+            &recipes,
+            &clock,
+            &payment,
+            &cell,
+            &no_listing_relay(),
+        )
+        .await;
         let arr = relays.data.unwrap();
         let arr = arr.as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -2541,7 +3035,16 @@ mod tests {
         assert_eq!(arr[1]["connected"], json!(false));
         assert_eq!(arr[1]["last_connected_at"], Value::Null);
 
-        let st = dispatch(Request::Status, &store, &recipes, &clock, &payment, &cell).await;
+        let st = dispatch(
+            Request::Status,
+            &store,
+            &recipes,
+            &clock,
+            &payment,
+            &cell,
+            &no_listing_relay(),
+        )
+        .await;
         let d = st.data.unwrap();
         assert_eq!(d["relays_total"], json!(2));
         assert_eq!(d["relays_connected"], json!(1));
@@ -2554,11 +3057,74 @@ mod tests {
             &clock,
             &payment,
             &RelayStatusCell::new(),
+            &no_listing_relay(),
         )
         .await;
         let d0 = st0.data.unwrap();
         assert_eq!(d0["relays_total"], json!(0));
         assert_eq!(d0["relays_connected"], json!(0));
+    }
+
+    // lnrent-i23: `Status` must answer the publication question from the DURABLE row — the same row
+    // order intake matches an order against — so "am I live?" and "will an order be accepted?" can
+    // never disagree. No row yet (a store that has never booted a supervisor) is NOT published.
+    #[tokio::test]
+    async fn status_reports_listing_published_from_the_durable_row() {
+        let store = mem_store();
+        let dir = format!("{}/../recipes", env!("CARGO_MANIFEST_DIR"));
+        let recipes = Arc::new(vec![Recipe::load(format!("{dir}/dummy")).unwrap()]);
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
+        let (cell, relay) = (RelayStatusCell::new(), no_listing_relay());
+        let status =
+            || dispatch(Request::Status, &store, &recipes, &clock, &payment, &cell, &relay);
+
+        let d = status().await.data.unwrap();
+        assert_eq!(d["listing"]["published"], json!(false));
+        assert_eq!(d["listing"]["state"], Value::Null, "no row yet");
+
+        for (state, published) in [
+            (listing::UNPUBLISHED, false),
+            (listing::ACTIVE, true),
+            (listing::WITHDRAWN, false),
+        ] {
+            store
+                .transaction(move |tx| {
+                    tx.execute(
+                        "INSERT INTO listing (id, recipe_id, d_tag, state, updated_at)
+                         VALUES ('30402:op:dummy', 'dummy', 'dummy', ?1, 1)
+                         ON CONFLICT(id) DO UPDATE SET state=excluded.state",
+                        rusqlite::params![state],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let d = status().await.data.unwrap();
+            assert_eq!(d["listing"]["state"], json!(state));
+            assert_eq!(
+                d["listing"]["published"],
+                json!(published),
+                "`published` must track the state order intake gates on ({state})"
+            );
+        }
+    }
+
+    // With no Nostr engine wired the listing verbs REFUSE rather than write a durable state whose
+    // event could never reach a relay.
+    #[tokio::test]
+    async fn listing_verbs_refuse_without_a_wired_engine() {
+        let (_store, sock) = serve_temp().await;
+        for req in [
+            Request::ListingPublish {
+                accept_unverified: false,
+            },
+            Request::ListingWithdraw,
+        ] {
+            let reply = call(&sock, req).await.unwrap();
+            assert!(!reply.ok);
+            assert_eq!(reply.error.unwrap().code, "unsupported");
+        }
     }
 
     #[tokio::test]

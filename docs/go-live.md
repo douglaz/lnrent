@@ -30,9 +30,10 @@ every build, so a build flag is not what keeps real money off.
 
 The code is go-live-ready for an **attended, operator-watched launch** (real Fedimint backend wired,
 refund path hardened, provisioning + the buyer and operator CLIs proven live end to end on a real
-federation). Be clear-eyed about one thing: **starting the daemon (step 4) publishes your public
-`30402` listing, and that IS public exposure** — any Nostr keypair can send you orders from that
-moment, already during the preflight checks (step 5 merely formalizes it). Until the GATE-0 abuse-resistance items in
+federation). Be clear-eyed about one thing: **`lnrent listing publish` (step 5) publishes your
+public `30402` listing, and that IS public exposure** — from that moment any Nostr keypair can send
+you orders. Starting the daemon does NOT: it boots quiet, and until you publish, every order is
+refused. Until the GATE-0 abuse-resistance items in
 `docs/specs/production-readiness.md` land (per-buyer reservation caps, inbound rate-limiting), a
 stranger can hold your capacity at zero cost, so an attended launch accepts that documented risk
 knowingly: keep the price real but small, capacity low, and watch the logs. GATE-1 (alerting,
@@ -109,10 +110,12 @@ backend; unset ⇒ the daemon self-DMs the operator key (still durable in the ou
 to import the operator key into a DM client to read it). `LNRENT_ALERTS_ENABLED=false` turns the
 sink off.
 
-## 4. Preflight — verify post-start readiness BEFORE you promote it
+## 4. Preflight — verify readiness BEFORE you publish
 
-Run the daemon (the config is now persisted; run only needs the data dir, the recipes dir, and `DO_TOKEN`
-for provisioning):
+Run the daemon. It starts **quiet**: it upserts your durable listing row, serves IPC, and publishes
+nothing. No buyer can discover or order from you yet, so everything below happens with zero public
+exposure. (The config is now persisted; run only needs the data dir, the recipes dir, and `DO_TOKEN`
+for provisioning.)
 
 ```sh
 RUST_LOG=lnrentd=info DO_TOKEN=<token> \
@@ -120,12 +123,17 @@ LNRENT_DATA_DIR=/srv/lnrent/data LNRENT_RECIPES_DIR=/srv/lnrent/recipes \
   ./target/release/lnrentd
 ```
 
-Confirm ALL of these before you ANNOUNCE the listing (as §intro says, orders are already
-technically possible from the moment the daemon started):
+Confirm ALL of these before you publish in step 5. Nothing here is time-pressured — until you
+publish, you are not taking orders:
 - Daemon log shows, in order: the operator npub (`operator identity ready`) ·
   `fedimint payment backend joined; real ecash money path active` · `operator recipe loaded` ·
-  `published … listing` · `ipc serving`. No `refund readiness warning:` / `refund readiness ALARM:`
-  lines (the daemon's actual not-ready markers).
+  `durable listing is not ACTIVE; publishing nothing` (the quiet start — on a re-run of an
+  already-published daemon this is `published … listing` instead) · `ipc serving`. No
+  `refund readiness warning:` / `refund readiness ALARM:` lines (the daemon's actual not-ready
+  markers).
+- `LNRENT_DATA_DIR=/srv/lnrent/data ./target/release/lnrent status` → `listing.published` is
+  `false` and `listing.state` is `UNPUBLISHED`. This is the field to check any time you want to know
+  whether you are live; it reads the same durable row order intake gates every order on.
 - `LNRENT_DATA_DIR=/srv/lnrent/data ./target/release/lnrent money` → `Gateway: ok` and `READY`.
 - `LNRENT_DATA_DIR=/srv/lnrent/data ./target/release/lnrent preflight` (alias `doctor`) → every
   emitted check passes: the refund gateway, federation guardians, lnv2 money path, DO token (the
@@ -133,18 +141,79 @@ technically possible from the moment the daemon started):
   `phoenixd` line on this Fedimint path — unlike the checks above, which report themselves as
   `skipped` when they do not apply, that one is emitted ONLY for `payment_backend=phoenixd`, so do not
   go looking for it here. Exits nonzero on any failure, `--json` for
-  machine output, so an agent can gate subsequent launch promotion on it. This is a post-start
-  health gate, not a publication interlock: as noted above, starting the daemon already published
-  the listing.
-- ONE real end-to-end order at a SMALL price first: a buyer discovers the listing → orders → pays →
-  gets a droplet → SSHes in → cancels. Drive it manually with the buyer CLI (`lnrent-buyer`) against
-  your live listing — no script covers the full product flow (`scripts/live-fed-e2e.sh` proves only
-  the ecash money path against a throwaway regtest federation). Do it before real customers.
+  machine output, so an agent can gate subsequent launch promotion on it. Running it here is a
+  read-only rehearsal — `listing publish` runs these same checks itself and is what actually gates
+  publication. Each FAILING check prints what it will do to that gate (and carries the same verdict
+  as `class` under `--json`), so you know before step 5 whether a failure hard-blocks or is one you
+  can override.
 
-## 5. Go live
+## 5. Go live — publish the listing
 
-The daemon publishing its `30402` listing (step 4) IS the go-live — buyers can discover + order it now.
-Share the listing coordinate / operator npub.
+This is the go-live, and it is an explicit act:
+
+```sh
+LNRENT_DATA_DIR=/srv/lnrent/data ./target/release/lnrent listing publish
+```
+
+It re-runs the step-4 preflight and splits the failures:
+
+- **Structural** — your own misconfiguration: invalid recipe provisioning params, a `DO_TOKEN` that
+  is missing/malformed/rejected, a federation with no lnv2 module, a phoenixd api password or fee
+  schedule that does not match the node. Publication is **refused**, the failing check is named with
+  its remedy, and there is **no override**. Fix it and run the command again.
+- **Reachability** — someone else is down right now: guardians unreachable, no gateway attached, the
+  DigitalOcean API not answering the `provider_token` check, phoenixd not responding. Publication is
+  refused too, but you can override it with `--accept-unverified` once you have decided a third
+  party's outage should not hold your launch. That is safe because the money path still fails CLOSED
+  at order time: if the dependency is still broken when a buyer orders, the daemon refuses the order
+  rather than taking money it cannot service. Nothing re-checks it for you afterwards — `lnrent
+  money` and `lnrent preflight` are how you follow up.
+
+Do not go by which dependency is at fault — go by the `class` the failing check reports. One case
+crosses the line: a recipe's `preflight` hook reports only a single nonzero exit, so when the
+`recipe_preflight` check fails because the provider's own **metadata** read failed (`… could not be
+validated — DigitalOcean regions metadata read failed`), it is reported **structural** and there is
+no override, even though the cause is an outage. Wait for the provider and run `listing publish`
+again. Splitting that apart needs a new hook contract across every recipe; until then
+`recipe_preflight` is unconditionally structural.
+
+On success `lnrent status` shows `listing.published: true`. **The decision is durable**: every later
+restart republishes the `30402` from the row on its own — you never run this again. Share the
+listing coordinate / operator npub.
+
+A refusal only ever declines to CHANGE something. If you re-run `listing publish` on a listing that
+is already live and a check now fails, the refusal leaves it live and says so — it keeps taking
+orders until you `listing withdraw`. Nothing but that command takes a listing down.
+
+Then do ONE real end-to-end order at a SMALL price before real customers: a buyer discovers the
+listing → orders → pays → gets a droplet → SSHes in → cancels. Drive it manually with the buyer CLI
+(`lnrent-buyer`) against your live listing — no script covers the full product flow
+(`scripts/live-fed-e2e.sh` proves only the ecash money path against a throwaway regtest federation).
+
+### Stopping — `lnrent listing withdraw`
+
+```sh
+LNRENT_DATA_DIR=/srv/lnrent/data ./target/release/lnrent listing withdraw
+```
+
+Use it for maintenance, exhausted capacity, a bad recipe, or an incident. It marks the listing
+withdrawn — which is what actually stops orders, immediately — and then asks your relays to drop the
+`30402`, best-effort. A relay that cannot be reached may keep serving the stale listing, but every
+order against it is refused anyway, so the retraction is buyer-UX and never blocks the withdrawal.
+If the command reports that the relays were not told, run it again once they are back: the durable
+withdrawal is already final and is not rewritten, but the retraction is asked again.
+Like publishing, it is durable: restarts do not bring the listing back. `listing publish` relists.
+
+Withdraw always wins a race with a publish. `listing publish` spends most of its time in the step-4
+probes, and a `listing withdraw` that lands while one is still probing is not overtaken: the publish
+is ABANDONED (it writes and broadcasts nothing, and reports the state your withdrawal left it in)
+rather than applied on top of your withdrawal. That holds for the withdrawals that change nothing
+too — one that answers "already withdrawn" or "was never published" still stops the publish behind
+it, so the answer you were given stays true. Run `listing publish` again when you want it back.
+
+**Nothing else ever withdraws your listing.** No probe, backend outage, or failed healthcheck
+retracts it — only you. The listing is not the safety mechanism; the money path is, and it already
+refuses orders it cannot service.
 
 ## 6. Operate
 

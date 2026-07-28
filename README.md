@@ -10,7 +10,8 @@ running their own daemon, selling into the same open Nostr marketplace — not a
 deployment run by this project.
 
 - **Control plane:** `lnrentd` (Rust) — orders, payments, subscriptions, provisioning, refunds, Nostr.
-- **Operator CLI:** `lnrent` — talks to a running daemon over a local IPC socket (status, subs, money).
+- **Operator CLI:** `lnrent` — talks to a running daemon over a local IPC socket (status, subs, money,
+  and `listing publish`/`withdraw`: the daemon starts quiet, so publication is your explicit act).
 - **Buyer CLI:** `lnrent-buyer` — agent-grade; discovers listings and places orders over Nostr.
 
 ## Status

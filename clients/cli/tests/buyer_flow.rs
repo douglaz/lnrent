@@ -185,6 +185,17 @@ async fn buyer_cli_drives_full_flow_over_a_real_operator() {
     let (running, sock) =
         start_supervisor(&op_keys, &url, store, payment.clone(), clock.clone()).await;
     wait_for_ipc_ok(&sock).await;
+    // The operator goes live (lnrent-i23): the daemon boots quiet, so nothing is discoverable until
+    // this. Driven through the real IPC verb, like `lnrent listing publish` does.
+    let published = ipc::call(
+        &sock,
+        ipc::Request::ListingPublish {
+            accept_unverified: false,
+        },
+    )
+    .await
+    .expect("operator publishes the listing");
+    assert!(published.ok, "operator publish: {:?}", published.error);
 
     // --- buyer identity: a key file the CLI loads (we know its pubkey to derive the settle key) ---
     let buyer_keys = Keys::generate();

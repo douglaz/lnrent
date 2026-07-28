@@ -38,10 +38,17 @@ enum Cmd {
     Reconcile,
     /// Preflight the three EXTERNAL go-live dependencies — refund gateway, federation guardians,
     /// provider API token (DO_TOKEN) — with per-check pass/fail + diagnostics. Exits nonzero when
-    /// any check fails, so an operator agent can gate subsequent launch promotion on it. The daemon
-    /// publishes before IPC starts, so this is not a publication interlock. Alias: `doctor`.
+    /// any check fails, so an operator agent can gate subsequent launch promotion on it. Read-only:
+    /// `listing publish` runs the same checks and is what actually gates publication. Alias: `doctor`.
     #[command(alias = "doctor")]
     Preflight,
+    /// Publish or withdraw your public 30402 listing. A fresh daemon starts QUIET — until you
+    /// `listing publish`, no buyer can order. Publishing persists: every later restart republishes
+    /// on its own.
+    Listing {
+        #[command(subcommand)]
+        cmd: ListingCmd,
+    },
     /// List subscriptions.
     Subs,
     /// Inspect one subscription.
@@ -85,6 +92,24 @@ enum DevCmd {
     Settle { subscription_id: String },
 }
 
+#[derive(Subcommand)]
+enum ListingCmd {
+    /// GO LIVE: run preflight, then publish the 30402 so buyers can discover + order. REFUSED on a
+    /// structural failure (your own misconfiguration — no override) and on an unverified dependency
+    /// unless you pass --accept-unverified. Persists across restarts.
+    Publish {
+        /// Publish even though a dependency (guardians, a gateway, the provider API, phoenixd)
+        /// could not be reached. Use when a third party's outage is the only thing in the way: the
+        /// money path still fails closed at order time if it is still down then.
+        #[arg(long)]
+        accept_unverified: bool,
+    },
+    /// STOP TAKING ORDERS: mark the listing withdrawn (order intake refuses immediately) and ask the
+    /// relays to drop the 30402, best-effort. Persists across restarts — nothing republishes it
+    /// until you `listing publish` again.
+    Withdraw,
+}
+
 /// Exit-code taxonomy (agent-grade, ADR-0014): 0 ok; 1 preflight check(s) failed (lnrent-y4m.9) or
 /// an unrecognized daemon error code; 2 not_found; 3 bad_request/invalid_state;
 /// 4 ipc/connection failure OR a graceful-shutdown restart race (lnrent-j3c); 5 internal.
@@ -100,9 +125,13 @@ fn exit_code_for(err_code: &str) -> u8 {
         // Request-level refusals the operator can act on, incl. the structured sweep refusals
         // (gate1-operator-sweep, urw.3): a bad/zero invoice, an unpriceable quote, another sweep in
         // flight, an insufficient surplus, a fee rise past the quote, or an in-flight-unconfirmed pay.
+        // ... and the publication-gate refusals (lnrent-i23): `listing_blocked` is the operator's own
+        // misconfiguration (fix it — there is no override), `listing_unverified` is a dependency that
+        // could not be reached (retry, or re-run with --accept-unverified). Both are decisions for
+        // the operator, not daemon failures, so both land on 3 with the rest of them.
         "bad_request" | "invalid_state" | "dev_disabled" | "unsupported" | "sweep_invalid"
         | "sweep_unpriceable" | "sweep_busy" | "sweep_insufficient" | "sweep_fee_rose"
-        | "sweep_in_flight" => 3,
+        | "sweep_in_flight" | "listing_blocked" | "listing_unverified" => 3,
         // A read-only request cancelled because the daemon is gracefully shutting down (lnrent-j3c):
         // a TRANSIENT restart race (the reply carries retryable:true), not a hard failure. Map it to
         // the same transient IPC/connection exit as an unreachable daemon (`ipc_unreachable`) so shell
@@ -124,6 +153,7 @@ enum HumanRender {
     Refunds,
     Relays,
     Sweep,
+    Listing,
 }
 
 #[tokio::main]
@@ -154,6 +184,15 @@ async fn main() -> ExitCode {
         Cmd::Relays => (Request::Relays, HumanRender::Relays),
         Cmd::Refunds => (Request::Refunds, HumanRender::Refunds),
         Cmd::RefundRetry { id } => (Request::RefundRetry { id }, HumanRender::Generic),
+        Cmd::Listing {
+            cmd: ListingCmd::Publish { accept_unverified },
+        } => (
+            Request::ListingPublish { accept_unverified },
+            HumanRender::Listing,
+        ),
+        Cmd::Listing {
+            cmd: ListingCmd::Withdraw,
+        } => (Request::ListingWithdraw, HumanRender::Listing),
         Cmd::Suspend { id } => (Request::AdminSuspend { id }, HumanRender::Generic),
         Cmd::Resume { id } => (Request::AdminResume { id }, HumanRender::Generic),
         Cmd::Dev {
@@ -203,9 +242,24 @@ fn render(reply: Reply, as_json: bool, human_render: HumanRender) -> ExitCode {
                 HumanRender::Refunds => render_refunds_human(&v),
                 HumanRender::Relays => render_relays_human(&v),
                 HumanRender::Sweep => render_sweep_human(&v),
+                HumanRender::Listing => render_listing_human(&v),
             },
         }
     } else if let Some(err) = &reply.error {
+        // A refusal may carry the per-check diagnostics behind it (the lnrent-i23 publication gate
+        // does). Print them: the REMEDY an operator needs lives in each check's `detail`, and the
+        // one-line message only names which checks refused.
+        if let Some(failed) = reply
+            .data
+            .as_ref()
+            .and_then(|d| d.get("failed"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for c in failed {
+                let s = |k: &str| c.get(k).and_then(serde_json::Value::as_str).unwrap_or("?");
+                eprintln!("  \u{00d7} {} \u{b7} {}", s("name"), s("detail"));
+            }
+        }
         eprintln!("lnrent: {} ({})", err.message, err.code);
     }
     match &reply.error {
@@ -418,12 +472,15 @@ fn render_preflight_human(v: &serde_json::Value) {
         .unwrap_or_default();
     for c in &checks {
         let s = |k: &str| c.get(k).and_then(serde_json::Value::as_str).unwrap_or("?");
-        let mark = if c.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
-            "\u{2022}"
-        } else {
-            "\u{00d7}"
-        };
+        let ok = c.get("ok").and_then(serde_json::Value::as_bool) == Some(true);
+        let mark = if ok { "\u{2022}" } else { "\u{00d7}" };
         println!("  {} {} \u{b7} {}", mark, s("name"), s("detail"));
+        // Preflight is the read-only REHEARSAL for `listing publish` (go-live.md §4 before §5), so a
+        // failure has to say which side of that gate it lands on — otherwise the operator cannot tell
+        // a hard block from something `--accept-unverified` would let them launch past.
+        if !ok {
+            println!("      {}", publish_gate_note(c));
+        }
     }
     if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
         println!("Preflight: \x1b[1mPASS\x1b[0m");
@@ -432,6 +489,84 @@ fn render_preflight_human(v: &serde_json::Value) {
             "Preflight: \x1b[1mFAIL\x1b[0m \u{2014} fix the failing check(s) before promoting"
         );
     }
+}
+
+/// What a failing preflight check means for `lnrent listing publish` (lnrent-i23), from the `class`
+/// the daemon minted with the verdict. An unknown/absent class is described neutrally rather than
+/// guessed at — the daemon is the only classifier.
+fn publish_gate_note(check: &serde_json::Value) -> &'static str {
+    match check.get("class").and_then(serde_json::Value::as_str) {
+        Some("structural") => {
+            "\u{21b3} BLOCKS `listing publish` — your own configuration; there is no override"
+        }
+        Some("reachability") => {
+            "\u{21b3} blocks `listing publish` unless you pass --accept-unverified (a third party \
+             is down; the money path still fails closed at order time)"
+        }
+        _ => "\u{21b3} fix this before `listing publish`",
+    }
+}
+
+/// Human render for `lnrent listing publish|withdraw` (lnrent-i23). Says LIVE or NOT LIVE first —
+/// that is the one thing an operator must not misread — then the coordinate they share, then any
+/// caveat (an overridden check, a relay that did not take the event / the retraction).
+fn render_listing_human(v: &serde_json::Value) {
+    println!("{}", listing_human_text(v));
+}
+
+fn listing_human_text(v: &serde_json::Value) -> String {
+    let s = |k: &str| v.get(k).and_then(serde_json::Value::as_str);
+    let published = v
+        .get("published")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    // The headline splits `published` (the DURABLE answer: order intake gates on it) from
+    // DISCOVERABILITY, because a reply can carry both `published: true` and a `relay_error` — and
+    // that error means ZERO relays took the event (`nostr_engine::require_relay_acceptance` fails
+    // only when none did). Promising "buyers can discover it" there would be exactly the false
+    // belief this gate exists to remove, so that half is claimed only when a relay accepted one.
+    // The ⚠ line below names the error and the automatic remedy.
+    let headline = match (published, s("relay_error").is_some()) {
+        (true, false) => "Listing: \x1b[1mLIVE\x1b[0m — buyers can discover and order it",
+        (true, true) => {
+            "Listing: \x1b[1mLIVE\x1b[0m — order intake accepts orders, but NO relay took this \
+             30402, so buyers may not be able to find it"
+        }
+        (false, _) => "Listing: \x1b[1mNOT LIVE\x1b[0m — order intake refuses every order",
+    };
+    let mut lines = vec![headline.to_string()];
+    if let Some(id) = s("listing_id") {
+        lines.push(format!("  coordinate: {id}"));
+    }
+    if let Some(note) = s("note") {
+        lines.push(format!("  note: {note}"));
+    }
+    for w in v
+        .get("warnings")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&Vec::new())
+    {
+        let f = |k: &str| w.get(k).and_then(serde_json::Value::as_str).unwrap_or("?");
+        lines.push(format!(
+            "  \u{26a0} published UNVERIFIED: {} \u{b7} {}",
+            f("name"),
+            f("detail")
+        ));
+    }
+    // The two relay caveats. Neither changes the durable answer above — the row is what order
+    // intake reads — but an operator who is told "LIVE" deserves to know no relay took the event.
+    if let Some(e) = s("relay_error") {
+        lines.push(format!(
+            "  \u{26a0} the 30402 did not reach a relay ({e}); the next restart republishes it"
+        ));
+    }
+    if let Some(e) = s("retract_error") {
+        lines.push(format!(
+            "  \u{26a0} the relays were not told to drop it ({e}); they may keep serving the stale \
+             listing, but every order is refused"
+        ));
+    }
+    lines.join("\n")
 }
 
 /// Human render for `lnrent teardowns` (lnrent-urw.2): the owed provider teardowns, or a clean line.
@@ -832,5 +967,101 @@ mod tests {
         let ok_false_no_error: Reply =
             serde_json::from_value(json!({"ok": false})).expect("deserializable envelope");
         assert!(preflight_checks_failed(&ok_false_no_error));
+    }
+
+    // lnrent-i23: both publication refusals are OPERATOR decisions (fix the config / decide whether
+    // to launch anyway), not daemon failures — so they land on the request-refusal exit 3 and never
+    // on the generic 1 that would make them indistinguishable from an unknown error code.
+    #[test]
+    fn publication_refusals_map_to_the_request_refusal_exit() {
+        assert_eq!(exit_code_for("listing_blocked"), 3);
+        assert_eq!(exit_code_for("listing_unverified"), 3);
+    }
+
+    // `lnrent preflight` is sold as the read-only rehearsal for `listing publish` (go-live.md §4
+    // before §5), so a failing check has to say which side of that gate it lands on — otherwise the
+    // operator cannot tell a hard block from something `--accept-unverified` would let them past.
+    #[test]
+    fn a_failing_preflight_check_says_what_it_does_to_publication() {
+        let note = |class| publish_gate_note(&json!({"name": "x", "ok": false, "class": class}));
+        assert!(
+            note("structural").contains("no override"),
+            "{}",
+            note("structural")
+        );
+        assert!(
+            note("reachability").contains("--accept-unverified"),
+            "{}",
+            note("reachability")
+        );
+        // An unclassified failure is described neutrally rather than guessed at — the daemon is the
+        // only classifier, and an older daemon's report has no `class` at all.
+        let unknown = publish_gate_note(&json!({"name": "x", "ok": false}));
+        assert!(!unknown.contains("--accept-unverified"), "{unknown}");
+        assert!(unknown.contains("listing publish"), "{unknown}");
+    }
+
+    // The one thing an operator must not misread, in both directions.
+    #[test]
+    fn listing_human_states_live_or_not_live() {
+        let live = listing_human_text(&json!({
+            "published": true,
+            "state": "ACTIVE",
+            "listing_id": "30402:abc:dummy",
+            "event_id": "ev1",
+            "warnings": [],
+        }));
+        assert!(live.contains("LIVE"), "{live}");
+        assert!(live.contains("30402:abc:dummy"), "{live}");
+
+        let down = listing_human_text(&json!({
+            "published": false,
+            "state": "WITHDRAWN",
+            "listing_id": "30402:abc:dummy",
+            "retracted_from_relays": true,
+        }));
+        assert!(down.contains("NOT LIVE"), "{down}");
+    }
+
+    // An override is only honest if it SAYS what was overridden, and a "LIVE" that no relay took is
+    // only honest if it says that too.
+    #[test]
+    fn listing_human_surfaces_the_override_and_relay_caveats() {
+        let rendered = listing_human_text(&json!({
+            "published": true,
+            "state": "ACTIVE",
+            "listing_id": "30402:abc:dummy",
+            "relay_error": "no relays accepted publishing 30402 listing",
+            "warnings": [
+                {"name": "federation", "ok": false, "detail": "guardians unreachable",
+                 "class": "reachability"}
+            ],
+        }));
+        assert!(rendered.contains("UNVERIFIED"), "{rendered}");
+        assert!(rendered.contains("federation"), "{rendered}");
+        assert!(rendered.contains("guardians unreachable"), "{rendered}");
+        assert!(rendered.contains("did not reach a relay"), "{rendered}");
+        // ...and the HEADLINE itself must not promise discovery no relay can serve: `relay_error`
+        // means zero relays accepted the event, so the operator is live (orders are accepted) and
+        // undiscoverable at the same time, and both halves have to be said.
+        assert!(rendered.contains("LIVE"), "{rendered}");
+        assert!(
+            !rendered.contains("can discover"),
+            "a publication no relay took must not claim buyers can discover it: {rendered}"
+        );
+    }
+
+    #[test]
+    fn listing_human_reports_a_failed_retraction_without_claiming_it_is_still_live() {
+        let rendered = listing_human_text(&json!({
+            "published": false,
+            "state": "WITHDRAWN",
+            "listing_id": "30402:abc:dummy",
+            "retracted_from_relays": false,
+            "retract_error": "no relays accepted retracting 30402 listing",
+        }));
+        assert!(rendered.contains("NOT LIVE"), "{rendered}");
+        assert!(rendered.contains("were not told to drop it"), "{rendered}");
+        assert!(rendered.contains("every order is refused"), "{rendered}");
     }
 }

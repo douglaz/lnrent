@@ -191,9 +191,15 @@ impl Recipe {
 
     /// Validate a recipe before it is used (lnrent-7fp.6, SPEC.md §7.2/§7.4/§9.1):
     /// the lifecycle hooks exist and are executable, the backend/isolation/tier/OS are known,
-    /// and every declared management operation is well-formed (valid kind, safe bare hook,
-    /// request-kind hook present + executable + contained in `ops/`, unique names).
+    /// every declared management operation is well-formed (valid kind, safe bare hook,
+    /// request-kind hook present + executable + contained in `ops/`, unique names), and the 30402
+    /// listing this recipe publishes can actually be built (§5.4).
     pub fn validate(&self) -> Result<()> {
+        // The service id IS the listing's `d` tag (`listing::d_tag`), so an empty one yields the
+        // malformed coordinate `30402:<pubkey>:` and a listing `lnrent_wire::build_listing` refuses.
+        if self.service.id.is_empty() {
+            bail!("recipe: service.id is empty, but it is the listing's `d` tag");
+        }
         // Lifecycle hooks present + executable.
         for name in LIFECYCLE_HOOKS {
             let h = self.hook(name);
@@ -294,6 +300,42 @@ impl Recipe {
                         );
                     }
                 }
+            }
+        }
+
+        // The 30402 this recipe publishes must be BUILDABLE (§5.4). `lnrent_wire::build_listing`
+        // bounds the published `params`/`operations` arrays it renders from these fields, and that
+        // is the one structural defect the publication gate (lnrent-i23) cannot catch for itself:
+        // `listing::publish` commits the durable `ACTIVE` state before the relay leg, so a recipe
+        // over these caps would leave the operator "LIVE" behind an event that NO relay can ever be
+        // given and that no restart can fix. Rejecting it at LOAD is where it has somewhere useful
+        // to be reported — `main::load_operator_recipe` names the recipe, disables it, and refuses
+        // to start if none is left.
+        if self.params.len() > lnrent_wire::MAX_PARAMS {
+            bail!(
+                "recipe `{}`: {} params exceeds the {} a 30402 listing can publish",
+                self.service.id,
+                self.params.len(),
+                lnrent_wire::MAX_PARAMS
+            );
+        }
+        if self.operations.len() > lnrent_wire::MAX_OPERATIONS {
+            bail!(
+                "recipe `{}`: {} operations exceeds the {} a 30402 listing can publish",
+                self.service.id,
+                self.operations.len(),
+                lnrent_wire::MAX_OPERATIONS
+            );
+        }
+        for op in &self.operations {
+            if op.params.len() > lnrent_wire::MAX_PARAMS {
+                bail!(
+                    "recipe `{}`: operation `{}` declares {} params, over the {} a 30402 listing can publish",
+                    self.service.id,
+                    op.name,
+                    op.params.len(),
+                    lnrent_wire::MAX_PARAMS
+                );
             }
         }
 
@@ -452,6 +494,71 @@ hook = "get-config"
         let mut r = wireguard();
         r.dir = PathBuf::from("/nonexistent-recipe-dir");
         assert!(r.validate().is_err());
+    }
+
+    // A recipe whose listing cannot be BUILT is refused at load, not at publication time: the
+    // publication gate (lnrent-i23) commits the durable `ACTIVE` state before the relay leg, so a
+    // recipe over `lnrent_wire::build_listing`'s caps would otherwise leave an operator "LIVE"
+    // behind a 30402 that no relay can be given and no restart can fix. Each case is checked
+    // against the real builder so the two bounds cannot drift apart.
+    #[test]
+    fn validate_rejects_a_recipe_whose_listing_cannot_be_built() {
+        // `fn` items, not closures: the cases below are `fn` pointers and must capture nothing.
+        fn param() -> Param {
+            Param {
+                key: "k".into(),
+                label: "K".into(),
+                ty: "string".into(),
+                required: false,
+            }
+        }
+        fn op() -> Operation {
+            Operation {
+                name: "status".into(),
+                label: "Status".into(),
+                kind: "interactive".into(),
+                hook: "status".into(),
+                params: vec![],
+            }
+        }
+        let cases: [fn(&mut Recipe); 4] = [
+            |r: &mut Recipe| r.service.id = String::new(),
+            |r: &mut Recipe| {
+                r.params = std::iter::repeat_with(param)
+                    .take(lnrent_wire::MAX_PARAMS + 1)
+                    .collect()
+            },
+            |r: &mut Recipe| {
+                r.operations = (0..=lnrent_wire::MAX_OPERATIONS)
+                    .map(|i| Operation {
+                        name: format!("op{i}"),
+                        ..op()
+                    })
+                    .collect()
+            },
+            |r: &mut Recipe| {
+                let mut o = op();
+                o.params = std::iter::repeat_with(param)
+                    .take(lnrent_wire::MAX_PARAMS + 1)
+                    .collect();
+                r.operations = vec![o];
+            },
+        ];
+        for mutate in cases {
+            let mut r = wireguard();
+            mutate(&mut r);
+            assert!(
+                r.validate().is_err(),
+                "a recipe whose 30402 cannot be built must not load"
+            );
+            // ...and the reason it must not load: the real builder rejects its listing.
+            let listing =
+                crate::nostr_engine::listing_from_recipe(&r, &r.service.id, "a".repeat(64));
+            assert!(
+                lnrent_wire::build_listing(&listing).is_err(),
+                "the cap this test pins is the one `build_listing` enforces"
+            );
+        }
     }
 
     // lnrent-y4m.7: the recipe env-passthrough allowlist is bounded, shape-checked, and can NEVER
