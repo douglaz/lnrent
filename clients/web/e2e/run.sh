@@ -40,7 +40,19 @@ RUST_LOG=lnrentd=info NO_COLOR=1 LNRENT_DEV=1 \
 for _ in $(seq 1 60); do grep -q 'ipc serving' "$WORK/daemon.log" && break; sleep 1; done
 NPUB="$(grep -oaE 'npub1[a-z0-9]{50,}' "$WORK/daemon.log" | head -1)"
 echo "   operator npub: ${NPUB:0:24}…"
-grep -q 'published' "$WORK/daemon.log" || { echo "daemon did not publish a listing"; tail -20 "$WORK/daemon.log"; exit 1; }
+
+# The daemon starts QUIET (lnrent-i23): the listing row is born UNPUBLISHED and nothing reaches the
+# relay until the operator publishes. So this harness has to do what an operator does. Buyer
+# discovery is the whole point of the run, so a failure here must abort rather than surface later as
+# an empty listing list. `--accept-unverified` because a preflight REACHABILITY check may legitimately
+# fail in CI (no provider credential on the mock/host backend); a STRUCTURAL failure still blocks and
+# should, since it would mean this harness's own recipe cannot build a valid 30402.
+say "publish the listing (the daemon starts quiet — lnrent-i23)"
+LNRENT_DATA_DIR="$WORK/data" ./target/debug/lnrent listing publish --accept-unverified \
+  >"$WORK/publish.log" 2>&1 || { echo "lnrent listing publish failed"; cat "$WORK/publish.log"; tail -20 "$WORK/daemon.log"; exit 1; }
+
+for _ in $(seq 1 20); do grep -q 'published' "$WORK/daemon.log" && break; sleep 0.5; done
+grep -q 'published' "$WORK/daemon.log" || { echo "daemon did not publish a listing"; cat "$WORK/publish.log"; tail -20 "$WORK/daemon.log"; exit 1; }
 
 say "serve static/ (with pkg)"
 python3 -m http.server "$PORT" --directory clients/web/static >/dev/null 2>&1 & SRV=$!
