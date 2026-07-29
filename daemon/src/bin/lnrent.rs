@@ -572,6 +572,17 @@ fn listing_human_text(v: &serde_json::Value) -> String {
              listing, but every order is refused"
         ));
     }
+    // NOT a relay problem — a relay took the event. The local write failed, and the usual cause
+    // makes the "LIVE" above misleading in the other direction: a full disk or IO error latches the
+    // store degraded, which refuses the reservation writes order intake needs, so the listing is
+    // discoverable while the daemon can accept nothing.
+    if let Some(e) = s("persist_error") {
+        lines.push(format!(
+            "  \u{26a0} a relay TOOK the listing but its event id could not be recorded ({e}) — \
+             check `lnrent money`/`lnrent status`: if the store is degraded, orders are being \
+             refused even though buyers can discover you"
+        ));
+    }
     lines.join("\n")
 }
 

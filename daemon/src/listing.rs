@@ -141,17 +141,27 @@ pub type RelayHandle = Option<Arc<dyn ListingRelay>>;
 pub enum PublishOutcome {
     /// The row is now `ACTIVE`. `event_id` is `None` when the durable state committed but the relay
     /// publish failed — the next boot republishes it (`warnings` carries the overridden checks).
+    ///
+    /// `persist_error` is the OTHER failure and must not be folded into `relay_error`: the relay
+    /// ACCEPTED the event and only recording its id locally failed. It is reported because the cause
+    /// is rarely cosmetic — a full disk or IO error latches the store degraded (lnrent-y4m.3), which
+    /// refuses the reservation writes order intake needs, so a listing that is genuinely
+    /// discoverable can still take no orders. Saying "LIVE" with nothing else would be true about
+    /// the relay and misleading about the daemon.
     Published {
         listing_id: String,
         event_id: Option<String>,
         relay_error: Option<String>,
+        persist_error: Option<String>,
         warnings: Vec<PreflightCheck>,
     },
-    /// Already `ACTIVE`; publish is idempotent and re-broadcast the event.
+    /// Already `ACTIVE`; publish is idempotent and re-broadcast the event. `persist_error` carries
+    /// the same meaning as on [`PublishOutcome::Published`].
     AlreadyPublished {
         listing_id: String,
         event_id: Option<String>,
         relay_error: Option<String>,
+        persist_error: Option<String>,
         warnings: Vec<PreflightCheck>,
     },
     /// Refused: the operator's own misconfiguration. No override.
@@ -568,12 +578,13 @@ pub(crate) async fn publish_gated(
     }
 
     let broadcast = publish_event(store, relay, recipe, &listing_id, &operator_hex).await;
-    let (event_id, relay_error) = match broadcast {
-        // A relay took it. `persist_warning` (the event id could not be recorded locally) is NOT a
-        // relay error: the listing is discoverable either way, so reporting it here would tell the
-        // operator the opposite of what happened. It is already logged at the failure site, and the
-        // absent `event_id` is what `lnrent status` renders.
-        Ok((id, _persist_warning)) => (Some(id), None),
+    let (event_id, relay_error, persist_error) = match broadcast {
+        // A relay took it. The persistence failure is carried SEPARATELY, never as `relay_error`:
+        // the listing is discoverable either way, so reporting it as a relay problem would tell the
+        // operator the opposite of what happened — but dropping it would hide that the store is
+        // very likely degraded (lnrent-y4m.3 latches on a full disk / IO error and then refuses the
+        // reservation writes order intake needs), i.e. discoverable but unable to take orders.
+        Ok((id, persist_warning)) => (Some(id), None, persist_warning),
         Err(e) => {
             let detail = format!("{e:#}");
             tracing::warn!(
@@ -581,7 +592,7 @@ pub(crate) async fn publish_gated(
                 error = %detail,
                 "listing is ACTIVE but the 30402 did not reach a relay; the next boot republishes"
             );
-            (None, Some(detail))
+            (None, Some(detail), None)
         }
     };
     Ok(if was_active {
@@ -589,6 +600,7 @@ pub(crate) async fn publish_gated(
             listing_id,
             event_id,
             relay_error,
+            persist_error,
             warnings: unverified,
         }
     } else {
@@ -596,6 +608,7 @@ pub(crate) async fn publish_gated(
             listing_id,
             event_id,
             relay_error,
+            persist_error,
             warnings: unverified,
         }
     })

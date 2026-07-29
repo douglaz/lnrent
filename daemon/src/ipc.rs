@@ -1244,10 +1244,17 @@ fn listing_row(r: &rusqlite::Row) -> rusqlite::Result<(String, String, Option<St
 fn publish_reply(outcome: listing::PublishOutcome) -> Reply {
     let checks_json = |checks: &[crate::preflight::PreflightCheck]| json!(checks);
     match outcome {
+        // `relay_error` and `persist_error` are SEPARATE fields on purpose: the first means no relay
+        // took the event (nobody can discover the listing), the second means a relay DID take it but
+        // its id could not be recorded locally — which usually means the store is degraded
+        // (lnrent-y4m.3 latches on a full disk / IO error and then refuses the reservation writes
+        // order intake needs), so the listing is discoverable while the daemon can take no orders.
+        // Collapsing them would report one as the other.
         listing::PublishOutcome::Published {
             listing_id,
             event_id,
             relay_error,
+            persist_error,
             warnings,
         } => Reply::ok(json!({
             "listing_id": listing_id,
@@ -1255,12 +1262,14 @@ fn publish_reply(outcome: listing::PublishOutcome) -> Reply {
             "published": true,
             "event_id": event_id,
             "relay_error": relay_error,
+            "persist_error": persist_error,
             "warnings": checks_json(&warnings),
         })),
         listing::PublishOutcome::AlreadyPublished {
             listing_id,
             event_id,
             relay_error,
+            persist_error,
             warnings,
         } => Reply::ok(json!({
             "listing_id": listing_id,
@@ -1268,6 +1277,7 @@ fn publish_reply(outcome: listing::PublishOutcome) -> Reply {
             "published": true,
             "event_id": event_id,
             "relay_error": relay_error,
+            "persist_error": persist_error,
             "warnings": checks_json(&warnings),
             "note": "already published; re-broadcast the 30402",
         })),
@@ -1329,11 +1339,17 @@ fn publish_reply(outcome: listing::PublishOutcome) -> Reply {
                 })),
                 error: Some(IpcError {
                     code: "invalid_state".into(),
+                    // Says "was superseded", not "changed to {state}". This refusal is deliberately
+                    // reachable on the EPOCH alone: a `listing withdraw` landing during preflight on
+                    // an UNPUBLISHED or already-WITHDRAWN row writes nothing durable, so `state` is
+                    // exactly what the publish first observed. Reporting a change there would assert
+                    // an event that did not occur — and the withdrawal, which DID occur, is the part
+                    // the operator needs to recognise as their own doing.
                     message: format!(
-                        "publication abandoned: `{listing_id}` changed to {state} while preflight \
-                         was running, so this command published and broadcast NOTHING — check \
-                         `lnrent status` and run `lnrent listing publish` again if that is not \
-                         what you want"
+                        "publication abandoned: `{listing_id}` was superseded while preflight was \
+                         running (it is {state} now) — most often your own `lnrent listing \
+                         withdraw`. This command published and broadcast NOTHING; check `lnrent \
+                         status` and run `lnrent listing publish` again if that is not what you want"
                     ),
                     retryable: false,
                 }),
