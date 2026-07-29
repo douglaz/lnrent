@@ -499,9 +499,13 @@ fn publish_gate_note(check: &serde_json::Value) -> &'static str {
         Some("structural") => {
             "\u{21b3} BLOCKS `listing publish` — your own configuration; there is no override"
         }
+        // Deliberately NOT "the money path still fails closed" — that is only true of the payment
+        // backend. `order_intake` never consults the compute provider, so overriding a provider
+        // reachability failure lets a Buyer pay into an outage and be refunded net of fees.
         Some("reachability") => {
             "\u{21b3} blocks `listing publish` unless you pass --accept-unverified (a third party \
-             is down; the money path still fails closed at order time)"
+             is down). If it is STILL down when a Buyer orders: a payment-backend outage refuses \
+             the order, but a provider outage lets them pay and be refunded net of fees"
         }
         _ => "\u{21b3} fix this before `listing publish`",
     }

@@ -717,13 +717,15 @@ pub async fn dispatch(
                     })),
                     error: Some(IpcError {
                         code: "invalid_state".into(),
-                        message: format!(
-                            "listing `{listing_id}` was never published by this daemon, so there is \
-                             nothing to withdraw — the relays were still asked to drop it, in case \
-                             an earlier data dir published it on this key. Run `lnrent listing \
-                             publish` to go live"
-                        ),
-                        retryable: false,
+                        message: not_published_message(&listing_id, retract_error.as_deref()),
+                        // Retryable exactly when the relay leg failed. The refusal itself is
+                        // terminal — no row was published, and re-running changes nothing durable —
+                        // but when `retract_error` is set the message tells the operator to re-run
+                        // once the relays are reachable, and an agent driving `--json` reads
+                        // `retryable` rather than the prose. Saying `false` there would tell it the
+                        // stale 30402 can never be retracted, which is the one thing this branch
+                        // exists to make possible.
+                        retryable: retract_error.is_some(),
                     }),
                 },
                 Err(e) => Reply::err("internal", format!("{e:#}")),
@@ -1160,6 +1162,31 @@ async fn refund_retry(store: &Store, id: &str, now: i64) -> Reply {
 /// [`serve`] form some unit tests use: `d_tag` is not unique across operator keys (the PK is the
 /// full coordinate), so it takes the most recently touched row — deterministic only while the clock
 /// advances, which is exactly why it is not the primary lookup.
+/// The refusal text for `listing withdraw` on a row this database never published (lnrent-i23).
+///
+/// The relay half is conditional ON PURPOSE. This is a REFUSAL, so the CLI renders it through its
+/// error path, which prints this message plus `data.failed` and nothing else — `retract_error`
+/// never reaches the human there the way `render_listing_human` surfaces it on the success paths.
+/// Asserting "the relays were asked" after the ask failed would be false in exactly the case this
+/// retraction exists for: a wiped or restored data dir on the same operator seed, where `withdraw`
+/// is the operator's ONLY affordance for removing a stale 30402. They would read it as done, never
+/// re-run it, and leave the listing discoverable while every order against it bounces.
+fn not_published_message(listing_id: &str, retract_error: Option<&str>) -> String {
+    match retract_error {
+        None => format!(
+            "listing `{listing_id}` was never published by this daemon, so there is nothing to \
+             withdraw — the relays were still asked to drop it, in case an earlier data dir \
+             published it on this key. Run `lnrent listing publish` to go live"
+        ),
+        Some(e) => format!(
+            "listing `{listing_id}` was never published by this daemon, so there is nothing to \
+             withdraw — and the relays could NOT be asked to drop it: {e}. If an earlier data dir \
+             published a listing on this key it may still be discoverable; re-run `lnrent listing \
+             withdraw` once the relays are reachable"
+        ),
+    }
+}
+
 async fn listing_view(
     store: &Store,
     recipes: &Arc<Vec<Recipe>>,
@@ -3118,6 +3145,37 @@ mod tests {
                 "`published` must track the state order intake gates on ({state})"
             );
         }
+    }
+
+    // The `NotPublished` refusal must not claim the relays were asked when the ask FAILED
+    // (lnrent-i23, multi-reviewer pass 3). This is the one operator-facing surface that carries the
+    // claim: the CLI renders a refusal through its error path, which prints only this message and
+    // `data.failed`, so unlike the success paths there is no second place `retract_error` shows up.
+    // In the case the retraction exists for — a wiped/restored data dir on the same seed, where
+    // withdraw is the only way to remove a stale 30402 — an operator who reads "the relays were
+    // asked" after a failed ask never re-runs it, and the listing stays discoverable.
+    #[test]
+    fn the_not_published_refusal_never_claims_a_failed_retraction_succeeded() {
+        let asked = not_published_message("30402:op:dummy", None);
+        assert!(
+            asked.contains("were still asked to drop it"),
+            "the success wording states the ask happened: {asked}"
+        );
+
+        let failed = not_published_message("30402:op:dummy", Some("no relay accepted the deletion"));
+        assert!(
+            failed.contains("could NOT be asked to drop it")
+                && failed.contains("no relay accepted the deletion"),
+            "a failed retraction must say so and carry the diagnostic: {failed}"
+        );
+        assert!(
+            !failed.contains("were still asked to drop it"),
+            "the failed case must not also assert the ask landed: {failed}"
+        );
+        assert!(
+            failed.contains("re-run"),
+            "and must tell the operator the remedy, since nothing else will: {failed}"
+        );
     }
 
     // With no Nostr engine wired the listing verbs REFUSE rather than write a durable state whose

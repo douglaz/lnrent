@@ -28,9 +28,27 @@
 //!   params, a rejected credential, a federation without the money module). It does not fix itself,
 //!   so publish HARD BLOCKS and names it. There is no override.
 //! - [`FailureClass::Reachability`] — someone else is down right now. Publish WARNS and refuses,
-//!   but `--accept-unverified` overrides it, because the money path ALREADY fails closed at order
-//!   time if the dependency is still broken then, and a third party's outage must not be able to
-//!   block an operator's launch.
+//!   but `--accept-unverified` overrides it, because a third party's outage must not be able to
+//!   block an operator's launch: down at publish time is not down at order time.
+//!
+//! What the override actually costs is NOT uniform across those dependencies, and the honest
+//! statement of it is per-dependency rather than a blanket "the money path fails closed":
+//!
+//! - **Payment backend down** — genuinely fails closed. `order_intake` cannot mint an invoice, so
+//!   the order is refused before any money moves. Overriding this one risks nothing but a Buyer
+//!   seeing a failed order.
+//! - **Provider (compute) down** — does NOT fail closed. `order_intake` runs a price check, a
+//!   capacity reservation and `create_invoice`, and consults the PROVIDER nowhere; provisioning
+//!   happens after settlement. So a Buyer who orders while the provider is still broken PAYS, fails
+//!   to provision, and is refunded net of fees (ADR-0019) — a real cost to them, on the ordinary
+//!   failed-provision path rather than a new hazard, but a cost the operator is choosing on their
+//!   behalf when they override. That is why the refusal names the check: overriding a provider
+//!   reachability failure is a different decision from overriding a payment-backend one.
+//!
+//! Gating invoice issuance on a live provider probe would close that, and is deliberately NOT done:
+//! it puts third-party network I/O on the money path (ADR-0016 keeps probes off it — the ledger
+//! authorizes, and only explicit `reconcile` reads the wallet) and would make every order depend on
+//! the provider's uptime rather than only the ones that reach provisioning.
 //!
 //! ## Why nothing here ever auto-withdraws
 //!
