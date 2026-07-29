@@ -939,17 +939,20 @@ impl OrderWrite {
             self.cache_refusal(tx)?;
             return Ok(OrderCommit::ListingGone);
         }
-        // The hold must still be LIVE, and this is not implied by the check above. A duplicate
-        // delivery of the same `order.request` shares this order's reservation row, so a sibling
-        // that reached the branch above first has already RELEASED it and answered `unavailable`
-        // without caching that refusal. If the operator republishes before this delivery arrives
-        // here, the listing reads ACTIVE again and — without this check — the order would commit a
-        // subscription and a payable invoice on top of a `RELEASED` reservation: the tail of this
-        // function only refreshes the hold's EXPIRY, never its state, so the slot would be counted
-        // free while a real subscription occupied it, letting capacity be handed out twice.
+        // DEFENCE IN DEPTH, and deliberately kept as such: no order is ever committed without a
+        // live hold behind it. The tail of this function only refreshes the hold's EXPIRY, never its
+        // state, so committing on a `RELEASED` row would leave the slot counted free while a real
+        // subscription occupied it — capacity handed out twice.
         //
-        // Refusing here keeps the invariant the reservation exists to carry: no order is ever
-        // committed without a live hold behind it.
+        // HONEST REACHABILITY (this guard's original rationale is no longer true, and saying so
+        // matters more than keeping the story tidy): it was added for a duplicate delivery whose
+        // sibling had hit the branch above, released their SHARED reservation, and returned without
+        // caching the refusal. Caching that refusal in the same transaction closed that path — the
+        // dedup read at the top of this function now answers any later delivery as `Duplicate`
+        // before it can reach here. No currently-reachable caller is known to trip this check; it
+        // stays because the invariant is cheap to enforce and expensive to lose, and because a
+        // future release path (a sweeper, a new refusal branch) would otherwise reopen the hazard
+        // silently.
         let hold_state: Option<String> = tx
             .query_row(
                 "SELECT state FROM reservation WHERE order_id=?1",
@@ -1040,10 +1043,12 @@ enum OrderCommit {
     /// The listing stopped being `ACTIVE` between the §5.4 check and this commit — an operator's
     /// `listing withdraw` landing across `create_invoice`'s network round-trip. NOTHING was written.
     ListingGone,
-    /// This order's capacity hold is no longer live: a duplicate delivery of the same request hit
-    /// [`OrderCommit::ListingGone`] first and released the shared reservation. Committing anyway
-    /// would put a subscription behind a `RELEASED` hold and let the slot be handed out twice.
-    /// NOTHING was written.
+    /// This order's capacity hold is no longer live. Committing anyway would put a subscription
+    /// behind a `RELEASED` hold and let the slot be handed out twice, so NOTHING was written.
+    ///
+    /// A fail-closed invariant rather than a reachable race today: the path it was written for (a
+    /// duplicate delivery whose sibling released the shared reservation) is now answered from the
+    /// refusal cache before it gets here. See the comment at the check itself.
     HoldLost,
 }
 
@@ -1598,11 +1603,15 @@ mod tests {
         }
     }
 
-    // lnrent-i23 (multi-reviewer pass 6): an order must never commit behind a RELEASED hold. The
-    // listing being ACTIVE is not sufficient — a duplicate delivery that refused first releases the
-    // reservation the two deliveries SHARE, and the commit tail only refreshes the hold's expiry,
-    // never its state. Without the hold check the slot would read free while a real subscription
-    // occupied it, so capacity could be handed out twice.
+    // lnrent-i23: an order must never commit behind a RELEASED hold — the commit tail only refreshes
+    // the hold's expiry, never its state, so the slot would read free while a real subscription
+    // occupied it and capacity could be handed out twice.
+    //
+    // The released hold is manufactured with a direct write ON PURPOSE. The duplicate-delivery race
+    // this guard was written for is no longer reachable (the refusal is cached in the same
+    // transaction that releases, so a later delivery is answered as `Duplicate` first), and a test
+    // that pretended otherwise would be narrating a path that cannot happen. What is pinned here is
+    // the invariant itself, against whatever future release path might reach this state.
     #[tokio::test]
     async fn an_order_never_commits_behind_a_released_hold() {
         let store = mem_store();
