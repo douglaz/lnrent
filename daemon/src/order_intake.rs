@@ -257,7 +257,17 @@ impl OrderIntake {
         //    cached inbound_request response. Re-check the dedup key INSIDE the txn so a concurrent
         //    duplicate that slipped past step 1 commits exactly one order (the store actor
         //    serializes txns, so the loser sees the winner's row).
+        // The refusal the two capacity-releasing branches cache in their OWN transaction. Built here
+        // because it must be durable together with the release: `reservation::reserve` bails on a
+        // `RELEASED` row, so a crash between the release and a separate cache write would leave
+        // every relay redelivery of this request failing instead of resending an idempotent answer.
+        let refusal_json = serde_json::to_string(&Msg::OrderError(OrderError {
+            request_id: req.id.clone(),
+            order_id: None,
+            error: unavailable("this listing is not currently offered"),
+        }))?;
         let owned = OrderWrite {
+            refusal_json,
             sender_hex: sender_hex.clone(),
             request_id: req.id.clone(),
             order_id: order_id.clone(),
@@ -843,6 +853,13 @@ impl OrderHandler for OrderIntake {
 
 /// Owned inputs for the atomic order write, so the transaction closure is `move + 'static`.
 struct OrderWrite {
+    /// The `order.error` to cache ATOMICALLY with a refusal branch (`ListingGone` / `HoldLost`).
+    /// Pre-built by the caller because those branches release capacity, and a crash between that
+    /// release and a separate cache write would leave a request that can never be answered:
+    /// `reservation::reserve` deliberately bails on a `RELEASED` row, so every relay redelivery
+    /// would fail instead of resending an idempotent refusal. Caching it in the SAME transaction
+    /// makes the release and its answer one durable fact.
+    refusal_json: String,
     sender_hex: String,
     request_id: String,
     order_id: String,
@@ -869,6 +886,25 @@ impl OrderWrite {
     /// PENDING sub + OPEN invoice + cached response in one txn. Returns `Some(json)` if a
     /// concurrent duplicate already committed the order (its cached response to resend), else
     /// `None` (we committed).
+    /// Cache the pre-built `order.error` for this request, in the caller's transaction. Same shape
+    /// and same `DO NOTHING` conflict rule as `cache_response_row`, so a concurrent winner's cached
+    /// answer is never clobbered — `fail_order` then reads it back and resends that winner.
+    fn cache_refusal(&self, tx: &rusqlite::Transaction) -> Result<()> {
+        tx.execute(
+            "INSERT INTO inbound_request
+                (sender_pubkey, request_id, kind, response_msg_type, response_json, created_at)
+             VALUES (?1, ?2, 'order', 'order.error', ?3, ?4)
+             ON CONFLICT(sender_pubkey, request_id) DO NOTHING",
+            params![
+                self.sender_hex,
+                self.request_id,
+                self.refusal_json,
+                self.now
+            ],
+        )?;
+        Ok(())
+    }
+
     fn write(self, tx: &rusqlite::Transaction) -> Result<OrderCommit> {
         let existing: Option<String> = tx
             .query_row(
@@ -900,6 +936,7 @@ impl OrderWrite {
             // together — a hold left behind would keep a slot reserved for an order that will never
             // exist until its TTL lapsed.
             crate::reservation::release_txn(tx, &self.order_id, self.now)?;
+            self.cache_refusal(tx)?;
             return Ok(OrderCommit::ListingGone);
         }
         // The hold must still be LIVE, and this is not implied by the check above. A duplicate
@@ -921,6 +958,7 @@ impl OrderWrite {
             )
             .optional()?;
         if !matches!(hold_state.as_deref(), Some("HELD") | Some("CONSUMED")) {
+            self.cache_refusal(tx)?;
             return Ok(OrderCommit::HoldLost);
         }
         // next_deadline = the invoice expiry: an unpaid PENDING order must be discoverable by the
@@ -1612,6 +1650,65 @@ mod tests {
             count(&store, "SELECT count(*) FROM invoice").await,
             0,
             "and nothing payable was committed"
+        );
+    }
+
+    // lnrent-i23 (multi-reviewer pass 8): the refusal must be durable in the SAME transaction that
+    // releases the capacity hold. `reservation::reserve` deliberately bails on a `RELEASED` row, so
+    // if a crash landed between the release and a separately-written cache, every relay redelivery
+    // of this request would fail at reserve instead of resending an idempotent `order.error` —
+    // stuck until the terminal-row reaper, which is 120d away. Asserting the cached row exists is
+    // what proves the two are one durable fact; the send that follows is the resend path.
+    #[tokio::test]
+    async fn the_withdrawal_refusal_is_cached_with_the_release_not_after_it() {
+        let store = mem_store();
+        let recipe = dummy_recipe();
+        let listing_id = "30402:op:dummy-1";
+        seed_listing(&store, listing_id, "dummy", recipe.pricing.amount_sat as i64).await;
+        let payment = Arc::new(WithdrawDuringMint {
+            inner: MockPayment::new(),
+            store: store.clone(),
+            listing_id: listing_id.to_string(),
+        });
+        let handler = OrderIntake::new(
+            store.clone(),
+            payment,
+            Arc::new(TestClock::new(1000)),
+            recipe,
+            budget_with_room(),
+            u32::MAX,
+        );
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                Keys::generate().public_key(),
+                order("q", listing_id, json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+        assert_eq!(expect_order_error(&out).error.code, "unavailable");
+
+        // The durable half: an answer exists for this request, and it is the refusal.
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM inbound_request WHERE response_msg_type='order.error'"
+            )
+            .await,
+            1,
+            "the refusal was cached, so a redelivery resends it instead of failing at reserve"
+        );
+        // And it is genuinely paired with the release, not written by a later step.
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM reservation WHERE state='RELEASED'"
+            )
+            .await,
+            1,
+            "the hold really was released in that same transaction"
         );
     }
 
