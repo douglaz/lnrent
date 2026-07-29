@@ -328,15 +328,24 @@ impl NostrEngine {
     ///
     /// Waiting is the whole fix, and it must be a wait rather than a `created_at` bumped into the
     /// future: a future-stamped event does not age out any sooner under the wall-clock comparison,
-    /// and relays reject far-future events outright. Only this daemon can author these events (it
-    /// holds the key), so remembering the deletion in PROCESS memory is complete: the one gap it
-    /// leaves — a RESTART between the retraction and the relist — cannot fit in the second that
-    /// matters. `listing::republish_on_boot` publishes nothing for a non-`ACTIVE` row, so a relist
-    /// can only come from `listing::publish`, which runs the whole preflight (guardian round-trip,
-    /// gateway selection refresh, an authenticated TLS call to the provider API, a `run_hook`
-    /// process spawn) BEFORE it reaches the broadcast — behind a restart's own join/connect/bind
-    /// costs. Bounded by [`MAX_DELETION_SETTLE_WAIT`] so a backwards clock jump cannot hang the
-    /// operator's command; past it the relay's answer is simply honest.
+    /// and relays reject far-future events outright.
+    ///
+    /// KNOWN GAP, tracked as **lnrent-yxg**: this memory is PROCESS-local (`last_listing_deletion`
+    /// starts at 0), so a withdraw → daemon restart → publish inside the deletion's own second skips
+    /// the wait entirely. The relay then rejects the relist while `listing::publish_gated` has
+    /// already committed `ACTIVE`, leaving a listing that is live to order intake and undiscoverable
+    /// until the next boot republishes it.
+    ///
+    /// An earlier version of this comment argued that window could not be hit — a relist runs the
+    /// whole preflight (guardian round-trip, gateway refresh, a TLS call to the provider API, a
+    /// `run_hook` spawn) behind a restart's own join/connect/bind costs. Do NOT rely on that: a
+    /// provider-free recipe published with `--accept-unverified` short-circuits nearly all of it,
+    /// and an auto-restarting supervisor supplies the rest. The bead carries the analysis and the
+    /// cheap fix (the withdrawal second is already durable in `listing.updated_at`; read it before
+    /// `upsert_row` overwrites it).
+    ///
+    /// Bounded by [`MAX_DELETION_SETTLE_WAIT`] so a backwards clock jump cannot hang the operator's
+    /// command; past it the relay's answer is simply honest.
     async fn wait_out_own_listing_deletion(&self) {
         let deleted_at = self.last_listing_deletion.load(Ordering::SeqCst);
         if deleted_at == 0 {
