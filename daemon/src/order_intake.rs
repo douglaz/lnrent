@@ -302,6 +302,26 @@ impl OrderIntake {
                     )
                     .await;
             }
+            // A duplicate delivery of this same request already refused it and released the shared
+            // hold. Answer identically rather than committing behind a dead reservation — from the
+            // Buyer's side one `order.request` got one answer, which is what the dedup contract
+            // promises.
+            Ok(OrderCommit::HoldLost) => {
+                tracing::info!(
+                    order = %order_id,
+                    "a duplicate delivery of this order already refused it and released the hold; \
+                     refusing this one too rather than committing without capacity"
+                );
+                return self
+                    .fail_order(
+                        &sender,
+                        &req.id,
+                        None,
+                        unavailable("this listing is not currently offered"),
+                        out,
+                    )
+                    .await;
+            }
             Ok(OrderCommit::Committed) => None,
             Ok(OrderCommit::Duplicate(json)) => Some(json),
             Err(e) => {
@@ -882,6 +902,27 @@ impl OrderWrite {
             crate::reservation::release_txn(tx, &self.order_id, self.now)?;
             return Ok(OrderCommit::ListingGone);
         }
+        // The hold must still be LIVE, and this is not implied by the check above. A duplicate
+        // delivery of the same `order.request` shares this order's reservation row, so a sibling
+        // that reached the branch above first has already RELEASED it and answered `unavailable`
+        // without caching that refusal. If the operator republishes before this delivery arrives
+        // here, the listing reads ACTIVE again and — without this check — the order would commit a
+        // subscription and a payable invoice on top of a `RELEASED` reservation: the tail of this
+        // function only refreshes the hold's EXPIRY, never its state, so the slot would be counted
+        // free while a real subscription occupied it, letting capacity be handed out twice.
+        //
+        // Refusing here keeps the invariant the reservation exists to carry: no order is ever
+        // committed without a live hold behind it.
+        let hold_state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM reservation WHERE order_id=?1",
+                params![self.order_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if !matches!(hold_state.as_deref(), Some("HELD") | Some("CONSUMED")) {
+            return Ok(OrderCommit::HoldLost);
+        }
         // next_deadline = the invoice expiry: an unpaid PENDING order must be discoverable by the
         // reconcile `next_deadline <= now` cursor (lnrent-7fp.9) so it flips to EXPIRED at expiry —
         // otherwise the invoice stays OPEN and a late settlement would be captured/provisioned.
@@ -961,6 +1002,11 @@ enum OrderCommit {
     /// The listing stopped being `ACTIVE` between the §5.4 check and this commit — an operator's
     /// `listing withdraw` landing across `create_invoice`'s network round-trip. NOTHING was written.
     ListingGone,
+    /// This order's capacity hold is no longer live: a duplicate delivery of the same request hit
+    /// [`OrderCommit::ListingGone`] first and released the shared reservation. Committing anyway
+    /// would put a subscription behind a `RELEASED` hold and let the slot be handed out twice.
+    /// NOTHING was written.
+    HoldLost,
 }
 
 /// Owned inputs for the atomic renewal-invoice write.
@@ -1464,6 +1510,124 @@ mod tests {
             0,
             "the capacity hold was released with the refusal, not left holding a slot"
         );
+    }
+
+    /// A backend that RELEASES this order's capacity hold during the mint, leaving the listing
+    /// ACTIVE. That is the state a duplicate delivery of the same `order.request` leaves behind when
+    /// its sibling hit the withdrawn-listing branch first and the operator then republished: the
+    /// listing reads ACTIVE again, but the shared reservation is already `RELEASED`.
+    struct ReleaseHoldDuringMint {
+        inner: MockPayment,
+        store: Store,
+    }
+
+    #[async_trait::async_trait]
+    impl PaymentBackend for ReleaseHoldDuringMint {
+        async fn create_invoice(
+            &self,
+            amount_sat: u64,
+            memo: &str,
+            expiry_s: u32,
+            external_id: &str,
+        ) -> Result<Invoice> {
+            self.store
+                .transaction(move |tx| {
+                    tx.execute("UPDATE reservation SET state='RELEASED'", [])?;
+                    Ok(())
+                })
+                .await?;
+            self.inner
+                .create_invoice(amount_sat, memo, expiry_s, external_id)
+                .await
+        }
+        async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
+            self.inner.lookup(id).await
+        }
+        async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            self.inner.lookup_settlement(id).await
+        }
+        async fn pay(&self, d: &str, a: u64, k: &str) -> Result<String> {
+            self.inner.pay(d, a, k).await
+        }
+        async fn payment_status(&self, id: &str) -> Result<PayStatus> {
+            self.inner.payment_status(id).await
+        }
+        async fn payment_status_by_key(&self, k: &str) -> Result<PayStatus> {
+            self.inner.payment_status_by_key(k).await
+        }
+        async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
+            self.inner.watch().await
+        }
+    }
+
+    // lnrent-i23 (multi-reviewer pass 6): an order must never commit behind a RELEASED hold. The
+    // listing being ACTIVE is not sufficient — a duplicate delivery that refused first releases the
+    // reservation the two deliveries SHARE, and the commit tail only refreshes the hold's expiry,
+    // never its state. Without the hold check the slot would read free while a real subscription
+    // occupied it, so capacity could be handed out twice.
+    #[tokio::test]
+    async fn an_order_never_commits_behind_a_released_hold() {
+        let store = mem_store();
+        let recipe = dummy_recipe();
+        let listing_id = "30402:op:dummy-1";
+        seed_listing(&store, listing_id, "dummy", recipe.pricing.amount_sat as i64).await;
+        let payment = Arc::new(ReleaseHoldDuringMint {
+            inner: MockPayment::new(),
+            store: store.clone(),
+        });
+        let handler = OrderIntake::new(
+            store.clone(),
+            payment,
+            Arc::new(TestClock::new(1000)),
+            recipe,
+            budget_with_room(),
+            u32::MAX,
+        );
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                Keys::generate().public_key(),
+                order("q", listing_id, json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+
+        let err = expect_order_error(&out);
+        assert_eq!(err.error.code, "unavailable");
+        // [9A] non-vacuity: the listing really was ACTIVE the whole time, so this refusal can only
+        // have come from the hold check — not from the withdrawn-listing branch beside it.
+        assert_eq!(
+            listing_state(&store, listing_id).await.as_deref(),
+            Some("ACTIVE"),
+            "the listing stayed ACTIVE; only the hold was lost"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM subscription").await,
+            0,
+            "no subscription behind a released hold"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice").await,
+            0,
+            "and nothing payable was committed"
+        );
+    }
+
+    async fn listing_state(store: &Store, id: &str) -> Option<String> {
+        let id = id.to_string();
+        store
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT state FROM listing WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?)
+            })
+            .await
+            .unwrap()
     }
 
     async fn seed_active_sub(store: &Store, id: &str, buyer_hex: &str, paid_through: i64) {
