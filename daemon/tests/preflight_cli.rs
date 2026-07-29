@@ -192,6 +192,8 @@ async fn run_cli(
             clock,
             payment,
             lnrentd::relay_status::RelayStatusCell::new(),
+            // No Nostr engine in this CLI harness, so the listing verbs are unsupported here.
+            None,
             &sock_for_server,
             shutdown_rx,
         )

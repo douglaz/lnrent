@@ -6,8 +6,12 @@
 //! federation invite passes it and only fails at runtime; `DO_TOKEN` validity used to be a
 //! hand-run curl in go-live.md §4 a stranger-operator can skip. This is the machine-readable
 //! replacement an operator agent can use to gate subsequent launch promotion (the CLI exits
-//! nonzero on any failed check). The daemon publishes its listing before starting IPC, so this is a
-//! post-start health gate, not a publication interlock.
+//! nonzero on any failed check).
+//!
+//! It is ALSO the publication interlock (lnrent-i23): `lnrent listing publish` runs these same
+//! checks and refuses on a [`FailureClass::Structural`] one, so a daemon can no longer be publicly
+//! listed with a misconfiguration preflight would have caught. Running it standalone stays a
+//! read-only health report.
 //!
 //! REUSED seams only — no new probes: on a non-phoenixd backend, gateway =
 //! [`PaymentBackend::refund_gateway_ready`] (the
@@ -56,15 +60,44 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// report and exit status it exists to provide.
 const READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// One preflight check result — the machine-readable `{name, ok, detail}` contract. A SKIPPED
-/// (genuinely not-configured) check reports `ok: true` with the reasoning in `detail`, so the
-/// aggregate stays a plain all-of; a dependency that IS configured but unusable is always a
-/// failure, never a skip.
+/// WHY a preflight check failed — the one classification the publication gate (lnrent-i23) branches
+/// on. It is minted HERE, at the single place each verdict is constructed, precisely so no caller has
+/// to re-derive it by string-matching a `detail` (which would be a second, silently-drifting
+/// classifier). A PASSING check carries none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    /// The OPERATOR's own misconfiguration: an invalid provisioning param, a rejected/absent
+    /// credential, a federation without the money module, a fee schedule never verified. It does not
+    /// fix itself, so `lnrent listing publish` HARD BLOCKS on it — there is no override.
+    Structural,
+    /// A third party is not answering RIGHT NOW: guardians, a gateway, the provider API, a phoenixd
+    /// node. Transient and not the operator's fault, and down at publish time is not down at order
+    /// time — so `lnrent listing publish` WARNS and the operator may override it with
+    /// `--accept-unverified` rather than have someone else's outage block a launch.
+    ///
+    /// What the override costs is NOT uniform, and must not be summarised as "the money path fails
+    /// closed": that holds for the PAYMENT BACKEND, which cannot mint an invoice while it is down,
+    /// and not for the COMPUTE PROVIDER, which `order_intake` never consults (price, reserve, mint —
+    /// provisioning is after settlement). Overriding a provider failure therefore lets a Buyer pay
+    /// into a live outage and be refunded net of fees. See `listing`'s module doc for why gating
+    /// invoice issuance on a provider probe was rejected instead.
+    Reachability,
+}
+
+/// One preflight check result — the machine-readable `{name, ok, detail}` contract, plus `class` on a
+/// FAILURE (see [`FailureClass`]). A SKIPPED (genuinely not-configured) check reports `ok: true` with
+/// the reasoning in `detail`, so the aggregate stays a plain all-of; a dependency that IS configured
+/// but unusable is always a failure, never a skip.
 #[derive(Debug, Clone, Serialize)]
 pub struct PreflightCheck {
     pub name: &'static str,
     pub ok: bool,
     pub detail: String,
+    /// Present iff `!ok`. Omitted from the JSON on a pass, so a fully-passing report is
+    /// byte-identical to the pre-i23 one and the CLI's structural gate is unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class: Option<FailureClass>,
 }
 
 impl PreflightCheck {
@@ -73,13 +106,23 @@ impl PreflightCheck {
             name,
             ok: true,
             detail: detail.into(),
+            class: None,
         }
     }
-    fn fail(name: &'static str, detail: impl Into<String>) -> Self {
+    /// A failure the OPERATOR must fix before publishing (see [`FailureClass::Structural`]).
+    fn fail_structural(name: &'static str, detail: impl Into<String>) -> Self {
+        Self::fail(name, detail, FailureClass::Structural)
+    }
+    /// A failure caused by an unreachable third party (see [`FailureClass::Reachability`]).
+    fn fail_reachability(name: &'static str, detail: impl Into<String>) -> Self {
+        Self::fail(name, detail, FailureClass::Reachability)
+    }
+    fn fail(name: &'static str, detail: impl Into<String>, class: FailureClass) -> Self {
         Self {
             name,
             ok: false,
             detail: detail.into(),
+            class: Some(class),
         }
     }
 }
@@ -157,6 +200,22 @@ pub async fn preflight_report(
     token: Option<Zeroizing<String>>,
     probe: &dyn ProviderTokenProbe,
 ) -> Value {
+    let checks = preflight_checks(payment, recipes, token, probe).await;
+    json!({
+        "ok": aggregate_ok(&checks),
+        "checks": checks,
+    })
+}
+
+/// The same run as [`preflight_report`], returning the TYPED checks instead of their JSON. The
+/// publication gate (lnrent-i23, `crate::listing`) consumes this so it branches on the
+/// [`FailureClass`] each check minted rather than re-deriving one from report text.
+pub async fn preflight_checks(
+    payment: &Arc<dyn PaymentBackend>,
+    recipes: &[Recipe],
+    token: Option<Zeroizing<String>>,
+    probe: &dyn ProviderTokenProbe,
+) -> Vec<PreflightCheck> {
     static SERIALIZE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _one_at_a_time = SERIALIZE.lock().await;
     // Ask the backend-specific seam first. `NotApplicable` is immediate for mock/Fedimint. For
@@ -185,10 +244,7 @@ pub async fn preflight_report(
     if let Some(check) = recipe_preflight_check(recipes).await {
         checks.push(check);
     }
-    json!({
-        "ok": aggregate_ok(&checks),
-        "checks": checks,
-    })
+    checks
 }
 
 /// The aggregate verdict the CLI's nonzero-exit gate rests on: every check `ok`. Pure. A skipped
@@ -218,12 +274,20 @@ async fn gateway_check_with_timeout(
     const NAME: &str = "gateway";
     match tokio::time::timeout(timeout, payment.refund_gateway_ready()).await {
         Ok(Ok(true)) => PreflightCheck::pass(NAME, "refund gateway reachable"),
-        Ok(Ok(false)) => PreflightCheck::fail(
+        // Every gateway verdict is REACHABILITY (lnrent-i23): the federation's gateways are third
+        // party, they attach/detach and recover without the operator, and the refund path already
+        // fails closed on them at pay time.
+        Ok(Ok(false)) => PreflightCheck::fail_reachability(
             NAME,
             "no configured gateway is reachable (backend reports not-ready)",
         ),
-        Ok(Err(e)) => PreflightCheck::fail(NAME, format!("gateway probe failed: {e:#}")),
-        Err(_) => PreflightCheck::fail(NAME, format!("gateway probe timed out after {timeout:?}")),
+        Ok(Err(e)) => {
+            PreflightCheck::fail_reachability(NAME, format!("gateway probe failed: {e:#}"))
+        }
+        Err(_) => PreflightCheck::fail_reachability(
+            NAME,
+            format!("gateway probe timed out after {timeout:?}"),
+        ),
     }
 }
 
@@ -248,12 +312,17 @@ async fn federation_check_with_timeout(
     const NAME: &str = "federation";
     match tokio::time::timeout(timeout, payment.backend_ready()).await {
         Ok(Ok(true)) => PreflightCheck::pass(NAME, "federation guardians reachable"),
-        Ok(Ok(false)) => PreflightCheck::fail(
+        // All REACHABILITY (lnrent-i23): this probes whether the ALREADY-JOINED federation answers
+        // now. An unusable invite — the operator's own misconfiguration — never reaches here at all;
+        // it fails `join_or_open` before the IPC socket exists (see the doc comment above).
+        Ok(Ok(false)) => PreflightCheck::fail_reachability(
             NAME,
             "federation guardians unreachable (backend reports not-ready)",
         ),
-        Ok(Err(e)) => PreflightCheck::fail(NAME, format!("federation probe failed: {e:#}")),
-        Err(_) => PreflightCheck::fail(
+        Ok(Err(e)) => {
+            PreflightCheck::fail_reachability(NAME, format!("federation probe failed: {e:#}"))
+        }
+        Err(_) => PreflightCheck::fail_reachability(
             NAME,
             format!("federation probe timed out after {timeout:?}"),
         ),
@@ -284,21 +353,32 @@ async fn lnv2_check_with_timeout(
             PreflightCheck::pass(NAME, "skipped (backend has no lnv2 money path)")
         }
         Ok(Ok(Lnv2Probe::GuardiansUnreachable(e))) => {
-            PreflightCheck::fail(NAME, format!("federation guardians unreachable: {e}"))
+            PreflightCheck::fail_reachability(
+                NAME,
+                format!("federation guardians unreachable: {e}"),
+            )
         }
-        Ok(Ok(Lnv2Probe::ModuleAbsent)) => PreflightCheck::fail(
+        // STRUCTURAL (lnrent-i23): the operator joined a federation that does not run the module the
+        // money path needs. No amount of waiting fixes it — only joining a different federation does.
+        Ok(Ok(Lnv2Probe::ModuleAbsent)) => PreflightCheck::fail_structural(
             NAME,
             "federation has no lnv2 module (join an lnv2-enabled federation)",
         ),
-        Ok(Ok(Lnv2Probe::GatewayAbsent)) => PreflightCheck::fail(
+        // REACHABILITY: gateway registration is the gateway operator's act, not this operator's —
+        // one can attach a minute from now with nothing for the operator to change.
+        Ok(Ok(Lnv2Probe::GatewayAbsent)) => PreflightCheck::fail_reachability(
             NAME,
             "lnv2 module present but no lnv2 gateway is attached to the federation",
         ),
-        Ok(Ok(Lnv2Probe::GatewayUnreachable(e))) => {
-            PreflightCheck::fail(NAME, format!("lnv2 gateway attached but unreachable: {e}"))
-        }
-        Ok(Err(e)) => PreflightCheck::fail(NAME, format!("lnv2 probe failed: {e:#}")),
-        Err(_) => PreflightCheck::fail(NAME, format!("lnv2 probe timed out after {timeout:?}")),
+        Ok(Ok(Lnv2Probe::GatewayUnreachable(e))) => PreflightCheck::fail_reachability(
+            NAME,
+            format!("lnv2 gateway attached but unreachable: {e}"),
+        ),
+        Ok(Err(e)) => PreflightCheck::fail_reachability(NAME, format!("lnv2 probe failed: {e:#}")),
+        Err(_) => PreflightCheck::fail_reachability(
+            NAME,
+            format!("lnv2 probe timed out after {timeout:?}"),
+        ),
     }
 }
 
@@ -334,11 +414,11 @@ async fn phoenixd_check_with_timeout(
 ) -> Option<PreflightCheck> {
     match tokio::time::timeout(timeout, payment.phoenixd_probe()).await {
         Ok(Ok(probe)) => phoenixd_check_from_probe(probe),
-        Ok(Err(e)) => Some(PreflightCheck::fail(
+        Ok(Err(e)) => Some(PreflightCheck::fail_reachability(
             PHOENIXD_CHECK,
             format!("phoenixd probe failed: {e:#}"),
         )),
-        Err(_) => Some(PreflightCheck::fail(
+        Err(_) => Some(PreflightCheck::fail_reachability(
             PHOENIXD_CHECK,
             format!(
                 "phoenixd probe timed out after {timeout:?} — a node that is unroutable, firewalled \
@@ -397,7 +477,9 @@ pub(crate) fn phoenixd_check_from_probe(probe: PhoenixdProbe) -> Option<Prefligh
             }
             PreflightCheck::pass(NAME, detail)
         }
-        PhoenixdProbe::AuthRejected { status } => PreflightCheck::fail(
+        // STRUCTURAL (lnrent-i23): the node answered and rejected the operator's OWN configured
+        // credential. The remedy is entirely local config.
+        PhoenixdProbe::AuthRejected { status } => PreflightCheck::fail_structural(
             NAME,
             format!(
                 "phoenixd REJECTED the api password (HTTP {status}) — set `[phoenixd] api_password` \
@@ -408,14 +490,14 @@ pub(crate) fn phoenixd_check_from_probe(probe: PhoenixdProbe) -> Option<Prefligh
         // proxy's 502, a 404 from a wrong sub-path), so the lead sentence says "no usable answer"
         // rather than "did not answer" — the appended diagnostic carries the status when there was
         // one, and naming the url's PATH is what a 404 actually needs.
-        PhoenixdProbe::Unreachable(e) => PreflightCheck::fail(
+        PhoenixdProbe::Unreachable(e) => PreflightCheck::fail_reachability(
             NAME,
             format!(
                 "phoenixd returned no usable answer to an authenticated getinfo — check that the \
                  node is running and that `[phoenixd] url` (including its path) points at it: {e}"
             ),
         ),
-        PhoenixdProbe::BalanceUnavailable(e) => PreflightCheck::fail(
+        PhoenixdProbe::BalanceUnavailable(e) => PreflightCheck::fail_reachability(
             NAME,
             format!(
                 "phoenixd answered authenticated getinfo, but getbalance failed while reading \
@@ -426,7 +508,10 @@ pub(crate) fn phoenixd_check_from_probe(probe: PhoenixdProbe) -> Option<Prefligh
             let running =
                 safe_phoenixd_version(&running, None).unwrap_or(REDACTED_PHOENIXD_VERSION);
             let verified = configured_version(&verified);
-            PreflightCheck::fail(
+            // STRUCTURAL (lnrent-i23): the node is reachable and authenticated; what is wrong is the
+            // operator's own fee-schedule configuration, and every automated refund fails closed
+            // until they set it.
+            PreflightCheck::fail_structural(
                 NAME,
                 format!(
                     "phoenixd {running} is not the {verified} release its trampoline fee schedule was \
@@ -500,7 +585,10 @@ async fn provider_token_check(
     // Blank/whitespace counts as unusable. The hooks reject an empty value immediately; whitespace
     // would reach the provider and be rejected later, so preflight fails both before making a request.
     let Some(token) = token.filter(|t| !t.trim().is_empty()) else {
-        return PreflightCheck::fail(
+        // Absent / blank / malformed / REJECTED are all STRUCTURAL (lnrent-i23): the operator's own
+        // credential, and the provisioning hooks die on it at the first order. Only the transport and
+        // the provider's own unexpected statuses below are reachability.
+        return PreflightCheck::fail_structural(
             NAME,
             format!(
                 "{DO_TOKEN_ENV} is not set (or is blank) in the daemon environment, but the loaded recipe \
@@ -514,7 +602,7 @@ async fn provider_token_check(
     // (adversarial y4m.9 review) — keep the absent/malformed/rejected/unreachable diagnostics
     // distinct. The token VALUE still never appears in the detail.
     if token.chars().any(|c| !c.is_ascii_graphic()) {
-        return PreflightCheck::fail(
+        return PreflightCheck::fail_structural(
             NAME,
             format!(
                 "{DO_TOKEN_ENV} is set but MALFORMED (contains whitespace, control, or non-ASCII \
@@ -530,18 +618,22 @@ async fn provider_token_check(
                  provisioning WRITE scopes are first exercised by a real provision"
             ),
         ),
-        Ok(status @ (401 | 403)) => PreflightCheck::fail(
+        Ok(status @ (401 | 403)) => PreflightCheck::fail_structural(
             NAME,
             format!(
                 "token REJECTED by the provider API (HTTP {status}) — invalid, revoked, or \
                  under-scoped"
             ),
         ),
-        Ok(status) => PreflightCheck::fail(
+        // An unexpected status is the PROVIDER misbehaving (a 5xx, a 429, a proxy in the way), not a
+        // bad credential — reachability, so it can be overridden.
+        Ok(status) => PreflightCheck::fail_reachability(
             NAME,
             format!("unexpected provider API response (HTTP {status})"),
         ),
-        Err(e) => PreflightCheck::fail(NAME, format!("provider API unreachable: {e:#}")),
+        Err(e) => {
+            PreflightCheck::fail_reachability(NAME, format!("provider API unreachable: {e:#}"))
+        }
     }
 }
 
@@ -567,7 +659,15 @@ async fn recipe_preflight_check(recipes: &[Recipe]) -> Option<PreflightCheck> {
         )
         .await
         {
-            return Some(PreflightCheck::fail(
+            // STRUCTURAL (lnrent-i23): this is the lnrent-1sr class — provisioning params that are
+            // invalid BEFORE any buyer pays. The operator must fix the recipe, so publish hard-blocks.
+            //
+            // KNOWN COARSENESS, deliberately not fixed here: the hook's contract is a single nonzero
+            // exit, so a do-vps run that fails because DigitalOcean's *metadata* read failed (a
+            // genuine reachability condition) is reported the same way as an invalid region/size slug
+            // and therefore also hard-blocks. Splitting them needs a new hook exit/stderr contract
+            // across every recipe — a hook-protocol change, not a publication-gate one.
+            return Some(PreflightCheck::fail_structural(
                 NAME,
                 format!(
                     "recipe `{}` preflight hook rejected the provisioning params: {e:#}",
@@ -1453,11 +1553,157 @@ mod tests {
         assert!(check["detail"].as_str().unwrap().contains("skipped"));
     }
 
+    /// The [`FailureClass`] one named check minted on a REAL preflight run — the value
+    /// `lnrent listing publish` gates on. Asserts the check actually FAILED, so a probe that stops
+    /// failing cannot leave this silently passing.
+    async fn failure_class(
+        payment: &Arc<dyn PaymentBackend>,
+        recipes: &[Recipe],
+        token: Option<Zeroizing<String>>,
+        probe: &dyn ProviderTokenProbe,
+        name: &str,
+    ) -> FailureClass {
+        let checks = preflight_checks(payment, recipes, token, probe).await;
+        let check = checks
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("{name} check present"));
+        assert!(!check.ok, "{name} was expected to FAIL: {}", check.detail);
+        check
+            .class
+            .unwrap_or_else(|| panic!("a failing check always carries a class: {name}"))
+    }
+
+    // The load-bearing decision of the publication gate (lnrent-i23): which REAL verdict hard-blocks
+    // a launch, and which one `--accept-unverified` may override. Every other test of the split
+    // drives the gate with hand-crafted checks, so without this one a `fail_structural` <->
+    // `fail_reachability` flip — turning an unoverridable block into an overridable warning, or
+    // letting a third party's outage block an operator's launch outright — passes the whole suite.
+    #[tokio::test]
+    async fn each_real_preflight_failure_keeps_its_publication_class() {
+        use FailureClass::{Reachability, Structural};
+        let dummy = [load_recipe("dummy")];
+
+        for (payment, name, expected) in [
+            // The federation's gateways and guardians are THIRD PARTIES: they attach, detach, and
+            // recover with nothing for the operator to change, and the money path fails closed on
+            // them at order time.
+            (
+                seam_payment(Seam::NotReady, Seam::Ready),
+                "gateway",
+                Reachability,
+            ),
+            (
+                seam_payment(Seam::Broken, Seam::Ready),
+                "gateway",
+                Reachability,
+            ),
+            (
+                seam_payment(Seam::Ready, Seam::NotReady),
+                "federation",
+                Reachability,
+            ),
+            (
+                seam_payment(Seam::Ready, Seam::Broken),
+                "federation",
+                Reachability,
+            ),
+            (
+                seam_payment_lnv2(Lnv2Probe::GuardiansUnreachable("no consensus".into())),
+                "lnv2",
+                Reachability,
+            ),
+            (
+                seam_payment_lnv2(Lnv2Probe::GatewayAbsent),
+                "lnv2",
+                Reachability,
+            ),
+            (
+                seam_payment_lnv2(Lnv2Probe::GatewayUnreachable("connection refused".into())),
+                "lnv2",
+                Reachability,
+            ),
+            // ...but the federation this operator CHOSE to join not running the module the money
+            // path needs never fixes itself.
+            (
+                seam_payment_lnv2(Lnv2Probe::ModuleAbsent),
+                "lnv2",
+                Structural,
+            ),
+            // phoenixd: an unreachable node and a failed balance read are the node's problem; a
+            // REJECTED api password and an unverified fee schedule are the operator's own config.
+            (
+                seam_payment_phoenixd(PhoenixdProbe::Unreachable("connection refused".into())),
+                "phoenixd",
+                Reachability,
+            ),
+            (
+                seam_payment_phoenixd(PhoenixdProbe::BalanceUnavailable("HTTP 502".into())),
+                "phoenixd",
+                Reachability,
+            ),
+            (
+                seam_payment_phoenixd(PhoenixdProbe::AuthRejected { status: 401 }),
+                "phoenixd",
+                Structural,
+            ),
+            (
+                seam_payment_phoenixd(PhoenixdProbe::VersionMismatch {
+                    running: "0.10.0-bdeadbee".into(),
+                    verified: "0.9.0".into(),
+                }),
+                "phoenixd",
+                Structural,
+            ),
+        ] {
+            assert_eq!(
+                failure_class(&payment, &dummy, None, &PanicProbe, name).await,
+                expected,
+                "{name} moved to the other side of the publication gate"
+            );
+        }
+
+        // The provider token: absent, malformed, or REJECTED is the operator's own credential, and
+        // the provisioning hooks die on it at the first order. The provider answering unexpectedly
+        // or not at all is not.
+        let ready = seam_payment(Seam::Ready, Seam::Ready);
+        let do_recipe = [do_token_recipe()];
+        let cases: [(Option<Zeroizing<String>>, &dyn ProviderTokenProbe, FailureClass); 6] = [
+            (None, &PanicProbe, Structural),
+            (token("dop_v1 with space"), &PanicProbe, Structural),
+            (token("dop_v1_x"), &StatusProbe(401), Structural),
+            (token("dop_v1_x"), &StatusProbe(403), Structural),
+            (token("dop_v1_x"), &StatusProbe(503), Reachability),
+            (token("dop_v1_x"), &FailProbe, Reachability),
+        ];
+        for (tok, probe, expected) in cases {
+            assert_eq!(
+                failure_class(&ready, &do_recipe, tok, probe, "provider_token").await,
+                expected,
+                "provider_token moved to the other side of the publication gate"
+            );
+        }
+
+        // Invalid provisioning params — the lnrent-1sr class the recipe hook exists to catch BEFORE
+        // a buyer pays. See `recipe_preflight_check` for the known coarseness this pins: the hook's
+        // contract is one nonzero exit, so a provider-metadata read that fails inside it lands here
+        // as structural too (go-live.md §5 says so).
+        let bad_recipe = [temp_recipe_with_preflight(
+            "class-invalid-image",
+            Some("#!/bin/sh\necho '{\"error\":\"DO_IMAGE=debian-12-x64 invalid\"}' >&2\nexit 1\n"),
+        )];
+        assert_eq!(
+            failure_class(&ready, &bad_recipe, None, &PanicProbe, "recipe_preflight").await,
+            Structural,
+            "recipe_preflight moved to the other side of the publication gate"
+        );
+    }
+
     // The aggregate is a pure all-of over the per-check verdicts.
     #[test]
     fn aggregate_ok_is_all_of() {
         let pass = PreflightCheck::pass("a", "x");
-        let fail = PreflightCheck::fail("b", "y");
+        let fail = PreflightCheck::fail_reachability("b", "y");
         assert!(aggregate_ok(&[]));
         assert!(aggregate_ok(&[pass.clone(), pass.clone()]));
         assert!(!aggregate_ok(&[pass.clone(), fail.clone()]));

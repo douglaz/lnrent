@@ -1271,7 +1271,7 @@ CREATE TABLE listing (               -- one Recipe -> many Listings (CONTEXT glo
   event_id TEXT,                     -- latest published event id
   amount_sat INTEGER,
   period_s INTEGER, renew_lead_s INTEGER, retention_s INTEGER,   -- the per-Listing timers (§6.3); copied to the subscription at order time
-  state TEXT,                        -- ACTIVE|WITHDRAWN
+  state TEXT,                        -- UNPUBLISHED|ACTIVE|WITHDRAWN (lnrent-i23: born UNPUBLISHED; only `lnrent listing publish`/`withdraw` write the other two)
   updated_at INTEGER);
 
 CREATE TABLE native_connect_session ( -- interactive-op authorization tickets (§7.4/§9.2; used from M1b)
@@ -1468,8 +1468,10 @@ Still open:
 3. **Listing updates (PARTIALLY RESOLVED v0.28):** `listing_id` is the addressable
    coordinate `30402:<pubkey>:<d>` (§5.4); a price/availability change re-publishes the same
    coordinate (`listing.state`/`amount_sat` updated), and a stale-price order is rejected with
-   `order.error{price_changed}`. Still open: sold-out/withdraw signaling encoding (a
-   `state`-tag value vs NIP-09 delete) and how long buyers cache a coordinate.
+   `order.error{price_changed}`. Withdraw signaling is RESOLVED (v0.29, lnrent-i23): the encoding is
+   a NIP-09 delete of the coordinate, sent best-effort by `lnrent listing withdraw` after the durable
+   `listing.state='WITHDRAWN'` write that actually stops orders. Still open: sold-out signaling, and
+   how long buyers cache a coordinate.
 4. **Manifest revocation latency:** the operator manifest is cacheable (§5.3) but
    replaceable events have no push invalidation or TTL, so a revoked operational key
    keeps verifying against cached manifests until each buyer refetches. Define a

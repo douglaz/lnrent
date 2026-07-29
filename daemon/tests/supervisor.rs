@@ -4,8 +4,10 @@
 //! dummy echo-creds recipe, with FAST loop intervals so every assertion completes in milliseconds.
 //!
 //! It proves the four acceptance criteria of the bead:
-//! 1. Boot — the supervisor serves IPC AND the Nostr engine concurrently and publishes its listing
-//!    (durable `listing` row + a fetchable NIP-99 30402).
+//! 1. Boot — the supervisor serves IPC AND the Nostr engine concurrently, and publishes NOTHING
+//!    (lnrent-i23): the durable `listing` row is born UNPUBLISHED, and only the operator's explicit
+//!    `listing publish` makes it ACTIVE + puts a fetchable NIP-99 30402 on the relay. That decision
+//!    (and `listing withdraw`) then survives a restart with no operator action.
 //! 2. Handshake — `order.request` -> `order.invoice`; `mock.settle(...)` -> the settlement loop
 //!    captures and the maintenance loop drives provisioning so the buyer receives `provision.ready`.
 //! 3. Supervision — a panic in a supervised loop is restarted (the loop keeps progressing) and does
@@ -138,8 +140,36 @@ async fn engine_for(op_keys: &Keys, url: &str, store: Store) -> NostrEngine {
         .expect("operator engine connects")
 }
 
-/// Build + start a supervisor with the dummy recipe and FAST intervals.
+/// Build + start a supervisor with the dummy recipe and FAST intervals, and then PUBLISH the
+/// listing through the real `lnrent listing publish` IPC verb.
+///
+/// Publication is no longer automatic (lnrent-i23): the daemon boots quiet, so a test that needs
+/// buyers to be able to order must ask for it exactly as an operator does. Tests about publication
+/// itself use [`start_supervisor_quiet`].
 async fn start_supervisor(
+    op_keys: &Keys,
+    url: &str,
+    store: Store,
+    payment: Arc<MockPayment>,
+    clock: Arc<TestClock>,
+) -> (RunningSupervisor, PathBuf) {
+    let (running, sock) = start_supervisor_quiet(op_keys, url, store, payment, clock).await;
+    assert!(wait_for_ipc_ok(&sock).await.ok);
+    let reply = ipc::call(
+        &sock,
+        ipc::Request::ListingPublish {
+            accept_unverified: false,
+        },
+    )
+    .await
+    .expect("publish over IPC");
+    assert!(reply.ok, "operator publish: {:?}", reply.error);
+    (running, sock)
+}
+
+/// Build + start a supervisor with the dummy recipe and FAST intervals. Publishes NOTHING — the
+/// production behaviour of a fresh daemon (lnrent-i23).
+async fn start_supervisor_quiet(
     op_keys: &Keys,
     url: &str,
     store: Store,
@@ -307,11 +337,34 @@ where
     .unwrap_or_else(|_| panic!("condition `{label}` not reached in time"));
 }
 
+/// Fetch the operator's 30402 listings currently retained by the relay.
+async fn fetch_listings(url: &str, op_keys: &Keys) -> Vec<Event> {
+    let reader = buyer_client(url, Keys::generate()).await;
+    reader
+        .fetch_events(
+            Filter::new()
+                .kind(Kind::Custom(LISTING_KIND))
+                .author(op_keys.public_key()),
+            DEADLINE,
+        )
+        .await
+        .expect("fetch listings")
+        .into_iter()
+        .collect()
+}
+
+/// The `listing` block of the IPC `Status` reply (lnrent-i23).
+async fn status_listing(sock: &Path) -> serde_json::Value {
+    let st = wait_for_ipc_ok(sock).await;
+    st.data.expect("status data")["listing"].clone()
+}
+
 // ==============================================================================================
-// 1. Boot: serves IPC AND Nostr concurrently AND publishes the listing.
+// 1. Boot: serves IPC AND Nostr concurrently and publishes NOTHING (lnrent-i23). Publication is
+//    the operator's explicit act; a fresh daemon must not expose itself on its own.
 // ==============================================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn boots_serving_ipc_and_nostr_and_publishes_listing() {
+async fn boots_serving_ipc_and_nostr_without_publishing() {
     let relay = mock_relay().await;
     let url = relay.url().await.to_string();
     let op_keys = Keys::generate();
@@ -320,38 +373,269 @@ async fn boots_serving_ipc_and_nostr_and_publishes_listing() {
     payment.set_now(START);
     let clock = Arc::new(TestClock::new(START));
 
-    let (running, sock) = start_supervisor(&op_keys, &url, store.clone(), payment, clock).await;
+    let (running, sock) =
+        start_supervisor_quiet(&op_keys, &url, store.clone(), payment, clock).await;
 
     // IPC is up (the accept loop runs concurrently with the Nostr loops).
     let status = wait_for_ipc_ok(&sock).await;
     assert!(status.ok, "IPC Status answered ok");
-    assert_eq!(status.data.unwrap()["recipes"], serde_json::json!(1));
+    let data = status.data.unwrap();
+    assert_eq!(data["recipes"], serde_json::json!(1));
 
-    // The durable listing row exists + is ACTIVE (order intake matches against it).
+    // The durable row exists, and is UNPUBLISHED — order intake refuses anything but ACTIVE.
     let coord = listing_coordinate(&op_keys.public_key().to_hex(), "dummy");
     assert_eq!(
         listing_row_state(&store, &coord).await.as_deref(),
-        Some("ACTIVE"),
-        "durable listing row published + ACTIVE"
+        Some("UNPUBLISHED"),
+        "a fresh boot must NOT publish"
+    );
+    // ...and `lnrent status` says so, so an operator cannot believe they are live when they are not.
+    assert_eq!(data["listing"]["published"], serde_json::json!(false));
+    assert_eq!(
+        data["listing"]["state"],
+        serde_json::json!("UNPUBLISHED"),
+        "status names the publication state"
     );
 
-    // The NIP-99 30402 event is fetchable from the relay and parses to the same coordinate.
-    let reader = buyer_client(&url, Keys::generate()).await;
-    let events = reader
-        .fetch_events(
-            Filter::new()
-                .kind(Kind::Custom(LISTING_KIND))
-                .author(op_keys.public_key()),
-            DEADLINE,
-        )
-        .await
-        .expect("fetch listing");
-    let event = events.first_owned().expect("a 30402 listing was published");
-    let parsed = parse_listing(&event).expect("parse fetched listing");
-    assert_eq!(
-        parsed.listing_id, coord,
-        "the published listing coordinate matches the durable row"
+    // No 30402 ever reached the relay.
+    assert!(
+        fetch_listings(&url, &op_keys).await.is_empty(),
+        "a fresh boot published no 30402"
     );
+
+    // Withdrawing a listing that was never published is refused — and the refusal still answers
+    // "am I live?" in machine-readable form, so an agent driving `--json` reads the publication
+    // state out of the reply it just got instead of guessing from the message.
+    let refused = ipc::call(&sock, ipc::Request::ListingWithdraw)
+        .await
+        .expect("withdraw call");
+    assert!(!refused.ok);
+    assert_eq!(refused.error.expect("error").code, "invalid_state");
+    assert_eq!(
+        refused.data.expect("a refusal carries the publication state")["published"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        listing_row_state(&store, &coord).await.as_deref(),
+        Some("UNPUBLISHED"),
+        "a refused withdrawal writes nothing"
+    );
+
+    running.shutdown().await.unwrap();
+}
+
+// ==============================================================================================
+// 1b. `lnrent listing publish` goes live, and the decision is DURABLE: a later boot republishes
+//     from the row with no operator action.
+// ==============================================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_publish_goes_live_and_survives_restart() {
+    let relay = mock_relay().await;
+    let url = relay.url().await.to_string();
+    let op_keys = Keys::generate();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let payment = Arc::new(MockPayment::new());
+    payment.set_now(START);
+    let clock = Arc::new(TestClock::new(START));
+    let coord = listing_coordinate(&op_keys.public_key().to_hex(), "dummy");
+
+    let (running, sock) = start_supervisor_quiet(
+        &op_keys,
+        &url,
+        store.clone(),
+        payment.clone(),
+        clock.clone(),
+    )
+    .await;
+    assert!(wait_for_ipc_ok(&sock).await.ok);
+
+    let reply = ipc::call(
+        &sock,
+        ipc::Request::ListingPublish {
+            accept_unverified: false,
+        },
+    )
+    .await
+    .expect("publish over IPC");
+    assert!(reply.ok, "publish: {:?}", reply.error);
+    let data = reply.data.expect("publish data");
+    assert_eq!(data["published"], serde_json::json!(true));
+    assert_eq!(data["listing_id"], serde_json::json!(coord));
+
+    assert_eq!(
+        listing_row_state(&store, &coord).await.as_deref(),
+        Some("ACTIVE")
+    );
+    assert_eq!(
+        status_listing(&sock).await["published"],
+        serde_json::json!(true),
+        "status reports published"
+    );
+    let listings = fetch_listings(&url, &op_keys).await;
+    let parsed = parse_listing(listings.first().expect("a 30402 was published"))
+        .expect("parse fetched listing");
+    assert_eq!(parsed.listing_id, coord);
+
+    // --- Restart on the SAME store. The operator does NOTHING. ---
+    running.shutdown().await.unwrap();
+    let (running2, sock2) =
+        start_supervisor_quiet(&op_keys, &url, store.clone(), payment, clock).await;
+    assert!(wait_for_ipc_ok(&sock2).await.ok);
+
+    assert_eq!(
+        listing_row_state(&store, &coord).await.as_deref(),
+        Some("ACTIVE"),
+        "the publication decision is durable"
+    );
+    assert_eq!(
+        status_listing(&sock2).await["published"],
+        serde_json::json!(true)
+    );
+    assert!(
+        !fetch_listings(&url, &op_keys).await.is_empty(),
+        "the boot republished the 30402 with no operator action"
+    );
+
+    running2.shutdown().await.unwrap();
+}
+
+// ==============================================================================================
+// 1c. `lnrent listing withdraw` stops orders, and STAYS withdrawn across a restart — the
+//     no-resurrect guard the boot upsert has always carried.
+// ==============================================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_withdraw_persists_across_restart() {
+    let relay = mock_relay().await;
+    let url = relay.url().await.to_string();
+    let op_keys = Keys::generate();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let payment = Arc::new(MockPayment::new());
+    payment.set_now(START);
+    let clock = Arc::new(TestClock::new(START));
+    let coord = listing_coordinate(&op_keys.public_key().to_hex(), "dummy");
+
+    let (running, sock) = start_supervisor(
+        &op_keys,
+        &url,
+        store.clone(),
+        payment.clone(),
+        clock.clone(),
+    )
+    .await;
+    assert_eq!(
+        listing_row_state(&store, &coord).await.as_deref(),
+        Some("ACTIVE")
+    );
+
+    let reply = ipc::call(&sock, ipc::Request::ListingWithdraw)
+        .await
+        .expect("withdraw over IPC");
+    assert!(reply.ok, "withdraw: {:?}", reply.error);
+    let data = reply.data.expect("withdraw data");
+    assert_eq!(data["published"], serde_json::json!(false));
+    // The relays were reachable here, so the best-effort retraction also landed.
+    assert_eq!(data["retracted_from_relays"], serde_json::json!(true));
+
+    assert_eq!(
+        listing_row_state(&store, &coord).await.as_deref(),
+        Some("WITHDRAWN")
+    );
+    assert_eq!(
+        status_listing(&sock).await["published"],
+        serde_json::json!(false)
+    );
+
+    // --- Restart on the SAME store: the boot upsert must NOT resurrect it. ---
+    running.shutdown().await.unwrap();
+    let (running2, sock2) =
+        start_supervisor_quiet(&op_keys, &url, store.clone(), payment, clock).await;
+    assert!(wait_for_ipc_ok(&sock2).await.ok);
+
+    assert_eq!(
+        listing_row_state(&store, &coord).await.as_deref(),
+        Some("WITHDRAWN"),
+        "a WITHDRAWN listing must not come back on the next boot"
+    );
+    assert_eq!(
+        status_listing(&sock2).await["published"],
+        serde_json::json!(false)
+    );
+
+    running2.shutdown().await.unwrap();
+}
+
+// ==============================================================================================
+// 1d. Withdraw -> publish again RELISTS on a real relay. `docs/go-live.md` tells the operator they
+//     can come back after a withdrawal, and the retraction is a NIP-09 kind-5 deletion naming the
+//     addressable coordinate — which a relay retains and enforces against later events for that
+//     coordinate. The FakeRelay in `listing.rs`'s unit tests cannot model that at all, so this runs
+//     against the in-process relay and re-FETCHES the 30402 rather than trusting the reply.
+// ==============================================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_relists_after_a_withdrawal() {
+    let relay = mock_relay().await;
+    let url = relay.url().await.to_string();
+    let op_keys = Keys::generate();
+    let store = Store::open_spawn(":memory:").unwrap();
+    let payment = Arc::new(MockPayment::new());
+    payment.set_now(START);
+    let clock = Arc::new(TestClock::new(START));
+    let coord = listing_coordinate(&op_keys.public_key().to_hex(), "dummy");
+
+    let (running, sock) = start_supervisor(
+        &op_keys,
+        &url,
+        store.clone(),
+        payment.clone(),
+        clock.clone(),
+    )
+    .await;
+    assert!(
+        !fetch_listings(&url, &op_keys).await.is_empty(),
+        "published once"
+    );
+
+    let reply = ipc::call(&sock, ipc::Request::ListingWithdraw)
+        .await
+        .expect("withdraw over IPC");
+    assert!(reply.ok, "withdraw: {:?}", reply.error);
+    assert_eq!(
+        reply.data.expect("withdraw data")["retracted_from_relays"],
+        serde_json::json!(true)
+    );
+
+    // Back to LIVE — the operator changed their mind. This is the leg no fake can prove: the relay
+    // has a standing deletion for this exact coordinate and has to accept the replacement anyway.
+    let reply = ipc::call(
+        &sock,
+        ipc::Request::ListingPublish {
+            accept_unverified: false,
+        },
+    )
+    .await
+    .expect("republish over IPC");
+    assert!(reply.ok, "republish: {:?}", reply.error);
+    let data = reply.data.expect("republish data");
+    assert_eq!(data["published"], serde_json::json!(true));
+    assert_eq!(
+        data["relay_error"],
+        serde_json::Value::Null,
+        "the relay took the relisted 30402"
+    );
+    assert_eq!(
+        listing_row_state(&store, &coord).await.as_deref(),
+        Some("ACTIVE")
+    );
+    assert_eq!(
+        status_listing(&sock).await["published"],
+        serde_json::json!(true)
+    );
+
+    // And a buyer can FETCH it again — the whole point of relisting.
+    let listings = fetch_listings(&url, &op_keys).await;
+    let parsed = parse_listing(listings.first().expect("the relisted 30402 is served again"))
+        .expect("parse fetched listing");
+    assert_eq!(parsed.listing_id, coord);
 
     running.shutdown().await.unwrap();
 }

@@ -6,9 +6,10 @@
 //! - [`Supervisor::build`] constructs the handlers/drivers from the injected seams (store, engine,
 //!   payment, clock, recipe) — sourcing the order-intake [`Budget`] from the `box` capacity row or a
 //!   bounded, clearly-logged M1a fallback.
-//! - [`Supervisor::start`] publishes the operator's listing (durable row + NIP-99 event), runs the
-//!   ordered boot recovery, then spawns every long-lived loop under [`supervise`] and returns a
-//!   [`RunningSupervisor`] handle.
+//! - [`Supervisor::start`] upserts the operator's durable listing row — republishing its NIP-99
+//!   event ONLY if the operator already published it (lnrent-i23: a fresh daemon starts QUIET) —
+//!   runs the ordered boot recovery, then spawns every long-lived loop under [`supervise`] and
+//!   returns a [`RunningSupervisor`] handle.
 //! - [`supervise`] is the one restart primitive every loop runs under: a panic / `Err` / unexpected
 //!   exit is logged and restarted with a capped backoff; a shared shutdown signal stops everything.
 //!
@@ -36,9 +37,8 @@ use crate::backends::{BackendKind,
 use crate::capture::{capture, Capture};
 use crate::clock::Clock;
 use crate::ipc;
-use crate::nostr_engine::{
-    listing_from_recipe, InboundDrainResult, NostrEngine, OpHandler, OrderHandler, Outbound,
-};
+use crate::listing::{self, ListingRelay};
+use crate::nostr_engine::{InboundDrainResult, NostrEngine, OpHandler, OrderHandler, Outbound};
 use crate::op_dispatch::OpDispatch;
 use crate::order_intake::OrderIntake;
 use crate::provision::{DeliveryResendOrderHandler, OutboxSender, Provisioner};
@@ -290,98 +290,11 @@ impl Supervisor {
         OutboxSender::new(self.store.clone(), self.clock.clone())
     }
 
-    /// Publish the operator's NIP-99 30402 listing when the durable row is ACTIVE, and upsert the
-    /// durable `listing` row. Order intake matches an incoming `order.request` against that row
-    /// (price/state, order_intake.rs), so the row is upserted FIRST and is authoritative; the relay
-    /// publish is best-effort discovery (a relay outage logs a warning, never fails boot — the next
-    /// boot republishes).
-    async fn publish_and_upsert_listing(&self) -> Result<()> {
-        let operator_hex = self.engine.operator_pubkey().to_hex();
-        // The NIP-99 replaceable-event `d` tag; the coordinate is then `30402:<operator>:<d>`. M1a
-        // serves one listing per recipe, so key `d` on the recipe id (stable across republishes).
-        let d = self.recipe.service.id.clone();
-        let listing_id = lnrent_wire::listing_coordinate(&operator_hex, &d);
-
-        let now = self.clock.now();
-        let amount_sat = self.recipe.pricing.amount_sat as i64;
-        let period_s = duration_secs(&self.recipe.pricing.period);
-        let renew_lead_s = duration_secs(&self.recipe.pricing.renew_lead);
-        let retention_s = duration_secs(&self.recipe.pricing.retention);
-        let recipe_id = self.recipe.service.id.clone();
-
-        // 1. Durable row first (authoritative for order matching).
-        {
-            let (id, recipe_id, d_tag) = (listing_id.clone(), recipe_id, d.clone());
-            self.store
-                .transaction(move |tx| {
-                    // A FRESH row is born ACTIVE; on CONFLICT only the price/timer columns are
-                    // refreshed and `state` is DELIBERATELY left untouched — re-publishing the
-                    // listing on every boot must NOT resurrect a deliberately WITHDRAWN listing back
-                    // to ACTIVE (review #5).
-                    tx.execute(
-                        "INSERT INTO listing
-                            (id, recipe_id, d_tag, amount_sat, period_s, renew_lead_s, retention_s, state, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ACTIVE', ?8)
-                         ON CONFLICT(id) DO UPDATE SET
-                            recipe_id=excluded.recipe_id, d_tag=excluded.d_tag, amount_sat=excluded.amount_sat,
-                            period_s=excluded.period_s, renew_lead_s=excluded.renew_lead_s,
-                            retention_s=excluded.retention_s, updated_at=excluded.updated_at",
-                        rusqlite::params![
-                            id, recipe_id, d_tag, amount_sat, period_s, renew_lead_s, retention_s, now
-                        ],
-                    )?;
-                    Ok(())
-                })
-                .await
-                .context("upserting durable listing row")?;
-        }
-
-        let listing_state: String = {
-            let id = listing_id.clone();
-            self.store
-                .read(move |c| {
-                    Ok(c.query_row(
-                        "SELECT state FROM listing WHERE id=?1",
-                        rusqlite::params![id],
-                        |r| r.get(0),
-                    )?)
-                })
-                .await
-                .context("reading durable listing state")?
-        };
-        if listing_state != "ACTIVE" {
-            tracing::info!(
-                listing = %listing_id,
-                state = %listing_state,
-                "durable listing is not ACTIVE; skipping 30402 publish"
-            );
-            return Ok(());
-        }
-
-        // 2. Publish the NIP-99 event (best-effort discovery). Record the event id on the row.
-        let listing = listing_from_recipe(&self.recipe, d, operator_hex);
-        match self.engine.publish_listing(&listing).await {
-            Ok(event_id) => {
-                let (id, ev) = (listing_id.clone(), event_id.to_hex());
-                let _ = self
-                    .store
-                    .transaction(move |tx| {
-                        tx.execute(
-                            "UPDATE listing SET event_id=?2 WHERE id=?1",
-                            rusqlite::params![id, ev],
-                        )?;
-                        Ok(())
-                    })
-                    .await;
-                tracing::info!(listing = %listing_id, event = %event_id.to_hex(), "published 30402 listing");
-            }
-            Err(e) => tracing::warn!(
-                listing = %listing_id,
-                error = %format!("{e:#}"),
-                "publishing 30402 listing failed (durable row upserted; will republish next boot)"
-            ),
-        }
-        Ok(())
+    /// The relay seam the listing gate (lnrent-i23) publishes/retracts through: this supervisor's
+    /// own connected engine, behind the narrow [`ListingRelay`] trait so the IPC surface takes a
+    /// dependency on publication, not on the whole Nostr engine.
+    fn listing_relay(&self) -> Arc<dyn ListingRelay> {
+        Arc::new(self.engine.clone())
     }
 
     /// Run-once boot recovery, in the order each subsystem's durable recovery requires (lnrent-7fp.21):
@@ -467,8 +380,9 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Boot: publish + upsert the listing, run ordered boot recovery, then spawn every long-lived
-    /// loop under [`supervise`]. Returns a [`RunningSupervisor`]; the loops run until it is shut down
+    /// Boot: upsert the listing row (and republish its 30402 ONLY if the operator already published
+    /// it — lnrent-i23), run ordered boot recovery, then spawn every long-lived loop under
+    /// [`supervise`]. Returns a [`RunningSupervisor`]; the loops run until it is shut down
     /// (graceful) or dropped (abort — the crash simulation in tests).
     pub async fn start(self) -> Result<RunningSupervisor> {
         // Seed the mock payment clock to the live clock BEFORE any expiry-sensitive work (settlement
@@ -487,7 +401,16 @@ impl Supervisor {
             .await
             .context("opening payment settlement stream")?;
 
-        self.publish_and_upsert_listing().await?;
+        // A fresh daemon starts QUIET (lnrent-i23): this upserts the durable row and republishes the
+        // 30402 only when the operator has already published it. Nothing here can publish a listing
+        // for the first time, and nothing here withdraws one.
+        listing::republish_on_boot(
+            &self.store,
+            &self.clock,
+            self.listing_relay().as_ref(),
+            &self.recipe,
+        )
+        .await?;
         self.boot_recovery().await?;
         log_refund_readiness(&self.store, &self.payment).await;
 
@@ -506,22 +429,34 @@ impl Supervisor {
             );
             let payment = self.payment.clone();
             let relays = self.relays.clone();
+            // The publication seam for `lnrent listing publish|withdraw` (lnrent-i23).
+            let listing_relay: listing::RelayHandle = Some(self.listing_relay());
             tasks.push(tokio::spawn(supervise(
                 "ipc",
                 shutdown_rx.clone(),
                 RESTART_BACKOFF,
                 move |sd| {
-                    let (store, recipes, clock, payment, relays, sock) = (
+                    let (store, recipes, clock, payment, relays, listing_relay, sock) = (
                         store.clone(),
                         recipes.clone(),
                         clock.clone(),
                         payment.clone(),
                         relays.clone(),
+                        listing_relay.clone(),
                         sock.clone(),
                     );
                     async move {
-                        ipc::serve_with_shutdown(store, recipes, clock, payment, relays, &sock, sd)
-                            .await
+                        ipc::serve_with_shutdown(
+                            store,
+                            recipes,
+                            clock,
+                            payment,
+                            relays,
+                            listing_relay,
+                            &sock,
+                            sd,
+                        )
+                        .await
                     }
                 },
             )));
@@ -2171,7 +2106,9 @@ fn parse_budget(capacity_json: &str) -> Option<Budget> {
 /// the durable `listing` row. A trailing `s`/`m`/`h`/`d`/`w` is the unit; a bare number is seconds.
 /// An unparseable value logs and falls back to [`DEFAULT_DURATION_S`] so a malformed recipe cannot
 /// write a zero/negative timer that would wedge capture/reconcile math.
-fn duration_secs(s: &str) -> i64 {
+/// `pub(crate)` so `listing.rs` (which owns the row's lifecycle since lnrent-i23) writes the SAME
+/// timers this module always wrote — one parser, not two.
+pub(crate) fn duration_secs(s: &str) -> i64 {
     let s = s.trim();
     if s.is_empty() {
         return DEFAULT_DURATION_S;

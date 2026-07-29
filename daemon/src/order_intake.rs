@@ -141,12 +141,31 @@ impl OrderIntake {
 
         // 2c. PRICE check: the referenced listing must still be the current, ACTIVE one for this
         //     recipe at the published price — a stale/unknown price is `price_changed` (§5.4).
+        //
+        //     A listing that is not ACTIVE is reported as `unavailable`, NOT `price_changed`
+        //     (lnrent-i23): the Operator has not published it, or has retracted it — the price did
+        //     not move, and telling a Buyer their price is stale invites them to re-quote against
+        //     something that is not being sold at all. Before i23 no code path ever wrote a
+        //     non-ACTIVE state, so this arm was unreachable and the conflation cost nothing; the
+        //     publication gate and the withdraw verb make it the state every install boots into.
         let listing = self.load_listing(&req.listing_id).await?;
+        if let Some(l) = &listing {
+            if l.state != "ACTIVE" {
+                return self
+                    .fail_order(
+                        &sender,
+                        &req.id,
+                        None,
+                        unavailable("this listing is not currently offered"),
+                        out,
+                    )
+                    .await;
+            }
+        }
         let stale = match &listing {
             None => true,
             Some(l) => {
-                l.state != "ACTIVE"
-                    || l.recipe_id.as_deref() != Some(self.recipe.service.id.as_str())
+                l.recipe_id.as_deref() != Some(self.recipe.service.id.as_str())
                     || l.amount_sat != self.recipe.pricing.amount_sat as i64
             }
         };
@@ -238,7 +257,17 @@ impl OrderIntake {
         //    cached inbound_request response. Re-check the dedup key INSIDE the txn so a concurrent
         //    duplicate that slipped past step 1 commits exactly one order (the store actor
         //    serializes txns, so the loser sees the winner's row).
+        // The refusal the two capacity-releasing branches cache in their OWN transaction. Built here
+        // because it must be durable together with the release: `reservation::reserve` bails on a
+        // `RELEASED` row, so a crash between the release and a separate cache write would leave
+        // every relay redelivery of this request failing instead of resending an idempotent answer.
+        let refusal_json = serde_json::to_string(&Msg::OrderError(OrderError {
+            request_id: req.id.clone(),
+            order_id: None,
+            error: unavailable("this listing is not currently offered"),
+        }))?;
         let owned = OrderWrite {
+            refusal_json,
             sender_hex: sender_hex.clone(),
             request_id: req.id.clone(),
             order_id: order_id.clone(),
@@ -262,7 +291,49 @@ impl OrderIntake {
         };
         let committed = self.store.transaction(move |tx| owned.write(tx)).await;
         let winner = match committed {
-            Ok(w) => w,
+            // The operator withdrew the listing while we were minting the invoice. Nothing was
+            // written and the hold was released in that same transaction, so answer the Buyer the
+            // same `unavailable` the §5.4 gate would have: from their side the listing simply is not
+            // being offered. The minted invoice is abandoned unpaid and expires on its own — it was
+            // never sent, so nobody can pay it (and capture would refuse it anyway: no subscription
+            // row exists).
+            Ok(OrderCommit::ListingGone) => {
+                tracing::info!(
+                    order = %order_id,
+                    "listing was withdrawn while this order was minting its invoice; refusing it"
+                );
+                return self
+                    .fail_order(
+                        &sender,
+                        &req.id,
+                        None,
+                        unavailable("this listing is not currently offered"),
+                        out,
+                    )
+                    .await;
+            }
+            // A duplicate delivery of this same request already refused it and released the shared
+            // hold. Answer identically rather than committing behind a dead reservation — from the
+            // Buyer's side one `order.request` got one answer, which is what the dedup contract
+            // promises.
+            Ok(OrderCommit::HoldLost) => {
+                tracing::info!(
+                    order = %order_id,
+                    "a duplicate delivery of this order already refused it and released the hold; \
+                     refusing this one too rather than committing without capacity"
+                );
+                return self
+                    .fail_order(
+                        &sender,
+                        &req.id,
+                        None,
+                        unavailable("this listing is not currently offered"),
+                        out,
+                    )
+                    .await;
+            }
+            Ok(OrderCommit::Committed) => None,
+            Ok(OrderCommit::Duplicate(json)) => Some(json),
             Err(e) => {
                 // Same redaction as the create_invoice arm: sqlite/store internals stay in the log.
                 tracing::warn!(order = %order_id, error = %e, "order commit failed");
@@ -782,6 +853,13 @@ impl OrderHandler for OrderIntake {
 
 /// Owned inputs for the atomic order write, so the transaction closure is `move + 'static`.
 struct OrderWrite {
+    /// The `order.error` to cache ATOMICALLY with a refusal branch (`ListingGone` / `HoldLost`).
+    /// Pre-built by the caller because those branches release capacity, and a crash between that
+    /// release and a separate cache write would leave a request that can never be answered:
+    /// `reservation::reserve` deliberately bails on a `RELEASED` row, so every relay redelivery
+    /// would fail instead of resending an idempotent refusal. Caching it in the SAME transaction
+    /// makes the release and its answer one durable fact.
+    refusal_json: String,
     sender_hex: String,
     request_id: String,
     order_id: String,
@@ -808,7 +886,26 @@ impl OrderWrite {
     /// PENDING sub + OPEN invoice + cached response in one txn. Returns `Some(json)` if a
     /// concurrent duplicate already committed the order (its cached response to resend), else
     /// `None` (we committed).
-    fn write(self, tx: &rusqlite::Transaction) -> Result<Option<String>> {
+    /// Cache the pre-built `order.error` for this request, in the caller's transaction. Same shape
+    /// and same `DO NOTHING` conflict rule as `cache_response_row`, so a concurrent winner's cached
+    /// answer is never clobbered — `fail_order` then reads it back and resends that winner.
+    fn cache_refusal(&self, tx: &rusqlite::Transaction) -> Result<()> {
+        tx.execute(
+            "INSERT INTO inbound_request
+                (sender_pubkey, request_id, kind, response_msg_type, response_json, created_at)
+             VALUES (?1, ?2, 'order', 'order.error', ?3, ?4)
+             ON CONFLICT(sender_pubkey, request_id) DO NOTHING",
+            params![
+                self.sender_hex,
+                self.request_id,
+                self.refusal_json,
+                self.now
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn write(self, tx: &rusqlite::Transaction) -> Result<OrderCommit> {
         let existing: Option<String> = tx
             .query_row(
                 "SELECT response_json FROM inbound_request WHERE sender_pubkey=?1 AND request_id=?2",
@@ -817,7 +914,55 @@ impl OrderWrite {
             )
             .optional()?;
         if let Some(json) = existing {
-            return Ok(Some(json));
+            return Ok(OrderCommit::Duplicate(json));
+        }
+        // RE-CHECK the listing INSIDE the txn (lnrent-i23). The §5.4 check upstream ran before
+        // `create_invoice`, which is a network round-trip to the payment backend — seconds during
+        // which `lnrent listing withdraw` can commit `WITHDRAWN`. Without this the order would still
+        // commit a PENDING subscription and an OPEN invoice AFTER the operator's stop, handing a
+        // Buyer a payable invoice for a listing that is no longer offered. The store actor
+        // serializes transactions, so reading it here is atomic against that write: withdraw either
+        // lands before this txn (and is seen) or after it (and the order was already accepted).
+        // Same discipline as lnrent-gdu.3, which moved authorization ahead of the durable claim.
+        let still_active: Option<String> = tx
+            .query_row(
+                "SELECT state FROM listing WHERE id=?1",
+                params![self.listing_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if still_active.as_deref() != Some("ACTIVE") {
+            // Release the capacity hold in THIS transaction, so the refusal and the release commit
+            // together — a hold left behind would keep a slot reserved for an order that will never
+            // exist until its TTL lapsed.
+            crate::reservation::release_txn(tx, &self.order_id, self.now)?;
+            self.cache_refusal(tx)?;
+            return Ok(OrderCommit::ListingGone);
+        }
+        // DEFENCE IN DEPTH, and deliberately kept as such: no order is ever committed without a
+        // live hold behind it. The tail of this function only refreshes the hold's EXPIRY, never its
+        // state, so committing on a `RELEASED` row would leave the slot counted free while a real
+        // subscription occupied it — capacity handed out twice.
+        //
+        // HONEST REACHABILITY (this guard's original rationale is no longer true, and saying so
+        // matters more than keeping the story tidy): it was added for a duplicate delivery whose
+        // sibling had hit the branch above, released their SHARED reservation, and returned without
+        // caching the refusal. Caching that refusal in the same transaction closed that path — the
+        // dedup read at the top of this function now answers any later delivery as `Duplicate`
+        // before it can reach here. No currently-reachable caller is known to trip this check; it
+        // stays because the invariant is cheap to enforce and expensive to lose, and because a
+        // future release path (a sweeper, a new refusal branch) would otherwise reopen the hazard
+        // silently.
+        let hold_state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM reservation WHERE order_id=?1",
+                params![self.order_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if !matches!(hold_state.as_deref(), Some("HELD") | Some("CONSUMED")) {
+            self.cache_refusal(tx)?;
+            return Ok(OrderCommit::HoldLost);
         }
         // next_deadline = the invoice expiry: an unpaid PENDING order must be discoverable by the
         // reconcile `next_deadline <= now` cursor (lnrent-7fp.9) so it flips to EXPIRED at expiry —
@@ -885,8 +1030,26 @@ impl OrderWrite {
                 self.now,
             ],
         )?;
-        Ok(None)
+        Ok(OrderCommit::Committed)
     }
+}
+
+/// What [`OrderWrite::write`] did, inside the one serialized transaction.
+enum OrderCommit {
+    /// The order is committed: PENDING sub + OPEN invoice + cached response.
+    Committed,
+    /// A concurrent duplicate already committed this order; carries its cached response to resend.
+    Duplicate(String),
+    /// The listing stopped being `ACTIVE` between the §5.4 check and this commit — an operator's
+    /// `listing withdraw` landing across `create_invoice`'s network round-trip. NOTHING was written.
+    ListingGone,
+    /// This order's capacity hold is no longer live. Committing anyway would put a subscription
+    /// behind a `RELEASED` hold and let the slot be handed out twice, so NOTHING was written.
+    ///
+    /// A fail-closed invariant rather than a reachable race today: the path it was written for (a
+    /// duplicate delivery whose sibling released the shared reservation) is now answered from the
+    /// refusal cache before it gets here. See the comment at the check itself.
+    HoldLost,
 }
 
 /// Owned inputs for the atomic renewal-invoice write.
@@ -1136,7 +1299,9 @@ mod tests {
         Mutex,
     };
 
-    use crate::backends::MockPayment;
+    use crate::backends::{
+        Invoice, MockPayment, PayStatus, PaymentBackend, PaymentStatus, Settlement,
+    };
     use lnrent_wire::Keys;
     use nostr::EventId;
     use rusqlite::Connection;
@@ -1243,19 +1408,332 @@ mod tests {
     }
 
     async fn seed_listing(store: &Store, id: &str, recipe_id: &str, amount_sat: i64) {
-        let (id, recipe_id) = (id.to_string(), recipe_id.to_string());
+        seed_listing_in_state(store, id, recipe_id, amount_sat, "ACTIVE").await
+    }
+
+    /// The publication state is a parameter because it is load-bearing (lnrent-i23): `UNPUBLISHED`
+    /// is what every fresh install is born in, so "a fresh daemon takes no orders" is a claim about
+    /// THIS column meeting the §5.4 gate below.
+    async fn seed_listing_in_state(
+        store: &Store,
+        id: &str,
+        recipe_id: &str,
+        amount_sat: i64,
+        state: &str,
+    ) {
+        let (id, recipe_id, state) = (id.to_string(), recipe_id.to_string(), state.to_string());
         store
             .transaction(move |tx| {
                 tx.execute(
                     "INSERT INTO listing
                         (id, recipe_id, d_tag, amount_sat, period_s, renew_lead_s, retention_s, state, updated_at)
-                     VALUES (?1, ?2, 'd', ?3, 2592000, 604800, 604800, 'ACTIVE', 0)",
-                    params![id, recipe_id, amount_sat],
+                     VALUES (?1, ?2, 'd', ?3, 2592000, 604800, 604800, ?4, 0)",
+                    params![id, recipe_id, amount_sat, state],
                 )?;
                 Ok(())
             })
             .await
             .unwrap();
+    }
+
+    /// A backend that WITHDRAWS the listing as a side effect of minting the invoice — the operator's
+    /// `listing withdraw` landing inside `create_invoice`'s network round-trip. That is the window
+    /// the in-transaction re-check closes: the §5.4 gate has already passed by then, so without it
+    /// the order commits a PENDING sub and an OPEN invoice AFTER the stop. Delegates the mint itself
+    /// to `MockPayment` so the order reaches the commit exactly as it normally would.
+    struct WithdrawDuringMint {
+        inner: MockPayment,
+        store: Store,
+        listing_id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl PaymentBackend for WithdrawDuringMint {
+        async fn create_invoice(
+            &self,
+            amount_sat: u64,
+            memo: &str,
+            expiry_s: u32,
+            external_id: &str,
+        ) -> Result<Invoice> {
+            let id = self.listing_id.clone();
+            self.store
+                .transaction(move |tx| {
+                    tx.execute(
+                        "UPDATE listing SET state='WITHDRAWN' WHERE id=?1",
+                        params![id],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            self.inner
+                .create_invoice(amount_sat, memo, expiry_s, external_id)
+                .await
+        }
+        async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
+            self.inner.lookup(id).await
+        }
+        async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            self.inner.lookup_settlement(id).await
+        }
+        async fn pay(&self, d: &str, a: u64, k: &str) -> Result<String> {
+            self.inner.pay(d, a, k).await
+        }
+        async fn payment_status(&self, id: &str) -> Result<PayStatus> {
+            self.inner.payment_status(id).await
+        }
+        async fn payment_status_by_key(&self, k: &str) -> Result<PayStatus> {
+            self.inner.payment_status_by_key(k).await
+        }
+        async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
+            self.inner.watch().await
+        }
+    }
+
+    // lnrent-i23 (multi-reviewer pass 4): `listing withdraw` is the operator's stop button, and it
+    // must not be outrun by an order already in flight. The §5.4 ACTIVE check runs BEFORE
+    // `create_invoice`, a network round-trip to the payment backend, so a withdrawal committed
+    // during it would otherwise still see a PENDING subscription and an OPEN invoice committed
+    // afterwards — handing a Buyer a payable invoice for a listing that is no longer offered.
+    #[tokio::test]
+    async fn a_withdrawal_during_the_invoice_mint_refuses_the_order() {
+        let store = mem_store();
+        let recipe = dummy_recipe();
+        let listing_id = "30402:op:dummy-1";
+        seed_listing(&store, listing_id, "dummy", recipe.pricing.amount_sat as i64).await;
+        let payment = Arc::new(WithdrawDuringMint {
+            inner: MockPayment::new(),
+            store: store.clone(),
+            listing_id: listing_id.to_string(),
+        });
+        // Not the `intake()` helper: it is typed to `Arc<MockPayment>`, and this case needs the
+        // wrapper above in the backend slot.
+        let handler = OrderIntake::new(
+            store.clone(),
+            payment,
+            Arc::new(TestClock::new(1000)),
+            recipe,
+            budget_with_room(),
+            u32::MAX,
+        );
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                Keys::generate().public_key(),
+                order("q", listing_id, json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+
+        let err = expect_order_error(&out);
+        assert_eq!(
+            err.error.code, "unavailable",
+            "the Buyer is told the listing is not being offered, as the §5.4 gate would have"
+        );
+        // The money path is what this protects: the stop button really stopped it.
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM subscription").await,
+            0,
+            "no subscription committed after the withdrawal"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice").await,
+            0,
+            "no OPEN invoice row committed, so nothing is payable"
+        );
+        // And the hold is released in the same transaction, not left to lapse on its TTL.
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM reservation WHERE state IN ('HELD','CONSUMED')"
+            )
+            .await,
+            0,
+            "the capacity hold was released with the refusal, not left holding a slot"
+        );
+    }
+
+    /// A backend that RELEASES this order's capacity hold during the mint, leaving the listing
+    /// ACTIVE. That is the state a duplicate delivery of the same `order.request` leaves behind when
+    /// its sibling hit the withdrawn-listing branch first and the operator then republished: the
+    /// listing reads ACTIVE again, but the shared reservation is already `RELEASED`.
+    struct ReleaseHoldDuringMint {
+        inner: MockPayment,
+        store: Store,
+    }
+
+    #[async_trait::async_trait]
+    impl PaymentBackend for ReleaseHoldDuringMint {
+        async fn create_invoice(
+            &self,
+            amount_sat: u64,
+            memo: &str,
+            expiry_s: u32,
+            external_id: &str,
+        ) -> Result<Invoice> {
+            self.store
+                .transaction(move |tx| {
+                    tx.execute("UPDATE reservation SET state='RELEASED'", [])?;
+                    Ok(())
+                })
+                .await?;
+            self.inner
+                .create_invoice(amount_sat, memo, expiry_s, external_id)
+                .await
+        }
+        async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
+            self.inner.lookup(id).await
+        }
+        async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            self.inner.lookup_settlement(id).await
+        }
+        async fn pay(&self, d: &str, a: u64, k: &str) -> Result<String> {
+            self.inner.pay(d, a, k).await
+        }
+        async fn payment_status(&self, id: &str) -> Result<PayStatus> {
+            self.inner.payment_status(id).await
+        }
+        async fn payment_status_by_key(&self, k: &str) -> Result<PayStatus> {
+            self.inner.payment_status_by_key(k).await
+        }
+        async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
+            self.inner.watch().await
+        }
+    }
+
+    // lnrent-i23: an order must never commit behind a RELEASED hold — the commit tail only refreshes
+    // the hold's expiry, never its state, so the slot would read free while a real subscription
+    // occupied it and capacity could be handed out twice.
+    //
+    // The released hold is manufactured with a direct write ON PURPOSE. The duplicate-delivery race
+    // this guard was written for is no longer reachable (the refusal is cached in the same
+    // transaction that releases, so a later delivery is answered as `Duplicate` first), and a test
+    // that pretended otherwise would be narrating a path that cannot happen. What is pinned here is
+    // the invariant itself, against whatever future release path might reach this state.
+    #[tokio::test]
+    async fn an_order_never_commits_behind_a_released_hold() {
+        let store = mem_store();
+        let recipe = dummy_recipe();
+        let listing_id = "30402:op:dummy-1";
+        seed_listing(&store, listing_id, "dummy", recipe.pricing.amount_sat as i64).await;
+        let payment = Arc::new(ReleaseHoldDuringMint {
+            inner: MockPayment::new(),
+            store: store.clone(),
+        });
+        let handler = OrderIntake::new(
+            store.clone(),
+            payment,
+            Arc::new(TestClock::new(1000)),
+            recipe,
+            budget_with_room(),
+            u32::MAX,
+        );
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                Keys::generate().public_key(),
+                order("q", listing_id, json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+
+        let err = expect_order_error(&out);
+        assert_eq!(err.error.code, "unavailable");
+        // [9A] non-vacuity: the listing really was ACTIVE the whole time, so this refusal can only
+        // have come from the hold check — not from the withdrawn-listing branch beside it.
+        assert_eq!(
+            listing_state(&store, listing_id).await.as_deref(),
+            Some("ACTIVE"),
+            "the listing stayed ACTIVE; only the hold was lost"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM subscription").await,
+            0,
+            "no subscription behind a released hold"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice").await,
+            0,
+            "and nothing payable was committed"
+        );
+    }
+
+    // lnrent-i23 (multi-reviewer pass 8): the refusal must be durable in the SAME transaction that
+    // releases the capacity hold. `reservation::reserve` deliberately bails on a `RELEASED` row, so
+    // if a crash landed between the release and a separately-written cache, every relay redelivery
+    // of this request would fail at reserve instead of resending an idempotent `order.error` —
+    // stuck until the terminal-row reaper, which is 120d away. Asserting the cached row exists is
+    // what proves the two are one durable fact; the send that follows is the resend path.
+    #[tokio::test]
+    async fn the_withdrawal_refusal_is_cached_with_the_release_not_after_it() {
+        let store = mem_store();
+        let recipe = dummy_recipe();
+        let listing_id = "30402:op:dummy-1";
+        seed_listing(&store, listing_id, "dummy", recipe.pricing.amount_sat as i64).await;
+        let payment = Arc::new(WithdrawDuringMint {
+            inner: MockPayment::new(),
+            store: store.clone(),
+            listing_id: listing_id.to_string(),
+        });
+        let handler = OrderIntake::new(
+            store.clone(),
+            payment,
+            Arc::new(TestClock::new(1000)),
+            recipe,
+            budget_with_room(),
+            u32::MAX,
+        );
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                Keys::generate().public_key(),
+                order("q", listing_id, json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+        assert_eq!(expect_order_error(&out).error.code, "unavailable");
+
+        // The durable half: an answer exists for this request, and it is the refusal.
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM inbound_request WHERE response_msg_type='order.error'"
+            )
+            .await,
+            1,
+            "the refusal was cached, so a redelivery resends it instead of failing at reserve"
+        );
+        // And it is genuinely paired with the release, not written by a later step.
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM reservation WHERE state='RELEASED'"
+            )
+            .await,
+            1,
+            "the hold really was released in that same transaction"
+        );
+    }
+
+    async fn listing_state(store: &Store, id: &str) -> Option<String> {
+        let id = id.to_string();
+        store
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT state FROM listing WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?)
+            })
+            .await
+            .unwrap()
     }
 
     async fn seed_active_sub(store: &Store, id: &str, buyer_hex: &str, paid_through: i64) {
@@ -1604,6 +2082,72 @@ mod tests {
             assert_eq!(err.error.code, "capacity_full");
             assert!(err.order_id.is_none());
             assert_clean(&store).await;
+        }
+    }
+
+    // lnrent-i23: the publication gate's safety claim — "a fresh daemon takes no orders until the
+    // operator publishes" — is enforced by the `l.state != "ACTIVE"` comparison in the §5.4 price
+    // check above and NOWHERE else. Before that bead the comparison was effectively dead (no code
+    // path ever wrote a non-ACTIVE state); now UNPUBLISHED is the state every install boots into,
+    // so it is the gate. This drives a real `order.request` at both non-ACTIVE states and asserts
+    // the refusal, so relaxing that comparison cannot stay green.
+    #[tokio::test]
+    async fn a_listing_that_is_not_active_takes_no_orders() {
+        for state in ["UNPUBLISHED", "WITHDRAWN"] {
+            let store = mem_store();
+            let recipe = dummy_recipe();
+            let listing_id = "30402:op:dummy-1";
+            seed_listing_in_state(
+                &store,
+                listing_id,
+                "dummy",
+                recipe.pricing.amount_sat as i64,
+                state,
+            )
+            .await;
+            let handler = intake(
+                store.clone(),
+                Arc::new(MockPayment::new()),
+                TestClock::new(1000),
+                recipe,
+                budget_with_room(),
+            );
+
+            let out = RecordingOutbound::default();
+            handler
+                .handle(
+                    Keys::generate().public_key(),
+                    order("q", listing_id, json!({})),
+                    &out,
+                )
+                .await
+                .unwrap();
+
+            let err = expect_order_error(&out);
+            // `unavailable`, not `price_changed`: the Operator is not offering this listing, and
+            // the price did not move. A Buyer told "price_changed" would re-quote against something
+            // that is not for sale.
+            assert_eq!(
+                err.error.code, "unavailable",
+                "a {state} listing is refused as not-offered"
+            );
+            assert!(err.order_id.is_none(), "no order was created for {state}");
+            // The money path is what this protects: no sub, no invoice, no held capacity.
+            assert_eq!(
+                count(&store, "SELECT count(*) FROM subscription").await,
+                0,
+                "{state}: no subscription"
+            );
+            assert_eq!(
+                count(&store, "SELECT count(*) FROM invoice").await,
+                0,
+                "{state}: nothing was minted"
+            );
+            assert_eq!(
+                count(&store, "SELECT count(*) FROM reservation").await,
+                0,
+                "{state}: no capacity reserved"
+            );
         }
     }
 

@@ -25,6 +25,11 @@ pub mod ipc;
 /// Ledger-authoritative money core (lnrent-urw.10): `expected_msat`, the LOCAL sqlite lower bound on
 /// spendable wallet holdings that replaces the live federation balance in every automatic path.
 pub mod ledger;
+/// The operator's PUBLICATION GATE (lnrent-i23): the durable `listing` row's lifecycle
+/// (UNPUBLISHED -> ACTIVE -> WITHDRAWN) and the `lnrent listing publish` / `withdraw` verbs behind
+/// it. A fresh daemon starts QUIET; publication is an explicit operator act, gated on structural
+/// preflight.
+pub mod listing;
 pub mod nostr_engine;
 pub mod op_dispatch;
 pub mod order_intake;
