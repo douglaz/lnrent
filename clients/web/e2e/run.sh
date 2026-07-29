@@ -44,9 +44,15 @@ echo "   operator npub: ${NPUB:0:24}…"
 # The daemon starts QUIET (lnrent-i23): the listing row is born UNPUBLISHED and nothing reaches the
 # relay until the operator publishes. So this harness has to do what an operator does. Buyer
 # discovery is the whole point of the run, so a failure here must abort rather than surface later as
-# an empty listing list. `--accept-unverified` because a preflight REACHABILITY check may legitimately
-# fail in CI (no provider credential on the mock/host backend); a STRUCTURAL failure still blocks and
-# should, since it would mean this harness's own recipe cannot build a valid 30402.
+# an empty listing list.
+#
+# `--accept-unverified` covers only REACHABILITY failures — here the mock backend's own checks, if a
+# probe is slow or unhappy on a loaded CI box. It is belt-and-braces rather than load-bearing: the
+# `dummy` recipe declares no DO_TOKEN, so the provider check SKIPS (a skip passes) and never needs
+# overriding. Do not copy this flag into a DO-recipe harness expecting it to paper over a missing
+# credential: a recipe that DECLARES DO_TOKEN without one fails STRUCTURAL, which no flag overrides
+# — by design, since that is the operator's own misconfiguration. A structural failure here would
+# likewise be a real defect in this harness's recipe, and should abort the run.
 say "publish the listing (the daemon starts quiet — lnrent-i23)"
 LNRENT_DATA_DIR="$WORK/data" ./target/debug/lnrent listing publish --accept-unverified \
   >"$WORK/publish.log" 2>&1 || { echo "lnrent listing publish failed"; cat "$WORK/publish.log"; tail -20 "$WORK/daemon.log"; exit 1; }
