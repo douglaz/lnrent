@@ -701,17 +701,27 @@ pub async fn dispatch(
                 // just got rather than issue a second `status` call. No `state` field — this arm
                 // also covers "no row at all", and naming a state for a row that may not exist
                 // would be a claim the daemon has not made.
-                Ok(listing::WithdrawOutcome::NotPublished { listing_id }) => Reply {
+                Ok(listing::WithdrawOutcome::NotPublished {
+                    listing_id,
+                    retract_error,
+                }) => Reply {
                     ok: false,
                     data: Some(json!({
                         "listing_id": listing_id,
                         "published": false,
+                        // The relays WERE asked to drop the coordinate even though this database
+                        // never published it (a reset/restored data dir on the same seed leaves a
+                        // stale 30402 up). Surfaced so an operator taking down a listing they can
+                        // still see is told whether that request landed.
+                        "retract_error": retract_error,
                     })),
                     error: Some(IpcError {
                         code: "invalid_state".into(),
                         message: format!(
-                            "listing `{listing_id}` was never published, so there is nothing to \
-                             withdraw — run `lnrent listing publish` to go live"
+                            "listing `{listing_id}` was never published by this daemon, so there is \
+                             nothing to withdraw — the relays were still asked to drop it, in case \
+                             an earlier data dir published it on this key. Run `lnrent listing \
+                             publish` to go live"
                         ),
                         retryable: false,
                     }),

@@ -215,8 +215,13 @@ pub enum WithdrawOutcome {
         listing_id: String,
         retract_error: Option<String>,
     },
-    /// Never published, so there is nothing to withdraw.
-    NotPublished { listing_id: String },
+    /// Never published *by this database*, so there is nothing durable to withdraw — but the relays
+    /// were still asked to drop the coordinate, and `retract_error` carries that attempt's
+    /// diagnostic. See [`withdraw`] for why a row that was never published still retracts.
+    NotPublished {
+        listing_id: String,
+        retract_error: Option<String>,
+    },
 }
 
 /// The NIP-99 replaceable-event `d` for `recipe`. M1a serves one listing per recipe, so `d` is the
@@ -633,9 +638,27 @@ pub async fn withdraw(
             });
         }
         Some(ACTIVE) => {}
-        // No row, or one that was never published: refuse rather than write WITHDRAWN over
-        // UNPUBLISHED, which would silently take away the operator's ability to tell the two apart.
-        _ => return Ok(WithdrawOutcome::NotPublished { listing_id }),
+        // No row, or one that was never published. The durable state is left alone — writing
+        // WITHDRAWN over UNPUBLISHED would silently take away the operator's ability to tell the two
+        // apart — but the RELAYS are still asked to drop the coordinate.
+        //
+        // That is not belt-and-braces: this database having no record is not evidence that no event
+        // exists. A 30402 is replaceable on `(kind, pubkey, d)`, and both halves of that key survive
+        // a data-dir reset — the pubkey comes from the operator seed, the `d` from the recipe id. So
+        // an operator who wipes and re-bootstraps on the same seed (or restores an older backup)
+        // gets an UNPUBLISHED row while relays still serve the PREVIOUS incarnation's listing.
+        // Before this bead that healed itself, because the row was born ACTIVE and the next boot
+        // republished over the stale event; quiet boot removes that, so without retracting here the
+        // operator has NO way to take it down — buyers keep discovering a listing whose orders all
+        // bounce (`unavailable`), and `withdraw`, the documented stop command, would answer "nothing
+        // to withdraw" while the thing they want gone is still up.
+        _ => {
+            let retract_error = retract_from_relays(relay, recipe, &listing_id).await;
+            return Ok(WithdrawOutcome::NotPublished {
+                listing_id,
+                retract_error,
+            });
+        }
     }
     // `event_id` is deliberately LEFT on the row (hence `false`): it names the event the retraction
     // below targets, and the one relays may keep serving if that retraction fails.
@@ -987,22 +1010,40 @@ mod tests {
         assert!(is_published(&store, &id).await.unwrap());
     }
 
-    // Withdraw is refused on a listing that was never published, so UNPUBLISHED and WITHDRAWN stay
-    // distinguishable.
+    // Withdraw does not write WITHDRAWN over a listing that was never published, so UNPUBLISHED and
+    // WITHDRAWN stay distinguishable — but it DOES ask the relays to drop the coordinate.
+    //
+    // The relay leg is the half that is not obvious. This database having no record of publishing is
+    // not evidence that no event exists: a 30402 is replaceable on `(kind, pubkey, d)`, and both
+    // halves survive a data-dir reset (pubkey from the operator seed, `d` from the recipe id). An
+    // operator who wipes and re-bootstraps on the same seed therefore has an UNPUBLISHED row while
+    // relays still serve the previous incarnation's listing. Quiet boot removed the accident that
+    // used to heal this (a row born ACTIVE republished over the stale event), so if `withdraw` did
+    // not retract here, nothing could.
     #[tokio::test]
-    async fn withdraw_refuses_an_unpublished_listing() {
+    async fn withdraw_leaves_an_unpublished_row_alone_but_still_retracts() {
         let (store, clock, _payment, recipes) = fixture();
         let relay = FakeRelay::new();
         republish_on_boot(&store, &clock, &relay, &recipes[0])
             .await
             .unwrap();
+        let id = coordinate(&recipes[0], &relay.operator_pubkey_hex());
 
         let out = withdraw(&store, &clock, &recipes, &relay).await.unwrap();
         assert!(
             matches!(out, WithdrawOutcome::NotPublished { .. }),
             "{out:?}"
         );
-        assert_eq!(relay.retract_count(), 0);
+        assert_eq!(
+            state(&store, &id).await.unwrap().as_deref(),
+            Some(UNPUBLISHED),
+            "the durable state must stay UNPUBLISHED, not become WITHDRAWN"
+        );
+        assert_eq!(
+            relay.retract_count(),
+            1,
+            "the relays are still asked to drop the coordinate a previous data dir may have published"
+        );
     }
 
     // Publish is idempotent: a second publish re-broadcasts without churning the state.
