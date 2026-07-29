@@ -1150,18 +1150,6 @@ async fn refund_retry(store: &Store, id: &str, now: i64) -> Reply {
     }
 }
 
-/// The `listing` block of `Request::Status` (lnrent-i23): is this daemon publicly listed?
-///
-/// Read from the DURABLE row keyed on the loaded recipe — the same row order intake matches an
-/// `order.request` against — so `published` cannot disagree with whether orders are actually being
-/// accepted. It deliberately does NOT consult a relay: what a relay still serves is not what decides
-/// an order. With no recipe loaded there is no listing to report, and `state` is null.
-///
-/// Keyed on the EXACT coordinate whenever the Nostr engine is wired, because that is the row the
-/// publish/withdraw verbs and order intake use. The `d_tag` fallback is only for the engine-less
-/// [`serve`] form some unit tests use: `d_tag` is not unique across operator keys (the PK is the
-/// full coordinate), so it takes the most recently touched row — deterministic only while the clock
-/// advances, which is exactly why it is not the primary lookup.
 /// The refusal text for `listing withdraw` on a row this database never published (lnrent-i23).
 ///
 /// The relay half is conditional ON PURPOSE. This is a REFUSAL, so the CLI renders it through its
@@ -1187,6 +1175,18 @@ fn not_published_message(listing_id: &str, retract_error: Option<&str>) -> Strin
     }
 }
 
+/// The `listing` block of `Request::Status` (lnrent-i23): is this daemon publicly listed?
+///
+/// Read from the DURABLE row keyed on the loaded recipe — the same row order intake matches an
+/// `order.request` against — so `published` cannot disagree with whether orders are actually being
+/// accepted. It deliberately does NOT consult a relay: what a relay still serves is not what decides
+/// an order. With no recipe loaded there is no listing to report, and `state` is null.
+///
+/// Keyed on the EXACT coordinate whenever the Nostr engine is wired, because that is the row the
+/// publish/withdraw verbs and order intake use. The `d_tag` fallback is only for the engine-less
+/// [`serve`] form some unit tests use: `d_tag` is not unique across operator keys (the PK is the
+/// full coordinate), so it takes the most recently touched row — deterministic only while the clock
+/// advances, which is exactly why it is not the primary lookup.
 async fn listing_view(
     store: &Store,
     recipes: &Arc<Vec<Recipe>>,
@@ -1304,8 +1304,9 @@ fn publish_reply(outcome: listing::PublishOutcome) -> Reply {
                 code: "listing_unverified".into(),
                 message: format!(
                     "publication refused: {} could not be verified — retry once they recover, or \
-                     publish anyway with --accept-unverified (the money path still fails closed at \
-                     order time if they are still down){}",
+                     publish anyway with --accept-unverified. If they are STILL down when a buyer \
+                     orders: a payment-backend outage refuses the order, but a provider outage lets \
+                     them pay and be refunded net of fees{}",
                     name_list(&failed),
                     still_state(still_published)
                 ),

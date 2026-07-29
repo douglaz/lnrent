@@ -281,7 +281,29 @@ impl OrderIntake {
         };
         let committed = self.store.transaction(move |tx| owned.write(tx)).await;
         let winner = match committed {
-            Ok(w) => w,
+            // The operator withdrew the listing while we were minting the invoice. Nothing was
+            // written and the hold was released in that same transaction, so answer the Buyer the
+            // same `unavailable` the §5.4 gate would have: from their side the listing simply is not
+            // being offered. The minted invoice is abandoned unpaid and expires on its own — it was
+            // never sent, so nobody can pay it (and capture would refuse it anyway: no subscription
+            // row exists).
+            Ok(OrderCommit::ListingGone) => {
+                tracing::info!(
+                    order = %order_id,
+                    "listing was withdrawn while this order was minting its invoice; refusing it"
+                );
+                return self
+                    .fail_order(
+                        &sender,
+                        &req.id,
+                        None,
+                        unavailable("this listing is not currently offered"),
+                        out,
+                    )
+                    .await;
+            }
+            Ok(OrderCommit::Committed) => None,
+            Ok(OrderCommit::Duplicate(json)) => Some(json),
             Err(e) => {
                 // Same redaction as the create_invoice arm: sqlite/store internals stay in the log.
                 tracing::warn!(order = %order_id, error = %e, "order commit failed");
@@ -827,7 +849,7 @@ impl OrderWrite {
     /// PENDING sub + OPEN invoice + cached response in one txn. Returns `Some(json)` if a
     /// concurrent duplicate already committed the order (its cached response to resend), else
     /// `None` (we committed).
-    fn write(self, tx: &rusqlite::Transaction) -> Result<Option<String>> {
+    fn write(self, tx: &rusqlite::Transaction) -> Result<OrderCommit> {
         let existing: Option<String> = tx
             .query_row(
                 "SELECT response_json FROM inbound_request WHERE sender_pubkey=?1 AND request_id=?2",
@@ -836,7 +858,29 @@ impl OrderWrite {
             )
             .optional()?;
         if let Some(json) = existing {
-            return Ok(Some(json));
+            return Ok(OrderCommit::Duplicate(json));
+        }
+        // RE-CHECK the listing INSIDE the txn (lnrent-i23). The §5.4 check upstream ran before
+        // `create_invoice`, which is a network round-trip to the payment backend — seconds during
+        // which `lnrent listing withdraw` can commit `WITHDRAWN`. Without this the order would still
+        // commit a PENDING subscription and an OPEN invoice AFTER the operator's stop, handing a
+        // Buyer a payable invoice for a listing that is no longer offered. The store actor
+        // serializes transactions, so reading it here is atomic against that write: withdraw either
+        // lands before this txn (and is seen) or after it (and the order was already accepted).
+        // Same discipline as lnrent-gdu.3, which moved authorization ahead of the durable claim.
+        let still_active: Option<String> = tx
+            .query_row(
+                "SELECT state FROM listing WHERE id=?1",
+                params![self.listing_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if still_active.as_deref() != Some("ACTIVE") {
+            // Release the capacity hold in THIS transaction, so the refusal and the release commit
+            // together — a hold left behind would keep a slot reserved for an order that will never
+            // exist until its TTL lapsed.
+            crate::reservation::release_txn(tx, &self.order_id, self.now)?;
+            return Ok(OrderCommit::ListingGone);
         }
         // next_deadline = the invoice expiry: an unpaid PENDING order must be discoverable by the
         // reconcile `next_deadline <= now` cursor (lnrent-7fp.9) so it flips to EXPIRED at expiry —
@@ -904,8 +948,19 @@ impl OrderWrite {
                 self.now,
             ],
         )?;
-        Ok(None)
+        Ok(OrderCommit::Committed)
     }
+}
+
+/// What [`OrderWrite::write`] did, inside the one serialized transaction.
+enum OrderCommit {
+    /// The order is committed: PENDING sub + OPEN invoice + cached response.
+    Committed,
+    /// A concurrent duplicate already committed this order; carries its cached response to resend.
+    Duplicate(String),
+    /// The listing stopped being `ACTIVE` between the §5.4 check and this commit — an operator's
+    /// `listing withdraw` landing across `create_invoice`'s network round-trip. NOTHING was written.
+    ListingGone,
 }
 
 /// Owned inputs for the atomic renewal-invoice write.
@@ -1155,7 +1210,9 @@ mod tests {
         Mutex,
     };
 
-    use crate::backends::MockPayment;
+    use crate::backends::{
+        Invoice, MockPayment, PayStatus, PaymentBackend, PaymentStatus, Settlement,
+    };
     use lnrent_wire::Keys;
     use nostr::EventId;
     use rusqlite::Connection;
@@ -1288,6 +1345,125 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    /// A backend that WITHDRAWS the listing as a side effect of minting the invoice — the operator's
+    /// `listing withdraw` landing inside `create_invoice`'s network round-trip. That is the window
+    /// the in-transaction re-check closes: the §5.4 gate has already passed by then, so without it
+    /// the order commits a PENDING sub and an OPEN invoice AFTER the stop. Delegates the mint itself
+    /// to `MockPayment` so the order reaches the commit exactly as it normally would.
+    struct WithdrawDuringMint {
+        inner: MockPayment,
+        store: Store,
+        listing_id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl PaymentBackend for WithdrawDuringMint {
+        async fn create_invoice(
+            &self,
+            amount_sat: u64,
+            memo: &str,
+            expiry_s: u32,
+            external_id: &str,
+        ) -> Result<Invoice> {
+            let id = self.listing_id.clone();
+            self.store
+                .transaction(move |tx| {
+                    tx.execute(
+                        "UPDATE listing SET state='WITHDRAWN' WHERE id=?1",
+                        params![id],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            self.inner
+                .create_invoice(amount_sat, memo, expiry_s, external_id)
+                .await
+        }
+        async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
+            self.inner.lookup(id).await
+        }
+        async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            self.inner.lookup_settlement(id).await
+        }
+        async fn pay(&self, d: &str, a: u64, k: &str) -> Result<String> {
+            self.inner.pay(d, a, k).await
+        }
+        async fn payment_status(&self, id: &str) -> Result<PayStatus> {
+            self.inner.payment_status(id).await
+        }
+        async fn payment_status_by_key(&self, k: &str) -> Result<PayStatus> {
+            self.inner.payment_status_by_key(k).await
+        }
+        async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
+            self.inner.watch().await
+        }
+    }
+
+    // lnrent-i23 (multi-reviewer pass 4): `listing withdraw` is the operator's stop button, and it
+    // must not be outrun by an order already in flight. The §5.4 ACTIVE check runs BEFORE
+    // `create_invoice`, a network round-trip to the payment backend, so a withdrawal committed
+    // during it would otherwise still see a PENDING subscription and an OPEN invoice committed
+    // afterwards — handing a Buyer a payable invoice for a listing that is no longer offered.
+    #[tokio::test]
+    async fn a_withdrawal_during_the_invoice_mint_refuses_the_order() {
+        let store = mem_store();
+        let recipe = dummy_recipe();
+        let listing_id = "30402:op:dummy-1";
+        seed_listing(&store, listing_id, "dummy", recipe.pricing.amount_sat as i64).await;
+        let payment = Arc::new(WithdrawDuringMint {
+            inner: MockPayment::new(),
+            store: store.clone(),
+            listing_id: listing_id.to_string(),
+        });
+        // Not the `intake()` helper: it is typed to `Arc<MockPayment>`, and this case needs the
+        // wrapper above in the backend slot.
+        let handler = OrderIntake::new(
+            store.clone(),
+            payment,
+            Arc::new(TestClock::new(1000)),
+            recipe,
+            budget_with_room(),
+            u32::MAX,
+        );
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                Keys::generate().public_key(),
+                order("q", listing_id, json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+
+        let err = expect_order_error(&out);
+        assert_eq!(
+            err.error.code, "unavailable",
+            "the Buyer is told the listing is not being offered, as the §5.4 gate would have"
+        );
+        // The money path is what this protects: the stop button really stopped it.
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM subscription").await,
+            0,
+            "no subscription committed after the withdrawal"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice").await,
+            0,
+            "no OPEN invoice row committed, so nothing is payable"
+        );
+        // And the hold is released in the same transaction, not left to lapse on its TTL.
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM reservation WHERE state IN ('HELD','CONSUMED')"
+            )
+            .await,
+            0,
+            "the capacity hold was released with the refusal, not left holding a slot"
+        );
     }
 
     async fn seed_active_sub(store: &Store, id: &str, buyer_hex: &str, paid_through: i64) {

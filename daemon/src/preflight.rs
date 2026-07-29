@@ -72,9 +72,16 @@ pub enum FailureClass {
     /// fix itself, so `lnrent listing publish` HARD BLOCKS on it — there is no override.
     Structural,
     /// A third party is not answering RIGHT NOW: guardians, a gateway, the provider API, a phoenixd
-    /// node. Transient and not the operator's fault, and the money path already fails CLOSED at order
-    /// time if it is still broken then — so `lnrent listing publish` WARNS and the operator may
-    /// override it with `--accept-unverified` rather than have someone else's outage block a launch.
+    /// node. Transient and not the operator's fault, and down at publish time is not down at order
+    /// time — so `lnrent listing publish` WARNS and the operator may override it with
+    /// `--accept-unverified` rather than have someone else's outage block a launch.
+    ///
+    /// What the override costs is NOT uniform, and must not be summarised as "the money path fails
+    /// closed": that holds for the PAYMENT BACKEND, which cannot mint an invoice while it is down,
+    /// and not for the COMPUTE PROVIDER, which `order_intake` never consults (price, reserve, mint —
+    /// provisioning is after settlement). Overriding a provider failure therefore lets a Buyer pay
+    /// into a live outage and be refunded net of fees. See `listing`'s module doc for why gating
+    /// invoice issuance on a provider probe was rejected instead.
     Reachability,
 }
 

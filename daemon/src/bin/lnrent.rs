@@ -99,8 +99,10 @@ enum ListingCmd {
     /// unless you pass --accept-unverified. Persists across restarts.
     Publish {
         /// Publish even though a dependency (guardians, a gateway, the provider API, phoenixd)
-        /// could not be reached. Use when a third party's outage is the only thing in the way: the
-        /// money path still fails closed at order time if it is still down then.
+        /// could not be reached. Use when a third party's outage is the only thing in the way.
+        /// If it is still down when a buyer orders, the cost differs by dependency: a
+        /// payment-backend outage refuses the order, but a provider outage lets the buyer pay and
+        /// be refunded net of fees.
         #[arg(long)]
         accept_unverified: bool,
     },

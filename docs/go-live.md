@@ -164,10 +164,16 @@ It re-runs the step-4 preflight and splits the failures:
 - **Reachability** — someone else is down right now: guardians unreachable, no gateway attached, the
   DigitalOcean API not answering the `provider_token` check, phoenixd not responding. Publication is
   refused too, but you can override it with `--accept-unverified` once you have decided a third
-  party's outage should not hold your launch. That is safe because the money path still fails CLOSED
-  at order time: if the dependency is still broken when a buyer orders, the daemon refuses the order
-  rather than taking money it cannot service. Nothing re-checks it for you afterwards — `lnrent
-  money` and `lnrent preflight` are how you follow up.
+  party's outage should not hold your launch — down at publish time is not down at order time.
+  **What that override costs is not the same for every dependency, so decide per check.** If the
+  payment backend is still down when a buyer orders, the daemon cannot mint an invoice and refuses
+  the order before any money moves. If the **compute provider** is still down, it does not: order
+  intake prices the order, reserves capacity and mints the invoice without consulting the provider
+  at all (provisioning happens after settlement), so the buyer PAYS, provisioning fails, and they
+  are refunded net of the Lightning fees (ADR-0019). That is the ordinary failed-provision path
+  rather than a new hazard, but it is a real cost to the buyer that you are accepting on their
+  behalf. Nothing re-checks it for you afterwards — `lnrent money` and `lnrent preflight` are how
+  you follow up.
 
 Do not go by which dependency is at fault — go by the `class` the failing check reports. One case
 crosses the line: a recipe's `preflight` hook reports only a single nonzero exit, so when the
