@@ -232,10 +232,14 @@ impl Reconciler {
                         let effective_suspend_at = pt.max(d.suspend_not_before.unwrap_or(pt));
                         if d.next_deadline < pt {
                             // Cursor before paid_through => it sits at soft_date: the renewal reminder.
+                            // `recipe_id` rides along so the reminder can refuse to quote a sub that
+                            // was ordered under a DIFFERENT recipe at THIS recipe's price
+                            // (lnrent-6id), the same ownership rule the two arms below apply.
                             if self
                                 .fire_soft_reminder(
                                     &d.id,
                                     &d.buyer_pubkey,
+                                    d.recipe_id.as_deref(),
                                     pt,
                                     effective_suspend_at,
                                     d.retention_s,
@@ -398,6 +402,16 @@ impl Reconciler {
     /// floor rises to `new_B - retention_s`. A SUSPENDED credit ALWAYS moves the cursor
     /// (`next_deadline = new_B`); the pre-reminder LEFT rule above is ACTIVE-only. Each UPDATE
     /// preserves the reconcile CAS shape. Returns the number of subs credited.
+    ///
+    /// DELIBERATELY UNGATED on `recipe_id` (lnrent-6id). The outage is the DAEMON's and every row in
+    /// this data dir lived through it — an exclusive lock on the data dir (main.rs) makes two live
+    /// daemons over one data dir impossible, so a foreign-recipe row was down exactly as long as ours.
+    /// This arm mints nothing, DMs nothing and runs no hook, and the two boundaries it writes (the
+    /// suspend FLOOR and the cursor) only ever move LATER, never earlier — so on a foreign row the
+    /// sole effect is to POSTPONE the owning daemon's suspend/destroy. Buyer-favouring, and the gated
+    /// arms still refuse the row when the later deadline comes due. It is also the one arm where a
+    /// skip would LOSE the credit rather than defer it: the heartbeat that measures the outage is
+    /// consumed in this SAME txn, so a skipped row could never be credited for that window again.
     pub async fn apply_restart_downtime_credit(&self, now: i64) -> Result<usize> {
         self.store
             .transaction(move |tx| {
@@ -749,16 +763,24 @@ impl Reconciler {
         }
     }
 
-    /// Whether this reconciler may run lifecycle hooks for a row owned by `row_recipe` (lnrent-yjl).
+    /// Whether this reconciler may ACT on a row owned by `row_recipe` (lnrent-yjl). Not scoped to
+    /// hooks: lnrent-6id added a hook-free money caller (`fire_soft_reminder`, which prices the
+    /// renewal at OUR recipe), so read this as "may this daemon serve that row at all".
     ///
     /// Skips ONLY an EXPLICITLY foreign owner — `Some(id)` that is not ours. A NULL/absent owner
     /// keeps the PRE-yjl behaviour and is allowed through, which is where this deliberately diverges
     /// from `provision.rs`/`resume.rs`: there, skipping an unowned row merely defers provisioning
-    /// (harmless, recoverable). Here the operation is destructive but OWED — skipping a legacy row
-    /// with no `recipe_id`, or a dead-letter whose subscription row is already gone, would leave the
-    /// provider resource permanently uncleaned and BILLING. A single-recipe M1a operator's rows are
-    /// exactly that NULL case, so treating unproven ownership as foreign would silently stop every
-    /// teardown they have (coderabbit Major + codex P2 on PR #63).
+    /// (harmless, recoverable). Here NO caller's skip is a mere deferral:
+    /// - the teardowns are destructive but OWED — skipping a legacy row with no `recipe_id`, or a
+    ///   dead-letter whose subscription row is already gone, would leave the provider resource
+    ///   permanently uncleaned and BILLING;
+    /// - the reminder (lnrent-6id) is the ONLY cursor driver for a pre-reminder ACTIVE row, so a
+    ///   NULL skip stalls that cursor below `paid_through` forever: dispatch keeps re-choosing the
+    ///   reminder arm, no quote is ever minted and `fire_suspend` is never even reached — an ACTIVE
+    ///   row with a live Instance that can never be billed again.
+    ///
+    /// A single-recipe M1a operator's rows are exactly that NULL case, so treating unproven ownership
+    /// as foreign would silently stop every teardown they have (coderabbit Major + codex P2 on PR #63).
     fn owns_recipe(&self, row_recipe: Option<&str>) -> bool {
         !matches!(row_recipe, Some(id) if id != self.recipe.service.id)
     }
@@ -953,6 +975,15 @@ impl Reconciler {
     /// guarded on `(state='PENDING', next_deadline=nd)`: sub `-> EXPIRED`, the OPEN order invoice
     /// `-> EXPIRED`, its reservation `-> RELEASED`, cursor cleared. Returns whether it fired
     /// (`false` = paid backend invoice, backend lookup unavailable, or stale/replayed cursor).
+    ///
+    /// DELIBERATELY UNGATED on `recipe_id` (lnrent-6id). A PENDING order was never provisioned, so no
+    /// provider resource outlives a mismarked row, no hook runs, and nothing is priced here — the order
+    /// invoice was minted at order time by whichever recipe took the order and is only flipped EXPIRED,
+    /// never re-minted (the money guard is `order_invoice_may_expire`, which is recipe-independent).
+    /// Gating would strand the ROW, not capacity: an expired unpaid hold already drops out of both the
+    /// host budget and the per-buyer cap on its own (reservation.rs), but the subscription itself would
+    /// sit PENDING forever — out of the terminal-row GC's reach (store.rs), a stale HELD reservation
+    /// beside it, re-selected by every tick until a daemon serving that recipe runs here.
     async fn fire_pending_expiry(&self, sub_id: &str, nd: i64, now: i64) -> Result<bool> {
         if !self.order_invoice_may_expire(sub_id).await? {
             return Ok(false);
@@ -988,17 +1019,46 @@ impl Reconciler {
     /// rows. `paid_through` is NOT extended here — that is capture's, on settlement. The cursor
     /// advances to `effective_suspend_at` (the downtime-credit FLOOR, §6.5), not raw `paid_through`,
     /// so a credited outage delays suspension; the invoice/`due_at` still key on `paid_through`.
+    ///
+    /// GATED on `recipe_id` (lnrent-6id), the same ownership rule as `fire_suspend`/`fire_destroy`:
+    /// the renewal is priced at `self.recipe.pricing.amount_sat`, so this is a MONEY arm even though
+    /// it runs no hook.
     #[allow(clippy::too_many_arguments)]
     async fn fire_soft_reminder(
         &self,
         sub_id: &str,
         buyer_hex: &str,
+        row_recipe: Option<&str>,
         paid_through: i64,
         effective_suspend_at: i64,
         retention_s: i64,
         cursor_nd: i64,
         now: i64,
     ) -> Result<bool> {
+        // lnrent-6id ownership gate, mirroring `fire_suspend`. A sub ordered under a DIFFERENT recipe
+        // would be quoted OUR price, and capture would extend `paid_through` on payment — the operator
+        // eats the difference when ours is cheaper, the buyer overpays when it is dearer. Gated BEFORE
+        // `create_invoice`, so no wrong-priced invoice exists at the backend either; a NULL owner is
+        // allowed through (see `owns_recipe`).
+        //
+        // Nothing moves — no invoice, no DM, cursor untouched — so the reminder is DEFERRED until a
+        // daemon serving that recipe runs against this data dir. The cursor is the mechanism, not a
+        // second skip: it stays BELOW `paid_through`, so dispatch keeps choosing THIS arm and
+        // `fire_suspend` is never reached at all for such a row — the buyer is not torn down over a
+        // reminder they never got. The recurring warn is the intended signal; do NOT "quiet" it by
+        // advancing the cursor. Warn-only matches the destructive arms (yjl shipped the same inertness
+        // for foreign SUSPENDED/CANCELLED rows) — an operator-facing signal belongs to the CLASS, and
+        // is lnrent-xr7. The BUYER-initiated `renew.request` door stays ungated and quotes the SERVED
+        // recipe's price; that sibling defect is lnrent-dvb's, which blocks ja2 exactly as this bead.
+        if !self.owns_recipe(row_recipe) {
+            tracing::warn!(
+                sub = %sub_id,
+                row_recipe = row_recipe.unwrap_or(""),
+                reconciler_recipe = %self.recipe.service.id,
+                "skipping renewal reminder for a different recipe"
+            );
+            return Ok(false);
+        }
         // external_id stays paid_through-anchored (one cycle = one invoice); only the expiry sizing
         // honors the credited boundary.
         let external_id = format!("renew:auto:{sub_id}:{paid_through}");
@@ -1008,7 +1068,12 @@ impl Reconciler {
         // renewal refund gate honors, after which a settlement would be refunded anyway. Sizing to
         // the stale paid_through + retention_s would, after a long credited outage, mint an invoice
         // that expires before B, leaving the credited window unusable for payment. Floored at
-        // RENEWAL_INVOICE_MIN_EXPIRY_S.
+        // RENEWAL_INVOICE_MIN_EXPIRY_S — which means that once the cursor has been stalled all the way
+        // past B (a backend outage across the window, or the ownership gate above), this arm still
+        // mints an hour of payability on the far side of a boundary at which capture only refunds. The
+        // gap is real and pre-dates lnrent-6id; it is lnrent-4kg's. Do NOT close it by returning early
+        // here — this arm is the ONLY cursor driver for a pre-reminder ACTIVE row, so a bare skip
+        // strands the sub ACTIVE forever with a live Instance. 4kg carries the proof and the shape.
         let expiry_s = u32::try_from(
             (effective_suspend_at + retention_s - now).max(i64::from(RENEWAL_INVOICE_MIN_EXPIRY_S)),
         )
@@ -1302,6 +1367,11 @@ impl Reconciler {
     /// Transition 5 — expire OPEN renewal invoices past their own expiry. Each flip is a CAS on
     /// `status='OPEN'` (a since-paid invoice affects 0 rows); the SUBSCRIPTION is never touched.
     /// Returns how many invoices expired.
+    ///
+    /// Deliberately recipe-AGNOSTIC (lnrent-6id), and outside the `due_subscriptions` scan: expiry is
+    /// a property of the invoice's own `expires_at`, not of who minted it, and the `invoice` table has
+    /// no `recipe_id` column to gate on at all (store.rs schema). Gating would leave a foreign
+    /// recipe's OPEN invoices OPEN forever and re-looked-up at the backend on every tick.
     async fn expire_open_renewals(&self, now: i64) -> Result<usize> {
         let rows: Vec<(String, String)> = self
             .store
@@ -1560,6 +1630,15 @@ mod tests {
         Reconciler::new(store, Arc::new(crate::backends::MockPayment::new()), recipe)
     }
 
+    /// The dummy recipe RE-PRICED, `service.id` unchanged so a seeded sub is still OWNED. Lets a
+    /// lnrent-6id test assert the MINTED renewal amount against a number no seed helper hard-codes,
+    /// so a quote at some other recipe's price cannot pass by coincidence.
+    fn priced_recipe(amount_sat: u64) -> Recipe {
+        let mut r = dummy_recipe();
+        r.pricing.amount_sat = amount_sat;
+        r
+    }
+
     /// A dummy-id recipe whose `destroy` hook FAILS (exit 1) — for the teardown dead-letter path
     /// (lnrent-urw.2). Returns the recipe + its dir so a test can later overwrite `destroy` to
     /// succeed and exercise the retry-resolution.
@@ -1795,6 +1874,52 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    async fn inv_amount_sat(store: &Store, external_id: &str) -> i64 {
+        let external_id = external_id.to_string();
+        store
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT amount_sat FROM invoice WHERE external_id=?1",
+                    params![external_id],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// The amount the buyer was actually QUOTED in their `billing.invoice` DM (lnrent-6id): the DB
+    /// invoice row and the wire message are two separate writes, so both are asserted.
+    ///
+    /// Reads ALL of them and asserts there is exactly one, rather than `query_row`-ing an arbitrary
+    /// row: a second renewal cycle enqueues a second quote, and a helper that silently picked one of
+    /// them would let a future multi-cycle test assert against the wrong amount and pass.
+    async fn billing_invoice_amount_sat(store: &Store, sub_id: &str) -> u64 {
+        let sub_id = sub_id.to_string();
+        let payloads: Vec<String> = store
+            .read(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT payload_json FROM outbox
+                      WHERE subscription_id=?1 AND msg_type='billing.invoice'",
+                )?;
+                let rows = stmt
+                    .query_map(params![sub_id], |r| r.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            payloads.len(),
+            1,
+            "expected exactly one billing.invoice DM for this sub"
+        );
+        match serde_json::from_str(&payloads[0]).unwrap() {
+            Msg::BillingInvoice(bi) => bi.amount_sat,
+            other => panic!("expected a billing.invoice DM, got {other:?}"),
+        }
     }
 
     async fn count(store: &Store, sql: &str) -> i64 {
@@ -2137,6 +2262,279 @@ mod tests {
         assert_eq!(inv_status(&store, "renew:auto:s1:1000").await, "OPEN");
     }
 
+    // lnrent-6id: a due ACTIVE sub at its soft_date, ordered under ANOTHER recipe, must not be quoted
+    // THIS recipe's renewal price. Nothing is minted and nothing is DMd, and because the cursor is
+    // untouched the reminder is DEFERRED not lost — proven by re-stamping the row to this recipe and
+    // re-ticking at the SAME `now`: it reminds, at that recipe's price.
+    #[tokio::test]
+    async fn soft_reminder_skips_a_subscription_from_a_different_recipe() {
+        let store = mem_store();
+        // paid_through=1000, soft_date(cursor)=900; the served recipe is priced 30000 (the `do-vps`-vs-
+        // `dummy` shape lnrent-ja2 makes live), the row belongs to a recipe priced elsewhere.
+        seed_sub(
+            &store,
+            "s1",
+            "ACTIVE",
+            "buyerhex",
+            Some(1000),
+            500,
+            Some(900),
+        )
+        .await;
+        set_recipe_id(&store, "s1", Some("other-recipe")).await;
+        // The test owns the backend so it can prove the gate sits BEFORE `create_invoice`, not merely
+        // before the DB write.
+        let payment = Arc::new(crate::backends::MockPayment::new());
+        let r = Reconciler::new(store.clone(), payment.clone(), priced_recipe(30_000));
+
+        let rep = r.reconcile_tick(900).await.unwrap();
+        assert_eq!(
+            rep.reminded, 0,
+            "a foreign recipe's sub gets no renewal quote"
+        );
+        // Nothing exists at the BACKEND either: `settle` errors only when no invoice was ever created
+        // for that external_id. A gate placed after the mint would leave a wrong-priced bolt11 live at
+        // the backend — and because `create_invoice` is idempotent on external_id, the owning recipe's
+        // later reminder would then be handed that stale invoice instead of minting its own.
+        assert!(
+            payment.settle("renew:auto:s1:1000", 900).is_err(),
+            "no renewal invoice was minted at the backend for a foreign recipe's sub"
+        );
+        assert_eq!(
+            rep.noops, 1,
+            "it is counted as a due row with no transition"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice WHERE kind='renewal'").await,
+            0,
+            "no renewal invoice minted at the wrong recipe's price"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM outbox WHERE msg_type='billing.invoice'"
+            )
+            .await,
+            0,
+            "the buyer is never DMd a quote for a recipe they did not order"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM outbox WHERE msg_type='billing.notice'"
+            )
+            .await,
+            0,
+            "and no renewal-available notice either"
+        );
+        assert_eq!(
+            sub_next_deadline(&store, "s1").await,
+            Some(900),
+            "cursor NOT advanced as if served — the row is still due at its soft_date"
+        );
+
+        // The stall is DEFERRAL, not a slow teardown — the load-bearing half of the gate's comment.
+        // A cursor left below `paid_through` means dispatch keeps choosing the REMINDER arm, so even
+        // long past B = paid_through + retention_s the suspend/destroy arms are never reached: the
+        // buyer is not torn down over a reminder they never got.
+        let late = r.reconcile_tick(1000 + 500 + 10_000).await.unwrap();
+        assert_eq!(
+            (late.suspended, late.terminated),
+            (0, 0),
+            "a gated row is never suspended or destroyed, however late the tick"
+        );
+        assert_eq!(late.noops, 1, "it is still just a due row with no transition");
+        assert_eq!(sub_state(&store, "s1").await, "ACTIVE");
+        assert_eq!(
+            sub_next_deadline(&store, "s1").await,
+            Some(900),
+            "and it is still parked at its soft_date, waiting for the recipe that owns it"
+        );
+
+        // Deferred, not lost: served by the owning recipe, the SAME `now` mints the reminder at the
+        // price that recipe charges.
+        set_recipe_id(&store, "s1", Some("dummy")).await;
+        assert_eq!(r.reconcile_tick(900).await.unwrap().reminded, 1);
+        assert_eq!(inv_amount_sat(&store, "renew:auto:s1:1000").await, 30_000);
+    }
+
+    // lnrent-6id (the regression that actually matters): a sub whose `recipe_id` MATCHES still gets its
+    // reminder, and both the minted invoice row and the `billing.invoice` DM carry ITS OWN recipe's
+    // price — asserted as a NUMBER, not merely "an invoice appeared".
+    #[tokio::test]
+    async fn soft_reminder_mints_at_the_subscriptions_own_recipe_price() {
+        let store = mem_store();
+        seed_sub(
+            &store,
+            "s1",
+            "ACTIVE",
+            "buyerhex",
+            Some(1000),
+            500,
+            Some(900),
+        )
+        .await;
+        let r = reconciler(store.clone(), priced_recipe(30_000));
+
+        assert_eq!(r.reconcile_tick(900).await.unwrap().reminded, 1);
+        assert_eq!(
+            inv_amount_sat(&store, "renew:auto:s1:1000").await,
+            30_000,
+            "the renewal is minted at the ordering == serving recipe's price"
+        );
+        assert_eq!(
+            billing_invoice_amount_sat(&store, "s1").await,
+            30_000,
+            "and the buyer is quoted that same amount"
+        );
+    }
+
+    // lnrent-6id + the lnrent-yjl regression guard: `recipe_id = NULL` is OWNED (`owns_recipe`), so a
+    // legacy row still gets its reminder at the served price. Gating NULL as foreign would STRAND the
+    // row, not merely delay it: this arm is the only cursor driver for a pre-reminder ACTIVE sub (the
+    // downtime credit deliberately leaves that cursor put, reconcile.rs:497), so the cursor would sit
+    // below `paid_through` forever, dispatch would keep choosing THIS arm (reconcile.rs:233) and
+    // `fire_suspend` would never even be reached — an ACTIVE row with a live Instance, never quoted,
+    // never billed again, never torn down.
+    #[tokio::test]
+    async fn soft_reminder_still_fires_for_a_legacy_subscription_with_no_recipe_id() {
+        let store = mem_store();
+        seed_sub(
+            &store,
+            "s1",
+            "ACTIVE",
+            "buyerhex",
+            Some(1000),
+            500,
+            Some(900),
+        )
+        .await;
+        set_recipe_id(&store, "s1", None).await;
+        let r = reconciler(store.clone(), priced_recipe(30_000));
+
+        assert_eq!(
+            r.reconcile_tick(900).await.unwrap().reminded,
+            1,
+            "a NULL-owner row keeps the pre-yjl behaviour and is still reminded"
+        );
+        assert_eq!(inv_amount_sat(&store, "renew:auto:s1:1000").await, 30_000);
+        assert_eq!(billing_invoice_amount_sat(&store, "s1").await, 30_000);
+        assert_eq!(
+            sub_next_deadline(&store, "s1").await,
+            Some(1000),
+            "and its cursor advances exactly as an owned row's does"
+        );
+    }
+
+    // lnrent-6id posture test for the first ungated arm: `fire_pending_expiry` stays UNGATED on
+    // purpose (see its doc). A foreign recipe's dead PENDING order still expires and still RELEASES
+    // its reservation — nothing was provisioned and nothing is priced here, so gating would only leave
+    // the row PENDING (never reaped) and its reservation stale HELD, behind a daemon that may never
+    // run against this data dir.
+    #[tokio::test]
+    async fn pending_expiry_is_ungated_for_a_different_recipes_dead_order() {
+        let store = mem_store();
+        seed_sub(&store, "o1", "PENDING", "buyer", None, 0, Some(100)).await;
+        seed_invoice(
+            &store,
+            "inv-o1",
+            "o1",
+            "order:o1",
+            "order",
+            "OPEN",
+            Some(100),
+        )
+        .await;
+        seed_reservation(&store, "o1").await;
+        set_recipe_id(&store, "o1", Some("other-recipe")).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        let rep = r.reconcile_tick(150).await.unwrap();
+        assert_eq!(
+            rep.expired, 1,
+            "an unpaid, never-provisioned order expires whoever serves the data dir"
+        );
+        assert_eq!(sub_state(&store, "o1").await, "EXPIRED");
+        assert_eq!(inv_status(&store, "order:o1").await, "EXPIRED");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM reservation WHERE order_id='o1' AND state='RELEASED'"
+            )
+            .await,
+            1,
+            "the reservation is RELEASED, not left stale HELD"
+        );
+    }
+
+    // lnrent-6id posture test for the second ungated arm: `apply_restart_downtime_credit` stays
+    // UNGATED on purpose (see its doc). The outage is the DAEMON's, every row lived through it, and a
+    // skip would LOSE the credit rather than defer it — the heartbeat is consumed in the same txn. It
+    // only raises the FLOOR, so the gated arms still refuse the row when that floor comes due.
+    #[tokio::test]
+    async fn downtime_credit_is_ungated_for_a_different_recipes_subscription() {
+        let store = mem_store();
+        // renew_lead=100, soft_date=900, paid_through=1000, cursor at paid_through (post-reminder).
+        seed_active_sub(&store, "s1", "buyer", 100, 900, 1000, 500, 1000).await;
+        set_recipe_id(&store, "s1", Some("other-recipe")).await;
+        set_heartbeat(&store, 950).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        assert_eq!(r.apply_restart_downtime_credit(1100).await.unwrap(), 1);
+        // Identical math to the owned case: pre_available = clamp(950-900,0,100)=50, so the floor is
+        // 1100 + (100-50) = 1150.
+        assert_eq!(sub_suspend_not_before(&store, "s1").await, Some(1150));
+
+        // The credit does NOT unlock the row for this daemon: at the credited floor the suspend arm
+        // still skips it, so a buyer-favouring floor never becomes a foreign teardown.
+        let rep = r.reconcile_tick(1150).await.unwrap();
+        assert_eq!(
+            rep.suspended, 0,
+            "the credited floor does not unlock a foreign recipe's suspend"
+        );
+        assert_eq!(rep.noops, 1);
+        assert_eq!(sub_state(&store, "s1").await, "ACTIVE");
+    }
+
+    // lnrent-6id posture test for scan B: `expire_open_renewals` stays recipe-AGNOSTIC on purpose
+    // (see its doc) — expiry is a property of the invoice's own `expires_at`, and `invoice` carries no
+    // `recipe_id` to gate on. The tripwire is for lnrent-ja2: joining `subscription.recipe_id` into
+    // that scan would leave a foreign recipe's OPEN invoices OPEN forever, re-looked-up every tick.
+    #[tokio::test]
+    async fn open_renewal_expiry_is_recipe_agnostic() {
+        let store = mem_store();
+        // Cursor far in the future, so scan A skips the sub entirely and only scan B can fire.
+        seed_sub(
+            &store,
+            "s1",
+            "ACTIVE",
+            "buyerhex",
+            Some(10_000),
+            500,
+            Some(10_000),
+        )
+        .await;
+        seed_invoice(
+            &store,
+            "inv-r1",
+            "s1",
+            "renew:auto:s1:10000",
+            "renewal",
+            "OPEN",
+            Some(100),
+        )
+        .await;
+        set_recipe_id(&store, "s1", Some("other-recipe")).await;
+        let r = reconciler(store.clone(), dummy_recipe());
+
+        assert_eq!(
+            r.reconcile_tick(150).await.unwrap().invoices_expired,
+            1,
+            "a foreign recipe's dead renewal invoice still expires"
+        );
+        assert_eq!(inv_status(&store, "renew:auto:s1:10000").await, "EXPIRED");
+    }
+
     // lnrent-yjl: a due ACTIVE sub ordered under ANOTHER recipe must not get THIS recipe's `suspend`
     // hook. Nothing moves — no hook, no state change, no notice, cursor untouched — and the row stays
     // DUE, proven by re-stamping it to this recipe and re-ticking at the SAME `now`: it suspends.
@@ -2263,10 +2661,11 @@ mod tests {
         );
     }
 
-    // lnrent-yjl: a NULL `recipe_id` is a NON-match for both teardown transitions, EXACTLY as in
-    // provision.rs:127 / resume.rs:92 — ownership is unproven, so the destructive hook is skipped
-    // rather than guessed. Unreachable in production (recipe_id is in the v1 SCHEMA baseline with no
-    // ALTER TABLE adding it, and order_intake always stamps the serving recipe's id).
+    // lnrent-yjl: a NULL `recipe_id` is OWNED for both teardown transitions, which is exactly where
+    // `owns_recipe` (this file) diverges from provision.rs:127 / resume.rs:92 — there a NULL is
+    // skipped because deferring provisioning is harmless, here a skip would strand an OWED teardown
+    // forever. Unreachable in production (recipe_id is in the v1 SCHEMA baseline with no ALTER TABLE
+    // adding it, and order_intake always stamps the serving recipe's id).
     #[tokio::test]
     async fn teardowns_still_run_for_a_legacy_subscription_with_no_recipe_id() {
         let store = mem_store();
