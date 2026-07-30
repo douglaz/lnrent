@@ -63,9 +63,15 @@ to the simplification; cover the rest with backend choice, not with lnv1 mainten
   original plan; it was reversed because it is churn for zero functional change. No
   version bump is involved (lnv2 ships in v0.11.1). Upstream PR #8818 remains a valid
   contribution for lnv1 users.
-- `docs/specs/backend-strategy.md` (lnrent-bi8) carries the execution detail: phoenixd
-  trait mapping, per-backend backup/reconcile stories, the lnv2 no-same-invoice-retry
-  gap across all bolt11 surfaces, retirement sequencing.
+- The execution detail lives in the CODE and its beads, not in a separate spec.
+  `docs/specs/backend-strategy.md` (lnrent-bi8) was planned and never written — bi8 closed
+  superseded — so do not go looking for it. The phoenixd trait mapping is
+  `daemon/src/phoenixd_backend.rs`'s module header; the per-backend backup story is
+  `daemon/src/backup.rs` plus lnrent-u43 (a seed-only restore rotates phoenixd's api
+  password, so the seed restores MONEY and `phoenix.conf` restores ACCESS); the lnv2
+  no-same-invoice-retry gap is `PaymentBackend::failed_refund_can_reuse_invoice`
+  (`daemon/src/backends.rs`), which returns `false` for lnv2 for exactly that reason;
+  retirement sequencing completed with lnrent-8ym.
 - There is no migration: lnrent is greenfield — no operator deployments exist. Retiring
   lnv1 means deleting it once a replacement backend is production-ready; the only lnv1
   wallet in the world is the author's own dogfood, drained by hand.
