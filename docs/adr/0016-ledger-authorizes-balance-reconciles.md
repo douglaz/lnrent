@@ -67,9 +67,10 @@ never over-authorize.
 
 ## Consequences
 
-*(Target state — lands with docs/specs/gate1-operator-sweep.md + gate1-alerting-operability.md.
-As of 2026-07-05 the startup probe, the readiness path, and `lnrent money` still read the
-balance, and no sweep/reconcile command exists.)*
+*(LANDED. This was written as a target state, with a 2026-07-05 note that the startup probe, the
+readiness path and `lnrent money` still read the balance and that no sweep/reconcile command
+existed. Both GATE-1 specs shipped — `lnrent sweep` and `lnrent reconcile` exist, and readiness is
+ledger-driven — so the consequences below describe current behaviour, not an intention.)*
 
 - `available_balance_msat()` keeps exactly one non-test call site (the reconcile handler); the
   Fedimint startup `log_readiness` balance probe is removed (its gateway-liveness half stays —

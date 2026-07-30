@@ -33,13 +33,24 @@ refund path hardened, provisioning + the buyer and operator CLIs proven live end
 federation). Be clear-eyed about one thing: **`lnrent listing publish` (step 5) publishes your
 public `30402` listing, and that IS public exposure** — from that moment any Nostr keypair can send
 you orders. Starting the daemon does NOT: it boots quiet, and until you publish, every order is
-refused. Until the GATE-0 abuse-resistance items in
-`docs/specs/production-readiness.md` land (per-buyer reservation caps, inbound rate-limiting), a
-stranger can hold your capacity at zero cost, so an attended launch accepts that documented risk
-knowingly: keep the price real but small, capacity low, and watch the logs. GATE-1 (alerting,
-teardown dead-letter, payout) gates leaving it to run unattended. What remains for the attended
-launch is yours: pick a mainnet federation, back up a seed, fund a DigitalOcean account, set a real
-price, and flip it on.
+refused.
+
+The abuse-resistance and operability gates in `docs/specs/production-readiness.md` have BOTH landed.
+GATE-0 shipped a per-buyer cap on outstanding held reservations, a per-pubkey inbound rate limit,
+authorization ahead of the durable claim, and caps on unpaid-invoice load, params size and message
+size — so a stranger can no longer hold your capacity at zero cost. GATE-1 shipped the operator
+alert DMs, the teardown dead-letter, the sweep, the refunds list and retry, relay-connectivity
+status, the draining-holdings warning, the single-instance data-dir lock, and the
+ledger-authoritative money core.
+
+That removes the specific risks this section used to ask you to accept knowingly. It does not turn
+"unattended" into a promise: judgement about price, capacity and how closely you watch a live
+marketplace stays yours, and the open beads are the honest list of what is still rough. Start with
+the price real but small and the capacity low anyway — not because a gate is missing, but because
+that is how you find out what your own box and recipe do under real orders.
+
+What remains for the attended launch is yours: pick a mainnet federation, back up a seed, fund a
+DigitalOcean account, set a real price, and flip it on.
 
 ## 0. The one irreversible fact — your mnemonic IS your ecash
 
