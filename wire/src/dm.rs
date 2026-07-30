@@ -53,10 +53,14 @@ pub struct OrderInvoice {
     pub expires_at: i64,
 }
 
-/// `order.error` — operator → buyer. A pre-order or order-time failure (SPEC.md §5.1).
+/// `order.error` — operator → buyer. A pre-order or order-time failure (SPEC.md §5.1). It is also
+/// the operator's refusal of a `renew.request` for a subscription this daemon does not serve
+/// (lnrent-dvb): the wire has no renew-specific error type, so a buyer client awaiting a renewal
+/// must accept this alongside `billing.invoice` / `billing.notice`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderError {
-    /// Correlates to the originating `order.request` `id`.
+    /// Correlates to the originating request's `id` — the `order.request`, or the `renew.request`
+    /// being refused.
     pub request_id: String,
     /// Absent for a pre-order validation failure (no order was created).
     #[serde(default, skip_serializing_if = "Option::is_none")]

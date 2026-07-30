@@ -781,8 +781,12 @@ impl Reconciler {
     ///
     /// A single-recipe M1a operator's rows are exactly that NULL case, so treating unproven ownership
     /// as foreign would silently stop every teardown they have (coderabbit Major + codex P2 on PR #63).
+    ///
+    /// The rule itself lives on [`Recipe::owns_row`] because the buyer-initiated `renew.request` gate
+    /// (lnrent-dvb, `order_intake`) is the same money rule and must not drift from this one. Only the
+    /// callers differ; the semantics — including NULL-is-owned — are shared, not copied.
     fn owns_recipe(&self, row_recipe: Option<&str>) -> bool {
-        !matches!(row_recipe, Some(id) if id != self.recipe.service.id)
+        self.recipe.owns_row(row_recipe)
     }
 
     /// Retry every OPEN teardown dead-letter whose backoff has elapsed (lnrent-urw.2): re-run its
@@ -1048,8 +1052,10 @@ impl Reconciler {
         // reminder they never got. The recurring warn is the intended signal; do NOT "quiet" it by
         // advancing the cursor. Warn-only matches the destructive arms (yjl shipped the same inertness
         // for foreign SUSPENDED/CANCELLED rows) — an operator-facing signal belongs to the CLASS, and
-        // is lnrent-xr7. The BUYER-initiated `renew.request` door stays ungated and quotes the SERVED
-        // recipe's price; that sibling defect is lnrent-dvb's, which blocks ja2 exactly as this bead.
+        // is lnrent-xr7. The BUYER-initiated `renew.request` door is the sibling of this one and is
+        // closed by lnrent-dvb, sharing this rule via `Recipe::owns_row`; it answers rather than
+        // defers, because a buyer asked. A THIRD door — `op.request`, which runs THIS recipe's hook
+        // against a foreign row — is still open and is lnrent-ml2.
         if !self.owns_recipe(row_recipe) {
             tracing::warn!(
                 sub = %sub_id,

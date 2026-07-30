@@ -45,6 +45,12 @@ const MIN_RENEWAL_INVOICE_EXPIRY_S: i64 = 60;
 /// option (a)). Shared so the cancel and renew branches cannot drift apart.
 const RESUMING_RETRY_NOTICE: &str = "a renewal is being applied — please retry in a moment";
 
+/// The `unavailable` message a `renew.request` gets when the subscription belongs to a recipe this
+/// daemon does not serve (lnrent-dvb). Deliberately says only that service for this subscription is
+/// not offered HERE: it does not name — or hint at the existence of — whatever else the operator
+/// runs, and it does not call the subscription invalid, because it is not.
+const FOREIGN_RECIPE_REFUSAL: &str = "this subscription is not currently served here";
+
 /// The order-intake integrator: implements [`OrderHandler`] over the injected store, payment
 /// backend, clock, recipe, and host budget. Cheap to share behind an `Arc` (the engine holds it
 /// as `Arc<dyn OrderHandler>`).
@@ -59,6 +65,20 @@ pub struct OrderIntake {
     budget: Budget,
     /// Per-pubkey anti-griefing cap: max concurrent LIVE HELD holds one buyer key may hold (PR-1).
     max_live_holds_per_buyer: u32,
+}
+
+/// The fields a buyer `renew.request` is authorized and priced against, read from the
+/// `subscription` row by [`OrderIntake::load_renewable`]. Named rather than a 6-tuple for the same
+/// reason [`ListingRow`] is: two of the columns are bare `Option<i64>` deadlines that a positional
+/// destructure would happily swap.
+struct RenewableRow {
+    buyer_hex: String,
+    state: String,
+    paid_through: Option<i64>,
+    retention_s: i64,
+    suspend_not_before: Option<i64>,
+    /// The recipe this subscription was ORDERED under; `None` for an unowned/legacy row.
+    recipe_id: Option<String>,
 }
 
 /// The fields the order path needs from the current `listing` row (§5.4): the published price +
@@ -382,9 +402,10 @@ impl OrderIntake {
         }
         // Structural id gate (mi9.2/DRIFT-3, gate0-abuse-resistance §D): the same 1..=128 /
         // [A-Za-z0-9_-] tail bound the order path enforces, BEFORE the id reaches the renew
-        // external id or the inbound_request row. Malformed → drop + log with NO reply: wire has
-        // no renew error variant (a renew is only ever answered by `billing.invoice`), matching
-        // renew's other rejects above/below.
+        // external id or the inbound_request row. Malformed → drop + log with NO reply: every renew
+        // reply correlates by echoing this exact id back (`billing.invoice`, the z4u RESUMING notice,
+        // the dvb refusal below), so an unvalidated id has nowhere to go — matching renew's other
+        // rejects above/below.
         if validate_buyer_request_id_tail(&req.id).is_err() {
             tracing::warn!(sub = %req.subscription_id, "renew.request with a malformed request id — dropped");
             return Ok(());
@@ -394,20 +415,103 @@ impl OrderIntake {
         // (ACTIVE/SUSPENDED) subscription. Otherwise drop silently — an outsider must not be able
         // to mint a payable billing.invoice for someone else's sub, and a PENDING/terminal sub must
         // not get a renewal invoice that capture would later refund (§5.1 sender auth, §6.3).
-        let Some((buyer_hex, state, paid_through, retention_s, suspend_not_before)) =
-            self.load_renewable(&req.subscription_id).await?
-        else {
+        let Some(sub) = self.load_renewable(&req.subscription_id).await? else {
             tracing::warn!(sub = %req.subscription_id, "renew.request for unknown subscription — dropped");
             return Ok(());
         };
-        if buyer_hex != sender.to_hex() {
+        if sub.buyer_hex != sender.to_hex() {
             tracing::warn!(sub = %req.subscription_id, "renew.request from a non-owner — dropped");
             return Ok(());
         }
+        // lnrent-dvb: the BUYER-initiated mirror of lnrent-6id's `fire_soft_reminder` gate, sharing
+        // its one ownership rule via `Recipe::owns_row` (NULL/absent owner is OWNED — gating NULL as
+        // foreign was the yjl regression). `issue_renewal` prices unconditionally at
+        // `self.recipe.pricing.amount_sat`, so a sub ordered under a DIFFERENT recipe would be quoted
+        // OUR price and capture would extend ITS `paid_through` on payment: the operator eats the
+        // difference when ours is cheaper, the buyer overpays when it is dearer. Gated BEFORE
+        // `create_invoice` exactly as 6id is — create is idempotent on `external_id`, so a
+        // wrong-priced bolt11 minted here would be handed back verbatim to any later renewal reusing
+        // that id, including one issued by the recipe that does own the row. And AFTER the owner
+        // check, so an outsider probing subscription ids still gets the silent drop.
+        //
+        // WHY THIS REPLY (§5.1 owns the vocabulary and records what a renew may be answered with).
+        // 6id skips silently because no one asked it anything; this is a request. The CARRIER is
+        // forced, not chosen — `order.error` is the wire's only error-bearing operator->buyer message
+        // outside `op.result` — so only the CODE is a choice, and `unavailable` is the honest one:
+        // the buyer did nothing wrong (`params_invalid` / `refund_dest_invalid` / `rejected` blame
+        // them), their subscription is real, capacity is irrelevant (`capacity_full`), and the
+        // message names no recipe so it leaks nothing about what else the operator runs. It is the
+        // same code, and the same `retryable: true`, the order path sends for a listing it is not
+        // offering (the listing-state check above) — a retry works the moment the operator repoints
+        // this daemon. NOT `price_changed`, which IS what the order path answers a listing naming a
+        // foreign recipe with: there a re-quote fixes it, here the price did not move and none can.
+        //
+        // Nothing durable is written, and the refusal is deliberately NOT cached in
+        // `inbound_request` (§5.1 records the exception). That cache exists so a redelivery "never
+        // creates a second reservation, order, or invoice"; this arm creates none of the three, and
+        // leaving the `(sender, request_id)` key unclaimed means this daemon never owes a stale
+        // refusal to a later request reusing that id — once it serves the owning recipe, that id
+        // mints the renewal normally. The beneficiary is a buyer RE-SENDING their `--request-id`
+        // (a fresh gift wrap): a true redelivery of the identical wrap never reaches here at all,
+        // since returning `Ok(())` writes its `seen_message` row and the transport dedupe
+        // short-circuits the replay (`nostr_engine`). `fail_order` must cache because ITS refusal
+        // has to be durable together with releasing a HELD reservation, or a crash between the two
+        // bricks every redelivery; this arm holds nothing.
+        if !self.recipe.owns_row(sub.recipe_id.as_deref()) {
+            tracing::warn!(
+                sub = %req.subscription_id,
+                row_recipe = sub.recipe_id.as_deref().unwrap_or(""),
+                serving_recipe = %self.recipe.service.id,
+                "renew.request for a different recipe — refused before minting an invoice"
+            );
+            // `retryable` answers "could this EVER succeed", not "would it succeed now": repointing
+            // this daemon at the owning recipe only helps if the row can still reach a state the
+            // renewal gate below accepts, so a row that cannot has an agent retrying a dead
+            // subscription until it gives up. Set from an ALLOWLIST of the states that can still get
+            // there (§6.3): PENDING/PROVISIONING become ACTIVE on payment+provision, RESUMING resolves
+            // into ACTIVE, and ACTIVE/SUSPENDED are already accepted. The five omitted are dead ends —
+            // TERMINATED/EXPIRED/CANCELLED/REFUNDED terminally, and REFUND_DUE because its only exit
+            // is REFUNDED. Positive rather than a denylist so a state added later defaults to "makes
+            // no promise": over-promising is the failure being fixed here, and this mirrors the
+            // ACTIVE/SUSPENDED allowlist the state gate below already uses. Only the flag varies —
+            // code and message stay uniform, because the REASON is identical in every state and a
+            // per-state refusal would narrate the row's state back to the sender.
+            //
+            // STATE only, deliberately not the resumable boundary B the gate below also enforces.
+            // Being past B looks terminal, but a repoint IS a daemon restart, and
+            // `apply_restart_downtime_credit` credits exactly the row whose window the outage ate:
+            // an ACTIVE candidate needs `effective_suspend_at >= last_heartbeat` and a SUSPENDED one
+            // `B_old > last_heartbeat`, both satisfiable while `now >= B`, and each sets a floor
+            // strictly AFTER `now` (`target = now + (lead - pre_available)`; `target_b = now +
+            // remaining`). So the restart that repoints the daemon can itself reopen the window, and
+            // `retryable: false` here would tell a buyer to abandon a rental the credit is designed
+            // to give back — the costlier of the two errors, since state is durable but B is not.
+            let mut error = unavailable(FOREIGN_RECIPE_REFUSAL);
+            error.retryable = matches!(
+                sub.state.as_str(),
+                "PENDING" | "PROVISIONING" | "ACTIVE" | "RESUMING" | "SUSPENDED"
+            );
+            let response = Msg::OrderError(OrderError {
+                request_id: req.id.clone(),
+                order_id: None,
+                error,
+            });
+            out.reply(&sender, &response).await?;
+            return Ok(());
+        }
+        let RenewableRow {
+            state,
+            paid_through,
+            retention_s,
+            suspend_not_before,
+            ..
+        } = sub;
         // lnrent-z4u: see handle_cancel for the decision. A renew that lands while the sub is
-        // transiently RESUMING gets the SAME stateless informational notice — renew has no wire
-        // error variant, so BillingNotice is the informational channel — owner-only (this branch
-        // sits after the owner check) and with NO state change. Deliberately not a RESUMING->X
+        // transiently RESUMING gets the SAME stateless informational notice — this is not a
+        // failure (the same request works once the resume lands), so BillingNotice is the right
+        // channel; the dvb arm above borrows `order.error` precisely because a refusal IS one and
+        // the wire has no renew-specific error type — owner-only (this branch sits after the owner
+        // check) and with NO state change. Deliberately not a RESUMING->X
         // shortcut / resume-driver hook (the reverted P1 trap noted in handle_cancel).
         if state == "RESUMING" {
             // request_id echoes THIS renew.request so the buyer's `renew()` matches it exactly (like
@@ -762,29 +866,29 @@ impl OrderIntake {
             .await
     }
 
-    /// The fields a buyer renewal must be authorized against: `(buyer_pubkey_hex, state,
-    /// paid_through, retention_s, suspend_not_before)` if the subscription exists, else `None`.
-    /// `suspend_not_before` is the downtime-credit FLOOR (§6.5); it widens the renewal eligibility
-    /// window the same way it widens capture's resumable boundary.
-    async fn load_renewable(
-        &self,
-        sub_id: &str,
-    ) -> Result<Option<(String, String, Option<i64>, i64, Option<i64>)>> {
+    /// The fields a buyer renewal must be authorized against, if the subscription exists, else
+    /// `None`. `suspend_not_before` is the downtime-credit FLOOR (§6.5); it widens the renewal
+    /// eligibility window the same way it widens capture's resumable boundary. `recipe_id` is the
+    /// row's OWNING recipe — the renewal is priced at ours, so `handle_renew` must be able to see
+    /// that it is somebody else's (lnrent-dvb); `None` there means an unowned/legacy row.
+    async fn load_renewable(&self, sub_id: &str) -> Result<Option<RenewableRow>> {
         let id = sub_id.to_string();
         self.store
             .read(move |c| {
                 Ok(c.query_row(
-                    "SELECT buyer_pubkey, state, paid_through, retention_s, suspend_not_before
+                    "SELECT buyer_pubkey, state, paid_through, retention_s, suspend_not_before,
+                            recipe_id
                      FROM subscription WHERE id = ?1",
                     params![id],
                     |r| {
-                        Ok((
-                            r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                            r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                            r.get::<_, Option<i64>>(2)?,
-                            r.get::<_, Option<i64>>(3)?.unwrap_or(0),
-                            r.get::<_, Option<i64>>(4)?,
-                        ))
+                        Ok(RenewableRow {
+                            buyer_hex: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                            state: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                            paid_through: r.get::<_, Option<i64>>(2)?,
+                            retention_s: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                            suspend_not_before: r.get::<_, Option<i64>>(4)?,
+                            recipe_id: r.get::<_, Option<String>>(5)?,
+                        })
                     },
                 )
                 .optional()?)
@@ -1365,6 +1469,15 @@ mod tests {
         (recipe, suspend_marker, destroy_marker)
     }
 
+    /// The dummy recipe RE-PRICED, `service.id` unchanged so a seeded sub is still OWNED. Lets the
+    /// lnrent-dvb tests assert the QUOTED amount against a number neither a seed helper nor another
+    /// recipe fixture hard-codes, so a quote at some other recipe's price cannot pass by coincidence.
+    fn priced_recipe(amount_sat: u64) -> Recipe {
+        let mut r = dummy_recipe();
+        r.pricing.amount_sat = amount_sat;
+        r
+    }
+
     fn budget_with_room() -> Budget {
         Budget {
             cpu: 4,
@@ -1825,6 +1938,57 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    /// Re-stamp a seeded sub's owning recipe (the seeds all write `dummy`), including to NULL for
+    /// the lnrent-yjl legacy-row guard.
+    async fn set_sub_recipe_id(store: &Store, id: &str, recipe_id: Option<&str>) {
+        let (id, recipe_id) = (id.to_string(), recipe_id.map(str::to_string));
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "UPDATE subscription SET recipe_id=?2 WHERE id=?1",
+                    params![id, recipe_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Every subscription column a renewal could plausibly move — state, the paid-through anchor,
+    /// the downtime-credit floor, the reconcile cursor, and the row's own mtime — so "the refusal
+    /// writes nothing durable" is a claim about the ROW, not just about its state.
+    async fn sub_snapshot(
+        store: &Store,
+        id: &str,
+    ) -> (String, Option<i64>, Option<i64>, Option<i64>, i64) {
+        let id = id.to_string();
+        store
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT state, paid_through, suspend_not_before, next_deadline, updated_at
+                       FROM subscription WHERE id=?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )?)
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn inv_amount_sat(store: &Store, external_id: &str) -> i64 {
+        let external_id = external_id.to_string();
+        store
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT amount_sat FROM invoice WHERE external_id=?1",
+                    params![external_id],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap()
     }
 
     async fn count(store: &Store, sql: &str) -> i64 {
@@ -2405,9 +2569,347 @@ mod tests {
         );
     }
 
-    // mi9.2/DRIFT-3: a malformed renew request id is dropped with NO reply (wire has no renew
-    // error variant) before any invoice or inbound_request row exists — the same 1..=128 /
-    // [A-Za-z0-9_-] bound the order path enforces — while a valid id still renews.
+    // lnrent-dvb: a buyer renew.request for a sub ordered under ANOTHER recipe must not be quoted
+    // THIS recipe's price. It is refused BEFORE any invoice exists — in the DB or at the backend —
+    // and the buyer gets the existing `unavailable` order.error rather than a silent drop, because
+    // unlike the daemon-initiated arm (lnrent-6id) this answers a request they made.
+    #[tokio::test]
+    async fn renew_request_for_a_foreign_recipe_is_refused_before_any_invoice() {
+        let store = mem_store();
+        let payment = Arc::new(MockPayment::new());
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        seed_active_sub(&store, "sub-1", &buyer_hex, 5000).await;
+        // The row belongs to a recipe this daemon does not serve (the `do-vps`-vs-`dummy` shape
+        // lnrent-ja2 makes live); the served recipe is priced at a number nothing else here uses.
+        set_sub_recipe_id(&store, "sub-1", Some("other-recipe")).await;
+        let handler = intake(
+            store.clone(),
+            payment.clone(),
+            TestClock::new(1000),
+            priced_recipe(30_000),
+            budget_with_room(),
+        );
+        let before = sub_snapshot(&store, "sub-1").await;
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                Msg::RenewRequest(RenewRequest {
+                    id: "rr-foreign".into(),
+                    subscription_id: "sub-1".into(),
+                }),
+                &out,
+            )
+            .await
+            .unwrap();
+
+        // The REFUSAL arm fired — not some other reject that happens to error. The message pins this
+        // branch: it is the only `unavailable` in the module carrying it, and every other renew
+        // reject replies nothing at all.
+        let (recipient, msg) = out.only();
+        assert_eq!(recipient, buyer.public_key());
+        let err = match msg {
+            Msg::OrderError(e) => e,
+            other => panic!("expected order.error, got {other:?}"),
+        };
+        assert_eq!(err.request_id, "rr-foreign", "correlated to THIS request");
+        assert_eq!(err.order_id, None, "a renewal refusal opens no order");
+        assert_eq!(err.error.code, "unavailable");
+        assert_eq!(err.error.message, FOREIGN_RECIPE_REFUSAL);
+        assert!(
+            !err.error.message.contains("other-recipe"),
+            "the refusal must not name what else the operator runs"
+        );
+
+        // No invoice was minted at the wrong price — in the DB…
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice").await,
+            0,
+            "no renewal invoice at this recipe's price for a sub ordered under another"
+        );
+        // …nor at the BACKEND: `settle` errors only when no invoice was ever created for that
+        // external_id. A gate placed after the mint would leave a wrong-priced bolt11 live there, and
+        // `create_invoice` is idempotent on external_id, so the owning recipe's own renewal would
+        // later be handed that stale invoice instead of minting one at its price.
+        let ext = format!("renew:req:{buyer_hex}:rr-foreign");
+        assert!(
+            payment.settle(&ext, 1000).is_err(),
+            "no renewal invoice was minted at the backend for a foreign recipe's sub"
+        );
+
+        // Nothing durable at all: no cached response claiming the (sender, request_id) key, no outbox
+        // DM, no journal entry, and the subscription row — state, paid_through, credit floor, cursor,
+        // mtime — is byte-identical.
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM inbound_request").await,
+            0,
+            "the refusal is re-derived, never cached"
+        );
+        assert_eq!(count(&store, "SELECT count(*) FROM outbox").await, 0);
+        assert_eq!(count(&store, "SELECT count(*) FROM event_log").await, 0);
+        assert_eq!(
+            sub_snapshot(&store, "sub-1").await,
+            before,
+            "a refused renewal moves no column on the subscription"
+        );
+
+        // And it is a REFUSAL, not a consumed request: because the (sender, request_id) key was left
+        // unclaimed, the very same id still renews once this daemon is pointed at the recipe that
+        // owns the row. A cached refusal would brick that id instead.
+        set_sub_recipe_id(&store, "sub-1", Some("dummy")).await;
+        let out2 = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                Msg::RenewRequest(RenewRequest {
+                    id: "rr-foreign".into(),
+                    subscription_id: "sub-1".into(),
+                }),
+                &out2,
+            )
+            .await
+            .unwrap();
+        match out2.only().1 {
+            Msg::BillingInvoice(bi) => assert_eq!(bi.amount_sat, 30_000),
+            other => panic!("expected billing.invoice once the recipe matches, got {other:?}"),
+        }
+        assert_eq!(inv_amount_sat(&store, &ext).await, 30_000);
+    }
+
+    // lnrent-dvb, the ORDER of the two gates: the recipe gate replies, the owner gate does not, so a
+    // stranger probing subscription ids must hit the owner gate FIRST. Otherwise the refusal itself
+    // becomes an oracle — "unavailable" for a real id vs silence for an invented one tells any sender
+    // which subscription ids exist, which is exactly what §5.1's non-disclosure rule forbids (and
+    // what `op.result`'s `unauthorized` posture is written to prevent). Pinned because the two gates
+    // are adjacent statements: a reorder would compile, pass every other test, and leak.
+    #[tokio::test]
+    async fn renew_request_from_a_stranger_is_dropped_silently_even_for_a_foreign_recipe() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let stranger = Keys::generate();
+        seed_active_sub(&store, "sub-1", &buyer.public_key().to_hex(), 5000).await;
+        set_sub_recipe_id(&store, "sub-1", Some("other-recipe")).await;
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1000),
+            priced_recipe(30_000),
+            budget_with_room(),
+        );
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                stranger.public_key(),
+                Msg::RenewRequest(RenewRequest {
+                    id: "rr-probe".into(),
+                    subscription_id: "sub-1".into(),
+                }),
+                &out,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            out.messages().is_empty(),
+            "a non-owner learns NOTHING — not even that this daemon does not serve the row: {:?}",
+            out.messages()
+        );
+        // …and it is indistinguishable from a subscription id that does not exist at all.
+        let out2 = RecordingOutbound::default();
+        handler
+            .handle(
+                stranger.public_key(),
+                Msg::RenewRequest(RenewRequest {
+                    id: "rr-probe-2".into(),
+                    subscription_id: "no-such-sub".into(),
+                }),
+                &out2,
+            )
+            .await
+            .unwrap();
+        assert!(out2.messages().is_empty());
+    }
+
+    // lnrent-dvb, the OTHER gate order: the recipe gate is decided BEFORE the state gate, so an owner
+    // gets the refusal whatever state their foreign row is in — including the terminal states whose
+    // own reject is a silent drop, and including transient RESUMING, whose z4u notice ("retry in a
+    // moment") would be a lie for a row this daemon will never serve. §5.1 and the buyer client's
+    // `renew()` doc both assert this ordering; pinned here so neither can go stale by a reorder.
+    #[tokio::test]
+    async fn renew_request_for_a_foreign_recipe_is_refused_in_every_state() {
+        // EVERY §6.3 state, not a sample: a partial list is exactly what let a wrong `retryable`
+        // through review, so this pins the whole matrix and a new state must be classified here.
+        for state in [
+            "PENDING",
+            "PROVISIONING",
+            "ACTIVE",
+            "RESUMING",
+            "SUSPENDED",
+            "TERMINATED",
+            "EXPIRED",
+            "CANCELLED",
+            "REFUND_DUE",
+            "REFUNDED",
+        ] {
+            let store = mem_store();
+            let buyer = Keys::generate();
+            seed_active_sub(&store, "sub-1", &buyer.public_key().to_hex(), 5000).await;
+            set_sub_recipe_id(&store, "sub-1", Some("other-recipe")).await;
+            let s = state.to_string();
+            store
+                .transaction(move |tx| {
+                    tx.execute(
+                        "UPDATE subscription SET state=?2 WHERE id=?1",
+                        params!["sub-1", s],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let handler = intake(
+                store.clone(),
+                Arc::new(MockPayment::new()),
+                TestClock::new(1000),
+                priced_recipe(30_000),
+                budget_with_room(),
+            );
+
+            let out = RecordingOutbound::default();
+            handler
+                .handle(
+                    buyer.public_key(),
+                    Msg::RenewRequest(RenewRequest {
+                        id: "rr-state".into(),
+                        subscription_id: "sub-1".into(),
+                    }),
+                    &out,
+                )
+                .await
+                .unwrap();
+            match out.only().1 {
+                Msg::OrderError(e) => {
+                    assert_eq!(e.error.code, "unavailable", "state {state}");
+                    assert_eq!(e.error.message, FOREIGN_RECIPE_REFUSAL, "state {state}");
+                    // Whether a repoint could EVER make this renew succeed — not whether it would
+                    // succeed now. True for the rows that can still reach ACTIVE/SUSPENDED (PENDING
+                    // and PROVISIONING on payment+provision, RESUMING on resume); false for the dead
+                    // ends, REFUND_DUE included, since its only exit is REFUNDED.
+                    assert_eq!(
+                        e.error.retryable,
+                        matches!(
+                            state,
+                            "PENDING" | "PROVISIONING" | "ACTIVE" | "RESUMING" | "SUSPENDED"
+                        ),
+                        "state {state}: retryable must not promise an impossible retry"
+                    );
+                }
+                other => panic!("state {state}: expected the recipe refusal, got {other:?}"),
+            }
+            assert_eq!(
+                count(&store, "SELECT count(*) FROM invoice").await,
+                0,
+                "state {state}"
+            );
+        }
+    }
+
+    // lnrent-dvb (the regression that actually matters): a sub whose `recipe_id` MATCHES still
+    // renews, and both the minted invoice row and the `billing.invoice` the buyer is quoted carry
+    // ITS OWN recipe's price — asserted as a NUMBER, not merely "an invoice appeared".
+    #[tokio::test]
+    async fn renew_request_is_quoted_the_subscriptions_own_recipe_price() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        seed_active_sub(&store, "sub-1", &buyer_hex, 5000).await; // seeds recipe_id='dummy'
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1000),
+            priced_recipe(30_000),
+            budget_with_room(),
+        );
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                Msg::RenewRequest(RenewRequest {
+                    id: "rr-own".into(),
+                    subscription_id: "sub-1".into(),
+                }),
+                &out,
+            )
+            .await
+            .unwrap();
+        let bi = match out.only().1 {
+            Msg::BillingInvoice(b) => b,
+            other => panic!("expected billing.invoice, got {other:?}"),
+        };
+        assert_eq!(
+            bi.amount_sat, 30_000,
+            "the buyer is quoted the ordering == serving recipe's price"
+        );
+        assert_eq!(
+            inv_amount_sat(&store, &format!("renew:req:{buyer_hex}:rr-own")).await,
+            30_000,
+            "and the persisted invoice carries that same amount"
+        );
+    }
+
+    // lnrent-dvb + the lnrent-yjl regression guard, pinned explicitly: `recipe_id = NULL` is OWNED
+    // (`Recipe::owns_row`), so a legacy row — which is every row a single-recipe M1a operator may
+    // hold — still renews on request, at the served price. Gating NULL as foreign would refuse those
+    // buyers their own renewals: the sub would run out its paid period and lapse with the buyer
+    // unable to pay for it, which is exactly the regression yjl shipped and PR #63 reverted.
+    #[tokio::test]
+    async fn renew_request_still_renews_for_a_legacy_subscription_with_no_recipe_id() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        seed_active_sub(&store, "sub-1", &buyer_hex, 5000).await;
+        set_sub_recipe_id(&store, "sub-1", None).await;
+        let handler = intake(
+            store.clone(),
+            Arc::new(MockPayment::new()),
+            TestClock::new(1000),
+            priced_recipe(30_000),
+            budget_with_room(),
+        );
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                Msg::RenewRequest(RenewRequest {
+                    id: "rr-legacy".into(),
+                    subscription_id: "sub-1".into(),
+                }),
+                &out,
+            )
+            .await
+            .unwrap();
+        let bi = match out.only().1 {
+            Msg::BillingInvoice(b) => b,
+            other => panic!("a NULL-owner row keeps the pre-yjl behaviour; got {other:?}"),
+        };
+        assert_eq!(bi.subscription_id, "sub-1");
+        assert_eq!(bi.request_id.as_deref(), Some("rr-legacy"));
+        assert_eq!(bi.amount_sat, 30_000);
+        assert_eq!(
+            inv_amount_sat(&store, &format!("renew:req:{buyer_hex}:rr-legacy")).await,
+            30_000
+        );
+    }
+
+    // mi9.2/DRIFT-3: a malformed renew request id is dropped with NO reply before any invoice or
+    // inbound_request row exists — the same 1..=128 / [A-Za-z0-9_-] bound the order path enforces —
+    // while a valid id still renews. NO reply because every renew reply correlates by echoing this
+    // exact id back, so an unvalidated one has nowhere to go (it is no longer true that the wire
+    // has no renew error variant — lnrent-dvb's refusal rides `order.error`).
     #[tokio::test]
     async fn renew_request_with_malformed_id_is_dropped_before_any_row() {
         let store = mem_store();

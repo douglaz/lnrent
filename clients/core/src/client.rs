@@ -27,7 +27,9 @@ fn transport(e: RelayError) -> BuyerError {
 /// `billing.notice` asking the buyer to retry once the resume completes (`Retry`, lnrent-z4u). Both
 /// carry this request's `request_id`, so the `renew` matcher accepts either and the RESUMING case
 /// surfaces as operator feedback instead of a timeout — while a relay-replayed stale notice from an
-/// earlier request (different id) is ignored.
+/// earlier request (different id) is ignored. A REFUSAL is not a variant here: the operator declining
+/// to serve the subscription at all (lnrent-dvb) rides a request-correlated `order.error` and comes
+/// back as `Err(BuyerError::Remote)`, the same shape a refused order gets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenewReply {
     /// A payable renewal invoice for the requested subscription.
@@ -194,9 +196,12 @@ impl<'a, R: Relay, S: NostrSigner, C: Clock> BuyerClient<'a, R, S, C> {
     /// daemon answers a renew during RESUMING with the notice INSTEAD of an invoice, echoing this
     /// request's `request_id`, so the notice is accepted immediately (no invoice is coming) and a
     /// relay-replayed stale RESUMING notice from an earlier request — carrying a different id —
-    /// cannot masquerade as this request's reply. An otherwise-invalid renewal (unknown sub /
-    /// non-owner / non-renewable state) is dropped by the operator with no reply, surfacing here as
-    /// a timeout.
+    /// cannot masquerade as this request's reply. A request-correlated `order.error` is the third
+    /// (lnrent-dvb): the operator refusing to serve this subscription at all, surfaced as
+    /// [`BuyerError::Remote`] exactly as `create_order` surfaces one — and it is decided FIRST, so a
+    /// subscription the operator does not serve gets that error whatever state it is in. An
+    /// otherwise-invalid renewal (unknown sub / non-owner / non-renewable state of a subscription the
+    /// operator DOES serve) is dropped with no reply, surfacing here as a timeout.
     pub async fn renew(&self, subscription_id: &str) -> Result<RenewReply, BuyerError> {
         let id = self.clock.new_request_id();
         let request = self
@@ -229,6 +234,23 @@ impl<'a, R: Relay, S: NostrSigner, C: Clock> BuyerClient<'a, R, S, C> {
                             && n.subscription_id == want_sub
                             && n.state == "RESUMING"
                     }
+                    // lnrent-dvb: the operator REFUSING this renew — e.g. the subscription belongs
+                    // to a recipe this daemon does not serve, so it will not quote its own price for
+                    // it. `order.error` is the wire's only error-bearing operator->buyer message
+                    // outside `op.result` (`wire/src/dm.rs`), so it carries this too; without this
+                    // arm the daemon's honest answer would be dropped here and the buyer would see
+                    // an indistinguishable timeout. Correlated by `request_id` alone because
+                    // `order.error` has no `subscription_id` field — the same correlation strength
+                    // `create_order` accepts. Exact for a FRESH id (the default): an earlier
+                    // request's replayed error carries a different id and cannot match. NOT exact
+                    // for a pinned `--request-id` re-sent after the operator repoints the daemon —
+                    // the first refusal is still stored on the relay, and NIP-59 randomizes a gift
+                    // wrap's `created_at`, so no `since` filter can exclude it; the stored refusal
+                    // can be matched ahead of the fresh invoice. The daemon still minted that
+                    // invoice (the refusal claims no dedup key), so the recourse is a fresh id.
+                    // Deliberately NOT "keep reading past an error in case an invoice follows":
+                    // that would burn the full timeout on every honest refusal.
+                    Msg::OrderError(e) => e.request_id == want_id,
                     _ => false,
                 }
             })
@@ -237,8 +259,13 @@ impl<'a, R: Relay, S: NostrSigner, C: Clock> BuyerClient<'a, R, S, C> {
         match reply {
             Msg::BillingInvoice(invoice) => Ok(RenewReply::Invoice(invoice)),
             Msg::BillingNotice(notice) => Ok(RenewReply::Retry(notice)),
+            // Surfaced with the operator's own { code, message, retryable } (exit 6), unchanged —
+            // identical handling to `create_order`, so an agent branches on renewal refusals exactly
+            // as it does on order refusals.
+            Msg::OrderError(err) => Err(BuyerError::Remote(err.error)),
             _ => unreachable!(
-                "the matcher restricts to a request-correlated billing.invoice or RESUMING billing.notice"
+                "the matcher restricts to a request-correlated billing.invoice, RESUMING \
+                 billing.notice, or order.error"
             ),
         }
     }
@@ -924,5 +951,70 @@ mod tests {
             matches!(err, BuyerError::Timeout(_)),
             "expected a timeout, got {err:?}"
         );
+    }
+
+    // lnrent-dvb: the operator refuses to serve this subscription (it belongs to a recipe this
+    // daemon does not serve) and answers with a request-correlated `order.error`. Without the
+    // matcher arm this reply is discarded and the buyer sees a timeout — i.e. the daemon's honest
+    // answer would be indistinguishable from an offline operator. It must surface as the operator's
+    // OWN structured error (exit 6), not a timeout (exit 4).
+    #[tokio::test]
+    async fn renew_refusal_surfaces_the_operators_order_error() {
+        let op = Keys::generate();
+        let buyer = Keys::generate();
+        let clock = TestClock::default();
+        let relay = FakeRelay::new();
+        let refusal = Msg::OrderError(lnrent_wire::OrderError {
+            request_id: "req-0".into(),
+            order_id: None,
+            error: WireError {
+                code: "unavailable".into(),
+                message: "this subscription is not currently served here".into(),
+                retryable: true,
+            },
+        });
+        relay.queue(reply(&op, &buyer.public_key(), refusal).await);
+
+        let c = client(&relay, &buyer, &clock, op.public_key());
+        let err = c
+            .renew("sub-1")
+            .await
+            .expect_err("a refusal is not a renewal");
+        assert_eq!(err.exit_code(), 6, "remote error, NOT the timeout's 4");
+        let env = err.envelope();
+        assert_eq!(env.code, "unavailable");
+        assert_eq!(
+            env.message,
+            "this subscription is not currently served here"
+        );
+        assert!(env.retryable);
+    }
+
+    // lnrent-dvb correlation: `order.error` carries no `subscription_id`, so `request_id` is the
+    // whole correlation. A replayed refusal from an EARLIER request must not be mistaken for this
+    // one's reply — otherwise a relay redelivery could turn a live renewal into a stale refusal.
+    #[tokio::test]
+    async fn renew_ignores_an_order_error_for_another_request() {
+        let op = Keys::generate();
+        let buyer = Keys::generate();
+        let clock = TestClock::default();
+        let relay = FakeRelay::new();
+        let stale = Msg::OrderError(lnrent_wire::OrderError {
+            request_id: "req-OLD".into(),
+            order_id: None,
+            error: WireError {
+                code: "unavailable".into(),
+                message: "this subscription is not currently served here".into(),
+                retryable: true,
+            },
+        });
+        relay.queue(reply(&op, &buyer.public_key(), stale).await);
+        relay.queue(reply(&op, &buyer.public_key(), billing_invoice("sub-1", Some("req-0"))).await);
+
+        let c = client(&relay, &buyer, &clock, op.public_key());
+        match c.renew("sub-1").await.expect("correlated invoice wins") {
+            RenewReply::Invoice(inv) => assert_eq!(inv.request_id.as_deref(), Some("req-0")),
+            RenewReply::Retry(n) => panic!("expected the correlated invoice, got {n:?}"),
+        }
     }
 }
