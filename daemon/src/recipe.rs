@@ -182,6 +182,31 @@ impl Recipe {
         self.operations.iter().find(|op| op.name == name)
     }
 
+    /// Whether a row tagged `row_recipe` (a `subscription.recipe_id`) belongs to THIS recipe, for
+    /// the callers that must not act on another recipe's row (lnrent-yjl / 6id / dvb).
+    ///
+    /// A NULL/absent owner is OWNED. That is deliberate and load-bearing, not a convenience: a
+    /// single-recipe M1a operator's legacy rows are exactly that case, and treating unproven
+    /// ownership as foreign made them permanently un-serviceable — the lnrent-yjl regression
+    /// (coderabbit Major + codex P2 on PR #63). Callers whose skip is a mere DEFERRAL —
+    /// `provision.rs` / `resume.rs` — deliberately use the STRICTER `Some(id) == ours` rule inline
+    /// instead; do not "unify" them onto this one, the divergence is the point.
+    ///
+    /// Lives here, on the recipe itself, so the money callers that share this rule
+    /// (`reconcile::Reconciler::owns_recipe` and the buyer `renew.request` gate in `order_intake`)
+    /// cannot drift apart silently.
+    ///
+    /// NOT a complete map of the callers that skip this check — several buyer verbs never read
+    /// `recipe_id` at all (`sub.cancel` and `delivery.resend.request` among them), and they are
+    /// tolerable only because they act purely on the ROW's own columns and run no recipe code.
+    /// `op_dispatch` is the one that is not: it authorizes an `op.request` on owner + ACTIVE alone
+    /// and then runs THIS recipe's hook, with THIS recipe's `provisioning.env`, against a foreign
+    /// row's instance (lnrent-ml2). Pre-existing and out of scope for the beads above; do not read
+    /// either list as exhaustive.
+    pub fn owns_row(&self, row_recipe: Option<&str>) -> bool {
+        !matches!(row_recipe, Some(id) if id != self.service.id)
+    }
+
     /// Absolute path to a management operation's hook executable, resolved as
     /// `<recipe-dir>/ops/<hook>`. `hook` is a bare filename (validated by
     /// `Operation::hook_is_safe` / the recipe runner) so this cannot escape `ops/`.

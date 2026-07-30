@@ -358,13 +358,13 @@ NIP-17 private DM between the buyer and operator pubkeys:
 |--|--|--|
 | `order.request`   | buyer -> operator | `id` (unique request id), `listing_id`, validated `params`, `refund_dest` (REQUIRED, re-resolvable Lightning address / HTTPS LNURL; raw bolt11 and BOLT12 rejected for new orders) |
 | `order.invoice`   | operator -> buyer | `request_id` (= the `order.request` `id`), `order_id`, `bolt11`, `amount_sat`, `period`, `expires_at` |
-| `order.error`     | operator -> buyer | `request_id`, `order_id` (optional — absent for a pre-order validation failure; currently ALWAYS absent: the order + invoice commit atomically, so no post-commit `order.error` path exists), `error` `{ code, message, retryable }` with `code` in `capacity_full` / `params_invalid` / `price_changed` / `unavailable` / `refund_dest_invalid` (missing/bolt11/BOLT12/malformed `refund_dest`) / `rejected` (reserved; not currently emitted) — same nested `error` shape as `op.result`, so a buyer agent branches uniformly |
+| `order.error`     | operator -> buyer | `request_id`, `order_id` (optional — absent for a pre-order validation failure; currently ALWAYS absent: the order + invoice commit atomically, so no post-commit `order.error` path exists), `error` `{ code, message, retryable }` with `code` in `capacity_full` / `params_invalid` / `price_changed` / `unavailable` / `refund_dest_invalid` (missing/bolt11/BOLT12/malformed `refund_dest`) / `rejected` (reserved; not currently emitted) — same nested `error` shape as `op.result`, so a buyer agent branches uniformly. Also carries the refusal of an owner's `renew.request` for a subscription this daemon does not serve (`unavailable`; the wire has no renew-specific error type) — see the `renew.request` row |
 | `provision.ready` | operator -> buyer | `subscription_id`, `payload` (the credentials) |
 | `delivery.resend.request` | buyer -> operator | `subscription_id` — re-send the latest `provision.ready` (dropped-DM resync; replaces the old overload of `renew.request` for this) |
 | `billing.invoice` | operator -> buyer | `subscription_id`, `request_id` (when answering a `renew.request`), `bolt11`, `amount_sat`, `due_at`, `expires_at` |
 | `billing.notice`  | operator -> buyer | `subscription_id`, `state`, `message` (renewal reminder / suspend / terminate) |
 | `billing.refund`  | operator -> buyer | `subscription_id`, `amount_sat`, `status` (sent / failed) |
-| `renew.request`   | buyer -> operator | `id` (unique request id), `subscription_id` (request a renewal invoice on demand) |
+| `renew.request`   | buyer -> operator | `id` (unique request id), `subscription_id` (request a renewal invoice on demand). Answered by `billing.invoice`, by a request-correlated `billing.notice` while the subscription is transiently RESUMING, or — when the subscription's `recipe_id` names a recipe this daemon does not serve, so it cannot honestly quote a price for it — by `order.error { code: "unavailable" }`. An unknown or non-owned subscription — and a non-renewable one this daemon DOES serve — is dropped with no reply at all (an outsider must not learn a subscription id exists). The recipe check runs before the state check, so an owner asking to renew a subscription this daemon does not serve gets the `unavailable` refusal whatever state that subscription is in |
 | `sub.cancel`      | buyer -> operator | `subscription_id` |
 | `op.request`      | buyer -> operator | `id` (unique request id), `subscription_id`, `op` (operation name), `params` (object) — invoke a recipe-declared management operation (§7.4) |
 | `op.result`       | operator -> buyer | `request_id` (= the `op.request` `id`), `subscription_id`, `op`, `status` (ok / error), `data` (object: config / `url` / status fields) on ok, or `error` `{ code, message, retryable }` |
@@ -405,7 +405,14 @@ row is written in the **same store transaction** as the order's PENDING-sub + OP
 the renewal invoice), so there is **no in-flight gap**: either the response is durably cached
 (a retry resends it) or the order was never created (a retry redoes it cleanly). A reservation
 taken before that commit but orphaned by a crash is released on its TTL (§9.3), so a clean
-retry never leaks capacity. `sub.cancel` and
+retry never leaks capacity. One reply is deliberately NOT cached: the `order.error` refusing a
+`renew.request` for a subscription this daemon does not serve. It creates no reservation, order
+or invoice, so there is nothing for the cache to make idempotent, and leaving the
+`(sender_pubkey, request_id)` key unclaimed means the daemon never owes a now-stale refusal to a
+later request reusing that `id`: once it is pointed at the recipe that owns the row, a re-send of
+that same `id` renews normally. (A relay redelivery of the *identical* gift wrap is short-circuited
+earlier, by the durable seen-message dedupe, so the beneficiary is specifically a buyer re-sending
+their idempotency key.) `sub.cancel` and
 `delivery.resend.request` are naturally idempotent (they act on existing subscription state),
 so they need no request id.
 
