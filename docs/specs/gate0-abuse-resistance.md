@@ -112,7 +112,10 @@ Split `claim()`'s insert-then-classify into validate-id → lookup → auth → 
    sub id; PR-2's bucket bounds the reply amplification.) **Op-resolution (`unknown_op`) and param
    validation (`invalid_params`) are NOT part of this row-free gate** — they run only AFTER the
    claim, on the authorized path (step 3 / step 4), and DO commit a terminal ERROR row for
-   cached-resend idempotency, exactly as today. Only the three auth rejects are row-free.
+   cached-resend idempotency, exactly as today. Only the auth rejects are row-free — three when this
+   was written, four since lnrent-ml2 added the foreign-recipe refusal (`unavailable`), which is
+   an auth reject in every respect that matters here: deterministic on re-delivery, needing no
+   cache, and reached before any hook resolution.
 3. **Authorized** → insert the RUNNING claim. **The auth read and the claim must be one serialized
    store transaction (or the ACTIVE check must be re-run INSIDE the claim txn)** — otherwise a sub
    can pass the ACTIVE read at step 2 and be suspended/terminated before the claim inserts, letting
@@ -129,7 +132,8 @@ Split `claim()`'s insert-then-classify into validate-id → lookup → auth → 
    today (step 4) — they are past auth, deterministic, and need the cached-resend so a retry gets
    the same error without re-evaluating. Do not make those row-free.
 4. `unknown_op` / `invalid_params` for an AUTHORIZED sender still commit a terminal ERROR row as
-   today (cached, idempotent). Only the *auth* rejects (unauthorized, not_active, unknown sub)
+   today (cached, idempotent). Only the *auth* rejects (unauthorized, not_active, unknown sub,
+   and `unavailable` for a sub owned by another recipe — lnrent-ml2)
    become row-free: they are deterministic on re-delivery and need no cache. Document that a buyer
    whose sub goes ACTIVE between retries will then get a fresh claim — correct behavior.
 

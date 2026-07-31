@@ -388,11 +388,21 @@ to a terminal `error { code: "interrupted", retryable: false }` (the hook's effe
 unknown, so it is neither re-run nor reported as success); a later duplicate then resends
 that cached `interrupted` error, and the buyer decides whether to reissue under a **new**
 `id`. `op.result.request_id` lets the buyer correlate the reply to its request. On `error`,
-no `data` is returned; `code` distinguishes `unauthorized` / `unknown_op` / `invalid_params`
-/ `not_active` / `timeout` / `hook_failed`, `retryable` tells the client whether to retry,
-and the operator does not reveal whether an unknown `subscription_id` exists to a non-buyer
-sender (an `unauthorized` op on someone else's sub is indistinguishable from one on a
-nonexistent sub).
+no `data` is returned; `code` distinguishes `unauthorized` / `invalid_request_id` / `unknown_op`
+/ `invalid_params` / `not_active` / `unavailable` / `timeout` / `hook_failed` / `interrupted`,
+`retryable` tells the client whether to retry, and the operator does not reveal whether an
+unknown `subscription_id` exists to a non-buyer sender (an `unauthorized` op on someone else's
+sub is indistinguishable from one on a nonexistent sub). `unavailable` is the OWNER-only refusal
+of an op on a subscription whose `recipe_id` names a recipe this daemon does not serve — it would
+otherwise run its own recipe's hook, with its own `provisioning.env`, against that
+subscription's instance. It carries the same code and message as the `renew.request` refusal,
+names no recipe, and does not call the subscription invalid. The recipe check runs after the
+owner check (a non-owner still gets the indistinguishable `unauthorized`) and before the ACTIVE
+check, so the refusal's code and message are the same whatever state that subscription is in;
+only `retryable` reads that state, and it is true just for the states that can still reach
+`ACTIVE` (`PENDING` / `PROVISIONING` / `ACTIVE` / `RESUMING` / `SUSPENDED`), since no repoint
+revives a dead row. It persists nothing: no `op_invocation` row is claimed, so a re-send of that
+same `id` still runs its op once the operator repoints the daemon at the owning recipe.
 
 **Order/renew idempotency.** `order.request` and `renew.request` likewise carry a
 client-chosen unique `id`. NIP-17 has no delivery guarantee, so the operator persists every
@@ -924,8 +934,10 @@ recipe — not the client — declares what can be managed (ADR-0013).
   the subscription's `buyer_pubkey`; an `interactive` op is authorized by the Native-connect
   ticket delivered for that subscription. Operations are refused unless the subscription is
   **ACTIVE** (M1a); a future per-op `allowed_states` manifest field will permit specific ops
-  (e.g. `get-credentials`) while a subscription is suspended. A request that fails
-  authorization returns an `unauthorized` `op.result` without revealing whether the
+  (e.g. `get-credentials`) while a subscription is suspended. They are also refused — with
+  `unavailable`, before the hook is resolved or run — when the subscription's `recipe_id` names
+  a recipe this daemon does not serve, since the ops it can run are its own recipe's. A request
+  that fails authorization returns an `unauthorized` `op.result` without revealing whether the
   subscription exists (§5.1).
 - **Security (narrow surface; AI-free by recipe discipline).** An operation is the recipe's
   *declared* surface, not arbitrary host access: Hermes `exec` is a scoped operation that

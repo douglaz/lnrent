@@ -48,8 +48,30 @@ const RESUMING_RETRY_NOTICE: &str = "a renewal is being applied — please retry
 /// The `unavailable` message a `renew.request` gets when the subscription belongs to a recipe this
 /// daemon does not serve (lnrent-dvb). Deliberately says only that service for this subscription is
 /// not offered HERE: it does not name — or hint at the existence of — whatever else the operator
-/// runs, and it does not call the subscription invalid, because it is not.
-const FOREIGN_RECIPE_REFUSAL: &str = "this subscription is not currently served here";
+/// runs, and it does not call the subscription invalid, because it is not. Shared with the
+/// `op.request` refusal (lnrent-ml2, `op_dispatch`): same buyer, same daemon, same reason, so one
+/// wording rather than two that can drift.
+pub(crate) const FOREIGN_RECIPE_REFUSAL: &str = "this subscription is not currently served here";
+
+/// `retryable` for that refusal, on both doors: can this row still reach `ACTIVE`, i.e. could
+/// repointing the daemon at the owning recipe EVER let the request through? PENDING/PROVISIONING get
+/// there on payment+provision, RESUMING resolves into it, SUSPENDED returns via RESUMING, ACTIVE is
+/// already there. The five omitted are dead ends — TERMINATED/EXPIRED/CANCELLED/REFUNDED terminally,
+/// REFUND_DUE because its only exit is REFUNDED — and telling their owner to retry is the
+/// over-promise lnrent-dvb fixed. An ALLOWLIST, not a denylist, so a state added later promises
+/// nothing until someone classifies it.
+///
+/// ONE definition for both refusals (lnrent-ml2), like the message above: the renewal gate accepts
+/// ACTIVE|SUSPENDED and the op gate ACTIVE, but nothing reaches SUSPENDED except through ACTIVE, so
+/// the two doors ask the same question and must not answer it differently. The op-dispatch and
+/// order-intake tests each pin the state matrix with their OWN literal list — deliberately, since an
+/// assertion routed through this function would prove nothing.
+pub(crate) fn can_still_reach_active(state: &str) -> bool {
+    matches!(
+        state,
+        "PENDING" | "PROVISIONING" | "ACTIVE" | "RESUMING" | "SUSPENDED"
+    )
+}
 
 /// The order-intake integrator: implements [`OrderHandler`] over the injected store, payment
 /// backend, clock, recipe, and host budget. Cheap to share behind an `Arc` (the engine holds it
@@ -467,15 +489,11 @@ impl OrderIntake {
             // `retryable` answers "could this EVER succeed", not "would it succeed now": repointing
             // this daemon at the owning recipe only helps if the row can still reach a state the
             // renewal gate below accepts, so a row that cannot has an agent retrying a dead
-            // subscription until it gives up. Set from an ALLOWLIST of the states that can still get
-            // there (§6.3): PENDING/PROVISIONING become ACTIVE on payment+provision, RESUMING resolves
-            // into ACTIVE, and ACTIVE/SUSPENDED are already accepted. The five omitted are dead ends —
-            // TERMINATED/EXPIRED/CANCELLED/REFUNDED terminally, and REFUND_DUE because its only exit
-            // is REFUNDED. Positive rather than a denylist so a state added later defaults to "makes
-            // no promise": over-promising is the failure being fixed here, and this mirrors the
-            // ACTIVE/SUSPENDED allowlist the state gate below already uses. Only the flag varies —
-            // code and message stay uniform, because the REASON is identical in every state and a
-            // per-state refusal would narrate the row's state back to the sender.
+            // subscription until it gives up. `can_still_reach_active` is that allowlist (§6.3), and
+            // it is shared with the `op.request` refusal so the two doors cannot answer the same
+            // question differently. Only the flag varies — code and message stay uniform, because the
+            // REASON is identical in every state and a per-state refusal would narrate the row's
+            // state back to the sender.
             //
             // STATE only, deliberately not the resumable boundary B the gate below also enforces.
             // Being past B looks terminal, but a repoint IS a daemon restart, and
@@ -487,10 +505,7 @@ impl OrderIntake {
             // `retryable: false` here would tell a buyer to abandon a rental the credit is designed
             // to give back — the costlier of the two errors, since state is durable but B is not.
             let mut error = unavailable(FOREIGN_RECIPE_REFUSAL);
-            error.retryable = matches!(
-                sub.state.as_str(),
-                "PENDING" | "PROVISIONING" | "ACTIVE" | "RESUMING" | "SUSPENDED"
-            );
+            error.retryable = can_still_reach_active(&sub.state);
             let response = Msg::OrderError(OrderError {
                 request_id: req.id.clone(),
                 order_id: None,
@@ -2861,10 +2876,11 @@ mod tests {
     }
 
     // lnrent-dvb + the lnrent-yjl regression guard, pinned explicitly: `recipe_id = NULL` is OWNED
-    // (`Recipe::owns_row`), so a legacy row — which is every row a single-recipe M1a operator may
-    // hold — still renews on request, at the served price. Gating NULL as foreign would refuse those
-    // buyers their own renewals: the sub would run out its paid period and lapse with the buyer
-    // unable to pay for it, which is exactly the regression yjl shipped and PR #63 reverted.
+    // (`Recipe::owns_row`), so a legacy row — one from OUTSIDE the order path, which has stamped
+    // `recipe_id` on every subscription it creates since its first commit — still renews on request,
+    // at the served price. Gating NULL as foreign would refuse those buyers their own renewals: the
+    // sub would run out its paid period and lapse with the buyer unable to pay for it, which is
+    // exactly the regression yjl shipped and PR #63 reverted.
     #[tokio::test]
     async fn renew_request_still_renews_for_a_legacy_subscription_with_no_recipe_id() {
         let store = mem_store();

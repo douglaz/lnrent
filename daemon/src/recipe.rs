@@ -192,17 +192,15 @@ impl Recipe {
     /// `provision.rs` / `resume.rs` — deliberately use the STRICTER `Some(id) == ours` rule inline
     /// instead; do not "unify" them onto this one, the divergence is the point.
     ///
-    /// Lives here, on the recipe itself, so the money callers that share this rule
-    /// (`reconcile::Reconciler::owns_recipe` and the buyer `renew.request` gate in `order_intake`)
-    /// cannot drift apart silently.
+    /// Lives here, on the recipe itself, so the callers that share this rule cannot drift apart
+    /// silently: `reconcile::Reconciler::owns_recipe`, the buyer `renew.request` gate in
+    /// `order_intake`, and the `op.request` claim txn in `op_dispatch` — the one that runs recipe
+    /// CODE, so its gate must precede hook resolution (lnrent-ml2).
     ///
     /// NOT a complete map of the callers that skip this check — several buyer verbs never read
     /// `recipe_id` at all (`sub.cancel` and `delivery.resend.request` among them), and they are
-    /// tolerable only because they act purely on the ROW's own columns and run no recipe code.
-    /// `op_dispatch` is the one that is not: it authorizes an `op.request` on owner + ACTIVE alone
-    /// and then runs THIS recipe's hook, with THIS recipe's `provisioning.env`, against a foreign
-    /// row's instance (lnrent-ml2). Pre-existing and out of scope for the beads above; do not read
-    /// either list as exhaustive.
+    /// tolerable only because they act purely on the ROW's own columns and run no recipe code. Do
+    /// not read either list as exhaustive.
     pub fn owns_row(&self, row_recipe: Option<&str>) -> bool {
         !matches!(row_recipe, Some(id) if id != self.service.id)
     }

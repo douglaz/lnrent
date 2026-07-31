@@ -1054,8 +1054,8 @@ impl Reconciler {
         // for foreign SUSPENDED/CANCELLED rows) — an operator-facing signal belongs to the CLASS, and
         // is lnrent-xr7. The BUYER-initiated `renew.request` door is the sibling of this one and is
         // closed by lnrent-dvb, sharing this rule via `Recipe::owns_row`; it answers rather than
-        // defers, because a buyer asked. A THIRD door — `op.request`, which runs THIS recipe's hook
-        // against a foreign row — is still open and is lnrent-ml2.
+        // defers, because a buyer asked. So does the THIRD door, `op.request` — which ran THIS
+        // recipe's hook against a foreign row — closed by lnrent-ml2 on the same shared rule.
         if !self.owns_recipe(row_recipe) {
             tracing::warn!(
                 sub = %sub_id,
