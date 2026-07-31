@@ -9,10 +9,11 @@
 //!   the `RUNNING` claim is taken BEFORE the hook and the terminal `DONE`/`ERROR` is committed
 //!   AFTER it, both outside the (async) hook, so a duplicate resends the cached `op.result` and
 //!   NEVER re-runs the hook;
-//! - authorization against the `subscription` row (owner + `ACTIVE`), folded into the claim txn and
-//!   run BEFORE the durable insert so the three auth rejects persist no row (gdu.3); op resolution via
-//!   [`Recipe::operation`] (the load-time [`Recipe::validate`] already enforces hook-name safety /
-//!   `ops/`-containment — not re-checked here), and op-param validation;
+//! - authorization against the `subscription` row (owner + THIS daemon's recipe + `ACTIVE`), folded
+//!   into the claim txn and run BEFORE the durable insert so the four auth rejects persist no row
+//!   (gdu.3, lnrent-ml2); op resolution via [`Recipe::operation`] (the load-time
+//!   [`Recipe::validate`] already enforces hook-name safety / `ops/`-containment — not re-checked
+//!   here), and op-param validation;
 //! - the hook itself via [`runner::run_hook`].
 //!
 //! A concurrent duplicate of an op that is STILL RUNNING in THIS process ATTACHES to the in-flight
@@ -53,12 +54,17 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 256;
 const HOOK_FAILED_MESSAGE: &str = "operation hook failed";
 
 /// The op-dispatch integrator: implements [`OpHandler`] over the injected store, clock, and recipe.
-/// Cheap to share behind an `Arc` (the engine holds it as `Arc<dyn OpHandler>`). M1a serves ONE
-/// operator recipe, so `recipe` IS the subscription's recipe — there is no per-sub recipe lookup.
+/// Cheap to share behind an `Arc` (the engine holds it as `Arc<dyn OpHandler>`). `recipe` is the ONE
+/// recipe this daemon serves, and its hooks are the only code it runs; a subscription row may name a
+/// DIFFERENT one, so [`Self::claim`] reads `subscription.recipe_id` and refuses rather than running
+/// our hook against someone else's instance (lnrent-ml2).
 pub struct OpDispatch {
     store: Store,
     clock: Arc<dyn Clock>,
-    recipe: Recipe,
+    /// `Arc` so the `'static` store closure in `claim` gets a pointer bump rather than a deep copy
+    /// of both `Vec`s, every `String` and the `PathBuf` on EVERY `op.request` — including cached
+    /// resends and pre-auth rejects, which never reach the ownership check at all.
+    recipe: Arc<Recipe>,
     /// lnrent-c95 in-flight registry (see [`InflightRegistry`]). `Default`-initialized so it stays
     /// OUT of the public `new`/supervisor wiring — a single shared `OpDispatch` whose `handle` is
     /// called concurrently is all this needs.
@@ -93,6 +99,11 @@ enum Claim {
     /// Auth reject (no row existed): unknown sub OR not the owner. Reply `unauthorized`, persist
     /// NOTHING — an unauthenticated stranger leaves no durable artifact (gdu.3).
     Unauthorized,
+    /// Auth reject (no row existed): the OWNER's sub belongs to a recipe this daemon does not serve,
+    /// so our hook must not run against it (lnrent-ml2). Reply `unavailable`, persist NOTHING.
+    /// Carries the row's recipe id for the operator LOG only — never for the buyer-facing reply —
+    /// and its state for the reply's `retryable` flag ALONE (see [`unavailable`]).
+    ForeignRecipe { row_recipe: String, state: String },
     /// Auth reject (no row existed): the owner's sub is not `ACTIVE`. Reply `not_active`, persist
     /// NOTHING (gdu.3).
     NotActive,
@@ -226,6 +237,7 @@ fn remove_inflight(registry: &InflightRegistry, key: &(String, String)) {
 
 impl OpDispatch {
     pub fn new(store: Store, clock: Arc<dyn Clock>, recipe: Recipe) -> Self {
+        let recipe = Arc::new(recipe);
         Self {
             store,
             clock,
@@ -237,8 +249,9 @@ impl OpDispatch {
     /// The `op.request` flow (SPEC.md §5.1/§7.4, ADR-0013, gdu.3): lookup → authorize → durable
     /// claim (one txn) → resolve → validate → run the hook outside any txn → commit terminal state →
     /// reply. Every AUTHORIZED business outcome (unknown/invalid/hook failure) is a committed, cached
-    /// `op.result` — never a handler `Err`, which would re-run the hook on transport retry. The three
-    /// AUTH rejects (unknown sub / not-owner / not-ACTIVE) reply the same error but persist NOTHING.
+    /// `op.result` — never a handler `Err`, which would re-run the hook on transport retry. The four
+    /// AUTH rejects (unknown sub / not-owner / foreign-recipe / not-ACTIVE) reply an error but
+    /// persist NOTHING.
     async fn dispatch(&self, sender: PublicKey, req: OpRequest, out: &dyn Outbound) -> Result<()> {
         let now = self.clock.now();
         let sender_hex = sender.to_hex();
@@ -255,7 +268,7 @@ impl OpDispatch {
 
         // 1. LOOKUP → AUTHORIZE → CLAIM in ONE serialized txn (see `claim`). A cached
         //    terminal/in-flight state wins BEFORE auth (cached-resend must survive a later sub state
-        //    change); the three auth rejects persist NOTHING; only an authorized request inserts the
+        //    change); the four auth rejects persist NOTHING; only an authorized request inserts the
         //    RUNNING claim, atomically with the ACTIVE read (TOCTOU-safe). Claim carries the
         //    authorized sub's state for the hook input.
         let subscription_state = match self.claim(&sender_hex, &req, now).await? {
@@ -296,6 +309,21 @@ impl OpDispatch {
             }
             Claim::NotActive => {
                 return self.reply_error(&sender, &req, not_active(), out).await;
+            }
+            // lnrent-ml2. Only the row's OWNER can reach this (see `claim`), so the log is safe to
+            // name both recipes: it is the operator's only signal that they have repointed this
+            // daemon away from a subscription its buyer is still managing.
+            Claim::ForeignRecipe { row_recipe, state } => {
+                tracing::warn!(
+                    sub = %req.subscription_id,
+                    op = %req.op,
+                    row_recipe = %row_recipe,
+                    serving_recipe = %self.recipe.service.id,
+                    "op.request for a different recipe — refused before the hook resolved"
+                );
+                return self
+                    .reply_error(&sender, &req, unavailable(&state), out)
+                    .await;
             }
         };
 
@@ -645,8 +673,8 @@ impl OpDispatch {
     /// - A pre-existing row wins BEFORE auth: cached-resend must survive a later sub state change, so
     ///   a previously-authorized op whose sub since left ACTIVE still resends its cached DONE/ERROR
     ///   rather than a fresh reject.
-    /// - With no row, the three auth rejects (unknown sub / not-owner / not-ACTIVE) return WITHOUT
-    ///   inserting — an unauthenticated stranger persists nothing.
+    /// - With no row, the four auth rejects (unknown sub / not-owner / foreign-recipe / not-ACTIVE)
+    ///   return WITHOUT inserting — an unauthenticated stranger persists nothing.
     /// - Only an authorized request inserts the claim, atomically with the ACTIVE read. This is the
     ///   TOCTOU guard: a sub cannot pass the ACTIVE check and then be suspended before the insert.
     ///   The concurrent-duplicate race (two fresh authorized requests) is caught by the top lookup —
@@ -658,32 +686,71 @@ impl OpDispatch {
             req.subscription_id.clone(),
             req.op.clone(),
         );
+        // The store closure must be `'static`, and the ownership rule has to run INSIDE the txn (the
+        // gdu.3 atomicity below), so we take the recipe WITH us rather than re-deriving its
+        // predicate here — `Recipe::owns_row` stays the single definition of what "ours" means.
+        // `Arc`, so carrying it costs a refcount bump and not a deep copy of the whole recipe on
+        // every request (the field's doc says why).
+        let recipe = Arc::clone(&self.recipe);
         self.store
             .transaction(move |tx| {
                 // 1. LOOKUP existing — a cached terminal/in-flight state wins before auth.
                 if let Some(claim) = lookup_existing(tx, &s, &r)? {
                     return Ok(claim);
                 }
-                // 2. AUTHORIZE against the subscription row WITHOUT inserting — the three auth
+                // 2. AUTHORIZE against the subscription row WITHOUT inserting — the four auth
                 //    rejects are row-free. The reply is IDENTICAL for a nonexistent sub and someone
                 //    else's sub (both `Unauthorized`) — no existence leak.
-                let sub_row: Option<(String, String)> = tx
+                let sub_row: Option<(String, String, Option<String>)> = tx
                     .query_row(
-                        "SELECT buyer_pubkey, state FROM subscription WHERE id=?1",
+                        "SELECT buyer_pubkey, state, recipe_id FROM subscription WHERE id=?1",
                         params![sub],
                         |row| {
                             Ok((
                                 row.get::<_, Option<String>>(0)?.unwrap_or_default(),
                                 row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                                row.get::<_, Option<String>>(2)?,
                             ))
                         },
                     )
                     .optional()?;
-                let Some((buyer, state)) = sub_row else {
+                let Some((buyer, state, row_recipe)) = sub_row else {
                     return Ok(Claim::Unauthorized);
                 };
                 if buyer != s {
                     return Ok(Claim::Unauthorized);
+                }
+                // lnrent-ml2 — the door that EXECUTES CODE, the last of the class yjl/6id/dvb closed
+                // for the money paths. Resolution and `run_hook` below use THIS daemon's recipe
+                // unconditionally, so an op on a row ordered under another recipe would run OUR hook,
+                // with OUR `provisioning.env`, against THEIR instance. Refuse here, in the SAME txn
+                // as the auth reads (gdu.3), and therefore before the op name is resolved, before
+                // `provisioning.env` is assembled, and before any process is spawned.
+                //
+                // The rule is `Recipe::owns_row` (NULL/absent owner is OWNED), NOT the stricter
+                // `Some(id) == ours` that `provision.rs` / `resume.rs` use: their skip DEFERS, so an
+                // unproven owner costs only a wait, while this arm REFUSES a live requester. NULL is
+                // the LEGACY row — the order path has stamped `recipe_id` since its first commit
+                // (`order_intake.rs`, the subscription INSERT), so a NULL owner means a row from
+                // OUTSIDE that path, not one a single-recipe operator keeps making — and refusing it
+                // would make their buyers' `status`/`restart` permanently unusable, the yjl
+                // regression, in the one place where the buyer is told "no" to their face.
+                //
+                // ORDER: after the owner check, before the ACTIVE check. After the owner check
+                // because `recipe_id` is a fact about a row a stranger has no right to learn
+                // anything about — a non-owner still gets the SAME `unauthorized` for this row as
+                // for a nonexistent one (no existence leak). Before the ACTIVE check because "we do
+                // not serve this subscription" is the standing reason and `not_active` is not: the
+                // row reaching ACTIVE would change nothing here, and the refusal's code and message
+                // are the same whatever state the row is in, so it never narrates that state back
+                // (only `retryable` reads it, for the OWNER alone — see `unavailable`). The same
+                // ordering dvb chose for `renew.request` (SPEC §5.1).
+                if !recipe.owns_row(row_recipe.as_deref()) {
+                    // `owns_row` is false ONLY for `Some(id) != ours`, so the row does name a recipe.
+                    return Ok(Claim::ForeignRecipe {
+                        row_recipe: row_recipe.unwrap_or_default(),
+                        state,
+                    });
                 }
                 if state != "ACTIVE" {
                     return Ok(Claim::NotActive);
@@ -1012,12 +1079,45 @@ fn cap_message(message: String) -> String {
 }
 
 // The `op.result` error codes this handler emits (SPEC.md §5.1, ADR-0014). `retryable` follows the
-// nature of the failure: a client/auth/shape error is permanent; only a hook timeout is transient.
+// nature of the failure: a client/auth/shape error is permanent; a hook timeout is transient, and so
+// is the foreign-recipe refusal — but only for a row a repoint could still serve (see below).
 fn unauthorized() -> WireError {
     WireError {
         code: "unauthorized".into(),
         message: "not authorized for this subscription".into(),
         retryable: false,
+    }
+}
+/// The lnrent-ml2 refusal: the OWNER asked for an op on a subscription this daemon does not serve.
+///
+/// A NEW code, not `unauthorized`. The codes are plain strings, not a closed wire enum, so adding
+/// one is a SPEC vocabulary change (§5.1) rather than a wire type change. `unauthorized` is
+/// deliberately the no-existence-leak answer — identical for a stranger's probe and a nonexistent
+/// sub — so reusing it here would tell the row's rightful owner they are not authorized for their
+/// own subscription, and `retryable: false` would have them abandon a rental the operator can
+/// restore by repointing this daemon. `unavailable` is the code — and the message — lnrent-dvb
+/// answers the sibling `renew.request` with: the buyer did nothing wrong, their subscription is
+/// real, and the message names no recipe, so it leaks nothing about what else the operator runs.
+///
+/// `retryable` answers "could this EVER succeed", not "would it succeed now" — the same reading dvb
+/// gave the sibling refusal. Repointing this daemon at the owning recipe only helps if the row can
+/// still reach the `ACTIVE` the gate above requires, so the flag comes from
+/// [`can_still_reach_active`], the allowlist (§6.3) SHARED with that sibling: one definition, since
+/// answering the same question differently on the two doors is the drift the shared message already
+/// rules out. A flat `true` would have an agent polling a dead row retry a request no repoint can
+/// satisfy, and the authoritative `not_active` only arrives AFTER that repoint — the same
+/// over-promise dvb fixed. Only the FLAG varies: the code and message stay uniform whatever the
+/// state, so the refusal itself never narrates the row's state back.
+///
+/// PERSISTS NOTHING, exactly like the auth rejects above (gdu.3): no hook ran and nothing is held,
+/// so there is nothing to make durable — and claiming the `op_invocation` idempotency key would
+/// cache this refusal against `(sender, request_id)` forever, so that id could never run its op even
+/// after the operator repoints this daemon at the owning recipe.
+fn unavailable(state: &str) -> WireError {
+    WireError {
+        code: "unavailable".into(),
+        message: crate::order_intake::FOREIGN_RECIPE_REFUSAL.into(),
+        retryable: crate::order_intake::can_still_reach_active(state),
     }
 }
 fn not_active() -> WireError {
@@ -1415,6 +1515,367 @@ mod tests {
         // gdu.3: the auth rejects are ROW-FREE — neither request persisted an op_invocation row
         // (no hook ran, and nothing terminal was committed). A stranger leaves no durable artifact.
         assert_eq!(count(&store, "SELECT count(*) FROM op_invocation").await, 0);
+    }
+
+    /// A recipe whose `status` hook TOUCHES a marker file — the lnrent-ml2 spy. The dummy recipe's
+    /// hooks leave no trace, and "an error came back" is NOT evidence the hook stayed unrun (a hook
+    /// that ran and then failed also returns an error). `service.id` stays `dummy`; only the hook
+    /// dir changes, so the ROW's `recipe_id` is what the tests vary.
+    fn marker_recipe(label: &str) -> (Recipe, std::path::PathBuf) {
+        let mut recipe = dummy_recipe();
+        let dir = std::env::temp_dir().join(format!("lnrent-ml2-{label}-{}", std::process::id()));
+        // Wipe first: a stale marker from a same-pid earlier run (containers/CI reuse pids) would
+        // make the "hook did not run" assertion fail spuriously — or, worse, hide a real regression.
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("ops")).unwrap();
+        let marker = dir.join("hook-ran");
+        write_hook(
+            &dir,
+            "status",
+            &format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\ncat >/dev/null\ntouch '{}'\necho '{{\"state\":\"running\"}}'\n",
+                marker.display()
+            ),
+        );
+        recipe.dir = dir;
+        (recipe, marker)
+    }
+
+    async fn set_sub_recipe_id(store: &Store, id: &str, recipe_id: Option<&str>) {
+        let (id, recipe_id) = (id.to_string(), recipe_id.map(str::to_string));
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "UPDATE subscription SET recipe_id=?2 WHERE id=?1",
+                    params![id, recipe_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    // lnrent-ml2, the assertion that matters: the RIGHTFUL OWNER's op on an ACTIVE sub whose
+    // `recipe_id` is a DIFFERENT recipe does NOT run our hook. The marker proves it — an error reply
+    // alone would not, since a hook that ran and failed also returns one.
+    #[tokio::test]
+    async fn op_on_a_foreign_recipe_subscription_refuses_and_never_runs_the_hook() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        seed_sub(&store, "sub-1", &buyer.public_key().to_hex(), "ACTIVE").await;
+        set_sub_recipe_id(&store, "sub-1", Some("other-recipe")).await;
+        let (recipe, marker) = marker_recipe("foreign");
+        let handler = dispatcher(store.clone(), TestClock::new(1000), recipe);
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                op_req("op-1", "sub-1", "status", json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !marker.exists(),
+            "the hook must not run against another recipe's subscription"
+        );
+        let res = expect_op_result(&out);
+        assert_eq!(res.status, OpStatus::Error);
+        assert_eq!(res.request_id, "op-1");
+        assert_eq!(res.subscription_id, "sub-1");
+        assert_eq!(res.op, "status");
+        let err = res.error.as_ref().unwrap();
+        // A new code, NOT `unauthorized` (which would lie to the row's owner) and NOT `not_active`
+        // (the state is not what blocks this) — the same code and message dvb answers
+        // `renew.request` with, so a buyer agent branches identically on both. Retryable because a
+        // repoint could still serve this ACTIVE row; the full state matrix is pinned further down.
+        assert_eq!(err.code, "unavailable");
+        assert_eq!(err.message, crate::order_intake::FOREIGN_RECIPE_REFUSAL);
+        assert!(err.retryable);
+        // The persistence choice, pinned: row-free like the other auth rejects (gdu.3).
+        assert_eq!(count(&store, "SELECT count(*) FROM op_invocation").await, 0);
+    }
+
+    // The reason the refusal persists NOTHING: leaving the `(sender, request_id)` key unclaimed
+    // means a RE-SEND of that same id still runs its op once the operator repoints this daemon at
+    // the owning recipe. Caching the refusal would poison that id forever.
+    #[tokio::test]
+    async fn foreign_recipe_refusal_leaves_the_request_id_usable_after_a_repoint() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        seed_sub(&store, "sub-1", &buyer.public_key().to_hex(), "ACTIVE").await;
+        set_sub_recipe_id(&store, "sub-1", Some("other-recipe")).await;
+        let (recipe, marker) = marker_recipe("repoint");
+        let refused = dispatcher(store.clone(), TestClock::new(1000), recipe.clone());
+
+        let out = RecordingOutbound::default();
+        refused
+            .handle(
+                buyer.public_key(),
+                op_req("op-same-id", "sub-1", "status", json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            expect_op_result(&out).error.as_ref().unwrap().code,
+            "unavailable"
+        );
+        assert!(!marker.exists());
+
+        // Repoint: the same daemon, same data dir, now serving the recipe that owns the row.
+        let mut repointed = recipe;
+        repointed.service.id = "other-recipe".into();
+        let handler = dispatcher(store.clone(), TestClock::new(2000), repointed);
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                op_req("op-same-id", "sub-1", "status", json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(expect_op_result(&out).status, OpStatus::Ok);
+        assert!(marker.exists(), "the repointed daemon runs the op normally");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM op_invocation WHERE state='DONE'"
+            )
+            .await,
+            1,
+            "the earlier refusal never claimed this id"
+        );
+    }
+
+    // A MATCHING `recipe_id` still dispatches — the gate refuses foreign rows, not every row.
+    #[tokio::test]
+    async fn op_on_a_matching_recipe_subscription_still_runs_the_hook() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        seed_sub(&store, "sub-1", &buyer.public_key().to_hex(), "ACTIVE").await; // recipe_id='dummy'
+        let (recipe, marker) = marker_recipe("matching");
+        let handler = dispatcher(store.clone(), TestClock::new(1000), recipe);
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                op_req("op-1", "sub-1", "status", json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(expect_op_result(&out).status, OpStatus::Ok);
+        assert!(marker.exists());
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM op_invocation WHERE state='DONE'"
+            )
+            .await,
+            1
+        );
+    }
+
+    // The other ordering the ml2 gate must not disturb: `lookup_existing` still wins BEFORE auth
+    // (§5.1), so a duplicate of an op this daemon ALREADY RAN resends its cached result even after
+    // the row is repointed at a recipe we do not serve. Every other cached-resend test seeds a row
+    // we do serve, so moving the recipe check above the lookup would leave the whole suite green
+    // while a buyer retrying for a completed op's output got `unavailable` instead — the mirror of
+    // the blindness `foreign_recipe_op_is_refused_in_every_state` closes for the ACTIVE check.
+    #[tokio::test]
+    async fn a_cached_result_still_wins_over_the_recipe_gate() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        seed_sub(&store, "sub-1", &buyer.public_key().to_hex(), "ACTIVE").await; // recipe_id='dummy'
+        let (recipe, marker) = marker_recipe("cached-repoint");
+        let handler = dispatcher(store.clone(), TestClock::new(1000), recipe);
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                op_req("op-1", "sub-1", "status", json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+        assert_eq!(expect_op_result(&out).status, OpStatus::Ok);
+        assert!(marker.exists());
+
+        // The op is DONE. Now the row names a recipe this daemon does not serve.
+        std::fs::remove_file(&marker).unwrap();
+        set_sub_recipe_id(&store, "sub-1", Some("other-recipe")).await;
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                op_req("op-1", "sub-1", "status", json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+
+        let res = expect_op_result(&out);
+        assert_eq!(
+            res.status,
+            OpStatus::Ok,
+            "the cached result, not the ml2 refusal"
+        );
+        assert!(res.error.is_none());
+        assert!(!marker.exists(), "and no hook re-run");
+    }
+
+    // The lnrent-yjl regression guard, pinned explicitly: `recipe_id = NULL` is OWNED
+    // (`Recipe::owns_row`), so a legacy row — one from outside the order path, which stamps
+    // `recipe_id` on every row it creates — still runs its ops. Gating NULL as foreign here would
+    // leave those buyers unable to manage services they are paying for.
+    #[tokio::test]
+    async fn op_on_a_legacy_subscription_with_no_recipe_id_still_runs_the_hook() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        seed_sub(&store, "sub-1", &buyer.public_key().to_hex(), "ACTIVE").await;
+        set_sub_recipe_id(&store, "sub-1", None).await;
+        let (recipe, marker) = marker_recipe("legacy-null");
+        let handler = dispatcher(store.clone(), TestClock::new(1000), recipe);
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                op_req("op-1", "sub-1", "status", json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(expect_op_result(&out).status, OpStatus::Ok);
+        assert!(
+            marker.exists(),
+            "a NULL-owner row keeps the pre-yjl behaviour"
+        );
+    }
+
+    // The gdu.3 no-existence-leak property still holds ACROSS the new gate: a stranger learns
+    // nothing about a foreign-recipe sub that they would not learn about a served sub or a
+    // nonexistent one. The recipe check sits AFTER the owner check precisely so it stays
+    // unreachable for a non-owner — otherwise the distinct `unavailable` reply would itself confirm
+    // that the subscription id exists.
+    #[tokio::test]
+    async fn unauthorized_stays_identical_for_a_foreign_recipe_subscription() {
+        let store = mem_store();
+        let owner = Keys::generate();
+        seed_sub(
+            &store,
+            "sub-foreign",
+            &owner.public_key().to_hex(),
+            "ACTIVE",
+        )
+        .await;
+        set_sub_recipe_id(&store, "sub-foreign", Some("other-recipe")).await;
+        seed_sub(&store, "sub-served", &owner.public_key().to_hex(), "ACTIVE").await;
+        let (recipe, marker) = marker_recipe("leak");
+        let handler = dispatcher(store.clone(), TestClock::new(1000), recipe);
+
+        let stranger = Keys::generate();
+        let mut errors = Vec::new();
+        for (id, sub) in [("a", "sub-foreign"), ("b", "sub-served"), ("c", "ghost")] {
+            let out = RecordingOutbound::default();
+            handler
+                .handle(
+                    stranger.public_key(),
+                    op_req(id, sub, "status", json!({})),
+                    &out,
+                )
+                .await
+                .unwrap();
+            let res = expect_op_result(&out);
+            assert_eq!(res.status, OpStatus::Error);
+            errors.push(res.error);
+        }
+        assert_eq!(errors[0].as_ref().unwrap().code, "unauthorized");
+        assert_eq!(
+            errors[0], errors[1],
+            "a foreign-recipe sub must answer a stranger exactly as a served one does"
+        );
+        assert_eq!(
+            errors[1], errors[2],
+            "…and exactly as a nonexistent one does"
+        );
+        assert!(!marker.exists());
+        assert_eq!(count(&store, "SELECT count(*) FROM op_invocation").await, 0);
+    }
+
+    // The ORDERING the other ml2 tests cannot reach: every one of them seeds ACTIVE, so moving the
+    // recipe check BELOW the ACTIVE check would keep them all green while silently changing the
+    // answer for a foreign non-ACTIVE row from `unavailable` to `not_active`. EVERY §6.3 state, not
+    // a sample — a state added later must be classified here — and the same loop pins the only
+    // thing the refusal reads off that state, its `retryable` flag.
+    #[tokio::test]
+    async fn foreign_recipe_op_is_refused_in_every_state() {
+        for state in [
+            "PENDING",
+            "PROVISIONING",
+            "ACTIVE",
+            "RESUMING",
+            "SUSPENDED",
+            "TERMINATED",
+            "EXPIRED",
+            "CANCELLED",
+            "REFUND_DUE",
+            "REFUNDED",
+        ] {
+            let store = mem_store();
+            let buyer = Keys::generate();
+            seed_sub(&store, "sub-1", &buyer.public_key().to_hex(), state).await;
+            set_sub_recipe_id(&store, "sub-1", Some("other-recipe")).await;
+            let (recipe, marker) = marker_recipe("every-state");
+            let handler = dispatcher(store.clone(), TestClock::new(1000), recipe);
+
+            let out = RecordingOutbound::default();
+            handler
+                .handle(
+                    buyer.public_key(),
+                    op_req("op-state", "sub-1", "status", json!({})),
+                    &out,
+                )
+                .await
+                .unwrap();
+
+            let res = expect_op_result(&out);
+            assert_eq!(res.status, OpStatus::Error, "state {state}");
+            let err = res.error.as_ref().unwrap();
+            assert_eq!(err.code, "unavailable", "state {state}");
+            assert_eq!(
+                err.message,
+                crate::order_intake::FOREIGN_RECIPE_REFUSAL,
+                "state {state}"
+            );
+            // Whether a repoint could EVER make this op succeed — not whether it would succeed now.
+            // True for the rows that can still reach the ACTIVE the op gate requires; false for the
+            // dead ends, REFUND_DUE included, since its only exit is REFUNDED.
+            assert_eq!(
+                err.retryable,
+                matches!(
+                    state,
+                    "PENDING" | "PROVISIONING" | "ACTIVE" | "RESUMING" | "SUSPENDED"
+                ),
+                "state {state}"
+            );
+            assert!(!marker.exists(), "state {state}");
+            assert_eq!(
+                count(&store, "SELECT count(*) FROM op_invocation").await,
+                0,
+                "state {state}"
+            );
+        }
     }
 
     // mi9.2/DRIFT-3: a malformed buyer-chosen id is rejected BEFORE the durable claim with the

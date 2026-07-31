@@ -15,8 +15,11 @@ use serde_json::Value;
 /// always `{ code, message, retryable }` — never a top-level `code` — so a buyer agent
 /// branches on errors uniformly regardless of which message carried them. `code` is an open
 /// string: `order.error` uses `capacity_full` / `params_invalid` / `price_changed` /
-/// `unavailable` / `refund_dest_invalid` / `rejected` (reserved; not currently emitted); `op.result` uses `unauthorized` / `unknown_op` /
-/// `invalid_params` / `not_active` / `timeout` / `hook_failed` / `interrupted`.
+/// `unavailable` / `refund_dest_invalid` / `rejected` (reserved; not currently emitted); `op.result` uses `unauthorized` / `invalid_request_id` /
+/// `unknown_op` / `invalid_params` / `not_active` / `unavailable` (this daemon does not serve the
+/// subscription's recipe — lnrent-ml2; its ONLY meaning here, unlike the broader `order.error` code,
+/// and the same message the sibling `renew.request` refusal carries) / `timeout` / `hook_failed` /
+/// `interrupted`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireError {
     pub code: String,
