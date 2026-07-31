@@ -33,11 +33,9 @@ A `sub.cancel` from the subscription's owner MUST:
     state change (the resume driver resolves it to ACTIVE or SUSPENDED; cancel again after).
     UPDATED 2026-07-31: the cancel is now ANSWERED, not silently dropped — lnrent-z4u (closed)
     ships an owner-only stateless `billing.notice`, so the "no-reply-DM UX gap" this doc described
-    is fixed. It is UNCORRELATED and unsolicited: `sub.cancel` carries no request id (`SubCancel`
-    has only `subscription_id`), so the notice sets `request_id: null` and reaches the buyer as an
-    async DM the client does not await. Request-correlation and client-side surfacing (lnrent-zs2)
-    apply to the RENEW path only, which has an `id` to echo. Deliberately still NOT a
-    RESUMING->CANCELLED shortcut: the driver keeps sole CAS ownership.
+    is fixed. The notice is uncorrelated and unsolicited, unlike the renew path's; SPEC.md §6.3 is
+    the contract for both and states the asymmetry. Deliberately still NOT a RESUMING->CANCELLED
+    shortcut.
   - `PENDING`/`PROVISIONING` — OUT OF SCOPE for this cut (see §6): a `PENDING` order expires on its own
     and a `PROVISIONING` sub is mid-hook (racy); drop with a WARN.
 - **CANCEL-3 (terminate at the end of the already-paid window; compute the deadline INSIDE the txn).**

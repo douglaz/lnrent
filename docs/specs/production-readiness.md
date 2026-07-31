@@ -1,13 +1,15 @@
 # Spec: lnrent production-readiness roadmap (M1a → public/mainnet)
 
 **Status:** **DELIVERED and SUPERSEDED as plan-of-record (2026-07-31).** Every gate this
-roadmap cut — GATE-0 (`gdu`), GATE-1 (`urw`), HARDEN (`y4m`), cleanup (`mi9`) — is closed: 35 child
-beads (4 + 10 + 19 + 2), 39 counting the four epics themselves. **Read the gap statements below as of 2026-07-03, not as of today:** the anti-griefing,
+roadmap cut — GATE-0 (`gdu`), GATE-1 (`urw`), HARDEN (`y4m`), cleanup (`mi9`) — is closed. The beads
+are the record; counts are deliberately not restated here. (One trap if you do count: `lnrent-mi9.2`
+is parented to `gdu`, so an id-prefix split is wrong even though the total is right.) **Read the gap statements below as of 2026-07-03, not as of today:** the anti-griefing,
 alert-transport and payout gaps it names are FIXED, and its sequencing section lists blockers that
 are long closed. docs/go-live.md records what actually landed.
 
-The current plan of record is the phased self-dogfood programme (SPEC.md §15): `lnrent-9q9` ->
-`lnrent-vam` -> `lnrent-ja2` -> `lnrent-5y9`, recorded in the beads so it cannot drift.
+The current plan of record is the phased self-dogfood programme — see SPEC.md §15, which names its
+beads and is the single place that sequence is written down. The ordering is enforced by dependency
+edges, not only by prose.
 
 This file stays at this path deliberately. It is the `**Source:**` anchor of every focused gate
 spec, and `daemon/src/alerts.rs` cites its PR-5 §A as the CLOSED set of alertable conditions — a
@@ -21,11 +23,12 @@ a `file:line` anchor.
 
 ## What this spec is (and is not)
 
-This is the **plan of record** for taking lnrent from "M1a single-box self-use, hardened money core"
-to "a platform a real operator can run unattended against mainnet money and expose to the public
-Nostr marketplace." It is a *roadmap*: it groups verified gaps into go-live gates, gives each a
-minimal design sketch, and is the source the follow-on focused specs + beads are cut from. It is
-**not** an instruction to implement now, and it deliberately **cuts** speculative mechanism (see
+This **was the plan of record** (2026-07-03 to 2026-07-31) for taking lnrent from "M1a single-box
+self-use, hardened money core" to "a platform a real operator can run unattended against mainnet
+money and expose to the public Nostr marketplace." Every gate it defines has since landed; the
+current plan of record is the phased self-dogfood programme (SPEC.md §15). It is a *roadmap*: it
+groups verified gaps into go-live gates, gives each a minimal design sketch, and is the source the
+follow-on focused specs + beads were cut from. It deliberately **cut** speculative mechanism (see
 §CUT) — overengineering is the top project risk.
 
 **"A real operator" is meant literally.** The project's goal is an ecosystem of independent

@@ -1,10 +1,8 @@
 # Spec: hook environment hygiene — seed never reaches hooks (PR-12)
 
-> **ARCHIVED — delivered.** Bead lnrent-y4m.7. Its header once read "GATES GO-LIVE", which was
-> true when written and misleading afterwards. The invariant — the operator seed must never
-> reach a hook — is enforced in `daemon/src/runner.rs` (`.env_clear()` + allowlist), validated
-> in `daemon/src/recipe.rs`, tested against a real child process, and restated in SPEC.md
-> §7.2/§13 and docs/go-live.md. This file is the DESIGN RECORD, not the only copy.
+> **ARCHIVED — delivered** (lnrent-y4m.7). See ../README.md. The invariant it protects — the
+> operator seed must never reach a hook — is enforced in code and restated in SPEC.md §7.2/§13
+> and docs/go-live.md; this is the design record, not the only copy.
 
 **Status:** **Implemented** (lnrent-y4m.7). Hooks start from an empty environment
 (`daemon/src/runner.rs` `.env_clear()`), recipe-declared `LNRENT*` forwarding is rejected

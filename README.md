@@ -44,9 +44,8 @@ against real money and expose to the public marketplace** is planned in
 [docs/specs/production-readiness.md](./docs/specs/production-readiness.md) — the DELIVERED go-live
 roadmap, written from a full read-only audit and cut into a dependency-ordered task graph. Its gates
 have all landed; it is kept as the historical record and as the source its focused specs cite.
-**It is no longer the plan of record** — that is the phased self-dogfood programme in SPEC.md §15
-(`lnrent-9q9` -> `lnrent-vam` -> `lnrent-ja2` -> `lnrent-5y9`), recorded in the beads. The gates it
-delivered were:
+**It is no longer the plan of record** — that is the phased self-dogfood programme in SPEC.md §15.
+The gates it delivered were:
 
 - **GATE-0 — abuse resistance** (before scaled public exposure): per-pubkey reservation caps and
   inbound rate-limiting, so an unauthenticated stranger with a free keypair can't strand host

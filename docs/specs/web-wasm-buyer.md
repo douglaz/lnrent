@@ -1,18 +1,16 @@
 # Spec: web (WASM) buyer — browser marketplace access (lnrent-7fp.18)
 
-**Status:** **Mostly implemented — one requirement OUTSTANDING, so this spec stays LIVE.**
+**Status:** **Mostly implemented — TWO requirements OUTSTANDING, so this spec stays LIVE.**
 The SPA ships (`clients/web/`), WebLN is invoked only on an explicit user click (codex P1 fix
-`96cdd9f`), and the headless e2e runs per-push (`clients/web/e2e/run.sh`). **But the restrictive
-Content-Security-Policy this spec requires (see Security, below) is NOT shipped** —
-`clients/web/static/index.html` carries no CSP and `clients/web/README.md` gives operators no
-guidance. Tracked as **lnrent-3ma**. Caught 2026-07-31 by a codex review that refused to accept
-this file's previous "Implemented" header at face value.
+`96cdd9f`), and the headless e2e runs per-push (`clients/web/e2e/run.sh`). Unmet:
 
-This spec is also the ONLY place the web security contract is written down — session-only key
-storage, no raw `localStorage`, credential non-persistence, configured-relay-only egress, the XSS
-constraints, and the CSP requirement. It is deliberately NOT archived with the other delivered
-specs (operator decision, 2026-07-31) until lnrent-3ma closes or those rules are extracted to
-`clients/web/README.md`.
+1. the restrictive Content-Security-Policy required by the Security section below — **lnrent-3ma**;
+2. the Security section's requirement that the e2e ASSERT a request-kind op runs and displays
+   `op.result.data`; the shipped check cannot fail — **lnrent-3zt**.
+
+This spec's Security section is also the ONLY written copy of the web security contract. It is
+deliberately NOT archived with the other delivered specs (operator decision, 2026-07-31) until both
+beads close or those rules move to `clients/web/README.md`.
 
 Two landed amendments to the text below: (1) WebLN is invoked ONLY on an explicit user click,
 never auto-triggered after `create_order`; (2) the e2e's out-of-band settle landed as the

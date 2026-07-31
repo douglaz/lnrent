@@ -361,10 +361,9 @@ grew two variants beyond the three arms sketched in the Supervisor block — `Ba
 (a balance query error is a loud ALARM, never treated as "no balance concept") and `Unpriceable`
 (a liability whose required outlay cannot be priced right now). This section's pseudocode is the
 earlier sketch. **The authoritative taxonomy is the shipped `RefundReadinessWarning` enum in
-daemon/src/supervisor.rs** — five tokens as of 2026-07-31: `FederationDown`, `GatewayUnavailable`,
-`InsufficientBalance`, `Unpriceable`, `ParkedManual`. (`BalanceQueryFailed` was RETIRED with the
-balance read, per gate1-alerting-operability.md §E.) The v1 set in
-docs/specs/archive/operator-money-cli.md is ARCHIVED and superseded — read the enum, not that doc.
+daemon/src/supervisor.rs** — read it, not a copy. (`BalanceQueryFailed` was RETIRED with the balance
+read, per gate1-alerting-operability.md §E.) The v1 set in docs/specs/archive/operator-money-cli.md
+is ARCHIVED and superseded.
 
 ### 3.3 INV-3 — refund provenance
 

@@ -8,6 +8,14 @@ only shows the outcome of — why a design was chosen, what was rejected, and wh
 were at the time. Git history preserves the text either way; keeping them readable at a stable path
 preserves the reasoning.
 
+## References written before the move
+Closed beads, old commit messages and superseded specs cite these files at their ORIGINAL path,
+`docs/specs/<name>.md`. Those references are historical records and are deliberately NOT rewritten —
+the same reason the specs themselves are not edited to match new code. To resolve one, insert
+`archive/`: `docs/specs/cleanup-cuts.md` is now `docs/specs/archive/cleanup-cuts.md`. To find them,
+`grep 'docs/specs/' .beads/issues.jsonl` — deliberately not listed here, since any such roster is
+stale the moment a bead is edited.
+
 ## Read them as of their date, not as of today
 A spec here was accurate when written. Where later work changed the behaviour it describes, the
 current truth is in `SPEC.md`, the code, or `docs/go-live.md` — not here. Do not treat an archived
@@ -18,16 +26,12 @@ record of what was decided then.
 `docs/specs/` holds only standing contracts — specs whose constraints still bind. Most are cited
 from source by name or by numbering; two are kept live for other reasons, noted in the table:
 
-| Spec | Why it is still binding |
-|---|---|
-| `gate0-abuse-resistance.md` | normative constraints cited from `order_intake.rs` / `nostr_engine.rs`; amended 2026-07-31 for lnrent-ml2 |
-| `gate1-alerting-operability.md` | §E/§F are the sanctioned-call-site contract, cited from `ipc.rs` and ADR-0016 |
-| `gate1-operator-sweep.md` | sweep invariants cited from 10 source files |
-| `refund-money-path-hardening.md` | declares itself the money-path contract; INV-1 cited from `backends.rs` |
-| `refund-provisioning-hardening.md` | its F-numbering is a citation namespace — `store.rs` and `SPEC.md` cite "F3/F6" by number |
-| `sub-cancel.md` | a contract, not a plan: defines authorization, non-enumeration and state gates for the cancel path. No `.rs` cites it — it stays live because `SPEC.md` §6.3 cites its path and this branch had to amend it, so it is still maintained text rather than a historical record |
-| `production-readiness.md` | delivered roadmap, but `alerts.rs` cites its PR-5 §A as the CLOSED alertable-condition set |
-| `web-wasm-buyer.md` | **not fully delivered** — the CSP it requires is unshipped (lnrent-3ma), and it holds the only copy of the web security contract |
+`gate0-abuse-resistance.md`, `gate1-alerting-operability.md`, `gate1-operator-sweep.md`,
+`refund-money-path-hardening.md`, `refund-provisioning-hardening.md`, `sub-cancel.md`,
+`production-readiness.md`, `web-wasm-buyer.md`.
+
+Each of those carries its own Status header saying why it is still binding — read it there rather
+than from a table here, which would have to be co-maintained with eight headers.
 
 The rule: a spec leaves this folder's sibling directory when its work is done AND no code depends
 on it by name. If source cites it, it stays live and gets amended instead.

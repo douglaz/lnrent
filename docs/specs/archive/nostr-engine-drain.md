@@ -1,8 +1,6 @@
 # Spec: NostrEngine graceful shutdown drain (lnrent-k82)
 
-> **ARCHIVED — delivered.** Bead lnrent-k82, closed. Shipped in `daemon/src/nostr_engine.rs`
-> (`InboundTaskState`, `drain`) + the supervisor's inbound-special-cased shutdown. Historical
-> delivery plan; the current behaviour is the code and its tests.
+> **ARCHIVED — delivered** (lnrent-k82). See ../README.md; the Status line below is accurate.
 
 **Status:** **Implemented** (master `02917b5`; nostr_engine.rs `InboundTaskState`/`drain`, supervisor.rs inbound-special-cased shutdown). Landed slightly stronger than specified: aux backlog/resubscribe tasks are aborted *and awaited* within the drain deadline, and the timed-out path awaits the aborted accept loop before snapshotting per-wrap handles.
 **Bead:** lnrent-k82 (P2, money-path). Confirmed by reading `daemon/src/supervisor.rs` + `daemon/src/nostr_engine.rs`.

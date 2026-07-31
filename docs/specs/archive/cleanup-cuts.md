@@ -1,8 +1,6 @@
 # Spec: dead-code cuts + comment drift + explicit synchronous (CUT-1..4, DRIFT-2/4, PR-7 residual)
 
-> **ARCHIVED — delivered.** Bead lnrent-mi9.1. CUT-1/2/4 are verified by absence, CUT-3's knob
-> remains inert for `deny_unknown_fields` back-compat, and the PR-7 residual
-> `PRAGMA synchronous=FULL` ships with a test. Pure historical delivery plan.
+> **ARCHIVED — delivered** (lnrent-mi9.1). See ../README.md.
 
 **Status:** **Implemented** (lnrent-mi9.1). CUT-1/2/4 verified by absence, CUT-3's knob is inert
 and documented, and the PR-7 residual `PRAGMA synchronous=FULL` ships with a test. Historical

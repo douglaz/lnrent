@@ -1,8 +1,7 @@
 # Spec: downtime credit for SUSPENDED subscriptions (lnrent-d6n)
 
-> **ARCHIVED — delivered.** Shipped as the SUSPENDED-retention arm of
-> `Reconciler::apply_restart_downtime_credit` (`daemon/src/reconcile.rs`). The standing
-> statement of this behaviour is SPEC.md §6.5 and ADR-0005; read those for current truth.
+> **ARCHIVED — delivered.** See ../README.md; the Status line below is accurate. Standing
+> statement of this behaviour: SPEC.md §6.5 and ADR-0005.
 
 **Status:** **Implemented** (master `17e3f6a`; `reconcile.rs::apply_restart_downtime_credit` SUSPENDED branch, reconcile.rs:416-463)
 **Bead:** lnrent-d6n (P2; confirmed by the 2026-07-02 codex review). Extends the 7fp.22 downtime credit.
