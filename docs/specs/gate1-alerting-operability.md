@@ -203,9 +203,11 @@ class for when that network read fails. Revise it to the ledger:
 - `BalanceQueryFailed` (warning variant + ALARM log + its call sites, supervisor.rs:1223/1272) is
   RETIRED — there is no automatic balance query left to fail. Remove the variant; the 5-variant
   taxonomy in docs/specs/archive/operator-money-cli.md becomes 4.
-  **STALE PREDICTION** — `BalanceQueryFailed` was removed as described, but the shipped count is not
-  four; the taxonomy gained variants elsewhere. Kept for its rationale. The authoritative set is the
-  `RefundReadinessWarning` enum in `daemon/src/supervisor.rs` — read it, not this bullet.
+  **STALE PREDICTION** — `BalanceQueryFailed` was removed as described, but the count returned to
+  five: `FederationDown` was added later, so the taxonomy SWAPPED a variant rather than shrinking.
+  Kept for its rationale. The authoritative set is the `RefundReadinessWarning` enum in
+  `daemon/src/supervisor.rs` — read it, not this bullet, and not the v1 list in the archived
+  operator-money-cli spec, which is a record of what v1 said and is deliberately not updated.
 - `lnrent money` reports the ledger figures (`expected_msat`, earned/reserved/paid-out per the
   sweep spec's breakdown once that lands) instead of `balance_msat`; plain `lnrent money` makes NO
   network calls except the existing gateway probe and §C's federation liveness probe (both are
