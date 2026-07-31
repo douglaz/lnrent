@@ -1,5 +1,12 @@
 # Spec: operator money view (`lnrent money`)
 
+> **ARCHIVED — superseded contract.** The `lnrent money` command ships, but this document's v1
+> behaviour did not survive: it specifies a `balance_msat` wallet read, and the shipped handler
+> deliberately does NOT read the wallet — per ADR-0016 the ledger authorizes and only reconcile
+> reads the balance. Current truth: `daemon/src/ipc.rs` (`Request::Money`),
+> `daemon/tests/operator_money_cli.rs` (pins the exact output), and the forward warning-taxonomy
+> contract in `docs/specs/gate1-alerting-operability.md` §E. Read this only for rationale.
+
 Status: **Implemented** (master `5dd2d28`; test `daemon/tests/operator_money_cli.rs`) — a read-only view of the daemon's ecash money position.
 *Pending revision (2026-07-04, ledger-authoritative — docs/specs/gate1-alerting-operability.md §E):
 the `balance_msat` field and the `BalanceQueryFailed` warning variant below are superseded — plain

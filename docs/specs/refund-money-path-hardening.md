@@ -359,9 +359,11 @@ used by refund quoting/paying.
 **Landed warning taxonomy note (`f35ee77`, post-dates the pseudocode above):** the readiness report
 grew two variants beyond the three arms sketched in the Supervisor block — `BalanceQueryFailed`
 (a balance query error is a loud ALARM, never treated as "no balance concept") and `Unpriceable`
-(a liability whose required outlay cannot be priced right now). The authoritative 5-variant set is
-documented in docs/specs/operator-money-cli.md and implemented at daemon/src/supervisor.rs:1230-1248;
-this section's pseudocode is the earlier sketch.
+(a liability whose required outlay cannot be priced right now). This section's pseudocode is the
+earlier sketch. **The authoritative taxonomy is the shipped `RefundReadinessWarning` enum in
+daemon/src/supervisor.rs** — read it, not a copy. (`BalanceQueryFailed` was RETIRED with the balance
+read, per gate1-alerting-operability.md §E.) The v1 set in docs/specs/archive/operator-money-cli.md
+is ARCHIVED and superseded.
 
 ### 3.3 INV-3 — refund provenance
 

@@ -1,7 +1,13 @@
 # Spec: hook environment hygiene — seed never reaches hooks (PR-12)
 
-**Status:** draft for codex-review-loop → rb-lite — **GATES GO-LIVE** (operator decision,
-2026-07-04 grill: on the critical path with GATE-0 + PR-5, ahead of the rest of GATE-1).
+> **ARCHIVED — delivered** (lnrent-y4m.7). See README.md. The invariant it protects — the
+> operator seed must never reach a hook — is enforced in code and restated in SPEC.md §7.2/§13
+> and docs/go-live.md; this is the design record, not the only copy.
+
+**Status:** **Implemented** (lnrent-y4m.7). Hooks start from an empty environment
+(`daemon/src/runner.rs` `.env_clear()`), recipe-declared `LNRENT*` forwarding is rejected
+(`daemon/src/recipe.rs`), and a child-process leakage test pins it. The invariant is restated in
+SPEC.md §7.2/§13 and docs/go-live.md, so this spec is the DESIGN RECORD, not the only copy.
 **Source:** docs/specs/production-readiness.md PR-12 (verified, 2026-07-03; found P1 by the
 security audit — "the actually-exploitable path" undercutting the seed-perms hardening). Severity
 nuance from the grill: the DOCUMENTED flow never exposes the seed to hooks (bootstrap is one-shot

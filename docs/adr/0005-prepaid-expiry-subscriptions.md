@@ -46,4 +46,4 @@ restart settlement catch-up. So a buyer is never suspended — nor destroyed, no
 renewal — for the operator's outage. The floor never moves a deadline *earlier*, self-expires
 once a renewal pushes `paid_through` past it, and is cleared on renewal. (Crediting an
 *already-SUSPENDED* sub's retention/destroy landed too — lnrent-d6n,
-docs/specs/downtime-credit-suspended.md.)
+docs/specs/archive/downtime-credit-suspended.md.)

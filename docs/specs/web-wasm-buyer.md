@@ -1,6 +1,23 @@
 # Spec: web (WASM) buyer — browser marketplace access (lnrent-7fp.18)
 
-**Status:** **Implemented** (master `2ae0e1a`…`68dc79c`, WebLN explicit-click P1 fix `96cdd9f`, CI e2e `f1d2e2d`; clients/web/). Two landed amendments to the text below: (1) WebLN is invoked ONLY on an explicit user click, never auto-triggered after `create_order` (codex P1, `96cdd9f`); (2) the e2e's out-of-band settle landed as the dev-gated `lnrent dev settle` IPC command (refused unless `LNRENT_DEV=1` + mock backend, ipc.rs) rather than a host-side `MockPayment` handle, and the e2e runs as a per-push CI job (clients/web/e2e/run.sh), not box-local.
+**Status:** **Mostly implemented — TWO requirements OUTSTANDING, so this spec stays LIVE.**
+The SPA ships (`clients/web/`), WebLN is invoked only on an explicit user click (codex P1 fix
+`96cdd9f`), and the headless e2e runs per-push (`clients/web/e2e/run.sh`). Unmet:
+
+1. the restrictive Content-Security-Policy required by the Security section below — **lnrent-3ma**;
+2. the Security section's requirement that the e2e ASSERT a request-kind op runs and displays
+   `op.result.data`; the shipped check cannot fail — **lnrent-3zt**.
+
+This spec's Security section is also the ONLY written copy of the web security contract. It is
+deliberately NOT archived with the other delivered specs (operator decision, 2026-07-31) until both
+beads close or those rules move to `clients/web/README.md`.
+
+Two landed amendments to the text below: (1) WebLN is invoked ONLY on an explicit user click,
+never auto-triggered after `create_order`; (2) the e2e's out-of-band settle landed as the
+dev-gated `lnrent dev settle` IPC command (refused unless `LNRENT_DEV=1` + mock backend) rather
+than a host-side `MockPayment` handle, and runs as a per-push CI job, not box-local.
+
+
 **Bead:** lnrent-7fp.18 (P1; blockers .13 CLI buyer + .15 ship gate are CLOSED). Grill-converged bead;
 this spec turns it into an implementable plan grounded in the current code.
 

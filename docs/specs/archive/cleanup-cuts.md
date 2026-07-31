@@ -1,6 +1,10 @@
 # Spec: dead-code cuts + comment drift + explicit synchronous (CUT-1..4, DRIFT-2/4, PR-7 residual)
 
-**Status:** draft for codex-review-loop → rb-lite
+> **ARCHIVED — delivered** (lnrent-mi9.1). See README.md.
+
+**Status:** **Implemented** (lnrent-mi9.1). CUT-1/2/4 verified by absence, CUT-3's knob is inert
+and documented, and the PR-7 residual `PRAGMA synchronous=FULL` ships with a test. Historical
+delivery plan — nothing here is still pending.
 **Source:** docs/specs/production-readiness.md CUT/DRIFT sections (verified, 2026-07-03). Pure risk
 reduction: deletions, comment fixes, and one behavior-identical explicit PRAGMA. Everything here is
 verified dead or verified stale; nothing changes runtime behavior (the PRAGMA pins the value the

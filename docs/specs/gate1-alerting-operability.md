@@ -1,6 +1,9 @@
 # Spec: GATE-1 alerting + operability (PR-5/PR-6/PR-9/PR-16 + the INV-2 ledger revision)
 
-**Status:** draft for codex-review-loop → rb-lite
+**Status:** **Implemented — standing contract.** All GATE-1 alerting beads are closed. §E/§F remain
+NORMATIVE as the **sanctioned-call-site** contract — that is what `daemon/src/ipc.rs` and ADR-0016
+cite. Their forward-looking *counts* are not: one stale prediction is flagged in place in §E. Where
+this spec and the code disagree on an enumeration, the code wins.
 **Source:** docs/specs/production-readiness.md GATE-1 (verified findings, 2026-07-03). Everything
 here is *around* the money core, not in it: surface conditions the daemon already detects, persist
 one failure class it currently swallows, and give the operator actuators. Thin dispatcher — NOT a
@@ -199,7 +202,12 @@ class for when that network read fails. Revise it to the ledger:
   balance-side operand changes from a federation query to the ledger lower bound.
 - `BalanceQueryFailed` (warning variant + ALARM log + its call sites, supervisor.rs:1223/1272) is
   RETIRED — there is no automatic balance query left to fail. Remove the variant; the 5-variant
-  taxonomy in docs/specs/operator-money-cli.md becomes 4.
+  taxonomy in docs/specs/archive/operator-money-cli.md becomes 4.
+  **STALE PREDICTION** — `BalanceQueryFailed` was removed as described, but the count returned to
+  five: `FederationDown` was added later, so the taxonomy SWAPPED a variant rather than shrinking.
+  Kept for its rationale. The authoritative set is the `RefundReadinessWarning` enum in
+  `daemon/src/supervisor.rs` — read it, not this bullet, and not the v1 list in the archived
+  operator-money-cli spec, which is a record of what v1 said and is deliberately not updated.
 - `lnrent money` reports the ledger figures (`expected_msat`, earned/reserved/paid-out per the
   sweep spec's breakdown once that lands) instead of `balance_msat`; plain `lnrent money` makes NO
   network calls except the existing gateway probe and §C's federation liveness probe (both are
@@ -207,7 +215,7 @@ class for when that network read fails. Revise it to the ledger:
 - Rationale (same as the sweep spec): if the wallet truly holds less than the books say, the refund
   pay itself fails cleanly and parks/alerts — the pay is the fail-safe; the pre-read added only a
   false sense of coverage plus a failure class. Wallet-vs-books drift detection moves to §F.
-- Annotate docs/specs/refund-money-path-hardening.md INV-2 and docs/specs/operator-money-cli.md
+- Annotate docs/specs/refund-money-path-hardening.md INV-2 and docs/specs/archive/operator-money-cli.md
   with one-line pointers to this revision (do not rewrite their landed history).
 
 ### F. Explicit reconcile — the ONLY place the balance is read

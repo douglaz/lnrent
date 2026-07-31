@@ -41,9 +41,11 @@ Built and tested:
 
 M1a is a hardened single-box money core. Taking it to a platform a stranger can run **unattended
 against real money and expose to the public marketplace** is planned in
-[docs/specs/production-readiness.md](./docs/specs/production-readiness.md) — the plan of record,
-written from a full read-only audit and cut into a dependency-ordered task graph. The remaining work
-groups into go-live gates:
+[docs/specs/production-readiness.md](./docs/specs/production-readiness.md) — the DELIVERED go-live
+roadmap, written from a full read-only audit and cut into a dependency-ordered task graph. Its gates
+have all landed; it is kept as the historical record and as the source its focused specs cite.
+**It is no longer the plan of record** — that is the phased self-dogfood programme in SPEC.md §15.
+The gates it delivered were:
 
 - **GATE-0 — abuse resistance** (before scaled public exposure): per-pubkey reservation caps and
   inbound rate-limiting, so an unauthenticated stranger with a free keypair can't strand host
@@ -129,9 +131,9 @@ $B order wait <order_id>              # -> access credentials (host/port/user)
 
 ## Docs
 
-- Roadmap to mainnet: [docs/specs/production-readiness.md](./docs/specs/production-readiness.md) · operator runbook: [docs/go-live.md](./docs/go-live.md)
+- Current plan of record: the phased programme in [SPEC.md](./SPEC.md) §15 · delivered go-live roadmap (historical): [docs/specs/production-readiness.md](./docs/specs/production-readiness.md) · operator runbook: [docs/go-live.md](./docs/go-live.md)
 - Spec: [SPEC.md](./SPEC.md) (draft v0.29) · glossary: [CONTEXT.md](./CONTEXT.md)
-- Decisions: [docs/adr/](./docs/adr/) (0001-0016) · change specs: [docs/specs/](./docs/specs/)
+- Decisions: [docs/adr/](./docs/adr/) (0001-0020) · change specs: [docs/specs/](./docs/specs/)
 - Security/deployment notes: [docs/security/](./docs/security/)
 
 ## License

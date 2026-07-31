@@ -1,6 +1,8 @@
 # Spec: GATE-0 abuse resistance (PR-1/PR-2/PR-3/PR-4 + DRIFT-3)
 
-**Status:** draft for codex-review-loop → rb-lite
+**Status:** **Implemented — standing contract.** Every bead cut from this spec is closed; the
+constraints below remain NORMATIVE and are cited from source (`daemon/src/order_intake.rs`,
+`daemon/src/nostr_engine.rs`). Amend it when the code changes.
 **Source:** docs/specs/production-readiness.md GATE-0 (verified findings, 2026-07-03). This is the
 cluster that gates unattended/scaled public exposure (attended-dogfood carve-out in the roadmap
 legend). Four bounded changes + one tiny validator extension. No reputation system, no deposits,
