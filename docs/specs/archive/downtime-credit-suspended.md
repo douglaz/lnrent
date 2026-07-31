@@ -1,6 +1,6 @@
 # Spec: downtime credit for SUSPENDED subscriptions (lnrent-d6n)
 
-> **ARCHIVED — delivered.** See ../README.md; the Status line below is accurate. Standing
+> **ARCHIVED — delivered.** See README.md; the Status line below is accurate. Standing
 > statement of this behaviour: SPEC.md §6.5 and ADR-0005.
 
 **Status:** **Implemented** (master `17e3f6a`; `reconcile.rs::apply_restart_downtime_credit` SUSPENDED branch, reconcile.rs:416-463)

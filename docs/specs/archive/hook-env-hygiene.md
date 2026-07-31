@@ -1,6 +1,6 @@
 # Spec: hook environment hygiene — seed never reaches hooks (PR-12)
 
-> **ARCHIVED — delivered** (lnrent-y4m.7). See ../README.md. The invariant it protects — the
+> **ARCHIVED — delivered** (lnrent-y4m.7). See README.md. The invariant it protects — the
 > operator seed must never reach a hook — is enforced in code and restated in SPEC.md §7.2/§13
 > and docs/go-live.md; this is the design record, not the only copy.
 
