@@ -1,6 +1,8 @@
 # Spec: GATE-1 operator sweep / payout (PR-8) — ledger-authoritative
 
-**Status:** draft for codex-review-loop → rb-lite
+**Status:** **Implemented — standing contract.** The sweep beads are closed; the invariants below
+remain NORMATIVE and are cited from source across `daemon/src/sweep.rs`, `daemon/src/ipc.rs` and
+`daemon/src/bin/lnrent.rs` (10 files).
 **Source:** docs/specs/production-readiness.md PR-8 (verified, 2026-07-03). Money-moving — kept as
 its own tight spec. **Revised 2026-07-04:** authorization is computed from the LEDGER ONLY; the
 federation balance is never read in this path. (The earlier draft authorized off

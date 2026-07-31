@@ -29,9 +29,12 @@ A `sub.cancel` from the subscription's owner MUST:
   no-op:
   - `CANCELLED`/`TERMINATED`/`EXPIRED`/`REFUNDED` — already terminal; drop.
   - `REFUND_DUE` — a refund is already owed; cancellation must not interfere; drop.
-  - `RESUMING` (added by lnrent-18v, post-dates this doc) — driver-owned in-flight paid state; drop
-    with WARN (the resume driver resolves it to ACTIVE or SUSPENDED; cancel again after). The
-    no-reply-DM UX gap in this window is tracked under z4u / production-readiness PR-9.
+  - `RESUMING` (added by lnrent-18v, post-dates this doc) — driver-owned in-flight paid state; no
+    state change (the resume driver resolves it to ACTIVE or SUSPENDED; cancel again after).
+    UPDATED 2026-07-31: the cancel is now ANSWERED, not silently dropped — lnrent-z4u ships an
+    owner-only stateless `billing.notice` correlated to the request `id`, and lnrent-zs2 surfaces
+    it in the buyer client. Both are closed; the "no-reply-DM UX gap" this doc described is fixed.
+    Deliberately still NOT a RESUMING->CANCELLED shortcut: the driver keeps sole CAS ownership.
   - `PENDING`/`PROVISIONING` — OUT OF SCOPE for this cut (see §6): a `PENDING` order expires on its own
     and a `PROVISIONING` sub is mid-hook (racy); drop with a WARN.
 - **CANCEL-3 (terminate at the end of the already-paid window; compute the deadline INSIDE the txn).**

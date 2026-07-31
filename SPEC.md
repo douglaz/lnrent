@@ -577,7 +577,7 @@ States: `PENDING`, `PROVISIONING`, `ACTIVE`, `RESUMING`, `SUSPENDED`, `TERMINATE
 `RESUMING` is the paid, in-flight resume state (the renewal analogue of `PROVISIONING`): a late
 renewal of a `SUSPENDED` sub is captured into `RESUMING`, not straight to `ACTIVE`, so the row is
 never read as running until the recipe `resume` hook has actually powered the service back on
-(docs/specs/resume-hook-driver.md, bead lnrent-18v).
+(docs/specs/archive/resume-hook-driver.md, bead lnrent-18v).
 
 Timers per Listing (operator-tunable): `period` (how much a payment extends
 `paid_through`, e.g. 30d), `renew_lead` (how far before expiry renewal is recommended
@@ -627,13 +627,16 @@ re-based to `settled_at`):
   the `paid_through` formula and moves the sub to **RESUMING** (paid, captured, but the service is
   not yet powered back on); the resume driver then runs the recipe `resume` hook and
   CAS-transitions **RESUMING -> ACTIVE** on success. `RESUMING` is driver-owned: reconcile never
-  treats it as ACTIVE/SUSPENDED, and buyer `cancel`/`renew` are dropped without a reply while in
-it (an idempotent no-op — the missing reply DM is the open z4u P3 UX gap).
+  treats it as ACTIVE/SUSPENDED, and buyer `cancel`/`renew` change no state while in it. They ARE
+  answered: an owner-only, stateless `billing.notice` correlated to the request's `id` asks the
+  buyer to retry once the resume lands (lnrent-z4u; surfaced by the buyer client in lnrent-zs2).
+  The notice is deliberately not a state transition — the resume driver keeps sole CAS ownership
+  of `state='RESUMING'`.
 - **RESUMING -> SUSPENDED** — the `resume` hook failed permanently (after bounded retries). Each
   captured-but-unresumed renewal (more can settle and stack while `RESUMING`) is auto-refunded via
   exactly one detached `refund_attempt` per renewal, the pre-renewal suspended timers are restored
   from the first baseline, and the instance/reservation are left intact — the sub is never left
-  wedged in `RESUMING` (docs/specs/resume-hook-driver.md).
+  wedged in `RESUMING` (docs/specs/archive/resume-hook-driver.md).
 - **SUSPENDED -> TERMINATED** — retention ended; run `destroy` (purge data).
 
 **Buyer-initiated** (docs/specs/sub-cancel.md, implemented `2f45dc5`):
@@ -714,8 +717,8 @@ transition missed while the Box was off fires on restart. But suspension is **cr
 for operator downtime** (ADR-0005): the daemon persists a heartbeat, and on restart it
 records a per-subscription `suspend_not_before` floor for any ACTIVE sub whose renewal
 window overlapped its downtime window — and extends the retention cursor of any
-already-SUSPENDED sub whose retention overlapped the outage (docs/specs/
-downtime-credit-suspended.md) — WITHOUT moving `paid_through` (the prepaid-money +
+already-SUSPENDED sub whose retention overlapped the outage
+(docs/specs/archive/downtime-credit-suspended.md) — WITHOUT moving `paid_through` (the prepaid-money +
 `renew:auto` invoice anchor), so renewal math and the duplicate-invoice guard are untouched.
 The credited "resumable until" boundary `B = max(paid_through, suspend_not_before) +
 retention_s` is honored uniformly by the suspend/destroy transitions, capture's renewal

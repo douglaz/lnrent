@@ -360,7 +360,7 @@ used by refund quoting/paying.
 grew two variants beyond the three arms sketched in the Supervisor block — `BalanceQueryFailed`
 (a balance query error is a loud ALARM, never treated as "no balance concept") and `Unpriceable`
 (a liability whose required outlay cannot be priced right now). The authoritative 5-variant set is
-documented in docs/specs/operator-money-cli.md and implemented at daemon/src/supervisor.rs:1230-1248;
+documented in docs/specs/archive/operator-money-cli.md and implemented at daemon/src/supervisor.rs:1230-1248;
 this section's pseudocode is the earlier sketch.
 
 ### 3.3 INV-3 — refund provenance
