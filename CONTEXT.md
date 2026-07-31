@@ -25,6 +25,16 @@ _Avoid_: customer, client, user; "tenant" is reserved for the VM-isolation conte
 Buyer's workload occupying an Instance — "tenant Instances", the §9 planes), never the
 marketplace actor
 
+**Synthetic Buyer**:
+A Buyer that is permanent infrastructure rather than a customer: a Nostr identity, funded
+wallet and automated agent that rents and pays on a schedule so the money path is
+exercised without a person. It is a Buyer in every respect the Operator can observe —
+the daemon cannot tell it apart, which is the point. Distinguished only by who owns it
+and why it exists. Deliberately not the same thing as an Operator dogfooding their own
+Box: a Synthetic Buyer proves mechanics, not operability.
+_Avoid_: test buyer, fake buyer, bot (it is a real Buyer spending real money); "probe" is
+reserved for the read-only doctor/preflight checks, which spend nothing
+
 ### Infrastructure
 
 **Box**:
