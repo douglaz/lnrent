@@ -1,8 +1,11 @@
 # Spec: GATE-1 alerting + operability (PR-5/PR-6/PR-9/PR-16 + the INV-2 ledger revision)
 
-**Status:** **Implemented — standing contract.** All GATE-1 alerting beads are closed; §E/§F
-remain NORMATIVE as the sanctioned-call-site contract, cited from `daemon/src/ipc.rs` and
-ADR-0016.
+**Status:** **Implemented — standing contract, with one stale prediction flagged in place.** All
+GATE-1 alerting beads are closed. §E/§F remain NORMATIVE as the **sanctioned-call-site** contract —
+that is what `daemon/src/ipc.rs` and ADR-0016 cite. Their forward-looking *counts* are not
+normative: §E predicted the refund-warning taxonomy would shrink to four, and as shipped it is five
+(see the marked correction in §E). Where this spec and the code disagree on an enumeration, the code
+wins.
 **Source:** docs/specs/production-readiness.md GATE-1 (verified findings, 2026-07-03). Everything
 here is *around* the money core, not in it: surface conditions the daemon already detects, persist
 one failure class it currently swallows, and give the operator actuators. Thin dispatcher — NOT a
@@ -202,6 +205,11 @@ class for when that network read fails. Revise it to the ledger:
 - `BalanceQueryFailed` (warning variant + ALARM log + its call sites, supervisor.rs:1223/1272) is
   RETIRED — there is no automatic balance query left to fail. Remove the variant; the 5-variant
   taxonomy in docs/specs/archive/operator-money-cli.md becomes 4.
+  **AS SHIPPED (2026-07-31) the count is FIVE, not four** — this bullet's arithmetic is a stale
+  prediction, kept for its rationale. `BalanceQueryFailed` was indeed removed, but the taxonomy
+  gained variants elsewhere. The live set is the `RefundReadinessWarning` enum in
+  `daemon/src/supervisor.rs`: `FederationDown`, `GatewayUnavailable`, `InsufficientBalance`,
+  `Unpriceable`, `ParkedManual`. A monitoring implementer must read the enum, not this count.
 - `lnrent money` reports the ledger figures (`expected_msat`, earned/reserved/paid-out per the
   sweep spec's breakdown once that lands) instead of `balance_msat`; plain `lnrent money` makes NO
   network calls except the existing gateway probe and §C's federation liveness probe (both are

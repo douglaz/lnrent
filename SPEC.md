@@ -627,11 +627,13 @@ re-based to `settled_at`):
   the `paid_through` formula and moves the sub to **RESUMING** (paid, captured, but the service is
   not yet powered back on); the resume driver then runs the recipe `resume` hook and
   CAS-transitions **RESUMING -> ACTIVE** on success. `RESUMING` is driver-owned: reconcile never
-  treats it as ACTIVE/SUSPENDED, and buyer `cancel`/`renew` change no state while in it. They ARE
-  answered: an owner-only, stateless `billing.notice` correlated to the request's `id` asks the
-  buyer to retry once the resume lands (lnrent-z4u; surfaced by the buyer client in lnrent-zs2).
-  The notice is deliberately not a state transition — the resume driver keeps sole CAS ownership
-  of `state='RESUMING'`.
+  treats it as ACTIVE/SUSPENDED, and buyer `cancel`/`renew` change no state while in it. Both ARE
+  answered by an owner-only, stateless `billing.notice` asking the buyer to retry once the resume
+  lands (lnrent-z4u), but they differ in correlation: `renew.request` carries an `id`, so its
+  notice echoes that `request_id` and the buyer client awaits it (lnrent-zs2); `sub.cancel` carries
+  no request id at all, so its notice sets `request_id: null` and arrives as an unsolicited async
+  DM. Neither is a state transition — the resume driver keeps sole CAS ownership of
+  `state='RESUMING'`.
 - **RESUMING -> SUSPENDED** — the `resume` hook failed permanently (after bounded retries). Each
   captured-but-unresumed renewal (more can settle and stack while `RESUMING`) is auto-refunded via
   exactly one detached `refund_attempt` per renewal, the pre-renewal suspended timers are restored

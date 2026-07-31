@@ -15,8 +15,8 @@ statement as a description of present behaviour, and do not "fix" one to match n
 record of what was decided then.
 
 ## What stayed live, and why
-`docs/specs/` holds only standing contracts — specs whose constraints still bind, and which source
-code cites by name or by numbering:
+`docs/specs/` holds only standing contracts — specs whose constraints still bind. Most are cited
+from source by name or by numbering; two are kept live for other reasons, noted in the table:
 
 | Spec | Why it is still binding |
 |---|---|
@@ -25,7 +25,7 @@ code cites by name or by numbering:
 | `gate1-operator-sweep.md` | sweep invariants cited from 10 source files |
 | `refund-money-path-hardening.md` | declares itself the money-path contract; INV-1 cited from `backends.rs` |
 | `refund-provisioning-hardening.md` | its F-numbering is a citation namespace — `store.rs` and `SPEC.md` cite "F3/F6" by number |
-| `sub-cancel.md` | defines authorization, non-enumeration and state gates for the cancel path |
+| `sub-cancel.md` | a contract, not a plan: defines authorization, non-enumeration and state gates for the cancel path. No `.rs` cites it — it stays live because `SPEC.md` §6.3 cites its path and this branch had to amend it, so it is still maintained text rather than a historical record |
 | `production-readiness.md` | delivered roadmap, but `alerts.rs` cites its PR-5 §A as the CLOSED alertable-condition set |
 | `web-wasm-buyer.md` | **not fully delivered** — the CSP it requires is unshipped (lnrent-3ma), and it holds the only copy of the web security contract |
 

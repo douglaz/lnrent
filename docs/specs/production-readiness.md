@@ -1,8 +1,8 @@
 # Spec: lnrent production-readiness roadmap (M1a → public/mainnet)
 
 **Status:** **DELIVERED and SUPERSEDED as plan-of-record (2026-07-31).** Every gate this
-roadmap cut — GATE-0 (`gdu`), GATE-1 (`urw`), HARDEN (`y4m`), cleanup (`mi9`) — is closed, 34 beads
-in all. **Read the gap statements below as of 2026-07-03, not as of today:** the anti-griefing,
+roadmap cut — GATE-0 (`gdu`), GATE-1 (`urw`), HARDEN (`y4m`), cleanup (`mi9`) — is closed: 35 child
+beads (4 + 10 + 19 + 2), 39 counting the four epics themselves. **Read the gap statements below as of 2026-07-03, not as of today:** the anti-griefing,
 alert-transport and payout gaps it names are FIXED, and its sequencing section lists blockers that
 are long closed. docs/go-live.md records what actually landed.
 
