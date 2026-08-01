@@ -68,6 +68,20 @@ jobs:
       # No `-- -D warnings` on the test step: after `--`, cargo test forwards args to the TEST
       # BINARY, not to rustc, and libtest rejects it ("Unrecognized option: 'D'"). Lint coverage of
       # test code comes from the `--all-targets` clippy steps.
+      # GUARD, and not a formality: `--no-default-features` disables defaults for the SELECTED
+      # packages, NOT for defaults re-activated through a dependency edge. `clients/cli` dev-depends
+      # on `lnrentd`, so without `default-features = false` on that edge, feature unification switched
+      # `fedimint` back on and this whole gate silently tested the DEFAULT configuration. The tell was
+      # that both configs ran an identical test count. Assert the fedimint tree is genuinely absent.
+      - name: assert the fedimint-disabled tree really excludes fedimint
+        run: |
+          if nix develop . --command cargo tree --workspace --no-default-features -i fedimint-client >/dev/null 2>&1; then
+            echo "::error::fedimint-client is reachable under --no-default-features — a dependency edge re-enabled the default feature, so the gates below prove nothing."
+            nix develop . --command cargo tree --workspace --no-default-features -i fedimint-client
+            exit 1
+          fi
+          echo "fedimint-client absent under --no-default-features, as intended"
+
       - name: test fedimint-disabled tree
         run: nix develop . --command cargo test --workspace --no-default-features
 

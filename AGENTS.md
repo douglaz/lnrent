@@ -95,7 +95,12 @@ run of the first block can still fail CI on the web surface. Run the e2e if you 
 `clients/web`.
 
 The `--no-default-features` build compiles **without fedimint/rocksdb**. It is a real shipping
-configuration, so it is linted and TESTED, not merely compiled. **It is not a "safe" or "mock-only"
+configuration, so it is linted and TESTED, not merely compiled — and CI asserts the fedimint tree is
+genuinely absent before running those gates. That guard exists because the gates were once vacuous:
+`--no-default-features` disables defaults for the SELECTED packages, not for defaults re-activated
+through a dependency edge, and `clients/cli`'s dev-dependency on `lnrentd` switched `fedimint` back
+on. The tell was that both configurations reported an identical test count (they now differ). If you
+add a workspace dependency on `lnrentd`, put `default-features = false` on that edge. **It is not a "safe" or "mock-only"
 build**: `phoenixd_backend` is deliberately not feature-gated (`daemon/src/lib.rs`), so that binary
 can still move real money. The safety boundary is the RUNTIME backend configuration, not the feature
 flag — see `docs/go-live.md`.
