@@ -12,7 +12,9 @@ concurrency:
 jobs:
   # The per-push gate: clippy + every non-ignored test (incl. the mocked end-to-end
   # money path in daemon/tests/e2e_money_path.rs) with the real Fedimint tree compiled
-  # in (default feature), plus the mock-only build. Runs inside the Nix devshell so
+  # in (default feature), plus the fedimint-disabled configuration (which is NOT "mock-only" —
+  # phoenixd is compiled in unconditionally and can move real money; the runtime backend config is
+  # the safety boundary, see docs/go-live.md). Runs inside the Nix devshell so
   # rustc + the bundled RocksDB/C++ toolchain match local. The live regtest-federation
   # e2e is a separate, heavier workflow (.github/workflows/fedimint-live.yml).
   lint-test:
@@ -39,28 +41,48 @@ jobs:
           workspaces: ". -> target"
           cache-on-failure: true
 
+      # `-D warnings` is deliberate: a warning that only prints is a warning nobody reads, and this
+      # tree is clean under it today. If a new lint lands in a rustc/clippy bump and floods CI, fix
+      # or #[allow] it with a reason — do not drop the flag.
       - name: clippy (workspace, all targets — default = fedimint)
-        run: nix develop . --command cargo clippy --workspace --all-targets
+        run: nix develop . --command cargo clippy --workspace --all-targets -- -D warnings
 
       - name: test (workspace — includes the mocked e2e money path)
         run: nix develop . --command cargo test --workspace
 
-      - name: build mock-only (no fedimint/rocksdb tree)
-        run: nix develop . --command cargo build -p lnrentd --no-default-features
+      # The fedimint-disabled tree is a SHIPPING configuration, not just a build variant, so RUN its
+      # tests rather than only proving it compiles. `cargo test` compiles too, so this strictly
+      # subsumes the `cargo build -p lnrentd --no-default-features` it replaced, and it covers the
+      # whole workspace in that config rather than lnrentd alone.
+      #
+      # Deliberately NOT called "mock-only": `--no-default-features` drops fedimint/rocksdb, but
+      # `phoenixd_backend` is not feature-gated (daemon/src/lib.rs), so this binary can still move
+      # REAL money. The safety boundary is the runtime backend config, not the feature flag
+      # (docs/go-live.md).
+      #
+      # No `-- -D warnings` on the test step: after `--`, cargo test forwards args to the TEST
+      # BINARY, not to rustc, and libtest rejects it ("Unrecognized option: 'D'"). Lint coverage of
+      # test code comes from the `--all-targets` clippy steps.
+      - name: test fedimint-disabled tree
+        run: nix develop . --command cargo test --workspace --no-default-features
+
+      - name: clippy fedimint-disabled tree
+        run: nix develop . --command cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 
       # The web buyer (clients/web) is wasm-primary — most of it is #[cfg(target_arch = "wasm32")]
       # (the NIP-07 bridge, the browser Relay, the wired flows), which the host clippy/test above do
       # NOT compile. Gate the wasm32 target explicitly so a wasm-only regression can't pass green.
       - name: clippy + build the web buyer for wasm32
         run: |
-          nix develop . --command cargo clippy -p lnrent-buyer-web --target wasm32-unknown-unknown
+          nix develop . --command cargo clippy -p lnrent-buyer-web --target wasm32-unknown-unknown -- -D warnings
           nix develop . --command cargo build  -p lnrent-buyer-web --target wasm32-unknown-unknown
 
   # The web buyer's FUNCTIONAL acceptance gate: build the wasm bundle, spawn a mock lnrentd + local
   # relay + a static server + headless Chrome, and drive the SPA through the full loop (settling the
   # mock invoice out-of-band via `lnrent dev settle`). ubuntu-latest ships google-chrome-stable + node
-  # + python3, all reachable inside `nix develop` (which keeps the runner PATH). The daemon is built
-  # mock-only (no fedimint/rocksdb tree), so this stays light.
+  # + python3, all reachable inside `nix develop` (which keeps the runner PATH). The daemon is BUILT
+  # fedimint-disabled (no rocksdb tree, so this stays light) and RUN with the mock payment backend —
+  # two separate things; the build flag alone would not make it safe.
   web-e2e:
     name: web buyer headless e2e (Chrome)
     runs-on: ubuntu-latest
