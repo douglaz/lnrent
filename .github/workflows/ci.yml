@@ -85,12 +85,18 @@ jobs:
           # utility crates in the block (futures-util) are deliberately skipped: other dependencies
           # pull them in regardless, so their presence proves nothing and checking them would fail
           # this gate on a non-problem.
-          pkgs=$(sed -n '/^fedimint = \[/,/^\]/p' daemon/Cargo.toml | grep -oE '"dep:fedimint-[a-z0-9-]+"' | sed 's/"dep://;s/"//')
+          # `|| true` is load-bearing: Actions runs this with `bash -e -o pipefail`, so a grep that
+          # matches nothing exits 1 and would kill the step DURING this assignment — before the
+          # emptiness check below could print its actionable message. Tolerate no-match here and let
+          # that check do the reporting.
+          pkgs=$(sed -n '/^fedimint = \[/,/^\]/p' daemon/Cargo.toml | grep -oE '"dep:fedimint-[a-z0-9-]+"' | sed 's/"dep://;s/"//' || true)
           if [ -z "$pkgs" ]; then
             echo "::error::could not derive the fedimint package set from daemon/Cargo.toml — the feature block moved or changed shape, so this guard is not checking anything."
             exit 1
           fi
-          echo "checking $(printf '%s' "$pkgs" | wc -l) packages derived from the fedimint feature"
+          # `wc -l <<<` not `printf '%s' | wc -l`: command substitution strips the trailing newline,
+          # so the printf form counts separators and reports one fewer than it checks.
+          echo "checking $(wc -l <<<"$pkgs") packages derived from the fedimint feature"
           fail=0
           for pkg in $pkgs; do
           set +e
