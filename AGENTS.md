@@ -70,8 +70,9 @@ several beads at once; that is history, not licence.
 
 ## Building and testing
 
-Everything runs through the Nix devshell. `.github/workflows/ci.yml` is authoritative — read it
-rather than trusting this list. As of now CI runs, across two jobs:
+Everything runs through the Nix devshell. **`.github/workflows/ci.yml` is the source of truth** —
+the block below is a convenience copy that WILL drift, so when they disagree, believe the workflow
+and fix this file. Across two jobs it runs:
 
 ```bash
 # job: lint + test
@@ -82,8 +83,10 @@ nix develop . --command cargo clippy --workspace --all-targets --no-default-feat
 nix develop . --command cargo clippy -p lnrent-buyer-web --target wasm32-unknown-unknown -- -D warnings
 nix develop . --command cargo build  -p lnrent-buyer-web --target wasm32-unknown-unknown
 
-# job: web buyer headless e2e — NOT covered by anything above
-clients/web/e2e/run.sh            # once with WebLN, once with NO_WEBLN=1
+# job: web buyer headless e2e — NOT covered by anything above.
+# CI wraps it, so run it the same way: once with WebLN, once with NO_WEBLN=1.
+nix develop . --command bash -c 'clients/web/e2e/run.sh'
+nix develop . --command bash -c 'NO_WEBLN=1 clients/web/e2e/run.sh'
 ```
 
 **Warnings are errors.** The host gates do NOT compile the wasm-only code (most of `clients/web` is
@@ -104,14 +107,15 @@ binary and libtest rejects it (`Unrecognized option: 'D'`). Lint coverage of tes
 ### Formatting — read this before you reach for `cargo fmt`
 
 **Do not run `cargo fmt` across the tree, and do not add `cargo fmt --check` to a gate.** CI does not
-format-check, and the tree currently has hundreds of drift sites. Running rustfmt on a module root
+format-check, and the tree is not rustfmt-clean — run `cargo fmt --check` if you want the current
+scale of it. Running rustfmt on a module root
 (`lib.rs`/`main.rs`) reformats *every file it declares*, burying a real change in unrelated lines.
 `daemon/src/order_intake.rs` also shows spurious diffs from rustfmt version drift. **Format only the
 lines you changed.**
 
 ## Layout
 
-```
+```text
 daemon/     lnrentd — the control plane (money, orders, provisioning, Nostr, IPC)
 wire/       the NIP-17 message types shared by daemon and clients
 clients/    core (buyer library) · cli (agent-grade buyer) · web (WASM SPA)
@@ -128,10 +132,12 @@ docs/       adr/ · specs/ (+ specs/archive/) · go-live.md · security/
   `lnrent listing publish` ever makes it `ACTIVE` (`daemon/src/listing.rs`). Do not "helpfully"
   publish on boot.
 - **The daemon is the sole sqlite writer** (ADR-0001). Never write the DB from a CLI or a hook.
-- **Money paths are ledger-authorized** (ADR-0016): the ledger authorizes. The wallet balance is read
-  only by the explicit `lnrent reconcile` command — *not* by the timer-driven reconcile loop, which
-  is a different thing with a confusingly similar name (`CONTEXT.md` distinguishes them). Do not add
-  a balance read to a money decision.
+- **Money paths are ledger-authorized** (ADR-0016): the ledger authorizes, and **no wallet read may
+  authorize money**. Do not add a balance read to a money decision. Reads for REPORTING are fine and
+  intentional — the explicit `lnrent reconcile` command, and the phoenixd doctor probe in
+  `daemon/src/preflight.rs`, which reports spendable balance and applies no funding rule. Note
+  `lnrent reconcile` (the command) is a different thing from the timer-driven reconcile loop, which
+  has a confusingly similar name; `CONTEXT.md` distinguishes them.
 - **Recipe hooks are trusted, high-privilege, unsandboxed code** (ADR-0002) — not a plugin boundary.
   Treat anything that reaches a hook's environment or arguments as a security surface.
 - **`recipe_id` ownership is scoped, not blanket.** A **recipe-scoped** path must never apply THIS

@@ -15,6 +15,11 @@ name: fedimint-live
 on:
   workflow_dispatch:
 
+# Least privilege: every job here only reads the tree and runs tests. Declared explicitly so
+# the workflow does not silently gain write scope if the repository default changes.
+permissions:
+  contents: read
+
 concurrency:
   group: fedimint-live
   cancel-in-progress: true
