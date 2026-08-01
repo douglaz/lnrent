@@ -75,12 +75,27 @@ jobs:
       # that both configs ran an identical test count. Assert the fedimint tree is genuinely absent.
       - name: assert the fedimint-disabled tree really excludes fedimint
         run: |
-          if nix develop . --command cargo tree --workspace --no-default-features -i fedimint-client >/dev/null 2>&1; then
-            echo "::error::fedimint-client is reachable under --no-default-features — a dependency edge re-enabled the default feature, so the gates below prove nothing."
-            nix develop . --command cargo tree --workspace --no-default-features -i fedimint-client
+          set +e
+          out=$(nix develop . --command cargo tree --workspace --no-default-features -i fedimint-client 2>&1)
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::fedimint-client is REACHABLE under --no-default-features — a dependency edge re-enabled the default feature, so the gates below prove nothing. Add default-features = false to that edge."
+            echo "$out"
             exit 1
           fi
-          echo "fedimint-client absent under --no-default-features, as intended"
+          # A nonzero exit is NOT proof of absence: `cargo tree -i` also exits 101 when the spec is
+          # AMBIGUOUS (two versions/sources of the same package — plausible here, since the fedimint
+          # deps are pinned to a fork and could coexist with upstream). Treating every failure as
+          # "absent" would make this guard vacuous in exactly the way it exists to prevent. Only the
+          # specific not-found message counts, and the diagnostic is always printed.
+          if printf '%s' "$out" | grep -q 'did not match any packages'; then
+            echo "fedimint-client absent under --no-default-features, as intended"
+          else
+            echo "::error::guard could not determine reachability — cargo tree failed for a reason other than the package being absent, so this gate proves nothing."
+            echo "$out"
+            exit 1
+          fi
 
       - name: test fedimint-disabled tree
         run: nix develop . --command cargo test --workspace --no-default-features
