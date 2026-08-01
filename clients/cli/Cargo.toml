@@ -26,6 +26,6 @@ async-trait = "0.1"
 
 [dev-dependencies]
 # The integration test boots the operator daemon's Supervisor over an in-process relay (TEST ONLY).
-lnrentd = { path = "../../daemon" }
+lnrentd = { path = "../../daemon", default-features = false }
 nostr-relay-builder = "0.44"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }

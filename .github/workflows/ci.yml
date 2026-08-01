@@ -5,6 +5,11 @@ on:
     branches: [master]
   pull_request:
 
+# Least privilege: every job here only reads the tree and runs tests. Declared explicitly so
+# the workflow does not silently gain write scope if the repository default changes.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -12,7 +17,9 @@ concurrency:
 jobs:
   # The per-push gate: clippy + every non-ignored test (incl. the mocked end-to-end
   # money path in daemon/tests/e2e_money_path.rs) with the real Fedimint tree compiled
-  # in (default feature), plus the mock-only build. Runs inside the Nix devshell so
+  # in (default feature), plus the fedimint-disabled configuration (which is NOT "mock-only" —
+  # phoenixd is compiled in unconditionally and can move real money; the runtime backend config is
+  # the safety boundary, see docs/go-live.md). Runs inside the Nix devshell so
   # rustc + the bundled RocksDB/C++ toolchain match local. The live regtest-federation
   # e2e is a separate, heavier workflow (.github/workflows/fedimint-live.yml).
   lint-test:
@@ -39,28 +46,104 @@ jobs:
           workspaces: ". -> target"
           cache-on-failure: true
 
+      # `-D warnings` is deliberate: a warning that only prints is a warning nobody reads, and this
+      # tree is clean under it today. If a new lint lands in a rustc/clippy bump and floods CI, fix
+      # or #[allow] it with a reason — do not drop the flag.
       - name: clippy (workspace, all targets — default = fedimint)
-        run: nix develop . --command cargo clippy --workspace --all-targets
+        run: nix develop . --command cargo clippy --workspace --all-targets -- -D warnings
 
       - name: test (workspace — includes the mocked e2e money path)
         run: nix develop . --command cargo test --workspace
 
-      - name: build mock-only (no fedimint/rocksdb tree)
-        run: nix develop . --command cargo build -p lnrentd --no-default-features
+      # The fedimint-disabled tree is a SHIPPING configuration, not just a build variant, so RUN its
+      # tests rather than only proving it compiles. `cargo test` compiles too, so this strictly
+      # subsumes the `cargo build -p lnrentd --no-default-features` it replaced, and it covers the
+      # whole workspace in that config rather than lnrentd alone.
+      #
+      # Deliberately NOT called "mock-only": `--no-default-features` drops fedimint/rocksdb, but
+      # `phoenixd_backend` is not feature-gated (daemon/src/lib.rs), so this binary can still move
+      # REAL money. The safety boundary is the runtime backend config, not the feature flag
+      # (docs/go-live.md).
+      #
+      # No `-- -D warnings` on the test step: after `--`, cargo test forwards args to the TEST
+      # BINARY, not to rustc, and libtest rejects it ("Unrecognized option: 'D'"). Lint coverage of
+      # test code comes from the `--all-targets` clippy steps.
+      # GUARD, and not a formality: `--no-default-features` disables defaults for the SELECTED
+      # packages, NOT for defaults re-activated through a dependency edge. `clients/cli` dev-depends
+      # on `lnrentd`, so without `default-features = false` on that edge, feature unification switched
+      # `fedimint` back on and this whole gate silently tested the DEFAULT configuration. The tell was
+      # that both configs ran an identical test count. Assert the fedimint tree is genuinely absent.
+      - name: assert the fedimint-disabled tree really excludes fedimint
+        run: |
+          # The package list is DERIVED from daemon/Cargo.toml's `fedimint = [...]` feature block, not
+          # hardcoded here: a hand-kept list would silently stop covering a dep added to that feature
+          # later, which is the same rot this guard exists to catch.
+          #
+          # Restricted to the `fedimint-*` crates, which are EXCLUSIVE to this feature. That is
+          # sufficient proof: every package in the block is gated by the SAME feature, so if it were
+          # enabled they would all be reachable — one absent fedimint crate settles it. Shared
+          # utility crates in the block (futures-util) are deliberately skipped: other dependencies
+          # pull them in regardless, so their presence proves nothing and checking them would fail
+          # this gate on a non-problem.
+          # `|| true` is load-bearing: Actions runs this with `bash -e -o pipefail`, so a grep that
+          # matches nothing exits 1 and would kill the step DURING this assignment — before the
+          # emptiness check below could print its actionable message. Tolerate no-match here and let
+          # that check do the reporting.
+          pkgs=$(sed -n '/^fedimint = \[/,/^\]/p' daemon/Cargo.toml | grep -oE '"dep:fedimint-[a-z0-9-]+"' | sed 's/"dep://;s/"//' || true)
+          if [ -z "$pkgs" ]; then
+            echo "::error::could not derive the fedimint package set from daemon/Cargo.toml — the feature block moved or changed shape, so this guard is not checking anything."
+            exit 1
+          fi
+          # `wc -l <<<` not `printf '%s' | wc -l`: command substitution strips the trailing newline,
+          # so the printf form counts separators and reports one fewer than it checks.
+          echo "checking $(wc -l <<<"$pkgs") packages derived from the fedimint feature"
+          fail=0
+          for pkg in $pkgs; do
+          set +e
+          out=$(nix develop . --command cargo tree --workspace --no-default-features -i "$pkg" 2>&1)
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::$pkg is REACHABLE under --no-default-features — a dependency edge re-enabled the default feature, so the gates below prove nothing. Add default-features = false to that edge."
+            echo "$out"
+            fail=1
+            continue
+          fi
+          # A nonzero exit is NOT proof of absence: `cargo tree -i` also exits 101 when the spec is
+          # AMBIGUOUS (two versions/sources of the same package — plausible here, since the fedimint
+          # deps are pinned to a fork and could coexist with upstream). Treating every failure as
+          # "absent" would make this guard vacuous in exactly the way it exists to prevent. Only the
+          # specific not-found message counts, and the diagnostic is always printed.
+          if printf '%s' "$out" | grep -q 'did not match any packages'; then
+            echo "  $pkg: absent, as intended"
+          else
+            echo "::error::guard could not determine reachability of $pkg — cargo tree failed for a reason other than the package being absent, so this gate proves nothing."
+            echo "$out"
+            fail=1
+          fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+
+      - name: test fedimint-disabled tree
+        run: nix develop . --command cargo test --workspace --no-default-features
+
+      - name: clippy fedimint-disabled tree
+        run: nix develop . --command cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 
       # The web buyer (clients/web) is wasm-primary — most of it is #[cfg(target_arch = "wasm32")]
       # (the NIP-07 bridge, the browser Relay, the wired flows), which the host clippy/test above do
       # NOT compile. Gate the wasm32 target explicitly so a wasm-only regression can't pass green.
       - name: clippy + build the web buyer for wasm32
         run: |
-          nix develop . --command cargo clippy -p lnrent-buyer-web --target wasm32-unknown-unknown
+          nix develop . --command cargo clippy -p lnrent-buyer-web --target wasm32-unknown-unknown -- -D warnings
           nix develop . --command cargo build  -p lnrent-buyer-web --target wasm32-unknown-unknown
 
   # The web buyer's FUNCTIONAL acceptance gate: build the wasm bundle, spawn a mock lnrentd + local
   # relay + a static server + headless Chrome, and drive the SPA through the full loop (settling the
   # mock invoice out-of-band via `lnrent dev settle`). ubuntu-latest ships google-chrome-stable + node
-  # + python3, all reachable inside `nix develop` (which keeps the runner PATH). The daemon is built
-  # mock-only (no fedimint/rocksdb tree), so this stays light.
+  # + python3, all reachable inside `nix develop` (which keeps the runner PATH). The daemon is BUILT
+  # fedimint-disabled (no rocksdb tree, so this stays light) and RUN with the mock payment backend —
+  # two separate things; the build flag alone would not make it safe.
   web-e2e:
     name: web buyer headless e2e (Chrome)
     runs-on: ubuntu-latest
