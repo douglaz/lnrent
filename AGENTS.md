@@ -85,8 +85,8 @@ nix develop . --command cargo build  -p lnrent-buyer-web --target wasm32-unknown
 
 # job: web buyer headless e2e — NOT covered by anything above.
 # CI wraps it, so run it the same way: once with WebLN, once with NO_WEBLN=1.
-nix develop . --command bash -c 'clients/web/e2e/run.sh'
-nix develop . --command bash -c 'NO_WEBLN=1 clients/web/e2e/run.sh'
+nix develop . --command bash -c 'bash clients/web/e2e/run.sh'
+nix develop . --command bash -c 'NO_WEBLN=1 bash clients/web/e2e/run.sh'
 ```
 
 **Warnings are errors.** The host gates do NOT compile the wasm-only code (most of `clients/web` is
@@ -95,8 +95,8 @@ run of the first block can still fail CI on the web surface. Run the e2e if you 
 `clients/web`.
 
 The `--no-default-features` build compiles **without fedimint/rocksdb**. It is a real shipping
-configuration, so it is linted and TESTED, not merely compiled — and CI asserts the fedimint tree is
-genuinely absent before running those gates. That guard exists because the gates were once vacuous:
+configuration, so it is linted and TESTED, not merely compiled — and CI asserts the fedimint crates
+are genuinely absent (deriving the list from the feature block) before running those gates. That guard exists because the gates were once vacuous:
 `--no-default-features` disables defaults for the SELECTED packages, not for defaults re-activated
 through a dependency edge, and `clients/cli`'s dev-dependency on `lnrentd` switched `fedimint` back
 on. The tell was that both configurations reported an identical test count (they now differ). If you
@@ -137,12 +137,15 @@ docs/       adr/ · specs/ (+ specs/archive/) · go-live.md · security/
   `lnrent listing publish` ever makes it `ACTIVE` (`daemon/src/listing.rs`). Do not "helpfully"
   publish on boot.
 - **The daemon is the sole sqlite writer** (ADR-0001). Never write the DB from a CLI or a hook.
-- **Money paths are ledger-authorized** (ADR-0016): the ledger authorizes, and **no wallet read may
-  authorize money**. Do not add a balance read to a money decision. Reads for REPORTING are fine and
-  intentional — the explicit `lnrent reconcile` command, and the phoenixd doctor probe in
-  `daemon/src/preflight.rs`, which reports spendable balance and applies no funding rule. Note
-  `lnrent reconcile` (the command) is a different thing from the timer-driven reconcile loop, which
-  has a confusingly similar name; `CONTEXT.md` distinguishes them.
+- **Money paths are ledger-authorized** (ADR-0016). The rule is about DIRECTION, not about avoiding
+  the balance: a wallet read must never be what PERMITS an outlay — the ledger decides that. Reads
+  that report, or that reduce what is booked as liability, are correct and some are load-bearing:
+  `lnrent reconcile` (the command — a different thing from the timer-driven reconcile loop, which
+  `CONTEXT.md` distinguishes), the phoenixd doctor probe in `daemon/src/preflight.rs`, and
+  `spendable_credit_msat` in `daemon/src/phoenixd_backend.rs`, which reads the balance to decide
+  whether a receipt is spendable or unspendable fee credit (ADR-0019) — deleting that one would
+  over-book liability. So: never add a balance read that authorizes paying out; do not remove one
+  that constrains what is owed.
 - **Recipe hooks are trusted, high-privilege, unsandboxed code** (ADR-0002) — not a plugin boundary.
   Treat anything that reaches a hook's environment or arguments as a security surface.
 - **`recipe_id` ownership is scoped, not blanket.** A **recipe-scoped** path must never apply THIS

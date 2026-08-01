@@ -75,14 +75,33 @@ jobs:
       # that both configs ran an identical test count. Assert the fedimint tree is genuinely absent.
       - name: assert the fedimint-disabled tree really excludes fedimint
         run: |
+          # The package list is DERIVED from daemon/Cargo.toml's `fedimint = [...]` feature block, not
+          # hardcoded here: a hand-kept list would silently stop covering a dep added to that feature
+          # later, which is the same rot this guard exists to catch.
+          #
+          # Restricted to the `fedimint-*` crates, which are EXCLUSIVE to this feature. That is
+          # sufficient proof: every package in the block is gated by the SAME feature, so if it were
+          # enabled they would all be reachable — one absent fedimint crate settles it. Shared
+          # utility crates in the block (futures-util) are deliberately skipped: other dependencies
+          # pull them in regardless, so their presence proves nothing and checking them would fail
+          # this gate on a non-problem.
+          pkgs=$(sed -n '/^fedimint = \[/,/^\]/p' daemon/Cargo.toml | grep -oE '"dep:fedimint-[a-z0-9-]+"' | sed 's/"dep://;s/"//')
+          if [ -z "$pkgs" ]; then
+            echo "::error::could not derive the fedimint package set from daemon/Cargo.toml — the feature block moved or changed shape, so this guard is not checking anything."
+            exit 1
+          fi
+          echo "checking $(printf '%s' "$pkgs" | wc -l) packages derived from the fedimint feature"
+          fail=0
+          for pkg in $pkgs; do
           set +e
-          out=$(nix develop . --command cargo tree --workspace --no-default-features -i fedimint-client 2>&1)
+          out=$(nix develop . --command cargo tree --workspace --no-default-features -i "$pkg" 2>&1)
           rc=$?
           set -e
           if [ "$rc" -eq 0 ]; then
-            echo "::error::fedimint-client is REACHABLE under --no-default-features — a dependency edge re-enabled the default feature, so the gates below prove nothing. Add default-features = false to that edge."
+            echo "::error::$pkg is REACHABLE under --no-default-features — a dependency edge re-enabled the default feature, so the gates below prove nothing. Add default-features = false to that edge."
             echo "$out"
-            exit 1
+            fail=1
+            continue
           fi
           # A nonzero exit is NOT proof of absence: `cargo tree -i` also exits 101 when the spec is
           # AMBIGUOUS (two versions/sources of the same package — plausible here, since the fedimint
@@ -90,12 +109,14 @@ jobs:
           # "absent" would make this guard vacuous in exactly the way it exists to prevent. Only the
           # specific not-found message counts, and the diagnostic is always printed.
           if printf '%s' "$out" | grep -q 'did not match any packages'; then
-            echo "fedimint-client absent under --no-default-features, as intended"
+            echo "  $pkg: absent, as intended"
           else
-            echo "::error::guard could not determine reachability — cargo tree failed for a reason other than the package being absent, so this gate proves nothing."
+            echo "::error::guard could not determine reachability of $pkg — cargo tree failed for a reason other than the package being absent, so this gate proves nothing."
             echo "$out"
-            exit 1
+            fail=1
           fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
 
       - name: test fedimint-disabled tree
         run: nix develop . --command cargo test --workspace --no-default-features
