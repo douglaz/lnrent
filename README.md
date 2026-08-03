@@ -133,7 +133,7 @@ $B order wait <order_id>              # -> access credentials (host/port/user)
 
 - Current plan of record: the phased programme in [SPEC.md](./SPEC.md) §15 · delivered go-live roadmap (historical): [docs/specs/production-readiness.md](./docs/specs/production-readiness.md) · operator runbook: [docs/go-live.md](./docs/go-live.md)
 - Spec: [SPEC.md](./SPEC.md) (draft v0.29) · glossary: [CONTEXT.md](./CONTEXT.md)
-- Decisions: [docs/adr/](./docs/adr/) (0001-0020) · change specs: [docs/specs/](./docs/specs/)
+- Decisions: [docs/adr/](./docs/adr/) (numbered, sequential) · change specs: [docs/specs/](./docs/specs/)
 - Security/deployment notes: [docs/security/](./docs/security/)
 
 ## License

@@ -43,6 +43,10 @@
 
             # ops convenience
             sqlite
+
+            # dependency hygiene: `cargo outdated` reports deps behind their latest
+            # release, INCLUDING semver-major bumps that `cargo update` will never make.
+            cargo-outdated
           ];
 
           # bindgen (librocksdb-sys, secp256k1) needs to find libclang
