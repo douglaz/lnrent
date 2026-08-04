@@ -31,6 +31,27 @@ fn transport(e: RelayError) -> BuyerError {
 /// declined.
 const PINNED_GRACE: Duration = Duration::from_secs(5);
 
+/// How long a pinned request holds an `Acceptable` reply while waiting for a `Preferred` one.
+///
+/// The two carriers need different answers and the asymmetry is the point:
+///
+/// - `renew` uses [`PinnedGrace::Window`]. An honest refusal there is COMMON (a RESUMING notice,
+///   a foreign-recipe error), so waiting the full deadline on every one would be the latency cost
+///   the bead explicitly declined.
+/// - `invoke_op` uses [`PinnedGrace::FullDeadline`]. A row-free refusal there is rare, while the
+///   live reply can legitimately be slow: hooks get 120s (`daemon/src/runner.rs:25`) and the
+///   shipped `restart` makes two curl calls at `--max-time 30` each (`recipes/do-vps/ops/restart`).
+///   A 5s window would expire mid-hook and return the stale refusal — the buyer then retries under
+///   a fresh id and the operation runs TWICE, which is the exact defect this change exists to
+///   close. Waiting costs nothing the caller did not already budget (`--timeout`, default 30s).
+#[derive(Debug, Clone, Copy)]
+enum PinnedGrace {
+    /// Hold for at most this long, then answer with what we have.
+    Window(Duration),
+    /// Hold until the request deadline the caller already chose.
+    FullDeadline,
+}
+
 /// The `op.result` error codes the daemon answers WITHOUT claiming the `(sender, request_id)`
 /// idempotency key. `daemon/src/op_dispatch.rs:249-254` states the contract: "Every AUTHORIZED
 /// business outcome (unknown/invalid/hook failure) is a committed, cached `op.result` ... The four
@@ -47,6 +68,12 @@ const PINNED_GRACE: Duration = Duration::from_secs(5);
 /// daemon resend its cached terminal — byte-identical to the stored copy, so neither outranks the
 /// other. Drift is safe both ways: a refusal code added later and missing here just returns as
 /// promptly as it does today, and one that later becomes cached is merely held for [`PINNED_GRACE`].
+/// The row-free refusals whose STORED copy can disagree with a live reply. `op_dispatch.rs`
+/// answers a FOURTH without claiming the idempotency key — `invalid_request_id` (`:263-266`) —
+/// deliberately EXCLUDED here: buyer-id validation is deterministic on the pinned id, so the
+/// stored and live replies always agree and holding for a "better" one would only add latency to
+/// a verdict that cannot change. The three below are the ones a repoint/authorization change can
+/// flip between attempts.
 const ROW_FREE_OP_REFUSALS: [&str; 3] = ["unauthorized", "not_active", "unavailable"];
 
 /// Whether this `op.result` is one of the [`ROW_FREE_OP_REFUSALS`] — i.e. a reply the daemon can
@@ -265,7 +292,7 @@ impl<'a, R: Relay, S: NostrSigner, C: Clock> BuyerClient<'a, R, S, C> {
         let want_sub = subscription_id.to_string();
         let operator = self.operator;
         let (sender, reply) = self
-            .exchange_preferred(Some(&request), move |sender, m| {
+            .exchange_preferred(Some(&request), PinnedGrace::Window(PINNED_GRACE), move |sender, m| {
                 if sender != &operator {
                     return ReplyMatch::Ignore;
                 }
@@ -356,7 +383,7 @@ impl<'a, R: Relay, S: NostrSigner, C: Clock> BuyerClient<'a, R, S, C> {
         let want_op = op.to_string();
         let operator = self.operator;
         let (sender, reply) = self
-            .exchange_preferred(Some(&request), move |sender, m| {
+            .exchange_preferred(Some(&request), PinnedGrace::FullDeadline, move |sender, m| {
                 if sender != &operator {
                     return ReplyMatch::Ignore;
                 }
@@ -432,7 +459,9 @@ impl<'a, R: Relay, S: NostrSigner, C: Clock> BuyerClient<'a, R, S, C> {
     where
         F: FnMut(&PublicKey, &Msg) -> bool,
     {
-        self.exchange_preferred(request, move |sender, msg| {
+        // This shim never yields `Acceptable`, so the grace value is inert here — every match is
+        // `Preferred` and returns at once, pinned or not.
+        self.exchange_preferred(request, PinnedGrace::Window(PINNED_GRACE), move |sender, msg| {
             if want(sender, msg) {
                 ReplyMatch::Preferred
             } else {
@@ -447,6 +476,7 @@ impl<'a, R: Relay, S: NostrSigner, C: Clock> BuyerClient<'a, R, S, C> {
     async fn exchange_preferred<F>(
         &self,
         request: Option<&Event>,
+        grace: PinnedGrace,
         mut want: F,
     ) -> Result<(PublicKey, Msg), BuyerError>
     where
@@ -468,7 +498,15 @@ impl<'a, R: Relay, S: NostrSigner, C: Clock> BuyerClient<'a, R, S, C> {
         let pinned = self.clock.request_id_is_pinned();
         let mut held: Option<(PublicKey, Msg)> = None;
         loop {
-            let next = stream.next().await.map_err(transport)?;
+            let next = match stream.next().await {
+                Ok(next) => next,
+                // A transport error AFTER we are already holding a real reply must not downgrade
+                // the caller to `Transport`: the held reply is a genuine operator answer and is
+                // strictly more useful than an error. Unreachable for `NostrStream` (its `next`
+                // never returns `Err`, `clients/cli/src/relay.rs`), reachable in shape for
+                // `BrowserGiftWrapStream`, which propagates its read error.
+                Err(e) => return held.ok_or_else(|| transport(e)),
+            };
             let Some(event) = next else { break };
             // A gift wrap that won't unwrap (not for us / undecodable) is skipped, not fatal.
             let Ok(unwrapped) = gift_unwrap(self.signer, &event).await else {
@@ -479,8 +517,15 @@ impl<'a, R: Relay, S: NostrSigner, C: Clock> BuyerClient<'a, R, S, C> {
                 ReplyMatch::Preferred => return Ok((unwrapped.sender, unwrapped.msg)),
                 ReplyMatch::Acceptable if !pinned => return Ok((unwrapped.sender, unwrapped.msg)),
                 ReplyMatch::Acceptable => {
-                    if held.is_none() && !stream.shorten_deadline(PINNED_GRACE) {
-                        return Ok((unwrapped.sender, unwrapped.msg));
+                    // Enter the window once. `FullDeadline` deliberately does NOT shorten: the
+                    // caller has already budgeted that wait, and truncating it is what lets a
+                    // stale refusal outrun a slow-but-live reply.
+                    if held.is_none() {
+                        if let PinnedGrace::Window(within) = grace {
+                            if !stream.shorten_deadline(within) {
+                                return Ok((unwrapped.sender, unwrapped.msg));
+                            }
+                        }
                     }
                     held.get_or_insert((unwrapped.sender, unwrapped.msg));
                 }
@@ -569,11 +614,17 @@ mod tests {
 
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+    /// An in-memory relay: `listings` answers discovery; `replies` is drained into the gift-wrap
+    /// stream when a flow subscribes (the STORED batch a Nostr REQ serves first); `late` holds
+    /// replies that arrive after it, served only until the deadline is shortened; `published`
+    /// records what the buyer sent. `can_shorten` models whether the stream supports shortening
+    /// at all — false reproduces the browser stream, which takes the trait default.
     struct FakeRelay {
         listings: Vec<Event>,
         replies: Mutex<VecDeque<Event>>,
         late: Mutex<VecDeque<Event>>,
         published: Mutex<Vec<Event>>,
+        can_shorten: Mutex<bool>,
     }
     impl FakeRelay {
         fn new() -> Self {
@@ -582,7 +633,13 @@ mod tests {
                 replies: Mutex::new(VecDeque::new()),
                 late: Mutex::new(VecDeque::new()),
                 published: Mutex::new(Vec::new()),
+                can_shorten: Mutex::new(true),
             }
+        }
+        /// Model a stream taking the trait's DEFAULT `shorten_deadline` (the browser stream).
+        fn without_deadline_shortening(self) -> Self {
+            *self.can_shorten.lock().unwrap() = false;
+            self
         }
         fn queue(&self, event: Event) {
             self.replies.lock().unwrap().push_back(event);
@@ -618,13 +675,20 @@ mod tests {
                 events,
                 late,
                 grace_entered: false,
+                can_shorten: *self.can_shorten.lock().unwrap(),
             }))
         }
     }
+    /// An in-memory relay stream. `events` are the STORED replies a Nostr REQ serves first;
+    /// `late` stands in for replies that arrive after them — `next` serves `late` only until
+    /// `shorten_deadline` is called, modelling "arrived after the shortened deadline".
+    /// `can_shorten` is the seam for streams that take the trait's DEFAULT `shorten_deadline`
+    /// (returning false), i.e. the browser stream.
     struct FakeStream {
         events: VecDeque<Event>,
         late: VecDeque<Event>,
         grace_entered: bool,
+        can_shorten: bool,
     }
     #[async_trait]
     impl GiftWrapStream for FakeStream {
@@ -644,7 +708,10 @@ mod tests {
                 "the grace window must sit well under the request timeout"
             );
             self.grace_entered = true;
-            true
+            // `can_shorten` is false in the test that covers streams taking the trait's DEFAULT
+            // impl (`clients/core/src/relay.rs`) — i.e. the browser stream, which does not
+            // override it. Without this the `!shorten_deadline(..)` branch is unreachable.
+            self.can_shorten
         }
     }
 
@@ -1301,6 +1368,43 @@ mod tests {
             .await
     }
 
+    // The P1 the reviewer panel caught: a FIXED grace window is wrong for `ops`. A management hook
+    // gets 120s (`daemon/src/runner.rs:25`) and the shipped `restart` makes two curl calls at
+    // `--max-time 30` each, so a live result can legitimately arrive well after any short window.
+    // `late` is served only until the deadline is SHORTENED, so this test passes only because
+    // `invoke_op` uses `PinnedGrace::FullDeadline` and never shortens. Under a fixed window it
+    // returns the stored refusal, the buyer retries under a fresh id, and the droplet reboots twice.
+    #[tokio::test]
+    async fn pinned_op_waits_past_any_short_window_for_a_slow_live_result() {
+        let got = fake_op(true, vec![op_error("unauthorized")], Some(op_ok()))
+            .await
+            .expect("the slow live result, not the stored refusal");
+        assert_eq!(got.status, OpStatus::Ok, "a slow hook must still win");
+    }
+
+    // A stream that cannot shorten its deadline takes the trait's DEFAULT `shorten_deadline`
+    // (`clients/core/src/relay.rs`) — that is the browser stream. `renew` must then answer with the
+    // acceptable reply immediately rather than silently holding it for a window it cannot enforce.
+    #[tokio::test]
+    async fn pinned_renew_returns_at_once_when_the_stream_cannot_shorten() {
+        let op = Keys::generate();
+        let buyer = Keys::generate();
+        let clock = TestClock::pinned();
+        let relay = FakeRelay::new().without_deadline_shortening();
+        relay.queue(reply(&op, &buyer.public_key(), resuming_notice("sub-1", Some("req-0"))).await);
+        relay.queue_late(reply(&op, &buyer.public_key(), billing_invoice("sub-1", Some("req-0"))).await);
+        match client(&relay, &buyer, &clock, op.public_key())
+            .renew("sub-1")
+            .await
+            .expect("the acceptable reply, returned at once")
+        {
+            RenewReply::Retry(_) => {}
+            RenewReply::Invoice(i) => {
+                panic!("an unshortenable stream must not hold for a late invoice: {i:?}")
+            }
+        }
+    }
+
     // The bead's worst carrier: a pinned id re-sent after a row-free refusal, where the daemon HAS
     // now run the hook. Reporting the stored refusal would have the buyer retry under a fresh id and
     // run a non-idempotent hook twice.
@@ -1329,11 +1433,19 @@ mod tests {
         assert_eq!(err.exit_code(), 6);
     }
 
-    // The far-off `ok` makes this fail if the grace wait is unbounded: an honest refusal comes back
-    // one PINNED_GRACE later, never at the full request deadline — and it is still a refusal.
+    // An honest refusal is still a refusal — never swallowed, never converted to a timeout.
+    //
+    // NOTE the deliberate asymmetry, and its cost: because `invoke_op` uses
+    // `PinnedGrace::FullDeadline`, a LONE row-free refusal on a PINNED op now surfaces at the
+    // request deadline rather than one short window after the reply. That is the accepted price of
+    // closing the double-execution hole — a hook may legitimately outlast any fixed window, so
+    // truncating the wait is what lets a stale refusal beat a live result. Row-free refusals on
+    // `ops` are rare and the caller already budgeted `--timeout`; `renew`, where honest refusals
+    // are COMMON, keeps the short window (see `PinnedGrace`). An earlier draft of this test
+    // asserted the opposite and encoded the defect.
     #[tokio::test]
-    async fn pinned_op_returns_a_lone_row_free_refusal_within_the_grace_window() {
-        let err = fake_op(true, vec![op_error("unavailable")], Some(op_ok()))
+    async fn pinned_op_still_surfaces_a_lone_row_free_refusal() {
+        let err = fake_op(true, vec![op_error("unavailable")], None)
             .await
             .expect_err("an honest refusal is not swallowed");
         assert_eq!(err.envelope().code, "unavailable");
