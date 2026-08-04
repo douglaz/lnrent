@@ -114,6 +114,12 @@ impl GiftWrapStream for NostrStream {
             }
         }
     }
+
+    // Preserve a nearer caller-supplied request deadline.
+    fn shorten_deadline(&mut self, within: Duration) -> bool {
+        self.deadline = self.deadline.min(Instant::now() + within);
+        true
+    }
 }
 
 /// System clock + request ids. The operator dedupes on `(sender, request_id)` (SPEC §5.1), so for a
@@ -162,6 +168,9 @@ impl Clock for SysClock {
             None => format!("req-{}", &Keys::generate().public_key().to_hex()[..24]),
         }
     }
+    fn request_id_is_pinned(&self) -> bool {
+        self.fixed_request_id.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -186,5 +195,13 @@ mod tests {
         let b = clock.new_request_id();
         assert_ne!(a, b, "fresh request ids must differ");
         assert!(a.starts_with("req-"));
+    }
+
+    #[test]
+    fn only_a_caller_supplied_request_id_reports_pinned() {
+        assert!(SysClock::with_request_id(Some("req-fixed-123".into())).request_id_is_pinned());
+        assert!(!SysClock::with_request_id(None).request_id_is_pinned());
+        assert!(!SysClock::new().request_id_is_pinned());
+        assert!(!SysClock::default().request_id_is_pinned());
     }
 }

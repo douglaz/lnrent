@@ -66,12 +66,22 @@ pub trait Relay: RelayBounds {
 #[async_trait::async_trait]
 pub trait GiftWrapStream: Send {
     async fn next(&mut self) -> Result<Option<Event>, RelayError>;
+
+    /// Shorten, but never extend, this stream's deadline. `false` means unsupported.
+    fn shorten_deadline(&mut self, _within: Duration) -> bool {
+        false
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
 #[async_trait::async_trait(?Send)]
 pub trait GiftWrapStream {
     async fn next(&mut self) -> Result<Option<Event>, RelayError>;
+
+    /// Shorten, but never extend, this stream's deadline. `false` means unsupported.
+    fn shorten_deadline(&mut self, _within: Duration) -> bool {
+        false
+    }
 }
 
 /// The time / fresh-id seam. `now_secs` is wall-clock unix seconds; `new_request_id` mints a
@@ -81,4 +91,9 @@ pub trait GiftWrapStream {
 pub trait Clock: Send + Sync {
     fn now_secs(&self) -> i64;
     fn new_request_id(&self) -> String;
+
+    /// Whether `new_request_id` returns a caller-pinned id rather than a freshly minted one.
+    fn request_id_is_pinned(&self) -> bool {
+        false
+    }
 }
