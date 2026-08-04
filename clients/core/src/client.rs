@@ -42,8 +42,16 @@ const PINNED_GRACE: Duration = Duration::from_secs(5);
 ///   live reply can legitimately be slow: hooks get 120s (`daemon/src/runner.rs:25`) and the
 ///   shipped `restart` makes two curl calls at `--max-time 30` each (`recipes/do-vps/ops/restart`).
 ///   A 5s window would expire mid-hook and return the stale refusal — the buyer then retries under
-///   a fresh id and the operation runs TWICE, which is the exact defect this change exists to
-///   close. Waiting costs nothing the caller did not already budget (`--timeout`, default 30s).
+///   a fresh id and the operation runs TWICE.
+///
+/// **This NARROWS the op double-execution hole; it does not close it, and the numbers above say
+/// so.** The buyer's own exchange deadline defaults to 30s (`clients/cli/src/main.rs:41`), a
+/// quarter of the hook budget. A hook that outlasts THAT ends the stream, and the held stale
+/// refusal is returned anyway — so an agent told "unauthorized" can still retry under a fresh id
+/// while the first hook is running. The residual is `lnrent-x1u`. The alternative — returning
+/// `Timeout` whenever a held refusal survives to the deadline, which steers the agent to re-send
+/// the SAME pinned id — trades this for a lone honest refusal surfacing as repeated timeouts
+/// forever, so it is a real design choice and not an oversight to patch in passing.
 #[derive(Debug, Clone, Copy)]
 enum PinnedGrace {
     /// Hold for at most this long, then answer with what we have.
@@ -67,13 +75,14 @@ enum PinnedGrace {
 /// one when the first attempt persisted nothing, because an attempt that did claim the key makes the
 /// daemon resend its cached terminal — byte-identical to the stored copy, so neither outranks the
 /// other. Drift is safe both ways: a refusal code added later and missing here just returns as
-/// promptly as it does today, and one that later becomes cached is merely held for [`PINNED_GRACE`].
-/// The row-free refusals whose STORED copy can disagree with a live reply. `op_dispatch.rs`
-/// answers a FOURTH without claiming the idempotency key — `invalid_request_id` (`:263-266`) —
-/// deliberately EXCLUDED here: buyer-id validation is deterministic on the pinned id, so the
-/// stored and live replies always agree and holding for a "better" one would only add latency to
-/// a verdict that cannot change. The three below are the ones a repoint/authorization change can
-/// flip between attempts.
+/// promptly as it does today. One that later becomes cached is held for the carrier's
+/// [`PinnedGrace`] — the short window on `renew`, the full request deadline on `invoke_op`, which
+/// is the only path that consults [`ROW_FREE_OP_REFUSALS`].
+///
+/// `op_dispatch.rs` answers a FOURTH row-free — `invalid_request_id` (`:263-266`) — deliberately
+/// excluded here, because buyer-id validation is deterministic on the pinned id: stored and live
+/// can never disagree, so holding for a "better" reply would only add latency to a verdict that
+/// cannot change.
 const ROW_FREE_OP_REFUSALS: [&str; 3] = ["unauthorized", "not_active", "unavailable"];
 
 /// Whether this `op.result` is one of the [`ROW_FREE_OP_REFUSALS`] — i.e. a reply the daemon can
@@ -349,7 +358,9 @@ impl<'a, R: Relay, S: NostrSigner, C: Clock> BuyerClient<'a, R, S, C> {
     /// error becomes a `Remote` error (exit 6); an `ok` result is returned for the caller to render.
     ///
     /// With a pinned request id, a matching [`ROW_FREE_OP_REFUSALS`] error may be a stored reply from
-    /// an earlier attempt that persisted nothing, so it is held for [`PINNED_GRACE`] to let THIS
+    /// an earlier attempt that persisted nothing, so it is held for the caller's FULL request
+    /// deadline ([`PinnedGrace::FullDeadline`], `--timeout`, 30s by default — NOT the short
+    /// [`PINNED_GRACE`] window `renew` uses) to let THIS
     /// attempt's result take precedence (lnrent-1jm). That matters more here than on `renew`: report
     /// a stale refusal for an attempt whose hook actually ran and the buyer retries under a fresh id,
     /// which runs a non-idempotent hook a SECOND time.
@@ -471,8 +482,9 @@ impl<'a, R: Relay, S: NostrSigner, C: Clock> BuyerClient<'a, R, S, C> {
         .await
     }
 
-    /// As [`Self::exchange`], but a pinned id holds an `Acceptable` reply for [`PINNED_GRACE`] so a
-    /// `Preferred` reply from the same subscription can win. Fresh ids return either match at once.
+    /// As [`Self::exchange`], but a pinned id holds an `Acceptable` reply for `grace` so a
+    /// `Preferred` reply correlated to the SAME request id can win — a short window on `renew`, the
+    /// caller's full request deadline on `invoke_op`. Fresh ids return either match at once.
     async fn exchange_preferred<F>(
         &self,
         request: Option<&Event>,
@@ -502,9 +514,16 @@ impl<'a, R: Relay, S: NostrSigner, C: Clock> BuyerClient<'a, R, S, C> {
                 Ok(next) => next,
                 // A transport error AFTER we are already holding a real reply must not downgrade
                 // the caller to `Transport`: the held reply is a genuine operator answer and is
-                // strictly more useful than an error. Unreachable for `NostrStream` (its `next`
-                // never returns `Err`, `clients/cli/src/relay.rs`), reachable in shape for
-                // `BrowserGiftWrapStream`, which propagates its read error.
+                // strictly more useful than an error.
+                //
+                // Defensive: unreachable in every SHIPPED configuration today, and the reason has
+                // two halves. `held` is only ever `Some` when pinned, and the only pinning `Clock`
+                // is the CLI's `SysClock`, whose `NostrStream::next` never returns `Err`
+                // (`clients/cli/src/relay.rs`). `BrowserGiftWrapStream` DOES propagate a read error
+                // (`clients/web/src/relay.rs`), but `BrowserClock` cannot pin — it takes the
+                // `request_id_is_pinned` default of `false` — so the composed system never reaches
+                // here either. It is kept so a future pinning client cannot silently regress; note
+                // that nothing pins it, since `FakeStream` has no error seam.
                 Err(e) => return held.ok_or_else(|| transport(e)),
             };
             let Some(event) = next else { break };
