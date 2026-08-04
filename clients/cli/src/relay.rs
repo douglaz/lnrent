@@ -114,6 +114,14 @@ impl GiftWrapStream for NostrStream {
             }
         }
     }
+
+    // lnrent-1jm: move the deadline in so buyer-core's pinned-`--request-id` grace window can keep
+    // reading THIS subscription briefly and then stop. `min` with the current deadline, never max:
+    // a caller who passed `--timeout 1` gets one second, not the grace window's two.
+    fn shorten_deadline(&mut self, within: Duration) -> bool {
+        self.deadline = self.deadline.min(Instant::now() + within);
+        true
+    }
 }
 
 /// System clock + request ids. The operator dedupes on `(sender, request_id)` (SPEC §5.1), so for a
@@ -162,6 +170,13 @@ impl Clock for SysClock {
             None => format!("req-{}", &Keys::generate().public_key().to_hex()[..24]),
         }
     }
+    // lnrent-1jm: TRUE exactly when the caller pinned the id with `--request-id`. A pinned id can
+    // already have a reply stored on the relay from an earlier attempt; a minted one cannot (it has
+    // never been published), which is why buyer-core's grace window keys off this and the default
+    // path is untouched.
+    fn request_id_is_pinned(&self) -> bool {
+        self.fixed_request_id.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -186,5 +201,41 @@ mod tests {
         let b = clock.new_request_id();
         assert_ne!(a, b, "fresh request ids must differ");
         assert!(a.starts_with("req-"));
+    }
+
+    // lnrent-1jm: the pinned flag buyer-core keys its grace window off. It must be TRUE only for a
+    // caller-supplied id — a minted id has never been published, so no stored reply can exist under
+    // it and the default path must stay exactly as fast as it is today.
+    #[test]
+    fn only_a_caller_supplied_request_id_reports_pinned() {
+        assert!(SysClock::with_request_id(Some("req-fixed-123".into())).request_id_is_pinned());
+        assert!(!SysClock::with_request_id(None).request_id_is_pinned());
+        assert!(!SysClock::new().request_id_is_pinned());
+        assert!(!SysClock::default().request_id_is_pinned());
+    }
+
+    // lnrent-1jm: `shorten_deadline` only ever moves the deadline EARLIER. A caller who ran with
+    // `--timeout 1` must not have their exchange stretched to the grace window's length.
+    #[tokio::test]
+    async fn shorten_deadline_never_extends_the_subscription() {
+        let (_tx, rx) = tokio::sync::broadcast::channel::<RelayPoolNotification>(1);
+        let opened = Instant::now();
+        let mut stream = NostrStream {
+            notifications: rx,
+            deadline: opened + Duration::from_secs(30),
+        };
+
+        assert!(stream.shorten_deadline(Duration::from_secs(2)));
+        let shortened = stream.deadline;
+        assert!(
+            shortened < opened + Duration::from_secs(3),
+            "a 30s deadline must come forward to ~2s from now"
+        );
+
+        assert!(stream.shorten_deadline(Duration::from_secs(600)));
+        assert_eq!(
+            stream.deadline, shortened,
+            "a LONGER window must leave the nearer deadline alone"
+        );
     }
 }
