@@ -67,18 +67,7 @@ pub trait Relay: RelayBounds {
 pub trait GiftWrapStream: Send {
     async fn next(&mut self) -> Result<Option<Event>, RelayError>;
 
-    /// Bring this subscription's deadline forward so it ends no later than `within` from now, and
-    /// report whether that was honored (lnrent-1jm).
-    ///
-    /// Core has no timer of its own — it is target-agnostic and carries no async runtime — so this
-    /// is the ONLY way it can bound a wait that is shorter than the timeout the subscription was
-    /// opened with. [`crate::client`]'s pinned-`--request-id` grace window uses it to keep reading
-    /// the SAME stream for a short while (switching streams would silently drop events the host has
-    /// already buffered) and then stop, instead of running to the full request deadline.
-    ///
-    /// It must never EXTEND a deadline: a stream already closer to expiry — a caller-shortened
-    /// `--timeout`, say — keeps its own. The default returns `false` for a host with no timer;
-    /// core then declines to enter a wait it cannot bound and answers exactly as it did before.
+    /// Shorten, but never extend, this stream's deadline. `false` means unsupported.
     fn shorten_deadline(&mut self, _within: Duration) -> bool {
         false
     }
@@ -89,8 +78,7 @@ pub trait GiftWrapStream: Send {
 pub trait GiftWrapStream {
     async fn next(&mut self) -> Result<Option<Event>, RelayError>;
 
-    /// See the native definition above — same contract, same default (the browser host does not
-    /// implement it, and does not need to: it never pins a request id, so core never asks).
+    /// Shorten, but never extend, this stream's deadline. `false` means unsupported.
     fn shorten_deadline(&mut self, _within: Duration) -> bool {
         false
     }
@@ -104,18 +92,7 @@ pub trait Clock: Send + Sync {
     fn now_secs(&self) -> i64;
     fn new_request_id(&self) -> String;
 
-    /// Whether `new_request_id` hands back an id the CALLER pinned (the CLI's `--request-id`
-    /// idempotency key, ADR-0014) rather than one this clock just minted (lnrent-1jm).
-    ///
-    /// This is the whole reason the client's grace window is cheap. A freshly minted id has never
-    /// been published, so nothing can already be STORED under it on a relay and every correlated
-    /// reply the client sees is necessarily this request's — the default path needs no grace window
-    /// at all and must not pay for one. A PINNED id has no such guarantee: a previous attempt's
-    /// reply is still on the relay under the same id, and NIP-59 randomizes a gift wrap's
-    /// `created_at` by up to days, so no `since` filter can exclude it.
-    ///
-    /// Defaults to `false` so a host that cannot pin an id keeps compiling — and keeps its exact
-    /// current behaviour.
+    /// Whether `new_request_id` returns a caller-pinned id rather than a freshly minted one.
     fn request_id_is_pinned(&self) -> bool {
         false
     }
