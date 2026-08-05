@@ -18,3 +18,7 @@
 
 # gstack skill temp output (codex review captures, etc.)
 .gstack/
+
+# `nix build` output symlinks (lnrent-m7g)
+/result
+/result-*

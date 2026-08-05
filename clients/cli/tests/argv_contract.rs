@@ -62,3 +62,25 @@ fn help_is_not_an_error_under_json() {
     assert_eq!(code, 0, "--help exits 0");
     assert!(stdout.contains("lnrent buyer CLI") || stdout.contains("Usage"), "help text is rendered");
 }
+
+// …and its twin. `handle_parse_error` has always routed `DisplayVersion` down the same exit-0
+// bypass as `DisplayHelp`, but that arm only became REACHABLE when lnrent-m7g declared
+// `#[command(version)]` — before it, `--version` was just an unexpected argument. So the branch the
+// doc comment promises is newly live and previously untested: pin it, or a later refactor of
+// `handle_parse_error` could route `--version` into the exit-3 bad_request envelope unnoticed.
+#[test]
+fn version_is_not_an_error_under_json() {
+    let (code, stdout, stderr) = run(&["--json", "--version"]);
+    assert_eq!(code, 0, "--version exits 0 even under --json; stderr:\n{stderr}");
+    assert!(
+        stdout.starts_with("lnrent-buyer "),
+        "version goes to stdout as plaintext, not a JSON envelope; stdout:\n{stdout}"
+    );
+    // Assert EMPTY, not merely "not JSON": `from_str(...).is_err()` would also hold for arbitrary
+    // plaintext noise, so the weaker predicate would keep passing while this line's stated
+    // guarantee was violated — the message-overstates-predicate trap.
+    assert!(
+        stderr.trim().is_empty(),
+        "nothing is emitted on the error channel for a successful --version; stderr:\n{stderr}"
+    );
+}

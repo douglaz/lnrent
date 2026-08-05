@@ -22,6 +22,7 @@ use crate::relay::{NostrRelay, SysClock};
 #[derive(Parser)]
 #[command(
     name = "lnrent-buyer",
+    version,
     about = "lnrent buyer CLI (agent-grade; talks to operators over Nostr; never pays)"
 )]
 struct Cli {
