@@ -109,6 +109,55 @@ One trap: `cargo test ... -- -D warnings` does NOT work. After `--`, cargo forwa
 binary and libtest rejects it (`Unrecognized option: 'D'`). Lint coverage of test code comes from the
 `--all-targets` clippy runs.
 
+### Nix packages and the container image
+
+`flake.nix` also builds the binaries and a container image, for our own nightly k8s run. That is
+INTERNAL infrastructure — the operator-facing release is a separate piece of work.
+
+```bash
+nix build .#lnrentd            # likewise .#lnrent and .#lnrent-buyer
+nix build .#image              # docker load < result  →  lnrent:<version>
+nix flake check                # both halves of the fedimint-presence probe — but see below
+```
+
+Those per-binary attributes narrow `result/bin`, and nothing else. They symlink into ONE shared
+build, which therefore stays a runtime dependency: `nix build .#lnrent-buyer` gives you a
+`result/bin` with just that binary, but its closure still carries all three (the daemon alone is
+~83MB). Do not reach for one of these expecting a slim closure — that split does not exist.
+
+And `nix flake check` reports `all checks passed!` after `running 0 flake checks` when the check
+derivations are already in the store. In that state it has proved nothing. The probe halves are
+built to be broken — point `marker` at a string no build emits, or flip a `expectMarker` — so if you
+change either one, break it and watch it fail rather than trusting a cached pass.
+
+**Smoke the image by STARTING the daemon, not with `--version`.** `--version` exits before the
+daemon does anything, so it passes on an image that cannot serve a single order. It did: the recipe
+tree was first published under `/opt`, where `buildLayeredImage`'s symlink farm made every `ops/`
+hook resolve into `/nix/store`, `Recipe::validate`'s containment check rejected them
+(`daemon/src/recipe.rs:313-324`), and the daemon died with `no valid recipe found` — while
+`--version` stayed green throughout. Nothing in CI runs this, so run it yourself after any change
+to `contents`, `Env`, or `recipesDir`:
+
+```bash
+nix build .#image && docker load < result
+timeout 25 docker run --rm --tmpfs /var/lib:rw,mode=0755 \
+  -e LNRENT_PAYMENT_BACKEND=mock -e LNRENT_RELAYS=wss://relay.example \
+  -e LNRENT_MNEMONIC="<any valid bip39>" lnrent:<version> lnrentd
+# exit 124 (still running) is the PASS. Exit 1 with `no valid recipe found` is the failure.
+```
+
+Two things to keep intact. Dependency artifacts (the fedimint tree + bundled RocksDB C++) build in
+their own crane derivation, so packaging/image edits that leave its inputs unchanged reuse it — do
+not collapse that into a single `buildRustPackage`. And the package build names its packages
+explicitly (`-p lnrentd -p lnrent-buyer-cli`) rather than `--workspace`: `clients/web` is
+wasm-primary, and while the gates above do compile it for the host, it yields no binary, so building
+it here would only add time to the image.
+
+Nothing in CI builds any of this — the cold fedimint/RocksDB build would dominate PR wall-clock —
+so it rots silently unless you run it. The one edge that rots on someone ELSE's change: the fedimint
+fork's vendor hash in `flake.nix` is keyed on the verbatim `source =` string in `Cargo.lock`, so
+repinning that fork breaks `nix build` while every cargo gate stays green. Repin and re-hash together.
+
 ### Formatting — read this before you reach for `cargo fmt`
 
 **Do not run `cargo fmt` across the tree, and do not add `cargo fmt --check` to a gate.** CI does not

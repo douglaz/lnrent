@@ -36,6 +36,7 @@ use zeroize::Zeroizing;
 #[derive(Parser)]
 #[command(
     name = "lnrentd",
+    version,
     about = "lnrent control plane daemon (and headless operator bootstrap)"
 )]
 struct Cli {

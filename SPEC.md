@@ -1394,7 +1394,7 @@ lnrent/
     core/                 # Rust buyer-core lib (DM protocol, order flow, gift-wrap; native + wasm32)
     cli/                  # thin native CLI over buyer-core
     web/                  # static WASM SPA over buyer-core (NIP-07 + WebLN + browser WS)
-  nix/                    # flake + NixOS module — PLANNED (today: devshell in flake.nix only)
+  nix/                    # NixOS module — PLANNED (flake.nix ships the rest; see it for current outputs)
   packaging/debian/       # systemd unit + install script — PLANNED
   docs/                   # protocol notes, NIP mapping, ADRs
 ```

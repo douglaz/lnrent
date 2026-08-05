@@ -10,6 +10,7 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(
     name = "lnrent",
+    version,
     about = "lnrent operator CLI (agent-grade; talks to lnrentd over a unix socket)"
 )]
 struct Cli {

@@ -55,6 +55,11 @@ the loop.
   shared prerequisite of this work AND lnrent-ea1. It is NOT the same deliverable: ea1 is
   an operator-facing release (portable binaries, systemd unit, install doc for a stranger
   on a VPS); this needs an internal container image. Build the package once, feed both.
+  > **SINCE SHIPPED (lnrent-m7g).** The sentence above describes the tree as it stood when
+  > this ADR was decided, and is kept because it is the rationale for that bead — it is no
+  > longer a statement about the current tree. `flake.nix` now ships the binary packages and
+  > the container image (see it for the current outputs). lnrent-ea1's operator-facing
+  > release is still outstanding, exactly as the split above anticipated.
 - **These gaps stay unproven, knowingly:** daemon survival across weeks; DigitalOcean
   billing over a real month; a real 30-day BOLT11 expiry (the compressed run never mints
   one); fedimint ecash sitting at rest that long; and any failure whose period is longer
