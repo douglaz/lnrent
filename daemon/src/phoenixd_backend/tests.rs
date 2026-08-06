@@ -38,6 +38,14 @@ struct FakeState {
     node_version: String,
     /// `getinfo.nodeId` — the WALLET identity a `PREPARED` attempt is pinned to.
     node_id: String,
+    /// Swap `node_id` to this the moment `pay_invoice` is called, modelling a wallet that changes
+    /// UNDER an in-flight POST (proxy failover, a restore onto another node). The receipt-less arm
+    /// re-reads `getinfo` after the POST precisely so that swap is caught.
+    node_id_after_pay: Option<String>,
+    /// Same, for the RELEASE: phoenixd restarted onto a new build between the POST and the
+    /// `outgoingbyhash` re-read. The marker's meaning is only measured for the verified release, so
+    /// a record read after that swap must not resolve anything.
+    node_version_after_pay: Option<String>,
     /// Scripted non-2xx statuses for `GET /getinfo` / `GET /getbalance`, delivered as the TYPED error
     /// the real HTTP layer returns — so the doctor probe's status classification is exercised with no
     /// socket (`node_ok = false` remains the transport-failure shape).
@@ -137,6 +145,14 @@ impl FakePhoenixdOps {
     fn set_node_id(&self, node_id: &str) {
         self.st.lock().unwrap().node_id = node_id.to_string();
     }
+
+    fn set_node_id_after_pay(&self, node_id: &str) {
+        self.st.lock().unwrap().node_id_after_pay = Some(node_id.to_string());
+    }
+
+    fn set_node_version_after_pay(&self, version: &str) {
+        self.st.lock().unwrap().node_version_after_pay = Some(version.to_string());
+    }
 }
 
 #[async_trait]
@@ -199,6 +215,12 @@ impl PhoenixdOps for FakePhoenixdOps {
     async fn pay_invoice(&self, bolt11: &str) -> Result<PayAttempt> {
         let mut st = self.st.lock().unwrap();
         st.pay_calls.push(bolt11.to_string());
+        if let Some(swapped) = st.node_id_after_pay.take() {
+            st.node_id = swapped;
+        }
+        if let Some(swapped) = st.node_version_after_pay.take() {
+            st.node_version = swapped;
+        }
         if let Some(scripted) = st.pay_script.pop_front() {
             return scripted.map_err(|e| anyhow!(e));
         }
@@ -1276,6 +1298,98 @@ async fn a_receipt_less_response_over_a_terminally_failed_record_resolves_failed
     assert!(
         format!("{err:#}").contains("FAILED at phoenixd"),
         "unexpected error: {err:#}"
+    );
+}
+
+// The receipt-less mirror's WALLET bind. phoenixd answers the POST with no receipt, and the wallet
+// answering changes before the post-POST `getinfo` re-read (proxy failover, a restore onto another
+// node). That other wallet's terminal record is evidence about ITS payment history, not about the
+// attempt we made against the prepared one, which may still be live — resolving on it would unlock a
+// retry that pays twice. The bind only works because this arm re-reads `getinfo` at decision time;
+// reusing the pre-POST answer (which `require_supported_version` had already validated) could never
+// catch a swap that happens after it.
+// The receipt-less mirror's VERSION bind, and the reason it must re-read `getinfo` instead of
+// reusing the pre-POST answer. `require_supported_version` validated the release BEFORE the POST, so
+// a bind against that value is deterministically true and proves nothing. Here phoenixd restarts
+// onto an unverified release inside the window between the POST and the `outgoingbyhash` re-read:
+// `completedAt` means whatever the NEW build says it means, so the record must not resolve anything.
+#[tokio::test]
+async fn a_receipt_less_terminal_record_on_a_release_swapped_under_the_post_stays_pending() {
+    let ops = FakePhoenixdOps::new();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let bolt11 = mint_bolt11(120_000, 92);
+    let hash = hash_of(&bolt11);
+    let key = "refund:order:92:g1";
+
+    ops.set_node_version_after_pay("0.10.0-unverified");
+    ops.set_outgoing_for(
+        &hash,
+        PhoenixdOutgoing {
+            payment_id: "pay-release-swapped".into(),
+            payment_hash: hash.clone(),
+            is_paid: false,
+            fees_msat: 0,
+            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+        },
+    );
+    ops.script_pay(Ok(PayAttempt::NoReceipt {
+        reason: Some("payment failed".into()),
+    }));
+
+    let err = be
+        .pay_refund_capped(&bolt11, 120, 130, key)
+        .await
+        .expect_err("a marker read on an unverified release cannot resolve the attempt");
+    assert_eq!(
+        be.payment_status_by_key(key).await.unwrap(),
+        PayStatus::Pending,
+        "a release swap under the POST must leave the attempt Pending"
+    );
+    assert_eq!(ops.pay_calls().len(), 1, "no retry is unlocked");
+    assert!(
+        format!("{err:#}").contains("release that marker was measured against"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_receipt_less_terminal_record_from_another_wallet_stays_pending() {
+    let ops = FakePhoenixdOps::new();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let bolt11 = mint_bolt11(120_000, 91);
+    let hash = hash_of(&bolt11);
+    let key = "refund:order:91:g1";
+
+    ops.set_node_id("03preparedwallet");
+    ops.set_node_id_after_pay("03otherwallet");
+    ops.set_outgoing_for(
+        &hash,
+        PhoenixdOutgoing {
+            payment_id: "pay-other-wallet-receiptless".into(),
+            payment_hash: hash.clone(),
+            is_paid: false,
+            fees_msat: 0,
+            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+        },
+    );
+    ops.script_pay(Ok(PayAttempt::NoReceipt {
+        reason: Some("payment failed".into()),
+    }));
+
+    let err = be
+        .pay_refund_capped(&bolt11, 120, 130, key)
+        .await
+        .expect_err("another wallet's terminal record cannot resolve this attempt");
+    assert_eq!(
+        be.payment_status_by_key(key).await.unwrap(),
+        PayStatus::Pending,
+        "a wallet swap under the POST must leave the attempt Pending"
+    );
+    assert_eq!(ops.pay_calls().len(), 1, "no retry is unlocked");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("03otherwallet") && rendered.contains("03preparedwallet"),
+        "the error must name both wallets: {rendered}"
     );
 }
 

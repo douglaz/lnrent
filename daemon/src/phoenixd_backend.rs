@@ -105,7 +105,8 @@
 //!    phoenixd can hold MORE THAN ONE outgoing attempt under one payment hash — the buried one and
 //!    the live one. `outgoingbyhash` answers with a single record and which one it picks among
 //!    several is NOT measured, so a terminal record is only actionable when lnrent's OWN ledger
-//!    proves the current `PREPARED` row is the first possible POST under that hash
+//!    shows the current `PREPARED` row is the only POST lnrent has WITNESSED under that hash
+//!    (sound as attribution only while nothing else POSTs to this wallet — see that function)
 //!    ([`pay_hash_has_only_current_attempt`]). Before the marker was measured, a `FAILED` key had
 //!    provably never POSTed and this state could not arise.
 //!
@@ -1043,7 +1044,7 @@ impl PhoenixdPayment {
                     // that release still running; anything else falls back to stay-Pending. It is
                     // also bound to the prepared WALLET and to the record's own hash. Finally,
                     // phoenixd may hold several attempts under that hash but returns only one, so
-                    // lnrent's OWN ledger must prove this is the first possible POST across all keys.
+                    // lnrent's OWN ledger must show this is the only POST it witnessed on that hash.
                     // No phoenixd payment-id comparison can provide that attribution.
                     Some(record) if outgoing_is_terminally_failed(&record) => {
                         if record.payment_hash != row.payment_hash {
@@ -1341,11 +1342,14 @@ impl PhoenixdPayment {
                     }
                     // Mirror of the recovery arm above: an unpaid record carrying the measured
                     // TERMINAL MARKER is a definite failure, so the key goes terminal `FAILED` and
-                    // the Refunder retries it. All three of recovery's binds are mirrored. The
-                    // record must name the hash we requested. The version bind uses the `getinfo`
-                    // answer already read before the POST. Attribution comes only from lnrent's OWN
-                    // ledger proving that no earlier or foreign POST can exist under the hash;
-                    // phoenixd cannot provide it because `outgoingbyhash` returns only one record.
+                    // the Refunder retries it. Recovery enforces FOUR binds before it resolves and
+                    // all four are mirrored here: the record must name the hash we requested;
+                    // lnrent's OWN ledger must show no earlier or foreign POST it witnessed under
+                    // that hash (phoenixd cannot supply that attribution, because `outgoingbyhash`
+                    // returns only one record and which one is unmeasured); the wallet answering
+                    // must be the one this attempt was prepared against; and the running release
+                    // must be the one the marker was measured on. The last two read `getinfo` FRESH
+                    // at this point rather than reusing the pre-POST answer — see below.
                     Ok(Some(record)) if outgoing_is_terminally_failed(&record) => {
                         if record.payment_hash != dest.payment_hash {
                             bail!(
@@ -1371,7 +1375,38 @@ impl PhoenixdPayment {
                                 dest.payment_hash
                             );
                         }
-                        if !self.fee_schedule.matches_running_version(&node.version) {
+                        // Re-read `getinfo` HERE rather than reusing the pre-POST `node`. That
+                        // earlier value came from `require_supported_version`, which already bailed
+                        // unless the version matched — so a bind against it is deterministically
+                        // true and proves nothing, and it would judge a record read AFTER the POST
+                        // by a version read BEFORE it. A phoenixd restarted onto a new release in
+                        // that window (one HTTP round trip, so narrow, but the marker is the whole
+                        // basis for resolving) would otherwise have its record judged on a stale
+                        // string. Recovery re-reads at decision time for exactly this reason; this
+                        // is its mirror, so it does the same and applies the SAME two binds.
+                        let live = self.ops.node_info().await.with_context(|| {
+                            format!(
+                                "re-reading the running phoenixd version and node identity before \
+                                 trusting the terminal marker for pay key {idempotency_key}; it is \
+                                 unreadable, so the attempt stays pending"
+                            )
+                        })?;
+                        // The wallet bind. `node` is the identity this attempt was PREPARED against
+                        // (it is what `pay_upsert_prepared` persisted before the POST), so a
+                        // different wallet answering now — proxy failover, a restore onto another
+                        // node — makes its terminal record evidence about someone else's payment
+                        // history while ours may still be live.
+                        if live.node_id != node.node_id {
+                            bail!(
+                                "phoenixd payinvoice for key {idempotency_key} was made against \
+                                 node {} but node {} is answering now, so its terminal record for \
+                                 hash {} is no evidence about our attempt; leaving it pending",
+                                node.node_id,
+                                live.node_id,
+                                dest.payment_hash
+                            );
+                        }
+                        if !self.fee_schedule.matches_running_version(&live.version) {
                             bail!(
                                 "phoenixd payinvoice for key {idempotency_key} returned no receipt \
                                  and a terminal outgoing record, but the running phoenixd is not \
@@ -2242,8 +2277,19 @@ fn pay_status_by_payment_id(index: &Mutex<Connection>, payment_id: &str) -> Resu
     .context("reading phoenixd_pay status by payment id")
 }
 
-/// Does lnrent's OWN ledger prove the current `PREPARED` row is the only possible POST ever made
+/// Does lnrent's OWN ledger show the current `PREPARED` row is the only POST *it has witnessed*
 /// under `payment_hash`?
+///
+/// **PRECONDITION — say it plainly, because the rest of this doc is only true given it.** This
+/// ledger witnesses lnrent's own POSTs and nothing else, so reading a `true` here as "the only POST
+/// that EXISTS" additionally assumes the phoenixd wallet is lnrent's alone. Under ADR-0018 it is
+/// (the wallet is derived from lnrent's own seed and dedicated to this daemon), and the sanctioned
+/// operator action for a stuck refund is `lnrent refund-retry <id>`, which goes THROUGH lnrent and
+/// so is witnessed. But an attempt made outside lnrent — paying the same bolt11 straight at the
+/// node's API, which a `RefundStuck` DM might tempt an operator into — is invisible here, and this
+/// function would then wrongly report the current attempt as sole. That is a double pay, so treat
+/// "never POST to this wallet by any other route" as an operating constraint of the daemon, not a
+/// stylistic preference.
 ///
 /// A terminal `outgoingbyhash` record proves the current witness did reach phoenixd, but phoenixd
 /// returns only ONE record when several attempts share a hash. Attribution is therefore sound only
