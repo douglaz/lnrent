@@ -1004,9 +1004,11 @@ impl PhoenixdPayment {
                     //   * comparing against the one buried payment id — a record from any OTHER dead
                     //     attempt, including another key's, still passes;
                     //   * proving from lnrent's own `phoenixd_pay` ledger that no earlier POST
-                    //     exists — the ledger witnesses only lnrent's POSTs, and `backup.rs`
-                    //     deliberately keeps the phoenixd WALLET out of the backup, so a restore
-                    //     leaves a clean index over a hash phoenixd still has history for;
+                    //     exists — the ledger witnesses only lnrent's POSTs, and the phoenixd
+                    //     WALLET is deliberately NOT in lnrent's backup (`daemon/src/backup.rs:27-34`
+                    //     states it: the funds live under phoenixd's own seed, and `phoenixd_index.db`
+                    //     is only lnrent's correlation map), so a restore leaves a clean index over a
+                    //     hash phoenixd still has history for;
                     //   * recording phoenixd's own pre-POST answer on the row — a restore that
                     //     RETAINS a `PREPARED` row restores that answer too, as stale as the
                     //     bookkeeping it was meant to outrank, and nothing enforces that no other
