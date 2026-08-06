@@ -1374,6 +1374,50 @@ async fn a_receipt_less_terminal_record_on_a_release_swapped_under_the_post_stay
 // has history for. The ledger gate cannot see that; only asking phoenixd before POSTing can. Here
 // the index is empty (as after a restore) while phoenixd already holds a terminal record: the new
 // attempt must never adopt it, or the retry it unlocks pays over a possibly-live payment.
+// An index created by a build that predates `remote_history_at_post` must still work after upgrade.
+// `CREATE TABLE IF NOT EXISTS` cannot add a column to an existing table, so without the migration
+// every pay_get/pay_upsert_prepared fails "no such column" and NO refund can be paid or prepared —
+// a total refund outage that only shows at pay time. The backfilled DEFAULT must be 1 (assume
+// phoenixd may already have held a record), since a row prepared before the column existed carries
+// no pre-POST probe answer.
+#[test]
+fn an_index_predating_the_probe_column_migrates_and_backfills_fail_closed() {
+    let conn = Connection::open_in_memory().unwrap();
+    // The phoenixd_pay table exactly as it shipped before this branch.
+    conn.execute_batch(
+        "CREATE TABLE phoenixd_pay (
+            idempotency_key TEXT PRIMARY KEY,
+            bolt11          TEXT NOT NULL,
+            payment_hash    TEXT NOT NULL,
+            node_id         TEXT,
+            payment_id      TEXT,
+            status          TEXT NOT NULL DEFAULT 'PREPARED',
+            terminal_at     INTEGER
+        );
+        INSERT INTO phoenixd_pay (idempotency_key, bolt11, payment_hash, node_id, status)
+             VALUES ('old:key', 'lnbc1old', 'deadbeef', '027e48node', 'PREPARED');",
+    )
+    .unwrap();
+    assert!(
+        !super::index_has_column(&conn, "phoenixd_pay", "remote_history_at_post").unwrap(),
+        "precondition: the old schema has no probe column"
+    );
+
+    super::migrate_index(&conn).unwrap();
+    assert!(super::index_has_column(&conn, "phoenixd_pay", "remote_history_at_post").unwrap());
+    let backfilled: i64 = conn
+        .query_row(
+            "SELECT remote_history_at_post FROM phoenixd_pay WHERE idempotency_key = 'old:key'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(backfilled, 1, "a pre-column row must backfill to fail-CLOSED, not to 0");
+
+    // Idempotent: running it again on the migrated dir is a no-op, not an error.
+    super::migrate_index(&conn).unwrap();
+}
+
 #[tokio::test]
 async fn a_terminal_record_that_predates_our_post_is_never_adopted_after_a_restore() {
     let ops = FakePhoenixdOps::new();

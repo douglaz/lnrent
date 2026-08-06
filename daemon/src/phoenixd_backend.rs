@@ -324,6 +324,37 @@ CREATE TABLE IF NOT EXISTS phoenixd_pay (
 CREATE INDEX IF NOT EXISTS phoenixd_pay_by_hash ON phoenixd_pay (payment_hash);
 ";
 
+/// Bring an EXISTING `phoenixd_index.db` up to `INDEX_SCHEMA`.
+///
+/// `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already exists, so a column added to the
+/// schema constant never reaches a data dir created by an earlier build — every `pay_get` /
+/// `pay_upsert_prepared` would then fail with "no such column" and NO refund could be paid or even
+/// prepared. `backup.rs` captures `phoenixd_index.db`, so old-schema files legitimately outlive an
+/// upgrade and this is reachable by restore as well as by plain upgrade.
+///
+/// Idempotent, and guarded by `PRAGMA table_info` rather than by catching the error, so a rerun on
+/// an already-migrated dir is a no-op instead of a swallowed failure.
+fn migrate_index(conn: &Connection) -> Result<()> {
+    if !index_has_column(conn, "phoenixd_pay", "remote_history_at_post")? {
+        // DEFAULT 1 is the whole point on backfill: a row prepared before this column existed has no
+        // pre-POST probe answer, so it must be treated as "phoenixd may already have held a record"
+        // and never resolve a terminal marker.
+        conn.execute(
+            "ALTER TABLE phoenixd_pay
+                 ADD COLUMN remote_history_at_post INTEGER NOT NULL DEFAULT 1",
+            [],
+        )
+        .context("adding phoenixd_pay.remote_history_at_post")?;
+    }
+    Ok(())
+}
+
+fn index_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    Ok(rows.any(|name| name.map(|n| n == column).unwrap_or(false)))
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Normalized phoenixd seam (`PhoenixdOps`)
 //
@@ -865,6 +896,7 @@ impl PhoenixdPayment {
         let conn = Connection::open(&index_path).context("opening phoenixd index db")?;
         conn.execute_batch(INDEX_SCHEMA)
             .context("initialising phoenixd index schema")?;
+        migrate_index(&conn).context("migrating the phoenixd index schema")?;
         Ok(Self::with_ops(Arc::new(ops), conn, clock, fee_schedule))
     }
 
@@ -1070,7 +1102,11 @@ impl PhoenixdPayment {
                         // there, an unreadable probe, or a row predating this column) fails closed.
                         if row.remote_history_at_post {
                             bail!(
-                                "phoenixd pay for key {idempotency_key} has a terminal outgoing                                  record for hash {}, but phoenixd already held a record for that                                  hash when this attempt POSTed (or the pre-POST probe could not be                                  read), so the record cannot be attributed to this attempt and the                                  payment stays pending",
+                                "phoenixd pay for key {idempotency_key} has a terminal outgoing \
+                                 record for hash {}, but phoenixd already held a record for that \
+                                 hash when this attempt POSTed (or the pre-POST probe could not be \
+                                 read), so the record cannot be attributed to this attempt and the \
+                                 payment stays pending",
                                 row.payment_hash
                             );
                         }
@@ -1320,7 +1356,9 @@ impl PhoenixdPayment {
                 tracing::warn!(
                     key = idempotency_key,
                     error = %format!("{e:#}"),
-                    "phoenixd: could not read whether this hash already had an outgoing record                      before POSTing, so a later terminal marker will not be attributed to this                      attempt; it will need an operator if it goes ambiguous"
+                    "phoenixd: could not read whether this hash already had an outgoing record \
+                     before POSTing, so a later terminal marker will not be attributed to this \
+                     attempt; it will need an operator if it goes ambiguous"
                 );
                 true
             }
