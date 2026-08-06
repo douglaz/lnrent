@@ -610,10 +610,14 @@ async fn spendable_credit_msat(
             received_sat = record.received_sat,
             fee_credit_sat,
             balance_sat = balance.balance_sat,
-            "phoenixd holds a non-spendable LSP fee credit; up to that much of lnrent's booked \
-             receipts may not be backed by spendable funds (ADR-0019). Booking this receipt because \
-             the wallet-level signal does not show both halves of the refusal — NOT because the \
-             balance is known to cover a refund of it, which it need not."
+            "phoenixd holds a non-spendable LSP fee credit ({fee_credit_sat} sat); up to that much \
+             of lnrent's booked receipts may not be backed by SPENDABLE funds (ADR-0019). This \
+             receipt is booked because the credit is smaller than the receipt, so the credit cannot \
+             account for the whole of it — NOT because the spendable balance ({} sat) is known to \
+             cover a refund of it, which it need not. If refunds start failing for insufficient \
+             funds, the wallet needs spendable float: send sats to it, or open inbound liquidity so \
+             receives stop landing in fee credit.",
+            balance.balance_sat
         ),
         CreditBacking::UnbackedAndUnpayable {
             fee_credit_sat,
@@ -979,11 +983,26 @@ impl PhoenixdPayment {
                     // Pending, and `RefundStuck` for a permanently ambiguous one. Reviving this needs
                     // attribution phoenixd's API cannot currently supply — do not re-derive it from
                     // local state.
+                    // Bind the record: this arm covers BOTH shapes, and saying "a terminal marker
+                    // cannot be attributed" over an in-flight record would state something false
+                    // about it. The message must also stand on its own — an operator reading a
+                    // stuck refund cannot see this file.
+                    Some(record) if record.completed_at_ms.is_none() => bail!(
+                        "phoenixd pay for key {idempotency_key} has an outgoing record for hash {} \
+                         that is not paid and carries no completion time, which is phoenixd's shape \
+                         for a payment still IN FLIGHT. Leaving it pending rather than paying again. \
+                         If it never completes, this surfaces as a RefundStuck alert to settle by \
+                         hand; do not pay this destination out of band while it is in flight.",
+                        row.payment_hash
+                    ),
                     Some(_) => bail!(
                         "phoenixd pay for key {idempotency_key} has an outgoing record for hash {} \
-                         that is not (yet) paid; leaving it in flight rather than paying again \
-                         (a terminal `completedAt` cannot be attributed to the CURRENT attempt, so \
-                         it is not treated as a definite failure here — see the truth table above)",
+                         that is not paid but DOES carry a completion time, which on the measured \
+                         phoenixd release means the payment failed. lnrent still leaves it pending: \
+                         phoenixd returns only one record per payment hash, so that record cannot be \
+                         proven to be this attempt rather than an earlier one, and retrying on it \
+                         could pay a live payment twice. Expect a RefundStuck alert; settling it \
+                         needs a human who can see the wallet's own payment list.",
                         row.payment_hash
                     ),
                     // A clean 404 PROVES this hash never paid AT THE NODE THAT ANSWERED — which is

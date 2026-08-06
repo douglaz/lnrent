@@ -227,7 +227,7 @@ impl PhoenixdOps for FakePhoenixdOps {
                 is_paid: true,
                 // `fees` is MSAT on the wire; the fake charges exactly the measured schedule.
                 fees_msat: FeeSchedule::default().fee_msat(u128::from(amount_msat)) as u64,
-    completed_at_ms: None,
+        completed_at_ms: None,
             },
         );
         Ok(PayAttempt::Paid {
@@ -1183,7 +1183,7 @@ async fn a_receipt_less_duplicate_response_is_success_equivalent() {
         payment_hash: hash.clone(),
         is_paid: true,
         fees_msat: 4_480,
-    completed_at_ms: None,
+        completed_at_ms: None,
     });
     ops.script_pay(Ok(PayAttempt::NoReceipt {
         reason: Some("this invoice has already been paid".into()),
@@ -1373,7 +1373,7 @@ async fn recovery_adopts_a_paid_record_without_paying_again() {
         payment_hash: hash,
         is_paid: true,
         fees_msat: 4_480,
-    completed_at_ms: None,
+        completed_at_ms: None,
     });
     let id = be
         .pay_refund_capped(&bolt11, 120, 130, "refund:order:5:g1")
@@ -1408,7 +1408,7 @@ async fn recovery_rejects_a_paid_record_for_a_different_hash() {
             payment_hash: "ff".repeat(32),
             is_paid: true,
             fees_msat: 4_480,
-    completed_at_ms: None,
+        completed_at_ms: None,
         },
     );
     let err = be
@@ -1437,6 +1437,51 @@ async fn recovery_rejects_a_paid_record_for_a_different_hash() {
 
 // An outgoing record that exists but is not paid is an UNVERIFIED phoenixd state: never retried
 // blindly (fact 3), never marked terminal.
+// The other half of the measured truth table. An unpaid record that DOES carry `completedAt` means
+// the payment failed on the release this was measured on — but lnrent still refuses to act on it,
+// because `outgoingbyhash` returns one record per hash and it cannot be proven to be THIS attempt.
+// Same outcome as the in-flight shape, different operator message: conflating the two hides whether
+// a refund is stuck mid-flight or stuck on an unattributable failure.
+#[tokio::test]
+async fn a_terminal_outgoing_record_stays_pending_but_reads_differently() {
+    let ops = FakePhoenixdOps::new();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let bolt11 = mint_bolt11(120_000, 7);
+    let hash = hash_of(&bolt11);
+
+    ops.script_pay(Err("timeout".into()));
+    be.pay_refund_capped(&bolt11, 120, 130, "refund:order:7:g1")
+        .await
+        .expect_err("ambiguous");
+    ops.set_outgoing(PhoenixdOutgoing {
+        payment_id: "pay-terminally-failed".into(),
+        payment_hash: hash,
+        is_paid: false,
+        fees_msat: 0,
+        completed_at_ms: Some(1_785_101_384_178),
+    });
+
+    let err = be
+        .pay_refund_capped(&bolt11, 120, 130, "refund:order:7:g1")
+        .await
+        .expect_err("an unattributable terminal record is not a green light either");
+    assert_eq!(
+        be.payment_status_by_key("refund:order:7:g1").await.unwrap(),
+        PayStatus::Pending,
+        "a terminal marker must NOT resolve the key while it cannot be attributed"
+    );
+    assert_eq!(ops.pay_calls().len(), 1, "and it must never unlock a second payinvoice");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("DOES carry a completion time"),
+        "the terminal shape must be reported as such: {rendered}"
+    );
+    assert!(
+        !rendered.contains("still IN FLIGHT"),
+        "and must not be reported as in flight: {rendered}"
+    );
+}
+
 #[tokio::test]
 async fn recovery_never_retries_an_unpaid_outgoing_record() {
     let ops = FakePhoenixdOps::new();
@@ -1453,14 +1498,24 @@ async fn recovery_never_retries_an_unpaid_outgoing_record() {
         payment_hash: hash,
         is_paid: false,
         fees_msat: 0,
-    completed_at_ms: None,
+        completed_at_ms: None,
     });
 
     let err = be
         .pay_refund_capped(&bolt11, 120, 130, "refund:order:6:g1")
         .await
         .expect_err("an unpaid record is ambiguous, not a green light");
-    assert!(format!("{err:#}").contains("not (yet) paid"));
+    // The in-flight shape must SAY in flight: this is the message an operator reads off a stuck
+    // refund, and calling it a failed-attribution would state something false about the record.
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("still IN FLIGHT"),
+        "the absent-completedAt shape must be reported as in flight: {rendered}"
+    );
+    assert!(
+        !rendered.contains("DOES carry a completion time"),
+        "it must not borrow the terminal shape's wording: {rendered}"
+    );
     assert_eq!(
         ops.pay_calls().len(),
         1,
