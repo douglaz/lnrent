@@ -536,6 +536,27 @@ enum CreditBacking {
 /// refund, and reconcile cannot expire a `Paid` invoice either), which loses the buyer's money in the
 /// far more common false-positive case. `balance_sat < received_sat` is what makes the refusal earn
 /// its cost: there, booking the receipt would promise a refund the wallet has no funds for at all.
+/// WHICH half of the refusal failed, for the operator warning on the book-and-warn arm.
+///
+/// Refusing a receipt needs BOTH `fee_credit >= received` AND `balance < received`
+/// ([`credit_backing`]). The warn arm is reached when AT LEAST ONE fails, so a message asserting
+/// "both did not hold" is false whenever only one did — which is the case in
+/// `credit_backing(1000, 999, 0)`, the example the docs around here are written on. This has been
+/// stated wrongly three times; it is a function with a test now so the next statement of it has to
+/// agree with the branch.
+///
+/// Only the credit half needs testing: if `fee_credit >= received` then the arm can only have been
+/// reached because `balance >= received`, so the two cases below are exhaustive.
+fn credit_booking_reason(received_sat: u64, fee_credit_sat: u64) -> &'static str {
+    if fee_credit_sat < received_sat {
+        "the fee credit is smaller than this receipt, so it cannot account for all of it — the \
+         spendable balance may still be zero"
+    } else {
+        "the spendable balance covers this receipt, even though the fee credit could account for \
+         all of it"
+    }
+}
+
 fn credit_backing(received_sat: u64, fee_credit_sat: u64, balance_sat: u64) -> CreditBacking {
     if fee_credit_sat == 0 {
         CreditBacking::FullyBacked
@@ -613,17 +634,19 @@ async fn spendable_credit_msat(
             received_sat = record.received_sat,
             fee_credit_sat,
             balance_sat = balance.balance_sat,
+            // Say which half of the refusal actually failed, rather than a general claim about the
+            // branch. Refusing needs BOTH `credit >= receipt` and `balance < receipt`; this arm is
+            // reached when AT LEAST ONE fails, so any message asserting "both did not hold" is false
+            // whenever only one did — including `credit_backing(1000, 999, 0)`, the case the
+            // surrounding docs are written around. Deriving the reason here keeps the two in step.
+            reason = credit_booking_reason(record.received_sat, fee_credit_sat),
             "phoenixd holds a non-spendable LSP fee credit ({fee_credit_sat} sat); up to that much \
              of lnrent's booked receipts may not be backed by SPENDABLE funds (ADR-0019). This \
-             receipt ({} sat) is booked because BOTH halves of the refusal did not hold — refusing \
-             needs the credit to cover the whole receipt AND the spendable balance ({} sat) not to. \
-             Whichever half failed here, do NOT read this as a guarantee that a refund of this \
-             receipt can be paid: when the credit is the smaller figure the balance may still be \
-             zero. If refunds start failing for insufficient funds, the wallet needs spendable \
-             float: send sats to it, or open inbound liquidity so receives stop landing in fee \
-             credit.",
-            record.received_sat,
-            balance.balance_sat
+             receipt ({} sat) is booked anyway — see `reason` for which half of the refusal did not \
+             hold. Booking is NOT a guarantee that a refund of this receipt can be paid. If refunds \
+             start failing for insufficient funds, the wallet needs spendable float: send sats to \
+             it, or open inbound liquidity so receives stop landing in fee credit.",
+            record.received_sat
         ),
         CreditBacking::UnbackedAndUnpayable {
             fee_credit_sat,

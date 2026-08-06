@@ -19,6 +19,52 @@ use super::*;
 /// SET, so a paid record with `None` is a shape the live node never emits and would test green
 /// against an impossible input.
 const MEASURED_COMPLETED_AT_MS: i64 = 1_785_101_384_178;
+
+/// The operator warning on the book-and-warn arm must name the half of the refusal that ACTUALLY
+/// failed. Refusing needs `fee_credit >= received` AND `balance < received`; the arm fires when at
+/// least one fails, so "both did not hold" is false whenever only one did. Three successive attempts
+/// at this sentence were wrong in one direction or the other, which is why the branch is a function
+/// with this test under it.
+#[test]
+fn the_credit_booking_reason_names_the_half_that_actually_failed() {
+    // The case the surrounding docs are written on: credit (999) < receipt (1000), balance zero.
+    // The BALANCE half of the refusal holds here, so a message blaming the balance would be false.
+    let reason = super::credit_booking_reason(1_000, 999);
+    assert!(
+        reason.contains("fee credit is smaller"),
+        "credit<receipt must blame the credit: {reason}"
+    );
+    assert!(
+        reason.contains("may still be zero"),
+        "and must NOT imply the balance covers a refund: {reason}"
+    );
+
+    // The other disjunct: the credit could cover the whole receipt, so the arm can only have been
+    // reached because the balance covers it. Blaming the credit here would be the inverse error.
+    let reason = super::credit_booking_reason(1_000, 5_000);
+    assert!(
+        reason.contains("spendable balance covers"),
+        "credit>=receipt must blame the balance: {reason}"
+    );
+    assert!(
+        !reason.contains("fee credit is smaller"),
+        "and must not also claim the credit is smaller: {reason}"
+    );
+
+    // Boundary: exactly equal is NOT "smaller", so it takes the balance-covers branch.
+    assert!(super::credit_booking_reason(1_000, 1_000).contains("spendable balance covers"));
+
+    // And the classifier really does route both of those inputs to this arm, or the reasons above
+    // would be describing a branch that never fires.
+    assert!(matches!(
+        super::credit_backing(1_000, 999, 0),
+        super::CreditBacking::UnattributedButPayable { .. }
+    ));
+    assert!(matches!(
+        super::credit_backing(1_000, 5_000, 2_000),
+        super::CreditBacking::UnattributedButPayable { .. }
+    ));
+}
 use crate::backends::{PayStatus, PaymentBackend, PaymentStatus};
 use crate::clock::{Clock, TestClock};
 
