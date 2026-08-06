@@ -497,7 +497,7 @@ async fn create_invoice_replaces_a_cached_invoice_phoenixd_reports_expired() {
             is_expired: true,
             requested_sat: first.amount_sat,
             received_sat: 0,
-            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+            completed_at_ms: None,
             expires_at_ms: None,
         }],
     );
@@ -797,7 +797,7 @@ async fn an_expired_unpaid_invoice_retires_but_a_live_one_keeps_being_polled() {
             is_expired: true,
             requested_sat: 25_000,
             received_sat: 0,
-            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+            completed_at_ms: None,
             expires_at_ms: None,
         }],
     );

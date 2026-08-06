@@ -615,11 +615,14 @@ async fn spendable_credit_msat(
             balance_sat = balance.balance_sat,
             "phoenixd holds a non-spendable LSP fee credit ({fee_credit_sat} sat); up to that much \
              of lnrent's booked receipts may not be backed by SPENDABLE funds (ADR-0019). This \
-             receipt is booked because the credit is smaller than the receipt, so the credit cannot \
-             account for the whole of it — NOT because the spendable balance ({} sat) is known to \
-             cover a refund of it, which it need not. If refunds start failing for insufficient \
-             funds, the wallet needs spendable float: send sats to it, or open inbound liquidity so \
-             receives stop landing in fee credit.",
+             receipt ({} sat) is booked because BOTH halves of the refusal did not hold — refusing \
+             needs the credit to cover the whole receipt AND the spendable balance ({} sat) not to. \
+             Whichever half failed here, do NOT read this as a guarantee that a refund of this \
+             receipt can be paid: when the credit is the smaller figure the balance may still be \
+             zero. If refunds start failing for insufficient funds, the wallet needs spendable \
+             float: send sats to it, or open inbound liquidity so receives stop landing in fee \
+             credit.",
+            record.received_sat,
             balance.balance_sat
         ),
         CreditBacking::UnbackedAndUnpayable {
@@ -939,17 +942,16 @@ impl PhoenixdPayment {
                     Some(record) if record.is_paid => {
                         self.adopt_paid(idempotency_key, &record, amount_sat, cap)
                     }
-                    // MEASUREMENT GAP, stated honestly: the live probe measured the 404 and the
-                    // paid/dedup shapes, NOT what `outgoingbyhash` returns for an outgoing payment
-                    // that definitively FAILED (route/liquidity). So an unpaid record is only
-                    // provably "not paid YET" — it may equally be a terminal failure. Classifying it
-                    // as failed on an unmeasured field would be a guess whose cost is a DOUBLE PAY
-                    // (re-paying a payment that was still in flight); lnrent's ambiguous-pay
-                    // discipline (lnrent-y4m.16) is the opposite — stay pending, never a second pay,
-                    // surface it. The key therefore reports `Pending`, the Refunder re-awaits it
-                    // without ever re-quoting or minting a new payment hash, and a permanently
-                    // ambiguous one becomes a `RefundStuck` operator alert rather than a silent
-                    // livelock.
+                    // An unpaid record leaves the key `Pending`: the Refunder re-awaits it without
+                    // ever re-quoting or minting a new payment hash, and a permanently ambiguous one
+                    // becomes a `RefundStuck` operator alert rather than a silent livelock. That is
+                    // lnrent's ambiguous-pay discipline (lnrent-y4m.16) — never a second pay.
+                    //
+                    // HISTORY, so the reason is not mistaken for the old one: this arm used to stay
+                    // Pending because the failed-outgoing SHAPE was unmeasured. That gap is closed —
+                    // the truth table below is the measurement. The reason it still stays Pending is
+                    // now ATTRIBUTION, which is a different and narrower claim, spelled out under
+                    // the table.
                     //
                     // The failed-outgoing shape IS now measured (live mainnet, 2026-07-26, phoenixd
                     // 0.9.0-b072567). `completedAt` is the terminal marker:
@@ -1661,8 +1663,9 @@ impl PaymentBackend for PhoenixdPayment {
         // every `FAILED` row this backend writes today is a PREFLIGHT REFUSAL that provably never
         // POSTed (module-header invariant), and `pay_inner` re-runs the full preflight for such a key
         // rather than bailing terminally — that is the retry this `true` unlocks. A payment that
-        // actually failed AT phoenixd stays `Pending` instead (see the measurement gap in
-        // `pay_inner`), so it never reaches this branch of the Refunder at all.
+        // actually failed AT phoenixd stays `Pending` instead — its terminal record cannot be
+        // attributed to the attempt outstanding now (the attribution refusal under `pay_inner`'s
+        // truth table), so it never reaches this branch of the Refunder at all.
         true
     }
 
