@@ -558,9 +558,12 @@ fn credit_backing(received_sat: u64, fee_credit_sat: u64, balance_sat: u64) -> C
 /// subtract per receipt; the only fee-credit signal the node exposes is the WALLET-level
 /// `getbalance`. So the rejection form is used, on BOTH figures of that one snapshot:
 ///  - `feeCreditSat == 0`: nothing is unbacked; book `receivedSat`.
-///  - fee credit exists, but `balanceSat >= receivedSat`: whatever this receipt is made of, the
-///    wallet holds at least that much SPENDABLE, so a refund of it can be paid. Book it and WARN —
-///    the over-book is bounded by `feeCreditSat`.
+///  - fee credit exists but the refusal below does NOT apply — i.e. the credit cannot account for
+///    this receipt in full, or the balance covers it. Book it and WARN; the over-book is bounded by
+///    `feeCreditSat`. Careful: this is NOT "the balance covers it, so a refund of it can be paid".
+///    `credit_backing(1000, 999, 0)` lands here — the credit (999) is smaller than the receipt
+///    (1000), so the refusal does not fire — with zero spendable sats. The rule is right (a
+///    wallet-level signal is the maximal precision phoenixd offers); the payable reading is not.
 ///  - `feeCreditSat >= receivedSat` AND `balanceSat < receivedSat`: this receipt could be fee credit
 ///    in full and there are not even spendable funds to refund it. Refused (the fail-closed
 ///    direction the rest of this module takes). The caller retries, so the operator sees a

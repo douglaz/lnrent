@@ -13,6 +13,12 @@ use async_trait::async_trait;
 use rusqlite::Connection;
 
 use super::*;
+
+/// phoenixd's `completedAt` from the 2026-07-26 live measurement, epoch MILLIS. Used wherever a test
+/// builds a record the measured truth table says must carry one: `isPaid=true` implies the marker is
+/// SET, so a paid record with `None` is a shape the live node never emits and would test green
+/// against an impossible input.
+const MEASURED_COMPLETED_AT_MS: i64 = 1_785_101_384_178;
 use crate::backends::{PayStatus, PaymentBackend, PaymentStatus};
 use crate::clock::{Clock, TestClock};
 
@@ -227,7 +233,7 @@ impl PhoenixdOps for FakePhoenixdOps {
                 is_paid: true,
                 // `fees` is MSAT on the wire; the fake charges exactly the measured schedule.
                 fees_msat: FeeSchedule::default().fee_msat(u128::from(amount_msat)) as u64,
-        completed_at_ms: None,
+                completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
             },
         );
         Ok(PayAttempt::Paid {
@@ -491,7 +497,7 @@ async fn create_invoice_replaces_a_cached_invoice_phoenixd_reports_expired() {
             is_expired: true,
             requested_sat: first.amount_sat,
             received_sat: 0,
-            completed_at_ms: None,
+            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
             expires_at_ms: None,
         }],
     );
@@ -791,7 +797,7 @@ async fn an_expired_unpaid_invoice_retires_but_a_live_one_keeps_being_polled() {
             is_expired: true,
             requested_sat: 25_000,
             received_sat: 0,
-            completed_at_ms: None,
+            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
             expires_at_ms: None,
         }],
     );
@@ -1183,7 +1189,7 @@ async fn a_receipt_less_duplicate_response_is_success_equivalent() {
         payment_hash: hash.clone(),
         is_paid: true,
         fees_msat: 4_480,
-        completed_at_ms: None,
+        completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
     });
     ops.script_pay(Ok(PayAttempt::NoReceipt {
         reason: Some("this invoice has already been paid".into()),
@@ -1373,7 +1379,7 @@ async fn recovery_adopts_a_paid_record_without_paying_again() {
         payment_hash: hash,
         is_paid: true,
         fees_msat: 4_480,
-        completed_at_ms: None,
+        completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
     });
     let id = be
         .pay_refund_capped(&bolt11, 120, 130, "refund:order:5:g1")
@@ -1408,7 +1414,7 @@ async fn recovery_rejects_a_paid_record_for_a_different_hash() {
             payment_hash: "ff".repeat(32),
             is_paid: true,
             fees_msat: 4_480,
-        completed_at_ms: None,
+            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
         },
     );
     let err = be
