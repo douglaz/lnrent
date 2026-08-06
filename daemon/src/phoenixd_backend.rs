@@ -536,6 +536,19 @@ enum CreditBacking {
 /// refund, and reconcile cannot expire a `Paid` invoice either), which loses the buyer's money in the
 /// far more common false-positive case. `balance_sat < received_sat` is what makes the refusal earn
 /// its cost: there, booking the receipt would promise a refund the wallet has no funds for at all.
+fn credit_backing(received_sat: u64, fee_credit_sat: u64, balance_sat: u64) -> CreditBacking {
+    if fee_credit_sat == 0 {
+        CreditBacking::FullyBacked
+    } else if fee_credit_sat >= received_sat && balance_sat < received_sat {
+        CreditBacking::UnbackedAndUnpayable {
+            fee_credit_sat,
+            balance_sat,
+        }
+    } else {
+        CreditBacking::UnattributedButPayable { fee_credit_sat }
+    }
+}
+
 /// WHICH half of the refusal failed, for the operator warning on the book-and-warn arm.
 ///
 /// Refusing a receipt needs BOTH `fee_credit >= received` AND `balance < received`
@@ -554,19 +567,6 @@ fn credit_booking_reason(received_sat: u64, fee_credit_sat: u64) -> &'static str
     } else {
         "the spendable balance covers this receipt, even though the fee credit could account for \
          all of it"
-    }
-}
-
-fn credit_backing(received_sat: u64, fee_credit_sat: u64, balance_sat: u64) -> CreditBacking {
-    if fee_credit_sat == 0 {
-        CreditBacking::FullyBacked
-    } else if fee_credit_sat >= received_sat && balance_sat < received_sat {
-        CreditBacking::UnbackedAndUnpayable {
-            fee_credit_sat,
-            balance_sat,
-        }
-    } else {
-        CreditBacking::UnattributedButPayable { fee_credit_sat }
     }
 }
 
@@ -1017,8 +1017,10 @@ impl PhoenixdPayment {
                     // stuck refund cannot see this file.
                     Some(record) if record.completed_at_ms.is_none() => bail!(
                         "phoenixd pay for key {idempotency_key} has an outgoing record for hash {} \
-                         that is not paid and carries no completion time, which is phoenixd's shape \
-                         for a payment still IN FLIGHT. Leaving it pending rather than paying again. \
+                         that is not paid and carries no completion time, which on the release \
+                         lnrent measured is the shape of a payment still IN FLIGHT (on any other \
+                         release that reading is unverified, so treat it as merely unresolved). \
+                         Leaving it pending rather than paying again. \
                          If it never completes, this surfaces as a RefundStuck alert to settle by \
                          hand; do not pay this destination out of band while it is in flight.",
                         row.payment_hash
@@ -1242,11 +1244,34 @@ impl PhoenixdPayment {
                         self.adopt_paid(idempotency_key, &record, amount_sat, cap)
                     }
                     // No paid record: nothing moved for this hash, but phoenixd also gave no proof
-                    // that it never will. Stay PREPARED (Pending) so the next drive re-resolves it
-                    // through `outgoingbyhash` — a 404 there unlocks a clean retry.
-                    Ok(_) => bail!(
+                    // that it never will. Stay PREPARED (Pending) either way so the next drive
+                    // re-resolves it through `outgoingbyhash` — a 404 there unlocks a clean retry.
+                    // The OUTCOME is identical for both shapes; only the operator text differs, and
+                    // it must, because "in flight" over a record that already terminated is a false
+                    // statement and this is the first error an operator sees on a stuck refund.
+                    Ok(Some(record)) if record.completed_at_ms.is_some() => bail!(
                         "phoenixd payinvoice for key {idempotency_key} returned no receipt \
-                         (reason: {}) and no paid outgoing record; leaving the attempt in flight",
+                         (reason: {}); its outgoing record is unpaid but DOES carry a completion \
+                         time, which on the release lnrent measured means the payment failed. The \
+                         attempt stays pending regardless: phoenixd returns one record per payment \
+                         hash, so it cannot be proven to be this attempt rather than an earlier one, \
+                         and on any other release the meaning of that field is unverified. Expect a \
+                         RefundStuck alert.",
+                        reason.as_deref().unwrap_or("<none>")
+                    ),
+                    Ok(Some(_)) => bail!(
+                        "phoenixd payinvoice for key {idempotency_key} returned no receipt \
+                         (reason: {}); its outgoing record is unpaid and carries no completion time, \
+                         which on the release lnrent measured is the shape of a payment still in \
+                         flight. Leaving it pending. Do not pay this destination out of band.",
+                        reason.as_deref().unwrap_or("<none>")
+                    ),
+                    // No record AT ALL. Distinct from both shapes above: there is nothing to
+                    // describe, so say that rather than claiming a record with some property.
+                    Ok(None) => bail!(
+                        "phoenixd payinvoice for key {idempotency_key} returned no receipt \
+                         (reason: {}) and phoenixd has no outgoing record for this hash at all; \
+                         leaving the attempt in flight, since a record may still appear",
                         reason.as_deref().unwrap_or("<none>")
                     ),
                     Err(e) => Err(e).context(format!(

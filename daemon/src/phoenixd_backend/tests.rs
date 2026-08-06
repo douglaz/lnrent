@@ -1494,6 +1494,60 @@ async fn recovery_rejects_a_paid_record_for_a_different_hash() {
 // because `outgoingbyhash` returns one record per hash and it cannot be proven to be THIS attempt.
 // Same outcome as the in-flight shape, different operator message: conflating the two hides whether
 // a refund is stuck mid-flight or stuck on an unattributable failure.
+// The receipt-less path needs the same split as recovery: it is the FIRST error an operator sees
+// after a POST that came back without a receipt, and calling a record that already terminated "in
+// flight" is simply false. Outcome is identical for both shapes (Pending, no second payinvoice);
+// only the text differs.
+#[tokio::test]
+async fn a_receipt_less_post_reports_terminal_and_in_flight_records_differently() {
+    for (label, completed_at_ms, expect, reject) in [
+        ("in flight", None, "still in flight", "DOES carry a completion time"),
+        (
+            "terminal",
+            Some(MEASURED_COMPLETED_AT_MS),
+            "DOES carry a completion time",
+            "still in flight",
+        ),
+    ] {
+        let ops = FakePhoenixdOps::new();
+        let be = backend(ops.clone(), TestClock::new(1_000));
+        let bolt11 = mint_bolt11(120_000, 41);
+        let hash = hash_of(&bolt11);
+        let key = "refund:order:41:g1";
+
+        ops.set_outgoing_for(
+            &hash,
+            PhoenixdOutgoing {
+                payment_id: "pay-receiptless".into(),
+                payment_hash: hash.clone(),
+                is_paid: false,
+                fees_msat: 0,
+                completed_at_ms,
+            },
+        );
+        ops.script_pay(Ok(PayAttempt::NoReceipt {
+            reason: Some("payment failed".into()),
+        }));
+
+        let err = be
+            .pay_refund_capped(&bolt11, 120, 130, key)
+            .await
+            .expect_err("a receipt-less POST is never a success");
+        assert_eq!(
+            be.payment_status_by_key(key).await.unwrap(),
+            PayStatus::Pending,
+            "{label}: both shapes stay Pending"
+        );
+        assert_eq!(ops.pay_calls().len(), 1, "{label}: no second payinvoice");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains(expect), "{label}: missing its own wording: {rendered}");
+        assert!(
+            !rendered.contains(reject),
+            "{label}: must not borrow the other shape's wording: {rendered}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_terminal_outgoing_record_stays_pending_but_reads_differently() {
     let ops = FakePhoenixdOps::new();
