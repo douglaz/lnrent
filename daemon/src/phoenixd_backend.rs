@@ -310,7 +310,16 @@ CREATE TABLE IF NOT EXISTS phoenixd_pay (
     -- key.
     payment_id      TEXT,
     status          TEXT NOT NULL DEFAULT 'PREPARED', -- PREPARED | SUCCEEDED | FAILED
-    terminal_at     INTEGER
+    terminal_at     INTEGER,
+    -- Did phoenixd ALREADY hold an outgoing record for this hash at the moment we POSTed? 0 = it
+    -- answered a clean 404, so any record found later can only be the one this attempt created;
+    -- 1 = it held one already, or the probe could not be read, so a later record cannot be
+    -- attributed to us. This is evidence from phoenixd ITSELF, which is why it is recorded rather
+    -- than derived from the local ledger: `phoenixd_pay` witnesses only lnrent's own POSTs, and a
+    -- restore-from-backup legitimately loses ones made after the snapshot (backup.rs: the phoenixd
+    -- WALLET is deliberately not in the backup) while phoenixd keeps them. DEFAULT 1 so every row
+    -- predating this column, and every row whose probe failed, fails CLOSED.
+    remote_history_at_post INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS phoenixd_pay_by_hash ON phoenixd_pay (payment_hash);
 ";
@@ -1056,6 +1065,15 @@ impl PhoenixdPayment {
                                 row.payment_hash
                             );
                         }
+                        // phoenixd's own pre-POST answer. Only a recorded clean 404 makes a record
+                        // found now attributable to this attempt; anything else (history already
+                        // there, an unreadable probe, or a row predating this column) fails closed.
+                        if row.remote_history_at_post {
+                            bail!(
+                                "phoenixd pay for key {idempotency_key} has a terminal outgoing                                  record for hash {}, but phoenixd already held a record for that                                  hash when this attempt POSTed (or the pre-POST probe could not be                                  read), so the record cannot be attributed to this attempt and the                                  payment stays pending",
+                                row.payment_hash
+                            );
+                        }
                         if !pay_hash_has_only_current_attempt(
                             &self.index,
                             &row.payment_hash,
@@ -1286,6 +1304,28 @@ impl PhoenixdPayment {
         // with, so recovery can tell "this node never paid it" from "a different node never paid it".
         let node = self.require_supported_version().await?;
 
+        // Ask phoenixd, BEFORE POSTing, whether it already holds a record for this hash. A clean 404
+        // here is the only thing that can later make a terminal record attributable to THIS attempt:
+        // if nothing existed at POST time, whatever exists afterwards is ours. The local ledger
+        // cannot supply that — it witnesses only lnrent's own POSTs, and a restore-from-backup
+        // legitimately loses ones made after the snapshot (backup.rs keeps the phoenixd WALLET out of
+        // the backup on purpose) while phoenixd keeps them, so a restored index can look clean over a
+        // hash phoenixd already has history for. Any answer other than a clean 404 — a record, or an
+        // unreadable probe — records history-present and permanently gives up resolution for this
+        // attempt (stay Pending -> `RefundStuck`), which is exactly today's behaviour.
+        let remote_history_at_post = match self.ops.outgoing_by_hash(&dest.payment_hash).await {
+            Ok(None) => false,
+            Ok(Some(_)) => true,
+            Err(e) => {
+                tracing::warn!(
+                    key = idempotency_key,
+                    error = %format!("{e:#}"),
+                    "phoenixd: could not read whether this hash already had an outgoing record                      before POSTing, so a later terminal marker will not be attributed to this                      attempt; it will need an operator if it goes ambiguous"
+                );
+                true
+            }
+        };
+
         // Every refusal is behind us: commit the recovery witness, then POST. A crash between the two
         // leaves no row (Unknown -> the next drive re-runs this whole preflight); a crash after it
         // leaves the witness `outgoingbyhash` resolves.
@@ -1295,6 +1335,7 @@ impl PhoenixdPayment {
             bolt11,
             &dest.payment_hash,
             &node.node_id,
+            remote_history_at_post,
         )?;
 
         match self.ops.pay_invoice(bolt11).await {
@@ -1358,6 +1399,16 @@ impl PhoenixdPayment {
                                  {} does not match the destination hash {}; leaving the attempt \
                                  pending",
                                 record.payment_hash,
+                                dest.payment_hash
+                            );
+                        }
+                        // Same pre-POST evidence as the recovery arm, still in hand from this very call.
+                        if remote_history_at_post {
+                            bail!(
+                                "phoenixd payinvoice for key {idempotency_key} returned no receipt and a \
+                                 terminal outgoing record for hash {}, but phoenixd already held a record \
+                                 for that hash when this attempt POSTed (or the pre-POST probe could not be \
+                                 read), so it cannot be attributed to this attempt, which stays pending",
                                 dest.payment_hash
                             );
                         }
@@ -2229,12 +2280,15 @@ struct PayRow {
     status: String,
     /// The phoenixd wallet this attempt was started against ([`PhoenixdPayment::require_prepared_node`]).
     node_id: Option<String>,
+    /// Whether phoenixd already held a record for this hash when we POSTed (see the schema). Only a
+    /// recorded 0 lets a terminal record be attributed to this attempt.
+    remote_history_at_post: bool,
 }
 
 fn pay_get(index: &Mutex<Connection>, key: &str) -> Result<Option<PayRow>> {
     let conn = index.lock().unwrap();
     conn.query_row(
-        "SELECT payment_hash, payment_id, status, node_id
+        "SELECT payment_hash, payment_id, status, node_id, remote_history_at_post
            FROM phoenixd_pay WHERE idempotency_key = ?1",
         params![key],
         |r| {
@@ -2243,6 +2297,7 @@ fn pay_get(index: &Mutex<Connection>, key: &str) -> Result<Option<PayRow>> {
                 payment_id: r.get(1)?,
                 status: r.get(2)?,
                 node_id: r.get(3)?,
+                remote_history_at_post: r.get::<_, i64>(4)? != 0,
             })
         },
     )
@@ -2301,6 +2356,19 @@ fn pay_status_by_payment_id(index: &Mutex<Connection>, payment_id: &str) -> Resu
 ///
 /// A foreign `FAILED` row with no payment id is a preflight refusal and never POSTed, so it does not
 /// make the first real attempt ambiguous. Every other shape fails closed to `Pending`/`RefundStuck`.
+///
+/// **This gate is REDUNDANT defence, and is deliberately kept as such.** `remote_history_at_post` —
+/// the pre-POST `outgoingbyhash` probe recorded on the row — is strictly stronger: it is phoenixd's
+/// OWN answer rather than an inference from lnrent's bookkeeping, so it also covers the case this
+/// ledger structurally cannot see (a restore-from-backup leaves the index clean over a hash phoenixd
+/// still has history for). In every ordering that can actually be constructed the probe refuses
+/// first, because a second key cannot POST the same hash while ours is `PREPARED` — so "the ledger
+/// learns of a foreign POST that phoenixd did not already hold at our probe" has no reachable path
+/// today. It is kept because both guards fail closed and this one costs a single indexed read, and
+/// because the cross-key rule is exactly the sort of thing a later change loosens.
+///
+/// Do NOT read a green suite as proof this gate works: no current test can distinguish it from the
+/// probe (breaking it alone fails nothing), so the honest claim is redundancy, not verification.
 fn pay_hash_has_only_current_attempt(
     index: &Mutex<Connection>,
     payment_hash: &str,
@@ -2364,17 +2432,19 @@ fn pay_upsert_prepared(
     bolt11: &str,
     payment_hash: &str,
     node_id: &str,
+    remote_history_at_post: bool,
 ) -> Result<()> {
     let conn = index.lock().unwrap();
     let changed = conn
         .execute(
-            "INSERT INTO phoenixd_pay (idempotency_key, bolt11, payment_hash, node_id, status)
-             VALUES (?1, ?2, ?3, ?4, 'PREPARED')
+            "INSERT INTO phoenixd_pay
+                 (idempotency_key, bolt11, payment_hash, node_id, status, remote_history_at_post)
+             VALUES (?1, ?2, ?3, ?4, 'PREPARED', ?5)
              ON CONFLICT(idempotency_key) DO UPDATE
                 SET bolt11 = ?2, payment_hash = ?3, node_id = ?4, status = 'PREPARED',
-                    terminal_at = NULL
+                    terminal_at = NULL, remote_history_at_post = ?5
               WHERE phoenixd_pay.status <> 'SUCCEEDED'",
-            params![key, bolt11, payment_hash, node_id],
+            params![key, bolt11, payment_hash, node_id, i64::from(remote_history_at_post)],
         )
         .context("committing the phoenixd_pay PREPARED intent")?;
     if changed != 1 {

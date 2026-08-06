@@ -46,6 +46,12 @@ struct FakeState {
     /// `outgoingbyhash` re-read. The marker's meaning is only measured for the verified release, so
     /// a record read after that swap must not resolve anything.
     node_version_after_pay: Option<String>,
+    /// Publish this outgoing record only WHEN `pay_invoice` is called — i.e. the POST is what
+    /// created it. That is the real sequence, and it matters: lnrent probes `outgoingbyhash` BEFORE
+    /// the POST and permanently declines to attribute a record when one already existed, so a test
+    /// that seeds the record up front is exercising the pre-existing-history refusal, not whatever
+    /// it meant to test.
+    outgoing_after_pay: Option<(String, PhoenixdOutgoing)>,
     /// Scripted non-2xx statuses for `GET /getinfo` / `GET /getbalance`, delivered as the TYPED error
     /// the real HTTP layer returns — so the doctor probe's status classification is exercised with no
     /// socket (`node_ok = false` remains the transport-failure shape).
@@ -153,6 +159,10 @@ impl FakePhoenixdOps {
     fn set_node_version_after_pay(&self, version: &str) {
         self.st.lock().unwrap().node_version_after_pay = Some(version.to_string());
     }
+
+    fn set_outgoing_after_pay(&self, hash: &str, record: PhoenixdOutgoing) {
+        self.st.lock().unwrap().outgoing_after_pay = Some((hash.to_string(), record));
+    }
 }
 
 #[async_trait]
@@ -220,6 +230,9 @@ impl PhoenixdOps for FakePhoenixdOps {
         }
         if let Some(swapped) = st.node_version_after_pay.take() {
             st.node_version = swapped;
+        }
+        if let Some((hash, record)) = st.outgoing_after_pay.take() {
+            st.outgoing.insert(hash, record);
         }
         if let Some(scripted) = st.pay_script.pop_front() {
             return scripted.map_err(|e| anyhow!(e));
@@ -1269,10 +1282,13 @@ async fn a_receipt_less_response_over_a_terminally_failed_record_resolves_failed
     let bolt11 = mint_bolt11(120_000, 31);
     let hash = hash_of(&bolt11);
 
-    // phoenixd's record for this hash: the POST landed, the route failed, the payment terminated.
-    ops.set_outgoing(PhoenixdOutgoing {
+    // phoenixd's record for this hash appears BECAUSE of the POST: it landed, the route failed, the
+    // payment terminated. Seeding it up front instead would mean phoenixd already had history for
+    // the hash before this attempt, which the pre-POST probe declines to attribute — a different
+    // behaviour from the one under test.
+    ops.set_outgoing_after_pay(&hash, PhoenixdOutgoing {
         payment_id: "pay-route-failed".into(),
-        payment_hash: hash,
+        payment_hash: hash.clone(),
         is_paid: false,
         fees_msat: 0,
         completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
@@ -1322,7 +1338,7 @@ async fn a_receipt_less_terminal_record_on_a_release_swapped_under_the_post_stay
     let key = "refund:order:92:g1";
 
     ops.set_node_version_after_pay("0.10.0-unverified");
-    ops.set_outgoing_for(
+    ops.set_outgoing_after_pay(
         &hash,
         PhoenixdOutgoing {
             payment_id: "pay-release-swapped".into(),
@@ -1352,6 +1368,52 @@ async fn a_receipt_less_terminal_record_on_a_release_swapped_under_the_post_stay
     );
 }
 
+// ISOLATES THE PRE-POST PROBE, and covers the restore-from-backup double pay. lnrent's ledger
+// witnesses only its OWN POSTs, and `backup.rs` deliberately keeps the phoenixd WALLET out of the
+// backup — so restoring an older snapshot gives lnrent a CLEAN ledger over a hash phoenixd already
+// has history for. The ledger gate cannot see that; only asking phoenixd before POSTing can. Here
+// the index is empty (as after a restore) while phoenixd already holds a terminal record: the new
+// attempt must never adopt it, or the retry it unlocks pays over a possibly-live payment.
+#[tokio::test]
+async fn a_terminal_record_that_predates_our_post_is_never_adopted_after_a_restore() {
+    let ops = FakePhoenixdOps::new();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let bolt11 = mint_bolt11(120_000, 93);
+    let hash = hash_of(&bolt11);
+    let key = "refund:order:93:g1";
+
+    // phoenixd's history from BEFORE the restored snapshot. Nothing in lnrent's index mentions it.
+    ops.set_outgoing_for(
+        &hash,
+        PhoenixdOutgoing {
+            payment_id: "pay-from-before-the-snapshot".into(),
+            payment_hash: hash.clone(),
+            is_paid: false,
+            fees_msat: 0,
+            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+        },
+    );
+    ops.script_pay(Err("timeout".into()));
+
+    be.pay_refund_capped(&bolt11, 120, 130, key)
+        .await
+        .expect_err("the POST is ambiguous");
+    let err = be
+        .pay_refund_capped(&bolt11, 120, 130, key)
+        .await
+        .expect_err("a record that predates our POST proves nothing about our attempt");
+    assert_eq!(
+        be.payment_status_by_key(key).await.unwrap(),
+        PayStatus::Pending,
+        "a pre-existing record must leave the attempt Pending even though the ledger is clean"
+    );
+    assert_eq!(ops.pay_calls().len(), 1, "no retry is unlocked");
+    assert!(
+        format!("{err:#}").contains("already held a record for that"),
+        "the refusal must come from the PRE-POST probe, not the ledger: {err:#}"
+    );
+}
+
 #[tokio::test]
 async fn a_receipt_less_terminal_record_from_another_wallet_stays_pending() {
     let ops = FakePhoenixdOps::new();
@@ -1362,7 +1424,7 @@ async fn a_receipt_less_terminal_record_from_another_wallet_stays_pending() {
 
     ops.set_node_id("03preparedwallet");
     ops.set_node_id_after_pay("03otherwallet");
-    ops.set_outgoing_for(
+    ops.set_outgoing_after_pay(
         &hash,
         PhoenixdOutgoing {
             payment_id: "pay-other-wallet-receiptless".into(),
@@ -1898,9 +1960,12 @@ async fn another_keys_buried_attempt_never_resolves_the_current_attempt() {
             2,
             "drive {drive}: B must never issue a second payinvoice over its possibly-live P2"
         );
+        let rendered = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("earlier or foreign POST may exist"),
-            "drive {drive}: unexpected error: {err:#}"
+            rendered.contains("earlier or foreign POST may exist")
+                || rendered.contains("already held a record for that"),
+            "drive {drive}: the refusal must be an ATTRIBUTION one — either guard may fire first, \
+             but nothing else may let this resolve: {rendered}"
         );
     }
 }
@@ -1971,9 +2036,12 @@ async fn the_first_of_two_buried_attempts_never_resolves_a_third_attempt() {
             3,
             "drive {drive}: no P4 may be POSTed over possibly-live P3"
         );
+        let rendered = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("earlier or foreign POST may exist"),
-            "drive {drive}: unexpected error: {err:#}"
+            rendered.contains("earlier or foreign POST may exist")
+                || rendered.contains("already held a record for that"),
+            "drive {drive}: the refusal must be an ATTRIBUTION one — either guard may fire first, \
+             but nothing else may let this resolve: {rendered}"
         );
     }
     assert_eq!(
@@ -2370,6 +2438,7 @@ async fn a_succeeded_key_can_never_be_walked_back_to_prepared() {
         &bolt11,
         &hash_of(&bolt11),
         "027e48node",
+        false,
     )
     .expect_err("a completed payment must never return to in-flight");
     assert!(format!("{err:#}").contains("already SUCCEEDED"));
