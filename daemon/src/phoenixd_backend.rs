@@ -341,6 +341,11 @@ pub(crate) struct PhoenixdOutgoing {
     pub(crate) payment_hash: String,
     pub(crate) is_paid: bool,
     pub(crate) fees_msat: u64,
+    /// phoenixd's `completedAt`, epoch MILLIS, ABSENT while the payment is in flight. See the
+    /// measured truth table on the recovery arm in `pay_inner`. Decoded and carried so the shape is
+    /// recorded in the type and pinned by a test; lnrent does NOT resolve a payment off it — the
+    /// reasons are on that truth table.
+    pub(crate) completed_at_ms: Option<i64>,
 }
 
 /// `GET /getbalance`. `fee_credit_sat` is tracked so it can be explicitly EXCLUDED from every
@@ -500,9 +505,16 @@ fn inv1_overrun_msat(
 enum CreditBacking {
     /// The wallet reports no fee credit at all, so nothing of this receipt can be sitting in it.
     FullyBacked,
-    /// Fee credit exists, so up to `fee_credit_sat` of this receipt might be sitting in it — but the
-    /// wallet's SPENDABLE balance covers the receipt anyway, so a refund of it can actually be paid.
-    /// Booked with a warning: the over-book is bounded by `fee_credit_sat`.
+    /// Fee credit exists and the wallet-level signal does not show BOTH halves of ADR-0019's
+    /// refusal, so this receipt is booked with a warning; the over-book is bounded by
+    /// `fee_credit_sat`.
+    ///
+    /// NOTE the justification, because the obvious one is WRONG: this is *not* "the spendable
+    /// balance covers it, so a refund of it can still be paid". `credit_backing(1000, 999, 0)`
+    /// lands here — the credit (999) cannot account for the receipt (1000) in full, so the refusal
+    /// does not apply — while the spendable balance covers nothing at all. The rule is right per
+    /// ADR-0019 (wallet-level rejection is the maximal precision available, since `receivedSat`
+    /// carries no per-receipt attribution); only the payability story was false.
     UnattributedButPayable { fee_credit_sat: u64 },
     /// The fee credit could account for this receipt IN FULL and the spendable balance cannot even
     /// cover it once: booking it would create refundable liability the wallet demonstrably cannot
@@ -537,6 +549,27 @@ fn credit_backing(received_sat: u64, fee_credit_sat: u64, balance_sat: u64) -> C
     }
 }
 
+/// WHICH half of the refusal failed, for the operator warning on the book-and-warn arm.
+///
+/// Refusing a receipt needs BOTH `fee_credit >= received` AND `balance < received`
+/// ([`credit_backing`]). The warn arm is reached when AT LEAST ONE fails, so a message asserting
+/// "both did not hold" is false whenever only one did — which is the case in
+/// `credit_backing(1000, 999, 0)`, the example the docs around here are written on. This has been
+/// stated wrongly three times; it is a function with a test now so the next statement of it has to
+/// agree with the branch.
+///
+/// Only the credit half needs testing: if `fee_credit >= received` then the arm can only have been
+/// reached because `balance >= received`, so the two cases below are exhaustive.
+fn credit_booking_reason(received_sat: u64, fee_credit_sat: u64) -> &'static str {
+    if fee_credit_sat < received_sat {
+        "the fee credit is smaller than this receipt, so it cannot account for all of it — the \
+         spendable balance may still be zero"
+    } else {
+        "the spendable balance covers this receipt, even though the fee credit could account for \
+         all of it"
+    }
+}
+
 /// The msat credit a PAID incoming record may be booked as refundable liability — `receivedSat` in
 /// msat — or `Err` when the verified API cannot show that credit is spendable.
 ///
@@ -546,9 +579,12 @@ fn credit_backing(received_sat: u64, fee_credit_sat: u64, balance_sat: u64) -> C
 /// subtract per receipt; the only fee-credit signal the node exposes is the WALLET-level
 /// `getbalance`. So the rejection form is used, on BOTH figures of that one snapshot:
 ///  - `feeCreditSat == 0`: nothing is unbacked; book `receivedSat`.
-///  - fee credit exists, but `balanceSat >= receivedSat`: whatever this receipt is made of, the
-///    wallet holds at least that much SPENDABLE, so a refund of it can be paid. Book it and WARN —
-///    the over-book is bounded by `feeCreditSat`.
+///  - fee credit exists but the refusal below does NOT apply — i.e. the credit cannot account for
+///    this receipt in full, or the balance covers it. Book it and WARN; the over-book is bounded by
+///    `feeCreditSat`. Careful: this is NOT "the balance covers it, so a refund of it can be paid".
+///    `credit_backing(1000, 999, 0)` lands here — the credit (999) is smaller than the receipt
+///    (1000), so the refusal does not fire — with zero spendable sats. The rule is right (a
+///    wallet-level signal is the maximal precision phoenixd offers); the payable reading is not.
 ///  - `feeCreditSat >= receivedSat` AND `balanceSat < receivedSat`: this receipt could be fee credit
 ///    in full and there are not even spendable funds to refund it. Refused (the fail-closed
 ///    direction the rest of this module takes). The caller retries, so the operator sees a
@@ -598,9 +634,19 @@ async fn spendable_credit_msat(
             received_sat = record.received_sat,
             fee_credit_sat,
             balance_sat = balance.balance_sat,
-            "phoenixd holds a non-spendable LSP fee credit; up to that much of lnrent's booked \
-             receipts may not be backed by spendable funds (ADR-0019). Booking this receipt because \
-             the spendable balance covers it, so a refund of it can still be paid."
+            // Say which half of the refusal actually failed, rather than a general claim about the
+            // branch. Refusing needs BOTH `credit >= receipt` and `balance < receipt`; this arm is
+            // reached when AT LEAST ONE fails, so any message asserting "both did not hold" is false
+            // whenever only one did — including `credit_backing(1000, 999, 0)`, the case the
+            // surrounding docs are written around. Deriving the reason here keeps the two in step.
+            reason = credit_booking_reason(record.received_sat, fee_credit_sat),
+            "phoenixd holds a non-spendable LSP fee credit ({fee_credit_sat} sat); up to that much \
+             of lnrent's booked receipts may not be backed by SPENDABLE funds (ADR-0019). This \
+             receipt ({} sat) is booked anyway — see `reason` for which half of the refusal did not \
+             hold. Booking is NOT a guarantee that a refund of this receipt can be paid. If refunds \
+             start failing for insufficient funds, the wallet needs spendable float: send sats to \
+             it, or open inbound liquidity so receives stop landing in fee credit.",
+            record.received_sat
         ),
         CreditBacking::UnbackedAndUnpayable {
             fee_credit_sat,
@@ -919,25 +965,81 @@ impl PhoenixdPayment {
                     Some(record) if record.is_paid => {
                         self.adopt_paid(idempotency_key, &record, amount_sat, cap)
                     }
-                    // MEASUREMENT GAP, stated honestly: the live probe measured the 404 and the
-                    // paid/dedup shapes, NOT what `outgoingbyhash` returns for an outgoing payment
-                    // that definitively FAILED (route/liquidity). So an unpaid record is only
-                    // provably "not paid YET" — it may equally be a terminal failure. Classifying it
-                    // as failed on an unmeasured field would be a guess whose cost is a DOUBLE PAY
-                    // (re-paying a payment that was still in flight); lnrent's ambiguous-pay
-                    // discipline (lnrent-y4m.16) is the opposite — stay pending, never a second pay,
-                    // surface it. The key therefore reports `Pending`, the Refunder re-awaits it
-                    // without ever re-quoting or minting a new payment hash, and a permanently
-                    // ambiguous one becomes a `RefundStuck` operator alert rather than a silent
-                    // livelock. TODO (lnrent-tof, needs the live node): measure the failed-outgoing
-                    // shape and, IF it is unambiguous, resolve it to `FAILED` here — which is also
-                    // what would make `failed_refund_can_reuse_invoice`'s retry apply to a real
-                    // payment failure and not only to the preflight refusals below.
+                    // An unpaid record leaves the key `Pending`: the Refunder re-awaits it without
+                    // ever re-quoting or minting a new payment hash, and a permanently ambiguous one
+                    // becomes a `RefundStuck` operator alert rather than a silent livelock. That is
+                    // lnrent's ambiguous-pay discipline (lnrent-y4m.16) — never a second pay.
+                    //
+                    // HISTORY, so the reason is not mistaken for the old one: this arm used to stay
+                    // Pending because the failed-outgoing SHAPE was unmeasured. That gap is closed —
+                    // the truth table below is the measurement. The reason it still stays Pending is
+                    // now ATTRIBUTION, which is a different and narrower claim, spelled out under
+                    // the table.
+                    //
+                    // The failed-outgoing shape IS now measured (live mainnet, 2026-07-26, phoenixd
+                    // 0.9.0-b072567). `completedAt` is the terminal marker:
+                    //
+                    //   | isPaid | completedAt | meaning   | samples |
+                    //   |--------|-------------|-----------|---------|
+                    //   | true   | SET         | SUCCEEDED | 2       |
+                    //   | false  | SET         | FAILED    | 2       |
+                    //   | false  | ABSENT      | PENDING   | 1       |
+                    //
+                    // The PENDING row is a controlled comparison, not a separate payment: one
+                    // paymentId read twice during one payment, byte-identical except the in-flight
+                    // read carries no `completedAt` key at all. lnrent decodes and carries it
+                    // (`PhoenixdOutgoing::completed_at_ms`) so the shape is recorded and pinned by a
+                    // test.
+                    //
+                    // lnrent nevertheless does NOT resolve this arm to `FAILED` off that marker, and
+                    // this is a decision rather than an omission (lnrent-ole). Resolving unlocks a
+                    // re-POST of the same hash, so it is only sound if the record can be attributed
+                    // to the attempt outstanding NOW — and `outgoingbyhash` returns exactly ONE
+                    // record, with no measurement of which one it picks when a hash has several.
+                    // (lnrent has measured no way to ENUMERATE outgoing records either; whether
+                    // phoenixd exposes such a list is untested here, and an unmeasured endpoint
+                    // could not be used for this anyway — the same "never a guess" rule that
+                    // produced this decision applies to the API surface it would rest on.)
+                    // Three attribution schemes were built and each was refuted:
+                    //   * comparing against the one buried payment id — a record from any OTHER dead
+                    //     attempt, including another key's, still passes;
+                    //   * proving from lnrent's own `phoenixd_pay` ledger that no earlier POST
+                    //     exists — the ledger witnesses only lnrent's POSTs, and the phoenixd
+                    //     WALLET is deliberately NOT in lnrent's backup (`daemon/src/backup.rs:27-34`
+                    //     states it: the funds live under phoenixd's own seed, and `phoenixd_index.db`
+                    //     is only lnrent's correlation map), so a restore leaves a clean index over a
+                    //     hash phoenixd still has history for;
+                    //   * recording phoenixd's own pre-POST answer on the row — a restore that
+                    //     RETAINS a `PREPARED` row restores that answer too, as stale as the
+                    //     bookkeeping it was meant to outrank, and nothing enforces that no other
+                    //     client POSTs to the wallet after it.
+                    // Each failure mode is a DOUBLE PAY of a live refund, so the arm stays as it was:
+                    // Pending, and `RefundStuck` for a permanently ambiguous one. Reviving this needs
+                    // attribution phoenixd's API cannot currently supply — do not re-derive it from
+                    // local state.
+                    // Bind the record: this arm covers BOTH shapes, and saying "a terminal marker
+                    // cannot be attributed" over an in-flight record would state something false
+                    // about it. The message must also stand on its own — an operator reading a
+                    // stuck refund cannot see this file.
+                    Some(record) if record.completed_at_ms.is_none() => bail!(
+                        "phoenixd pay for key {idempotency_key} has an outgoing record for hash {} \
+                         that is not paid and carries no completion time, which on the release \
+                         lnrent measured is the shape of a payment still IN FLIGHT (on any other \
+                         release that reading is unverified, so treat it as merely unresolved). \
+                         Leaving it pending rather than paying again. \
+                         If it never completes, this surfaces as a stuck-payment operator alert \
+                         (RefundStuck for a refund, SweepStuck for a sweep) to settle by hand; do not pay this destination out of band while it is in flight.",
+                        row.payment_hash
+                    ),
                     Some(_) => bail!(
                         "phoenixd pay for key {idempotency_key} has an outgoing record for hash {} \
-                         that is not (yet) paid; leaving it in flight rather than paying again \
-                         (phoenixd's failed-payment record shape is not yet measured, so this can \
-                         be neither confirmed nor refuted here)",
+                         that is not paid but DOES carry a completion time, which on the measured \
+                         phoenixd release means the payment failed. lnrent still leaves it pending: \
+                         phoenixd returns only one record per payment hash, so that record cannot be \
+                         proven to be this attempt rather than an earlier one, and retrying on it \
+                         could pay a live payment twice. Expect a stuck-payment operator alert \
+                         (RefundStuck for a refund, SweepStuck for a sweep); settling it \
+                         needs a human who can see the wallet's own payment list.",
                         row.payment_hash
                     ),
                     // A clean 404 PROVES this hash never paid AT THE NODE THAT ANSWERED — which is
@@ -1149,11 +1251,35 @@ impl PhoenixdPayment {
                         self.adopt_paid(idempotency_key, &record, amount_sat, cap)
                     }
                     // No paid record: nothing moved for this hash, but phoenixd also gave no proof
-                    // that it never will. Stay PREPARED (Pending) so the next drive re-resolves it
-                    // through `outgoingbyhash` — a 404 there unlocks a clean retry.
-                    Ok(_) => bail!(
+                    // that it never will. Stay PREPARED (Pending) either way so the next drive
+                    // re-resolves it through `outgoingbyhash` — a 404 there unlocks a clean retry.
+                    // The OUTCOME is identical for both shapes; only the operator text differs, and
+                    // it must, because "in flight" over a record that already terminated is a false
+                    // statement and this is the first error an operator sees on a stuck refund.
+                    Ok(Some(record)) if record.completed_at_ms.is_some() => bail!(
                         "phoenixd payinvoice for key {idempotency_key} returned no receipt \
-                         (reason: {}) and no paid outgoing record; leaving the attempt in flight",
+                         (reason: {}); its outgoing record is unpaid but DOES carry a completion \
+                         time, which on the release lnrent measured means the payment failed. The \
+                         attempt stays pending regardless: phoenixd returns one record per payment \
+                         hash, so it cannot be proven to be this attempt rather than an earlier one, \
+                         and on any other release the meaning of that field is unverified. Expect a \
+                         stuck-payment operator alert (RefundStuck for a refund, SweepStuck for a \
+                         sweep).",
+                        reason.as_deref().unwrap_or("<none>")
+                    ),
+                    Ok(Some(_)) => bail!(
+                        "phoenixd payinvoice for key {idempotency_key} returned no receipt \
+                         (reason: {}); its outgoing record is unpaid and carries no completion time, \
+                         which on the release lnrent measured is the shape of a payment still in \
+                         flight. Leaving it pending. Do not pay this destination out of band.",
+                        reason.as_deref().unwrap_or("<none>")
+                    ),
+                    // No record AT ALL. Distinct from both shapes above: there is nothing to
+                    // describe, so say that rather than claiming a record with some property.
+                    Ok(None) => bail!(
+                        "phoenixd payinvoice for key {idempotency_key} returned no receipt \
+                         (reason: {}) and phoenixd has no outgoing record for this hash at all; \
+                         leaving the attempt in flight, since a record may still appear",
                         reason.as_deref().unwrap_or("<none>")
                     ),
                     Err(e) => Err(e).context(format!(
@@ -1593,8 +1719,9 @@ impl PaymentBackend for PhoenixdPayment {
         // every `FAILED` row this backend writes today is a PREFLIGHT REFUSAL that provably never
         // POSTed (module-header invariant), and `pay_inner` re-runs the full preflight for such a key
         // rather than bailing terminally — that is the retry this `true` unlocks. A payment that
-        // actually failed AT phoenixd stays `Pending` instead (see the measurement gap in
-        // `pay_inner`), so it never reaches this branch of the Refunder at all.
+        // actually failed AT phoenixd stays `Pending` instead — its terminal record cannot be
+        // attributed to the attempt outstanding now (the attribution refusal under `pay_inner`'s
+        // truth table), so it never reaches this branch of the Refunder at all.
         true
     }
 
@@ -2296,6 +2423,14 @@ mod real {
         /// MSAT (phoenixd's `fees`), NOT sat — `routingFeeSat` is the same figure rounded down.
         #[serde(rename = "fees")]
         fees: u64,
+        /// MEASURED: an in-flight outgoing payment carries NO `completedAt` key at all, so its
+        /// absence must be DATA (still in flight) and never a decode error. serde's derive already
+        /// maps a missing field on an `Option` to `None` — VERIFIED by deleting the attribute below
+        /// and watching the decode test still pass — so `default` is redundant here and kept only to
+        /// state the intent at the field. Do not describe it as load-bearing; the test is what pins
+        /// the behaviour.
+        #[serde(rename = "completedAt", default)]
+        completed_at: Option<i64>,
     }
 
     #[derive(Deserialize)]
@@ -2450,6 +2585,7 @@ mod real {
                 payment_hash: record.payment_hash,
                 is_paid: record.is_paid,
                 fees_msat: record.fees,
+                completed_at_ms: record.completed_at,
             }))
         }
 
@@ -2530,6 +2666,58 @@ mod real {
             // And it must stay REQUIRED: an absent-means-zero `feeCreditSat` would book the receive
             // above — the one case `spendable_credit_msat` exists to refuse.
             assert!(serde_json::from_str::<BalanceResponse>(r#"{"balanceSat":0}"#).is_err());
+        }
+
+        /// The 2026-07-26 outgoing measurement (phoenixd 0.9.0-b072567). `completedAt` is the
+        /// TERMINAL marker, and the leg that matters most is its ABSENCE: an in-flight payment
+        /// carries no such key at all, so the in-flight record must decode as data rather than as a
+        /// DECODE ERROR, or the recovery arm would never see the shape it reasons about. (serde
+        /// gives that for an `Option` on its own; this test is the thing that pins it, not the
+        /// `#[serde(default)]` attribute — removing that attribute keeps this test green.)
+        ///
+        /// The two records below are the controlled comparison: ONE paymentId read twice during one
+        /// payment, byte-identical apart from that key.
+        #[test]
+        fn the_outgoing_terminal_marker_and_its_absence_both_decode() {
+            let in_flight = r#"{
+                "paymentId":"3d9d75f9-6940-45f6-b611-575a21a91ef9",
+                "paymentHash":"aa",
+                "preimage":"",
+                "isPaid":false,
+                "sent":0,
+                "fees":0,
+                "invoice":"lnbc...",
+                "createdAt":1785101380000
+            }"#;
+            let decoded: OutgoingResponse =
+                serde_json::from_str(in_flight).expect("an in-flight record MUST decode");
+            assert!(!decoded.is_paid);
+            assert_eq!(
+                decoded.completed_at, None,
+                "an absent completedAt is PENDING, and must decode as data rather than erroring"
+            );
+
+            let terminated = r#"{
+                "paymentId":"3d9d75f9-6940-45f6-b611-575a21a91ef9",
+                "paymentHash":"aa",
+                "preimage":"",
+                "isPaid":false,
+                "sent":0,
+                "fees":0,
+                "invoice":"lnbc...",
+                "completedAt":1785101384178,
+                "createdAt":1785101380000
+            }"#;
+            let decoded: OutgoingResponse =
+                serde_json::from_str(terminated).expect("a terminated record MUST decode");
+            assert!(!decoded.is_paid, "unpaid + completedAt SET is the FAILED leg");
+            assert_eq!(decoded.completed_at, Some(1_785_101_384_178));
+
+            // An explicit null is the same statement as absence, not a decode error.
+            let nulled: OutgoingResponse =
+                serde_json::from_str(&terminated.replace("1785101384178", "null"))
+                    .expect("an explicit null completedAt MUST decode");
+            assert_eq!(nulled.completed_at, None);
         }
 
         #[test]
