@@ -16,9 +16,7 @@
 //!    paymentHash, paymentPreimage}`, or — for a bolt11 phoenixd ALREADY paid — HTTP **200** with
 //!    `{paymentHash, reason:"this invoice has already been paid"}` and NO `paymentId`/preimage.
 //!  - `GET /payments/outgoingbyhash/{hash}` -> the outgoing record, or **404 `Not found`** when the
-//!    hash is unknown to phoenixd. On that record `completedAt` is the TERMINAL MARKER and `isPaid`
-//!    splits success from failure (MEASURED 2026-07-26; the truth table, its controlled in-flight
-//!    comparison, and the version bind it is used under live on [`outgoing_is_terminally_failed`]).
+//!    hash is unknown to phoenixd.
 //!  - `GET /payments/incoming?externalId=<urlencoded>&all=true` -> an **ARRAY** of incoming records.
 //!    (The `/payments/incomingbyexternalid` path in the b2f design does NOT exist — 404 Unknown
 //!    endpoint.) **`all=true` is REQUIRED and load-bearing**: measured 2026-07-25, the same query
@@ -91,24 +89,11 @@
 //!    second POST. **A transport error** is NOT proof the payment did not start (unlike lnv2's
 //!    pre-funding `Retryable`), so the `PREPARED` row is NEVER deleted on one — deleting it is what
 //!    would permit a double pay.
-//!  - `FAILED` is recorded for a refusal that provably never POSTed (an expired destination,
-//!    structural preflight, or the INV-1 cap), and for an attempt phoenixd's own record shows
-//!    reached a terminal FAILURE ([`outgoing_is_terminally_failed`] — MEASURED 2026-07-26, and
-//!    version-bound to the release it was measured against). **Invariant: a `FAILED` row means no
-//!    outbound payment is OUTSTANDING under that key** — either none was ever started, or the one
-//!    that was is terminally dead — which is why
+//!  - `FAILED` is recorded ONLY for a refusal that provably never POSTed (an expired destination,
+//!    structural preflight, or the INV-1 cap). **Invariant: a `FAILED` row means no outbound payment
+//!    was ever started under that key** — which is why
 //!    [`PaymentBackend::failed_refund_can_reuse_invoice`] can be `true` here and a retry of a
-//!    `FAILED` key simply re-runs the preflight: it is a genuinely new attempt, never a second pay
-//!    of a live one.
-//!  - **A consequence of the line above, and a change to what one payment hash means here.** Once a
-//!    real payment failure can resolve a key, the retry it unlocks POSTs the SAME bolt11 again, so
-//!    phoenixd can hold MORE THAN ONE outgoing attempt under one payment hash — the buried one and
-//!    the live one. `outgoingbyhash` answers with a single record and which one it picks among
-//!    several is NOT measured, so a terminal record is only actionable when lnrent's OWN ledger
-//!    shows the current `PREPARED` row is the only POST lnrent has WITNESSED under that hash
-//!    (sound as attribution only while nothing else POSTs to this wallet — see that function)
-//!    ([`pay_hash_has_only_current_attempt`]). Before the marker was measured, a `FAILED` key had
-//!    provably never POSTed and this state could not arise.
+//!    `FAILED` key simply re-runs the preflight.
 //!
 //! ## Cross-order same-invoice guard (ported [8A], lnrent-85t)
 //! phoenixd dedups by payment hash across the WHOLE node, so if some other idempotency key already
@@ -303,57 +288,13 @@ CREATE TABLE IF NOT EXISTS phoenixd_pay (
     -- a 404 proves this hash never paid, which only holds against that same wallet, so the identity
     -- is recorded with the witness. NULL = unknown identity, which recovery treats as unproven.
     node_id         TEXT,
-    -- phoenixd's own uuid. On a SUCCEEDED row it is the payment that PAID. On a non-SUCCEEDED row a
-    -- non-NULL value proves this key POSTed at least one earlier attempt under the hash; it is carried
-    -- across retries so `pay_hash_has_only_current_attempt` can fail closed without relying on which
-    -- one of several records `outgoingbyhash` returns. NULL = no payment record has been bound to the
-    -- key.
+    -- phoenixd's own uuid; known only once a payment record exists (NULL while PREPARED/FAILED).
     payment_id      TEXT,
     status          TEXT NOT NULL DEFAULT 'PREPARED', -- PREPARED | SUCCEEDED | FAILED
-    terminal_at     INTEGER,
-    -- Did phoenixd ALREADY hold an outgoing record for this hash at the moment we POSTed? 0 = it
-    -- answered a clean 404, so any record found later can only be the one this attempt created;
-    -- 1 = it held one already, or the probe could not be read, so a later record cannot be
-    -- attributed to us. This is evidence from phoenixd ITSELF, which is why it is recorded rather
-    -- than derived from the local ledger: `phoenixd_pay` witnesses only lnrent's own POSTs, and a
-    -- restore-from-backup legitimately loses ones made after the snapshot (backup.rs: the phoenixd
-    -- WALLET is deliberately not in the backup) while phoenixd keeps them. DEFAULT 1 so every row
-    -- predating this column, and every row whose probe failed, fails CLOSED.
-    remote_history_at_post INTEGER NOT NULL DEFAULT 1
+    terminal_at     INTEGER
 );
 CREATE INDEX IF NOT EXISTS phoenixd_pay_by_hash ON phoenixd_pay (payment_hash);
 ";
-
-/// Bring an EXISTING `phoenixd_index.db` up to `INDEX_SCHEMA`.
-///
-/// `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already exists, so a column added to the
-/// schema constant never reaches a data dir created by an earlier build — every `pay_get` /
-/// `pay_upsert_prepared` would then fail with "no such column" and NO refund could be paid or even
-/// prepared. `backup.rs` captures `phoenixd_index.db`, so old-schema files legitimately outlive an
-/// upgrade and this is reachable by restore as well as by plain upgrade.
-///
-/// Idempotent, and guarded by `PRAGMA table_info` rather than by catching the error, so a rerun on
-/// an already-migrated dir is a no-op instead of a swallowed failure.
-fn migrate_index(conn: &Connection) -> Result<()> {
-    if !index_has_column(conn, "phoenixd_pay", "remote_history_at_post")? {
-        // DEFAULT 1 is the whole point on backfill: a row prepared before this column existed has no
-        // pre-POST probe answer, so it must be treated as "phoenixd may already have held a record"
-        // and never resolve a terminal marker.
-        conn.execute(
-            "ALTER TABLE phoenixd_pay
-                 ADD COLUMN remote_history_at_post INTEGER NOT NULL DEFAULT 1",
-            [],
-        )
-        .context("adding phoenixd_pay.remote_history_at_post")?;
-    }
-    Ok(())
-}
-
-fn index_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let mut rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-    Ok(rows.any(|name| name.map(|n| n == column).unwrap_or(false)))
-}
 
 // ---------------------------------------------------------------------------------------------------
 // Normalized phoenixd seam (`PhoenixdOps`)
@@ -400,9 +341,10 @@ pub(crate) struct PhoenixdOutgoing {
     pub(crate) payment_hash: String,
     pub(crate) is_paid: bool,
     pub(crate) fees_msat: u64,
-    /// phoenixd's TERMINAL MARKER, epoch MILLISECONDS — `None` while the payment is still IN
-    /// FLIGHT. See [`outgoing_is_terminally_failed`] for the measured truth table, and for why the
-    /// absence must decode as `None` rather than as an error.
+    /// phoenixd's `completedAt`, epoch MILLIS, ABSENT while the payment is in flight. See the
+    /// measured truth table on the recovery arm in `pay_inner`. Decoded and carried so the shape is
+    /// recorded in the type and pinned by a test; lnrent does NOT resolve a payment off it — the
+    /// reasons are on that truth table.
     pub(crate) completed_at_ms: Option<i64>,
 }
 
@@ -556,39 +498,6 @@ fn inv1_overrun_msat(
         .filter(|over| *over > 0)
 }
 
-/// Is this outgoing record a TERMINAL FAILURE — a payment that definitively did not move money and
-/// never will under this payment hash?
-///
-/// MEASURED on the live mainnet node 2026-07-26 (phoenixd 0.9.0-b072567). **`completedAt` is the
-/// terminal marker; `isPaid` then splits success from failure:**
-///
-/// | `isPaid` | `completedAt` | meaning   | samples |
-/// |----------|---------------|-----------|---------|
-/// | true     | SET           | SUCCEEDED | 2       |
-/// | false    | SET           | FAILED    | 2       |
-/// | false    | ABSENT        | PENDING   | 1       |
-///
-/// The PENDING row is a CONTROLLED comparison rather than a different payment: the SAME `paymentId`
-/// was read twice during one payment, and the two records are byte-identical except that the
-/// in-flight read carries no `completedAt` key at all while the terminated read carries
-/// `completedAt: 1785101384178`. (Caught with a hold invoice plus a 50 ms poll, since an ACINQ
-/// trampoline fails a held HTLC back in ~1.6 s; the HTLC failed back and the drill cost 0 sat.)
-///
-/// ABSENT therefore means IN FLIGHT and must stay `Pending` — forever if need be (lnrent-y4m.16's
-/// ambiguous-pay discipline). Reading it the other way re-POSTs a live payment, i.e. a DOUBLE PAY, so
-/// every non-terminal shape resolves toward Pending: a non-positive `completedAt` is treated as
-/// absent too, because no measured record produced one and Pending is the direction that cannot
-/// double-pay.
-///
-/// This is OBSERVED behaviour of ONE release, not a documented API contract. Both call sites
-/// therefore gate it on the running phoenixd still BEING that release
-/// ([`FeeSchedule::matches_running_version`]), so an upgrade re-opens the question instead of
-/// inheriting an assumption about someone else's build. HTTP status is never part of the answer:
-/// `payinvoice` returns 200 even on failure.
-fn outgoing_is_terminally_failed(record: &PhoenixdOutgoing) -> bool {
-    !record.is_paid && record.completed_at_ms.is_some_and(|ms| ms > 0)
-}
-
 /// How much of a PAID receipt the wallet's own fee credit could account for. phoenixd's fee credit
 /// is the LSP crediting a receive it would not open a channel for: `receivedSat` counts it, but
 /// `balanceSat` does not, so it is NOT spendable (ADR-0019's phoenixd caveat).
@@ -596,14 +505,16 @@ fn outgoing_is_terminally_failed(record: &PhoenixdOutgoing) -> bool {
 enum CreditBacking {
     /// The wallet reports no fee credit at all, so nothing of this receipt can be sitting in it.
     FullyBacked,
-    /// Fee credit exists, so up to `fee_credit_sat` of this receipt might be sitting in it, but the
-    /// wallet-level signal does not show BOTH halves of the refusal below — either the credit cannot
-    /// account for this receipt in full, or the spendable balance covers it. Booked with a warning:
-    /// the over-book is bounded by `fee_credit_sat`. NOTE the name is about the REFUSAL RULE, not a
-    /// proof of funds: in the partial-credit sub-case (`credit_backing(1000, 999, 0)`) the spendable
-    /// balance covers nothing at all and the receipt is still booked, because refusing more broadly
-    /// strands buyer money in the far more common false-positive case (see [`credit_backing`]). A
-    /// refund that then outruns the balance fails at `payinvoice` and raises `RefundStuck`.
+    /// Fee credit exists and the wallet-level signal does not show BOTH halves of ADR-0019's
+    /// refusal, so this receipt is booked with a warning; the over-book is bounded by
+    /// `fee_credit_sat`.
+    ///
+    /// NOTE the justification, because the obvious one is WRONG: this is *not* "the spendable
+    /// balance covers it, so a refund of it can still be paid". `credit_backing(1000, 999, 0)`
+    /// lands here — the credit (999) cannot account for the receipt (1000) in full, so the refusal
+    /// does not apply — while the spendable balance covers nothing at all. The rule is right per
+    /// ADR-0019 (wallet-level rejection is the maximal precision available, since `receivedSat`
+    /// carries no per-receipt attribution); only the payability story was false.
     UnattributedButPayable { fee_credit_sat: u64 },
     /// The fee credit could account for this receipt IN FULL and the spendable balance cannot even
     /// cover it once: booking it would create refundable liability the wallet demonstrably cannot
@@ -647,13 +558,9 @@ fn credit_backing(received_sat: u64, fee_credit_sat: u64, balance_sat: u64) -> C
 /// subtract per receipt; the only fee-credit signal the node exposes is the WALLET-level
 /// `getbalance`. So the rejection form is used, on BOTH figures of that one snapshot:
 ///  - `feeCreditSat == 0`: nothing is unbacked; book `receivedSat`.
-///  - fee credit exists but only ONE half of the refusal below holds — `feeCreditSat < receivedSat`
-///    (the credit cannot account for this receipt in full) or `balanceSat >= receivedSat` (the
-///    wallet holds at least that much SPENDABLE). Book it and WARN — the over-book is bounded by
-///    `feeCreditSat`. This arm does NOT prove a refund of the receipt is payable: with
-///    `receivedSat: 1000, feeCreditSat: 999, balanceSat: 0` it books while the balance covers
-///    nothing. It is booked because the refusal is deliberately confined to the case below, for the
-///    reason spelled out under it.
+///  - fee credit exists, but `balanceSat >= receivedSat`: whatever this receipt is made of, the
+///    wallet holds at least that much SPENDABLE, so a refund of it can be paid. Book it and WARN —
+///    the over-book is bounded by `feeCreditSat`.
 ///  - `feeCreditSat >= receivedSat` AND `balanceSat < receivedSat`: this receipt could be fee credit
 ///    in full and there are not even spendable funds to refund it. Refused (the fail-closed
 ///    direction the rest of this module takes). The caller retries, so the operator sees a
@@ -705,10 +612,8 @@ async fn spendable_credit_msat(
             balance_sat = balance.balance_sat,
             "phoenixd holds a non-spendable LSP fee credit; up to that much of lnrent's booked \
              receipts may not be backed by spendable funds (ADR-0019). Booking this receipt because \
-             the wallet-level signal does not show it is BOTH unattributable to spendable funds and \
-             unrefundable — refusing on less than that strands paid orders (see credit_backing). If \
-             the spendable balance below is short of the receipt, a refund of it will fail at \
-             payinvoice and raise RefundStuck."
+             the wallet-level signal does not show both halves of the refusal — NOT because the \
+             balance is known to cover a refund of it, which it need not."
         ),
         CreditBacking::UnbackedAndUnpayable {
             fee_credit_sat,
@@ -896,7 +801,6 @@ impl PhoenixdPayment {
         let conn = Connection::open(&index_path).context("opening phoenixd index db")?;
         conn.execute_batch(INDEX_SCHEMA)
             .context("initialising phoenixd index schema")?;
-        migrate_index(&conn).context("migrating the phoenixd index schema")?;
         Ok(Self::with_ops(Arc::new(ops), conn, clock, fee_schedule))
     }
 
@@ -948,48 +852,6 @@ impl PhoenixdPayment {
         Ok(info)
     }
 
-    /// May the `completedAt` terminal marker be trusted against the phoenixd answering NOW?
-    ///
-    /// The truth table in [`outgoing_is_terminally_failed`] is observed behaviour of the release
-    /// [`FeeSchedule::verified_version`] names, so resolving a refund to `FAILED` on it is only sound
-    /// while that release is what is running. Unlike [`Self::require_supported_version`], a mismatch
-    /// answers `false` and restores exactly the stay-`Pending` behaviour that predates the
-    /// measurement. The caller reads `getinfo` separately so an unreadable version is reported as
-    /// that fault rather than being mislabeled as a version mismatch.
-    ///
-    /// The bind rides on the SAME `verified_version` the trampoline fee reserve does, deliberately:
-    /// that field is this module's one "phoenixd's behaviour was verified against this release"
-    /// declaration, and a second knob could disagree with it while neither was checked against the
-    /// node. An operator who moves it to their own verified release is making that declaration for
-    /// both, so [`crate::config::PhoenixdFeeSchedule::version`] says outright that setting it also
-    /// re-enables this resolution and what to check before doing so.
-    ///
-    /// §13: the remote-controlled version reaches the log only through the ops layer's
-    /// credential-aware projection, never raw.
-    fn terminal_marker_is_verified(
-        &self,
-        idempotency_key: &str,
-        info: &PhoenixdNodeInfo,
-    ) -> bool {
-        if self.fee_schedule.matches_running_version(&info.version) {
-            return true;
-        }
-        tracing::warn!(
-            key = idempotency_key,
-            running = self
-                .ops
-                .operator_safe_version(&info.version)
-                .unwrap_or(REDACTED_PHOENIXD_VERSION),
-            verified = self.fee_schedule.verified_version,
-            "phoenixd reports a terminal marker on this key's outgoing payment, but the running \
-             release is not the one lnrent measured that marker against; leaving the payment \
-             pending rather than resolving it FAILED on an unverified release. Verify \
-             outgoingbyhash's completedAt semantics on this release and configure \
-             [phoenixd] fee_schedule_version for it."
-        );
-        false
-    }
-
     /// Is the phoenixd answering now the SAME WALLET the `PREPARED` attempt was started against?
     ///
     /// Recovery's central inference — "`outgoingbyhash` 404s, so this hash never paid, so retrying is
@@ -1000,25 +862,22 @@ impl PhoenixdPayment {
     /// `getinfo.nodeId` and this check gates the retry on it, failing CLOSED (the key stays PREPARED
     /// -> `Pending`, the Refunder re-awaits, and a permanently unresolvable one surfaces as
     /// `RefundStuck`) whenever the identity differs or was never recorded.
-    fn require_prepared_node(
-        &self,
-        idempotency_key: &str,
-        row: &PayRow,
-        info: &PhoenixdNodeInfo,
-    ) -> Result<()> {
+    async fn require_prepared_node(&self, idempotency_key: &str, row: &PayRow) -> Result<()> {
+        let info = self.ops.node_info().await.context(
+            "identifying the phoenixd node before retrying a payment its history does not show",
+        )?;
         match row.node_id.as_deref() {
             Some(prepared) if prepared == info.node_id => Ok(()),
             Some(prepared) => bail!(
                 "phoenixd pay key {idempotency_key} was prepared against node {prepared} but node \
-                 {} is answering now, so that node's payment history for hash {} is no evidence \
-                 about the earlier attempt; refusing to pay again",
+                 {} is answering now, so that node's 404 for hash {} is no evidence about the \
+                 earlier attempt; refusing to pay again",
                 info.node_id,
                 row.payment_hash
             ),
             None => bail!(
-                "phoenixd pay key {idempotency_key} has no recorded node identity, so payment \
-                 history for hash {} cannot prove what happened to the earlier attempt; refusing \
-                 to pay again",
+                "phoenixd pay key {idempotency_key} has no recorded node identity, so a 404 for \
+                 hash {} cannot prove the earlier attempt never paid; refusing to pay again",
                 row.payment_hash
             ),
         }
@@ -1073,127 +932,75 @@ impl PhoenixdPayment {
                     Some(record) if record.is_paid => {
                         self.adopt_paid(idempotency_key, &record, amount_sat, cap)
                     }
-                    // An unpaid record carrying phoenixd's TERMINAL MARKER is a definite FAILURE —
-                    // the route/liquidity failure that is the common real-world outcome against an
-                    // arbitrary buyer destination. `outgoing_is_terminally_failed` holds the measured
-                    // truth table this reads. Nothing is outstanding under this key, so it goes
-                    // terminal `FAILED` and the Refunder RETRIES it (that is what
-                    // `failed_refund_can_reuse_invoice() == true` unlocks) instead of an operator
-                    // having to clear a `RefundStuck` DM by hand for every failed refund.
+                    // MEASUREMENT GAP, stated honestly: the live probe measured the 404 and the
+                    // paid/dedup shapes, NOT what `outgoingbyhash` returns for an outgoing payment
+                    // that definitively FAILED (route/liquidity). So an unpaid record is only
+                    // provably "not paid YET" — it may equally be a terminal failure. Classifying it
+                    // as failed on an unmeasured field would be a guess whose cost is a DOUBLE PAY
+                    // (re-paying a payment that was still in flight); lnrent's ambiguous-pay
+                    // discipline (lnrent-y4m.16) is the opposite — stay pending, never a second pay,
+                    // surface it. The key therefore reports `Pending`, the Refunder re-awaits it
+                    // without ever re-quoting or minting a new payment hash, and a permanently
+                    // ambiguous one becomes a `RefundStuck` operator alert rather than a silent
+                    // livelock.
                     //
-                    // The marker is observed behaviour of one release, so the resolution is bound to
-                    // that release still running; anything else falls back to stay-Pending. It is
-                    // also bound to the prepared WALLET and to the record's own hash. Finally,
-                    // phoenixd may hold several attempts under that hash but returns only one, so
-                    // lnrent's OWN ledger must show this is the only POST it witnessed on that hash.
-                    // No phoenixd payment-id comparison can provide that attribution.
-                    Some(record) if outgoing_is_terminally_failed(&record) => {
-                        if record.payment_hash != row.payment_hash {
-                            bail!(
-                                "phoenixd pay for key {idempotency_key} has a terminal outgoing \
-                                 record whose payment hash {} does not match the prepared hash {}; \
-                                 leaving it pending rather than resolving evidence for another hash",
-                                record.payment_hash,
-                                row.payment_hash
-                            );
-                        }
-                        // phoenixd's own pre-POST answer. Only a recorded clean 404 makes a record
-                        // found now attributable to this attempt; anything else (history already
-                        // there, an unreadable probe, or a row predating this column) fails closed.
-                        if row.remote_history_at_post {
-                            bail!(
-                                "phoenixd pay for key {idempotency_key} has a terminal outgoing \
-                                 record for hash {}, but phoenixd already held a record for that \
-                                 hash when this attempt POSTed (or the pre-POST probe could not be \
-                                 read), so the record cannot be attributed to this attempt and the \
-                                 payment stays pending",
-                                row.payment_hash
-                            );
-                        }
-                        if !pay_hash_has_only_current_attempt(
-                            &self.index,
-                            &row.payment_hash,
-                            idempotency_key,
-                        )? {
-                            bail!(
-                                "phoenixd pay for key {idempotency_key} has a terminal outgoing \
-                                 record for hash {}, but lnrent's ledger shows an earlier or foreign \
-                                 POST may exist under that hash; outgoingbyhash returns only one \
-                                 record, so it cannot be attributed to the current attempt and the \
-                                 payment stays pending",
-                                row.payment_hash
-                            );
-                        }
-                        let info = self.ops.node_info().await.with_context(|| {
-                            format!(
-                                "reading the running phoenixd version and node identity before \
-                                 trusting the terminal marker for pay key {idempotency_key}; its \
-                                 version is unreadable, so the payment stays pending"
-                            )
-                        })?;
-                        self.require_prepared_node(idempotency_key, &row, &info)?;
-                        if self.terminal_marker_is_verified(idempotency_key, &info) {
-                            self.refuse(
-                                idempotency_key,
-                                bolt11,
-                                &row.payment_hash,
-                                Some(&record.payment_id),
-                                format!(
-                                    "phoenixd pay for key {idempotency_key} FAILED at phoenixd: its \
-                                     outgoing record for hash {} is terminal (completedAt set) and \
-                                     unpaid, so nothing is outstanding and the refund may be \
-                                     retried",
-                                    row.payment_hash
-                                ),
-                            )
-                        } else {
-                            bail!(
-                                "phoenixd pay for key {idempotency_key} has a terminal-looking \
-                                 outgoing record for hash {}, but the running phoenixd is not the \
-                                 release that marker was measured against; leaving it pending \
-                                 rather than resolving it on an unverified release",
-                                row.payment_hash
-                            )
-                        }
-                    }
-                    // AMBIGUOUS: the record carries no terminal marker and the payment is still IN
-                    // FLIGHT. Resolving it would be a guess whose cost is a DOUBLE PAY, so lnrent's
-                    // ambiguous-pay discipline (lnrent-y4m.16) applies unchanged — stay pending,
-                    // never a second pay, surface it. One that never terminates becomes a
-                    // `RefundStuck` operator alert rather than a silent livelock.
-                    Some(record) => bail!(
+                    // The failed-outgoing shape IS now measured (live mainnet, 2026-07-26, phoenixd
+                    // 0.9.0-b072567). `completedAt` is the terminal marker:
+                    //
+                    //   | isPaid | completedAt | meaning   | samples |
+                    //   |--------|-------------|-----------|---------|
+                    //   | true   | SET         | SUCCEEDED | 2       |
+                    //   | false  | SET         | FAILED    | 2       |
+                    //   | false  | ABSENT      | PENDING   | 1       |
+                    //
+                    // The PENDING row is a controlled comparison, not a separate payment: one
+                    // paymentId read twice during one payment, byte-identical except the in-flight
+                    // read carries no `completedAt` key at all. lnrent decodes and carries it
+                    // (`PhoenixdOutgoing::completed_at_ms`) so the shape is recorded and pinned by a
+                    // test.
+                    //
+                    // lnrent nevertheless does NOT resolve this arm to `FAILED` off that marker, and
+                    // this is a decision rather than an omission (lnrent-ole). Resolving unlocks a
+                    // re-POST of the same hash, so it is only sound if the record can be attributed
+                    // to the attempt outstanding NOW — and `outgoingbyhash` returns exactly ONE
+                    // record, with no list endpoint and no measurement of which one it picks when a
+                    // hash has several. Three attribution schemes were built and each was refuted:
+                    //   * comparing against the one buried payment id — a record from any OTHER dead
+                    //     attempt, including another key's, still passes;
+                    //   * proving from lnrent's own `phoenixd_pay` ledger that no earlier POST
+                    //     exists — the ledger witnesses only lnrent's POSTs, and `backup.rs`
+                    //     deliberately keeps the phoenixd WALLET out of the backup, so a restore
+                    //     leaves a clean index over a hash phoenixd still has history for;
+                    //   * recording phoenixd's own pre-POST answer on the row — a restore that
+                    //     RETAINS a `PREPARED` row restores that answer too, as stale as the
+                    //     bookkeeping it was meant to outrank, and nothing enforces that no other
+                    //     client POSTs to the wallet after it.
+                    // Each failure mode is a DOUBLE PAY of a live refund, so the arm stays as it was:
+                    // Pending, and `RefundStuck` for a permanently ambiguous one. Reviving this needs
+                    // attribution phoenixd's API cannot currently supply — do not re-derive it from
+                    // local state.
+                    Some(_) => bail!(
                         "phoenixd pay for key {idempotency_key} has an outgoing record for hash {} \
-                         that {}; leaving it pending rather than paying again",
-                        row.payment_hash,
-                        if record.payment_hash == row.payment_hash {
-                            "is not paid and carries no terminal completedAt, so it is still in \
-                             flight"
-                        } else {
-                            "names a different payment hash and carries no usable evidence about \
-                             this attempt"
-                        }
+                         that is not (yet) paid; leaving it in flight rather than paying again \
+                         (a terminal `completedAt` cannot be attributed to the CURRENT attempt, so \
+                         it is not treated as a definite failure here — see the truth table above)",
+                        row.payment_hash
                     ),
                     // A clean 404 PROVES this hash never paid AT THE NODE THAT ANSWERED — which is
                     // proof about OUR attempt only while that is still the same wallet
                     // (`require_prepared_node`). Once it is, the retry is a genuinely new attempt and
                     // must re-run the full preflight, INV-1 included.
                     None => {
-                        let info = self.ops.node_info().await.context(
-                            "identifying the phoenixd node before retrying a payment its history \
-                             does not show",
-                        )?;
-                        self.require_prepared_node(idempotency_key, &row, &info)?;
+                        self.require_prepared_node(idempotency_key, &row).await?;
                         self.start_pay(bolt11, amount_sat, idempotency_key, cap)
                             .await
                     }
                 }
             }
             Some(row) if row.status == STATUS_FAILED => {
-                // FAILED asserts nothing is OUTSTANDING under this key (module header invariant) —
-                // a refusal that provably never POSTed, or an attempt phoenixd's own record showed
-                // terminally failed — and phoenixd can re-pay the same bolt11, so a retry re-runs
-                // the whole preflight. This is what makes `failed_refund_can_reuse_invoice() == true`
-                // actually progress.
+                // FAILED is only ever a refusal that provably never POSTed (module header invariant),
+                // and phoenixd can re-pay the same bolt11, so a retry re-runs the whole preflight.
+                // This is what makes `failed_refund_can_reuse_invoice() == true` actually progress.
                 self.start_pay(bolt11, amount_sat, idempotency_key, cap)
                     .await
             }
@@ -1210,10 +1017,8 @@ impl PhoenixdPayment {
 
     /// Fund a NEW phoenixd payment for `idempotency_key`. The caller has PROVEN no live attempt exists
     /// for this key ([7A]): either there is no row, or recovery just saw a clean 404 for its hash, or
-    /// the row is `FAILED`, whose whole assertion is that nothing is OUTSTANDING under the key —
-    /// a refusal that never POSTed, or an attempt phoenixd's own record showed terminally failed
-    /// ([`outgoing_is_terminally_failed`]). Every refusal below is therefore safe to record as
-    /// terminal `FAILED` — it can never race a live payment.
+    /// the row is a FAILED refusal that never POSTed. Every refusal below is therefore safe to record
+    /// as terminal `FAILED` — it can never race a live payment.
     async fn start_pay(
         &self,
         bolt11: &str,
@@ -1244,7 +1049,6 @@ impl PhoenixdPayment {
                 idempotency_key,
                 bolt11,
                 &dest.payment_hash,
-                None,
                 format!(
                     "phoenixd refund pay refused for key {idempotency_key}: destination invoice \
                      expired at {} (now {})",
@@ -1266,7 +1070,6 @@ impl PhoenixdPayment {
                     idempotency_key,
                     bolt11,
                     &dest.payment_hash,
-                    None,
                     format!(
                         "phoenixd refund pay refused for key {idempotency_key}: invoice amount \
                          {invoice_msat} msat != owed {amount_sat} sat ({payout_msat} msat)"
@@ -1278,7 +1081,6 @@ impl PhoenixdPayment {
                     idempotency_key,
                     bolt11,
                     &dest.payment_hash,
-                    None,
                     format!(
                         "phoenixd refund pay refused for key {idempotency_key}: the destination \
                          invoice encodes no amount, and the verified payinvoice form cannot bound \
@@ -1305,7 +1107,6 @@ impl PhoenixdPayment {
                 idempotency_key,
                 bolt11,
                 &dest.payment_hash,
-                None,
                 format!(
                     "phoenixd refund pay refused for key {idempotency_key}: its destination invoice \
                      is already owned by idempotency key {other_key}"
@@ -1324,7 +1125,6 @@ impl PhoenixdPayment {
                     idempotency_key,
                     bolt11,
                     &dest.payment_hash,
-                    None,
                     format!(
                         "phoenixd refund pay refused for key {idempotency_key}: payout {amount_sat} \
                          sat plus the reserved trampoline fee ({reserve_msat} msat) is \
@@ -1340,30 +1140,6 @@ impl PhoenixdPayment {
         // with, so recovery can tell "this node never paid it" from "a different node never paid it".
         let node = self.require_supported_version().await?;
 
-        // Ask phoenixd, BEFORE POSTing, whether it already holds a record for this hash. A clean 404
-        // here is the only thing that can later make a terminal record attributable to THIS attempt:
-        // if nothing existed at POST time, whatever exists afterwards is ours. The local ledger
-        // cannot supply that — it witnesses only lnrent's own POSTs, and a restore-from-backup
-        // legitimately loses ones made after the snapshot (backup.rs keeps the phoenixd WALLET out of
-        // the backup on purpose) while phoenixd keeps them, so a restored index can look clean over a
-        // hash phoenixd already has history for. Any answer other than a clean 404 — a record, or an
-        // unreadable probe — records history-present and permanently gives up resolution for this
-        // attempt (stay Pending -> `RefundStuck`), which is exactly today's behaviour.
-        let remote_history_at_post = match self.ops.outgoing_by_hash(&dest.payment_hash).await {
-            Ok(None) => false,
-            Ok(Some(_)) => true,
-            Err(e) => {
-                tracing::warn!(
-                    key = idempotency_key,
-                    error = %format!("{e:#}"),
-                    "phoenixd: could not read whether this hash already had an outgoing record \
-                     before POSTing, so a later terminal marker will not be attributed to this \
-                     attempt; it will need an operator if it goes ambiguous"
-                );
-                true
-            }
-        };
-
         // Every refusal is behind us: commit the recovery witness, then POST. A crash between the two
         // leaves no row (Unknown -> the next drive re-runs this whole preflight); a crash after it
         // leaves the witness `outgoingbyhash` resolves.
@@ -1373,7 +1149,6 @@ impl PhoenixdPayment {
             bolt11,
             &dest.payment_hash,
             &node.node_id,
-            remote_history_at_post,
         )?;
 
         match self.ops.pay_invoice(bolt11).await {
@@ -1419,111 +1194,12 @@ impl PhoenixdPayment {
                     Ok(Some(record)) if record.is_paid => {
                         self.adopt_paid(idempotency_key, &record, amount_sat, cap)
                     }
-                    // Mirror of the recovery arm above: an unpaid record carrying the measured
-                    // TERMINAL MARKER is a definite failure, so the key goes terminal `FAILED` and
-                    // the Refunder retries it. Recovery enforces FOUR binds before it resolves and
-                    // all four are mirrored here: the record must name the hash we requested;
-                    // lnrent's OWN ledger must show no earlier or foreign POST it witnessed under
-                    // that hash (phoenixd cannot supply that attribution, because `outgoingbyhash`
-                    // returns only one record and which one is unmeasured); the wallet answering
-                    // must be the one this attempt was prepared against; and the running release
-                    // must be the one the marker was measured on. The last two read `getinfo` FRESH
-                    // at this point rather than reusing the pre-POST answer — see below.
-                    Ok(Some(record)) if outgoing_is_terminally_failed(&record) => {
-                        if record.payment_hash != dest.payment_hash {
-                            bail!(
-                                "phoenixd payinvoice for key {idempotency_key} returned no receipt, \
-                                 then outgoingbyhash returned a terminal record whose payment hash \
-                                 {} does not match the destination hash {}; leaving the attempt \
-                                 pending",
-                                record.payment_hash,
-                                dest.payment_hash
-                            );
-                        }
-                        // Same pre-POST evidence as the recovery arm, still in hand from this very call.
-                        if remote_history_at_post {
-                            bail!(
-                                "phoenixd payinvoice for key {idempotency_key} returned no receipt and a \
-                                 terminal outgoing record for hash {}, but phoenixd already held a record \
-                                 for that hash when this attempt POSTed (or the pre-POST probe could not be \
-                                 read), so it cannot be attributed to this attempt, which stays pending",
-                                dest.payment_hash
-                            );
-                        }
-                        if !pay_hash_has_only_current_attempt(
-                            &self.index,
-                            &dest.payment_hash,
-                            idempotency_key,
-                        )? {
-                            bail!(
-                                "phoenixd payinvoice for key {idempotency_key} returned no receipt \
-                                 and a terminal outgoing record for hash {}, but lnrent's ledger \
-                                 shows an earlier or foreign POST may exist under that hash; the \
-                                 record cannot be attributed to the current attempt, which stays \
-                                 pending",
-                                dest.payment_hash
-                            );
-                        }
-                        // Re-read `getinfo` HERE rather than reusing the pre-POST `node`. That
-                        // earlier value came from `require_supported_version`, which already bailed
-                        // unless the version matched — so a bind against it is deterministically
-                        // true and proves nothing, and it would judge a record read AFTER the POST
-                        // by a version read BEFORE it. A phoenixd restarted onto a new release in
-                        // that window (one HTTP round trip, so narrow, but the marker is the whole
-                        // basis for resolving) would otherwise have its record judged on a stale
-                        // string. Recovery re-reads at decision time for exactly this reason; this
-                        // is its mirror, so it does the same and applies the SAME two binds.
-                        let live = self.ops.node_info().await.with_context(|| {
-                            format!(
-                                "re-reading the running phoenixd version and node identity before \
-                                 trusting the terminal marker for pay key {idempotency_key}; it is \
-                                 unreadable, so the attempt stays pending"
-                            )
-                        })?;
-                        // The wallet bind. `node` is the identity this attempt was PREPARED against
-                        // (it is what `pay_upsert_prepared` persisted before the POST), so a
-                        // different wallet answering now — proxy failover, a restore onto another
-                        // node — makes its terminal record evidence about someone else's payment
-                        // history while ours may still be live.
-                        if live.node_id != node.node_id {
-                            bail!(
-                                "phoenixd payinvoice for key {idempotency_key} was made against \
-                                 node {} but node {} is answering now, so its terminal record for \
-                                 hash {} is no evidence about our attempt; leaving it pending",
-                                node.node_id,
-                                live.node_id,
-                                dest.payment_hash
-                            );
-                        }
-                        if !self.fee_schedule.matches_running_version(&live.version) {
-                            bail!(
-                                "phoenixd payinvoice for key {idempotency_key} returned no receipt \
-                                 and a terminal outgoing record, but the running phoenixd is not \
-                                 the release that marker was measured against; leaving the attempt \
-                                 pending"
-                            );
-                        }
-                        self.refuse(
-                            idempotency_key,
-                            bolt11,
-                            &dest.payment_hash,
-                            Some(&record.payment_id),
-                            format!(
-                                "phoenixd payinvoice for key {idempotency_key} returned no receipt \
-                                 (reason: {}) and its outgoing record is terminal (completedAt set) \
-                                 and unpaid, so the payment FAILED at phoenixd and may be retried",
-                                reason.as_deref().unwrap_or("<none>")
-                            ),
-                        )
-                    }
-                    // No paid record and no terminal marker: nothing moved for this hash, but
-                    // phoenixd also gave no proof that it never will. Stay PREPARED (Pending) so the
-                    // next drive re-resolves it through `outgoingbyhash` — a 404 there unlocks a
-                    // clean retry, and a terminal marker there takes the arm above.
+                    // No paid record: nothing moved for this hash, but phoenixd also gave no proof
+                    // that it never will. Stay PREPARED (Pending) so the next drive re-resolves it
+                    // through `outgoingbyhash` — a 404 there unlocks a clean retry.
                     Ok(_) => bail!(
                         "phoenixd payinvoice for key {idempotency_key} returned no receipt \
-                         (reason: {}) and no paid or terminally failed outgoing record; leaving the \
-                         attempt in flight",
+                         (reason: {}) and no paid outgoing record; leaving the attempt in flight",
                         reason.as_deref().unwrap_or("<none>")
                     ),
                     Err(e) => Err(e).context(format!(
@@ -1545,32 +1221,16 @@ impl PhoenixdPayment {
         }
     }
 
-    /// Record a terminal `FAILED` row and return it as an error. Exactly two things reach here, and
-    /// they share the ONE property the `FAILED` status asserts — **no outbound payment is
-    /// outstanding under this key**, so a later retry is a genuinely new attempt and never a second
-    /// pay of a live one:
-    ///  - a preflight refusal that provably never POSTed ([7A]-safe; see [`Self::start_pay`]), and
-    ///  - phoenixd's OWN record showing the attempt reached a terminal FAILURE
-    ///    ([`outgoing_is_terminally_failed`], and only on the release that marker was measured
-    ///    against).
-    ///
-    /// `terminal_payment_id` separates the two: the terminal-failure path persists a non-NULL marker
-    /// proving this key has POSTed before, so every later single-record `outgoingbyhash` answer under
-    /// the same hash fails [`pay_hash_has_only_current_attempt`]; a refusal passes `None` because it
-    /// never POSTed.
-    ///
-    /// `FAILED` — not a silent `Unknown`, and not a permanent `Pending` — is what lets the Refunder
-    /// retry, or advance to a fresh invoice generation, instead of re-awaiting a payment that will
-    /// never exist. On the refusal path the terminal row is written DIRECTLY (never via `PREPARED`),
-    /// which is what keeps a refused key from ever naming a hash recovery could adopt (see the
-    /// ordering note in [`Self::start_pay`]); the terminal-failure path necessarily starts from the
-    /// `PREPARED` witness it is resolving.
+    /// Record a terminal refusal that provably never POSTed ([7A]-safe; see [`Self::start_pay`]) and
+    /// return it as an error. `FAILED` — not a silent `Unknown` — is what lets the Refunder advance
+    /// to a fresh invoice generation instead of re-awaiting a payment that will never exist. Writes
+    /// the terminal row DIRECTLY (never via `PREPARED`), which is what keeps a refused key from ever
+    /// naming a hash recovery could adopt (see the ordering note in [`Self::start_pay`]).
     fn refuse(
         &self,
         idempotency_key: &str,
         bolt11: &str,
         payment_hash: &str,
-        terminal_payment_id: Option<&str>,
         message: String,
     ) -> Result<String> {
         pay_upsert_failed(
@@ -1579,7 +1239,6 @@ impl PhoenixdPayment {
             bolt11,
             payment_hash,
             self.clock.now(),
-            terminal_payment_id,
         )?;
         bail!(message)
     }
@@ -1977,14 +1636,11 @@ impl PaymentBackend for PhoenixdPayment {
         // invoice, so once that reaches a terminal the SAME bolt11 can never be re-sent. phoenixd has
         // no such binding: it refuses only a bolt11 it has ALREADY PAID (fact 2), so re-attempting
         // the same invoice is legitimate. Scope note, so this answer is not read as more than it is:
-        // a `FAILED` row means nothing is OUTSTANDING under the key (module-header invariant) —
-        // either a preflight refusal that never POSTed, or a payment phoenixd's own record shows
-        // terminally failed — and `pay_inner` re-runs the full preflight for such a key rather than
-        // bailing terminally. That is the retry this `true` unlocks, and since the terminal marker
-        // was measured (lnrent-ole) it reaches real payment failures rather than only refusals. An
-        // attempt still IN FLIGHT, one whose terminality lnrent cannot verify against the running
-        // release, and every attempt after lnrent's ledger shows an earlier POST under the same hash
-        // all stay `Pending` instead and never reach this branch of the Refunder at all.
+        // every `FAILED` row this backend writes today is a PREFLIGHT REFUSAL that provably never
+        // POSTed (module-header invariant), and `pay_inner` re-runs the full preflight for such a key
+        // rather than bailing terminally — that is the retry this `true` unlocks. A payment that
+        // actually failed AT phoenixd stays `Pending` instead (see the measurement gap in
+        // `pay_inner`), so it never reaches this branch of the Refunder at all.
         true
     }
 
@@ -2318,15 +1974,12 @@ struct PayRow {
     status: String,
     /// The phoenixd wallet this attempt was started against ([`PhoenixdPayment::require_prepared_node`]).
     node_id: Option<String>,
-    /// Whether phoenixd already held a record for this hash when we POSTed (see the schema). Only a
-    /// recorded 0 lets a terminal record be attributed to this attempt.
-    remote_history_at_post: bool,
 }
 
 fn pay_get(index: &Mutex<Connection>, key: &str) -> Result<Option<PayRow>> {
     let conn = index.lock().unwrap();
     conn.query_row(
-        "SELECT payment_hash, payment_id, status, node_id, remote_history_at_post
+        "SELECT payment_hash, payment_id, status, node_id
            FROM phoenixd_pay WHERE idempotency_key = ?1",
         params![key],
         |r| {
@@ -2335,7 +1988,6 @@ fn pay_get(index: &Mutex<Connection>, key: &str) -> Result<Option<PayRow>> {
                 payment_id: r.get(1)?,
                 status: r.get(2)?,
                 node_id: r.get(3)?,
-                remote_history_at_post: r.get::<_, i64>(4)? != 0,
             })
         },
     )
@@ -2354,11 +2006,6 @@ fn pay_status_by_key(index: &Mutex<Connection>, key: &str) -> Result<Option<Stri
     .context("reading phoenixd_pay status by key")
 }
 
-/// Look a key's status up by phoenixd's payment id. Since `payment_id` also remembers a BURIED
-/// attempt on a non-`SUCCEEDED` row (see the schema), a hit is not by itself proof the row succeeded —
-/// callers read the STATUS, which is what says so. No buried id can reach here in practice anyway:
-/// [`PhoenixdPayment::pay_inner`] returns a payment id only on the paths that mark the row
-/// `SUCCEEDED`, so a buried one is never handed to anything that could ask about it.
 fn pay_status_by_payment_id(index: &Mutex<Connection>, payment_id: &str) -> Result<Option<String>> {
     let conn = index.lock().unwrap();
     conn.query_row(
@@ -2370,75 +2017,9 @@ fn pay_status_by_payment_id(index: &Mutex<Connection>, payment_id: &str) -> Resu
     .context("reading phoenixd_pay status by payment id")
 }
 
-/// Does lnrent's OWN ledger show the current `PREPARED` row is the only POST *it has witnessed*
-/// under `payment_hash`?
-///
-/// **PRECONDITION — say it plainly, because the rest of this doc is only true given it.** This
-/// ledger witnesses lnrent's own POSTs and nothing else, so reading a `true` here as "the only POST
-/// that EXISTS" additionally assumes the phoenixd wallet is lnrent's alone. Under ADR-0018 it is
-/// (the wallet is derived from lnrent's own seed and dedicated to this daemon), and the sanctioned
-/// operator action for a stuck refund is `lnrent refund-retry <id>`, which goes THROUGH lnrent and
-/// so is witnessed. But an attempt made outside lnrent — paying the same bolt11 straight at the
-/// node's API, which a `RefundStuck` DM might tempt an operator into — is invisible here, and this
-/// function would then wrongly report the current attempt as sole. That is a double pay, so treat
-/// "never POST to this wallet by any other route" as an operating constraint of the daemon, not a
-/// stylistic preference.
-///
-/// A terminal `outgoingbyhash` record proves the current witness did reach phoenixd, but phoenixd
-/// returns only ONE record when several attempts share a hash. Attribution is therefore sound only
-/// in the first-POST case:
-///
-/// - the current row is `PREPARED` with no `payment_id` carried from an earlier terminal attempt;
-/// - no foreign row is live/succeeded, and no foreign `FAILED` row carries a payment id proving it
-///   previously POSTed.
-///
-/// A foreign `FAILED` row with no payment id is a preflight refusal and never POSTed, so it does not
-/// make the first real attempt ambiguous. Every other shape fails closed to `Pending`/`RefundStuck`.
-///
-/// **This gate is REDUNDANT defence, and is deliberately kept as such.** `remote_history_at_post` —
-/// the pre-POST `outgoingbyhash` probe recorded on the row — is strictly stronger: it is phoenixd's
-/// OWN answer rather than an inference from lnrent's bookkeeping, so it also covers the case this
-/// ledger structurally cannot see (a restore-from-backup leaves the index clean over a hash phoenixd
-/// still has history for). In every ordering that can actually be constructed the probe refuses
-/// first, because a second key cannot POST the same hash while ours is `PREPARED` — so "the ledger
-/// learns of a foreign POST that phoenixd did not already hold at our probe" has no reachable path
-/// today. It is kept because both guards fail closed and this one costs a single indexed read, and
-/// because the cross-key rule is exactly the sort of thing a later change loosens.
-///
-/// Do NOT read a green suite as proof this gate works: no current test can distinguish it from the
-/// probe (breaking it alone fails nothing), so the honest claim is redundancy, not verification.
-fn pay_hash_has_only_current_attempt(
-    index: &Mutex<Connection>,
-    payment_hash: &str,
-    current_key: &str,
-) -> Result<bool> {
-    let conn = index.lock().unwrap();
-    conn.query_row(
-        "SELECT EXISTS (
-             SELECT 1 FROM phoenixd_pay AS current
-              WHERE current.idempotency_key = ?2
-                AND current.payment_hash = ?1
-                AND current.status = 'PREPARED'
-                AND current.payment_id IS NULL
-                AND NOT EXISTS (
-                    SELECT 1 FROM phoenixd_pay AS other
-                     WHERE other.payment_hash = ?1
-                       AND other.idempotency_key <> ?2
-                       AND (other.status <> 'FAILED' OR other.payment_id IS NOT NULL)
-                )
-         )",
-        params![payment_hash, current_key],
-        |r| r.get(0),
-    )
-    .context("proving the current phoenixd_pay row is the only POST under its payment hash")
-}
-
 /// The FIRST other idempotency key holding this payment hash in a non-`FAILED` state ([8A]). A
-/// `FAILED` row is excluded because of what that status asserts (module header): either it provably
-/// never POSTed, or phoenixd's own record shows its attempt terminally failed. Either way it owns no
-/// LIVE payment and must not block a legitimate new POST. If it did POST before failing,
-/// [`pay_hash_has_only_current_attempt`] prevents phoenixd's single-record answer from resolving that
-/// new POST terminally.
+/// `FAILED` row is excluded because the module-header invariant makes it "never POSTed" — it owns no
+/// payment and must not block a legitimate one.
 fn pay_other_key_for_hash(
     index: &Mutex<Connection>,
     payment_hash: &str,
@@ -2457,32 +2038,25 @@ fn pay_other_key_for_hash(
 }
 
 /// Commit the `PREPARED` witness before `payinvoice`. Re-preparing a `FAILED` key is allowed (that
-/// status asserts nothing is outstanding under it — see [`PhoenixdPayment::refuse`]); a `SUCCEEDED`
-/// row is CAS-protected so no path can ever walk a completed payment back to in-flight.
-///
-/// `payment_id` is deliberately CARRIED OVER rather than cleared: on a row being re-prepared its
-/// presence proves this key has POSTed before, which makes every later single-record
-/// `outgoingbyhash` answer unattributable ([`pay_hash_has_only_current_attempt`]). `terminal_at` IS
-/// cleared, because the row is no longer terminal.
+/// row provably never POSTed); a `SUCCEEDED` row is CAS-protected so no path can ever walk a
+/// completed payment back to in-flight.
 fn pay_upsert_prepared(
     index: &Mutex<Connection>,
     key: &str,
     bolt11: &str,
     payment_hash: &str,
     node_id: &str,
-    remote_history_at_post: bool,
 ) -> Result<()> {
     let conn = index.lock().unwrap();
     let changed = conn
         .execute(
-            "INSERT INTO phoenixd_pay
-                 (idempotency_key, bolt11, payment_hash, node_id, status, remote_history_at_post)
-             VALUES (?1, ?2, ?3, ?4, 'PREPARED', ?5)
+            "INSERT INTO phoenixd_pay (idempotency_key, bolt11, payment_hash, node_id, status)
+             VALUES (?1, ?2, ?3, ?4, 'PREPARED')
              ON CONFLICT(idempotency_key) DO UPDATE
                 SET bolt11 = ?2, payment_hash = ?3, node_id = ?4, status = 'PREPARED',
-                    terminal_at = NULL, remote_history_at_post = ?5
+                    payment_id = NULL, terminal_at = NULL
               WHERE phoenixd_pay.status <> 'SUCCEEDED'",
-            params![key, bolt11, payment_hash, node_id, i64::from(remote_history_at_post)],
+            params![key, bolt11, payment_hash, node_id],
         )
         .context("committing the phoenixd_pay PREPARED intent")?;
     if changed != 1 {
@@ -2520,34 +2094,26 @@ fn pay_mark_succeeded(
     Ok(())
 }
 
-/// Terminal `FAILED`, written in ONE step so a REFUSED key never passes through `PREPARED` (which
+/// Terminal refusal, written in ONE step so a refused key never passes through `PREPARED` (which
 /// would invite recovery to adopt whatever `outgoingbyhash` says about that hash). Only ever called
-/// where nothing is outstanding under the key — no payment was started ([7A]), or phoenixd's record
-/// shows the one that was is terminally failed (see [`PhoenixdPayment::refuse`]). CAS-guarded on the
-/// row NOT being `SUCCEEDED`, so it can never demote a completed payment.
-///
-/// `terminal_payment_id` is `Some` only on the terminal-failure path. Its presence is durable proof
-/// that this key has POSTed before, so [`pay_hash_has_only_current_attempt`] refuses to attribute any
-/// later single-record answer under the hash. A preflight refusal passes `None`: it never POSTed.
+/// where no payment was started ([7A]); CAS-guarded on the row NOT being `SUCCEEDED`, so a refusal
+/// can never demote a completed payment.
 fn pay_upsert_failed(
     index: &Mutex<Connection>,
     key: &str,
     bolt11: &str,
     payment_hash: &str,
     terminal_at: i64,
-    terminal_payment_id: Option<&str>,
 ) -> Result<()> {
     let conn = index.lock().unwrap();
     conn.execute(
-        "INSERT INTO phoenixd_pay (idempotency_key, bolt11, payment_hash, status, terminal_at,
-                                   payment_id)
-         VALUES (?1, ?2, ?3, 'FAILED', ?4, ?5)
+        "INSERT INTO phoenixd_pay (idempotency_key, bolt11, payment_hash, status, terminal_at)
+         VALUES (?1, ?2, ?3, 'FAILED', ?4)
          ON CONFLICT(idempotency_key) DO UPDATE
-            SET bolt11 = ?2, payment_hash = ?3, status = 'FAILED',
-                payment_id = COALESCE(?5, phoenixd_pay.payment_id),
+            SET bolt11 = ?2, payment_hash = ?3, status = 'FAILED', payment_id = NULL,
                 terminal_at = ?4
           WHERE phoenixd_pay.status <> 'SUCCEEDED'",
-        params![key, bolt11, payment_hash, terminal_at, terminal_payment_id],
+        params![key, bolt11, payment_hash, terminal_at],
     )
     .context("recording a phoenixd_pay refusal")?;
     // The rows-changed count is deliberately NOT asserted here, unlike `pay_upsert_prepared`. The one
@@ -2776,17 +2342,12 @@ mod real {
         /// MSAT (phoenixd's `fees`), NOT sat — `routingFeeSat` is the same figure rounded down.
         #[serde(rename = "fees")]
         fees: u64,
-        /// phoenixd's terminal marker, epoch MILLIS. **Must never become a required field**: an
-        /// in-flight outgoing payment carries NO `completedAt` key at all (MEASURED — see
-        /// `outgoing_is_terminally_failed`), so its absence has to decode as `None`. A decode error
-        /// there would turn every in-flight recovery read into a failed one, which is not "stay
-        /// pending" — it is a refund that resolves in neither direction.
-        ///
-        /// The `Option<i64>` is what carries that, not the `default`: serde's derive already treats
-        /// an `Option` field as absent-is-`None`, and this decoder still accepts the in-flight record
-        /// with the attribute removed (verified by mutating it away). `default` is kept as intent,
-        /// matching `expiresAt` above; what a change here has to preserve is the TYPE, and
-        /// `the_measured_outgoing_terminal_marker_decodes_off_the_wire` is what fails if it does not.
+        /// MEASURED: an in-flight outgoing payment carries NO `completedAt` key at all, so its
+        /// absence must be DATA (still in flight) and never a decode error. serde's derive already
+        /// maps a missing field on an `Option` to `None` — VERIFIED by deleting the attribute below
+        /// and watching the decode test still pass — so `default` is redundant here and kept only to
+        /// state the intent at the field. Do not describe it as load-bearing; the test is what pins
+        /// the behaviour.
         #[serde(rename = "completedAt", default)]
         completed_at: Option<i64>,
     }
@@ -3026,6 +2587,58 @@ mod real {
             assert!(serde_json::from_str::<BalanceResponse>(r#"{"balanceSat":0}"#).is_err());
         }
 
+        /// The 2026-07-26 outgoing measurement (phoenixd 0.9.0-b072567). `completedAt` is the
+        /// TERMINAL marker, and the leg that matters most is its ABSENCE: an in-flight payment
+        /// carries no such key at all, so the in-flight record must decode as data rather than as a
+        /// DECODE ERROR, or the recovery arm would never see the shape it reasons about. (serde
+        /// gives that for an `Option` on its own; this test is the thing that pins it, not the
+        /// `#[serde(default)]` attribute — removing that attribute keeps this test green.)
+        ///
+        /// The two records below are the controlled comparison: ONE paymentId read twice during one
+        /// payment, byte-identical apart from that key.
+        #[test]
+        fn the_outgoing_terminal_marker_and_its_absence_both_decode() {
+            let in_flight = r#"{
+                "paymentId":"3d9d75f9-6940-45f6-b611-575a21a91ef9",
+                "paymentHash":"aa",
+                "preimage":"",
+                "isPaid":false,
+                "sent":0,
+                "fees":0,
+                "invoice":"lnbc...",
+                "createdAt":1785101380000
+            }"#;
+            let decoded: OutgoingResponse =
+                serde_json::from_str(in_flight).expect("an in-flight record MUST decode");
+            assert!(!decoded.is_paid);
+            assert_eq!(
+                decoded.completed_at, None,
+                "an absent completedAt is PENDING, and must decode as data rather than erroring"
+            );
+
+            let terminated = r#"{
+                "paymentId":"3d9d75f9-6940-45f6-b611-575a21a91ef9",
+                "paymentHash":"aa",
+                "preimage":"",
+                "isPaid":false,
+                "sent":0,
+                "fees":0,
+                "invoice":"lnbc...",
+                "completedAt":1785101384178,
+                "createdAt":1785101380000
+            }"#;
+            let decoded: OutgoingResponse =
+                serde_json::from_str(terminated).expect("a terminated record MUST decode");
+            assert!(!decoded.is_paid, "unpaid + completedAt SET is the FAILED leg");
+            assert_eq!(decoded.completed_at, Some(1_785_101_384_178));
+
+            // An explicit null is the same statement as absence, not a decode error.
+            let nulled: OutgoingResponse =
+                serde_json::from_str(&terminated.replace("1785101384178", "null"))
+                    .expect("an explicit null completedAt MUST decode");
+            assert_eq!(nulled.completed_at, None);
+        }
+
         #[test]
         fn incoming_money_and_status_fields_are_required() {
             let valid = r#"{
@@ -3056,43 +2669,6 @@ mod real {
                     "missing isPaid/receivedSat must not decode as unpaid or zero credit"
                 );
             }
-        }
-
-        /// The 2026-07-26 terminal-marker drill, at the wire layer. All three legs were observed on
-        /// real records against phoenixd 0.9.0-b072567; what this pins is that the DECODER preserves
-        /// the distinction the money path reads (`super::super::outgoing_is_terminally_failed`).
-        ///
-        /// The PENDING leg is the one that must never regress: an in-flight record carries NO
-        /// `completedAt` key at all, so a required field here would turn every in-flight recovery
-        /// read into a decode ERROR — and an error is not "stay pending", it is a refund that never
-        /// resolves either way.
-        #[test]
-        fn the_measured_outgoing_terminal_marker_decodes_off_the_wire() {
-            // SUCCEEDED and FAILED differ ONLY in `isPaid`; both carry the marker.
-            let succeeded: OutgoingResponse = serde_json::from_str(
-                r#"{"paymentId":"3d9d75f9","paymentHash":"00","isPaid":true,"fees":4480,
-                    "completedAt":1785101384178}"#,
-            )
-            .expect("measured SUCCEEDED shape");
-            assert!(succeeded.is_paid);
-            assert_eq!(succeeded.completed_at, Some(1_785_101_384_178));
-
-            let failed: OutgoingResponse = serde_json::from_str(
-                r#"{"paymentId":"3d9d75f9","paymentHash":"00","isPaid":false,"fees":0,
-                    "completedAt":1785101384178}"#,
-            )
-            .expect("measured FAILED shape");
-            assert!(!failed.is_paid);
-            assert_eq!(failed.completed_at, Some(1_785_101_384_178));
-
-            // The controlled comparison: the SAME payment read while in flight — byte-identical to
-            // the FAILED record above except that `completedAt` is ABSENT, not null.
-            let pending: OutgoingResponse = serde_json::from_str(
-                r#"{"paymentId":"3d9d75f9","paymentHash":"00","isPaid":false,"fees":0}"#,
-            )
-            .expect("an in-flight record MUST decode; its missing completedAt is the PENDING signal");
-            assert!(!pending.is_paid);
-            assert_eq!(pending.completed_at, None);
         }
 
         #[test]
