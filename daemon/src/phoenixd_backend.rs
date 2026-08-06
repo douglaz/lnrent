@@ -995,8 +995,12 @@ impl PhoenixdPayment {
                     // this is a decision rather than an omission (lnrent-ole). Resolving unlocks a
                     // re-POST of the same hash, so it is only sound if the record can be attributed
                     // to the attempt outstanding NOW — and `outgoingbyhash` returns exactly ONE
-                    // record, with no list endpoint and no measurement of which one it picks when a
-                    // hash has several. Three attribution schemes were built and each was refuted:
+                    // record, with no measurement of which one it picks when a hash has several.
+                    // (lnrent has measured no way to ENUMERATE outgoing records either; whether
+                    // phoenixd exposes such a list is untested here, and an unmeasured endpoint
+                    // could not be used for this anyway — the same "never a guess" rule that
+                    // produced this decision applies to the API surface it would rest on.)
+                    // Three attribution schemes were built and each was refuted:
                     //   * comparing against the one buried payment id — a record from any OTHER dead
                     //     attempt, including another key's, still passes;
                     //   * proving from lnrent's own `phoenixd_pay` ledger that no earlier POST
@@ -1021,8 +1025,8 @@ impl PhoenixdPayment {
                          lnrent measured is the shape of a payment still IN FLIGHT (on any other \
                          release that reading is unverified, so treat it as merely unresolved). \
                          Leaving it pending rather than paying again. \
-                         If it never completes, this surfaces as a RefundStuck alert to settle by \
-                         hand; do not pay this destination out of band while it is in flight.",
+                         If it never completes, this surfaces as a stuck-payment operator alert \
+                         (RefundStuck for a refund, SweepStuck for a sweep) to settle by hand; do not pay this destination out of band while it is in flight.",
                         row.payment_hash
                     ),
                     Some(_) => bail!(
@@ -1031,7 +1035,8 @@ impl PhoenixdPayment {
                          phoenixd release means the payment failed. lnrent still leaves it pending: \
                          phoenixd returns only one record per payment hash, so that record cannot be \
                          proven to be this attempt rather than an earlier one, and retrying on it \
-                         could pay a live payment twice. Expect a RefundStuck alert; settling it \
+                         could pay a live payment twice. Expect a stuck-payment operator alert \
+                         (RefundStuck for a refund, SweepStuck for a sweep); settling it \
                          needs a human who can see the wallet's own payment list.",
                         row.payment_hash
                     ),
@@ -1256,7 +1261,8 @@ impl PhoenixdPayment {
                          attempt stays pending regardless: phoenixd returns one record per payment \
                          hash, so it cannot be proven to be this attempt rather than an earlier one, \
                          and on any other release the meaning of that field is unverified. Expect a \
-                         RefundStuck alert.",
+                         stuck-payment operator alert (RefundStuck for a refund, SweepStuck for a \
+                         sweep).",
                         reason.as_deref().unwrap_or("<none>")
                     ),
                     Ok(Some(_)) => bail!(
