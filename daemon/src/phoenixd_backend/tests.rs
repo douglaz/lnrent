@@ -1279,6 +1279,42 @@ async fn a_receipt_less_response_over_a_terminally_failed_record_resolves_failed
     );
 }
 
+#[tokio::test]
+async fn a_receipt_less_terminal_record_for_another_hash_stays_pending() {
+    let ops = FakePhoenixdOps::new();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let bolt11 = mint_bolt11(120_000, 32);
+    let requested_hash = hash_of(&bolt11);
+    let wrong_hash = "fe".repeat(32);
+
+    ops.set_outgoing_for(
+        &requested_hash,
+        PhoenixdOutgoing {
+            payment_id: "pay-wrong-hash".into(),
+            payment_hash: wrong_hash.clone(),
+            is_paid: false,
+            fees_msat: 0,
+            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+        },
+    );
+    ops.script_pay(Ok(PayAttempt::NoReceipt {
+        reason: Some("payment failed".into()),
+    }));
+
+    let key = "refund:order:32:g1";
+    let err = be
+        .pay_refund_capped(&bolt11, 120, 130, key)
+        .await
+        .expect_err("terminal evidence for another hash cannot resolve this attempt");
+    assert_eq!(be.payment_status_by_key(key).await.unwrap(), PayStatus::Pending);
+    assert_eq!(ops.pay_calls().len(), 1, "no retry is unlocked");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains(&wrong_hash) && rendered.contains(&requested_hash),
+        "unexpected error: {rendered}"
+    );
+}
+
 // Fact 3: an `outgoingbyhash` 404 PROVES the pay never landed, so the retry is a genuinely new
 // attempt (and re-runs the INV-1 preflight).
 #[tokio::test]
@@ -1619,26 +1655,161 @@ async fn recovery_resolves_a_terminally_failed_outgoing_record_and_lets_the_retr
     assert_eq!(be.payment_status(&id).await.unwrap(), PayStatus::Succeeded);
 }
 
-// The ATTRIBUTION BIND, and the reason it exists: resolving a terminal failure is what lets the
-// Refunder re-POST the SAME bolt11, so from the second attempt on, phoenixd can hold a BURIED attempt
-// and a LIVE one under one payment hash. `outgoingbyhash` returns a single record and which one it
-// picks among several was never measured, so a stale answer must not be allowed to resolve the
-// attempt made after it — that would mark a live payment terminal and let the next retry pay over it.
 #[tokio::test]
-async fn a_buried_attempts_record_never_resolves_the_retry_that_followed_it() {
+async fn recovery_keeps_a_terminal_record_for_another_hash_pending() {
     let ops = FakePhoenixdOps::new();
     let be = backend(ops.clone(), TestClock::new(1_000));
-    let bolt11 = mint_bolt11(120_000, 64);
-    let hash = hash_of(&bolt11);
-    let key = "refund:order:64:g1";
+    let bolt11 = mint_bolt11(120_000, 67);
+    let requested_hash = hash_of(&bolt11);
+    let wrong_hash = "fd".repeat(32);
+    let key = "refund:order:67:g1";
 
-    // Attempt 1 POSTs and goes ambiguous, then phoenixd's record for the hash terminates unpaid.
+    ops.script_pay(Err("timeout".into()));
+    be.pay_refund_capped(&bolt11, 120, 130, key)
+        .await
+        .expect_err("ambiguous");
+    ops.set_outgoing_for(
+        &requested_hash,
+        PhoenixdOutgoing {
+            payment_id: "pay-wrong-hash".into(),
+            payment_hash: wrong_hash.clone(),
+            is_paid: false,
+            fees_msat: 0,
+            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+        },
+    );
+
+    let err = be
+        .pay_refund_capped(&bolt11, 120, 130, key)
+        .await
+        .expect_err("terminal evidence for another hash cannot resolve this attempt");
+    assert_eq!(be.payment_status_by_key(key).await.unwrap(), PayStatus::Pending);
+    assert_eq!(ops.pay_calls().len(), 1, "no retry is unlocked");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains(&wrong_hash) && rendered.contains(&requested_hash),
+        "unexpected error: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn recovery_keeps_terminal_evidence_from_another_wallet_pending() {
+    let ops = FakePhoenixdOps::new();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let bolt11 = mint_bolt11(120_000, 68);
+    let hash = hash_of(&bolt11);
+    let key = "refund:order:68:g1";
+
     ops.script_pay(Err("timeout".into()));
     be.pay_refund_capped(&bolt11, 120, 130, key)
         .await
         .expect_err("ambiguous");
     ops.set_outgoing(PhoenixdOutgoing {
-        payment_id: "pay-attempt-1".into(),
+        payment_id: "pay-other-wallet".into(),
+        payment_hash: hash,
+        is_paid: false,
+        fees_msat: 0,
+        completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+    });
+    ops.set_node_id("03differentwallet");
+
+    let err = be
+        .pay_refund_capped(&bolt11, 120, 130, key)
+        .await
+        .expect_err("another wallet's record says nothing about the prepared attempt");
+    assert_eq!(be.payment_status_by_key(key).await.unwrap(), PayStatus::Pending);
+    assert_eq!(ops.pay_calls().len(), 1, "no retry is unlocked");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("03differentwallet") && rendered.contains("payment history"),
+        "unexpected error: {rendered}"
+    );
+}
+
+// Cross-key double-pay regression: key A terminally failed after POSTing P1. `FAILED` no longer
+// blocks key B's legitimate POST of the same invoice, but it DOES prove that `outgoingbyhash` has
+// multiple possible answers. If B times out while P2 is live and phoenixd returns P1, B must stay
+// Pending; resolving it would let B's next drive POST P3 over live P2.
+#[tokio::test]
+async fn another_keys_buried_attempt_never_resolves_the_current_attempt() {
+    let ops = FakePhoenixdOps::new();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let bolt11 = mint_bolt11(120_000, 64);
+    let hash = hash_of(&bolt11);
+    let key_a = "refund:order:64-a:g1";
+    let key_b = "refund:order:64-b:g1";
+
+    // Key A POSTs P1 and then safely resolves its first failure.
+    ops.script_pay(Err("timeout".into()));
+    be.pay_refund_capped(&bolt11, 120, 130, key_a)
+        .await
+        .expect_err("ambiguous");
+    ops.set_outgoing(PhoenixdOutgoing {
+        payment_id: "p1".into(),
+        payment_hash: hash.clone(),
+        is_paid: false,
+        fees_msat: 0,
+        completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+    });
+    be.pay_refund_capped(&bolt11, 120, 130, key_a)
+        .await
+        .expect_err("a terminal failure is not a payment");
+    assert_eq!(
+        be.payment_status_by_key(key_a).await.unwrap(),
+        PayStatus::Failed,
+        "the first POST under a fresh hash keeps the operational win"
+    );
+
+    // A FAILED foreign key is allowed by the cross-key start guard, so B POSTs P2 and times out. The
+    // fake deliberately keeps returning the FIRST buried record, P1.
+    ops.script_pay(Err("timeout".into()));
+    be.pay_refund_capped(&bolt11, 120, 130, key_b)
+        .await
+        .expect_err("ambiguous");
+    assert_eq!(ops.pay_calls().len(), 2, "A's P1 and B's possibly-live P2 POSTed");
+
+    // P1 says nothing about B's P2. Repeated recovery must neither resolve B nor POST P3.
+    for drive in 1..=3 {
+        let err = be
+            .pay_refund_capped(&bolt11, 120, 130, key_b)
+            .await
+            .expect_err("another key's buried record resolves nothing");
+        assert_eq!(
+            be.payment_status_by_key(key_b).await.unwrap(),
+            PayStatus::Pending,
+            "drive {drive}: B's possibly-live P2 must remain Pending"
+        );
+        assert_eq!(
+            ops.pay_calls().len(),
+            2,
+            "drive {drive}: B must never issue a second payinvoice over its possibly-live P2"
+        );
+        assert!(
+            format!("{err:#}").contains("earlier or foreign POST may exist"),
+            "drive {drive}: unexpected error: {err:#}"
+        );
+    }
+}
+
+// Same-key three-attempt regression. This seeds the exact durable state an older unsafe build can
+// leave: P1 and P2 are buried, but the one `payment_id` slot remembers only P2. Attempt 3 is live;
+// phoenixd returns the FIRST record P1. Comparing record ids (`P1 != P2`) would wrongly resolve
+// attempt 3 and unlock P4, so attribution must instead reject every hash with any prior POST.
+#[tokio::test]
+async fn the_first_of_two_buried_attempts_never_resolves_a_third_attempt() {
+    let ops = FakePhoenixdOps::new();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let bolt11 = mint_bolt11(120_000, 66);
+    let hash = hash_of(&bolt11);
+    let key = "refund:order:66:g1";
+
+    // Attempt 1 POSTs P1 and resolves normally: this is the feature's supported first-failure case.
+    ops.script_pay(Err("timeout".into()));
+    be.pay_refund_capped(&bolt11, 120, 130, key)
+        .await
+        .expect_err("attempt 1 is ambiguous");
+    ops.set_outgoing(PhoenixdOutgoing {
+        payment_id: "p1".into(),
         payment_hash: hash.clone(),
         is_paid: false,
         fees_msat: 0,
@@ -1646,62 +1817,54 @@ async fn a_buried_attempts_record_never_resolves_the_retry_that_followed_it() {
     });
     be.pay_refund_capped(&bolt11, 120, 130, key)
         .await
-        .expect_err("a terminal failure is not a payment");
-    assert_eq!(
-        be.payment_status_by_key(key).await.unwrap(),
-        PayStatus::Failed,
-        "attempt 1 resolves normally — the FIRST failure under a key always does"
-    );
+        .expect_err("attempt 1 terminally failed");
 
-    // Attempt 2 is the retry that resolution unlocked. It POSTs over the SAME hash and goes ambiguous
-    // too, so from here on a payment may be LIVE at phoenixd under this key.
+    // Attempt 2 POSTs and times out. Model the persisted P2 burial an older unsafe build could then
+    // write; this intentionally bypasses today's guard so recovery compatibility is exercised.
     ops.script_pay(Err("timeout".into()));
     be.pay_refund_capped(&bolt11, 120, 130, key)
         .await
-        .expect_err("ambiguous");
-    assert_eq!(ops.pay_calls().len(), 2, "the retry POSTed");
+        .expect_err("attempt 2 is ambiguous");
+    pay_upsert_failed(
+        &be.index,
+        key,
+        &bolt11,
+        &hash,
+        1_001,
+        Some("p2"),
+    )
+    .unwrap();
 
-    // phoenixd now answers `outgoingbyhash` with the BURIED attempt — the record is untouched, still
-    // `pay-attempt-1`, still terminal. It says nothing about attempt 2, so the key must stay Pending
-    // however many times it is driven, and must never issue a third POST over a live payment.
+    // Attempt 3 POSTs and may be live. The fake still returns the first buried record P1.
+    ops.script_pay(Err("timeout".into()));
+    be.pay_refund_capped(&bolt11, 120, 130, key)
+        .await
+        .expect_err("attempt 3 is ambiguous");
+    assert_eq!(ops.pay_calls().len(), 3);
+
     for drive in 1..=3 {
         let err = be
             .pay_refund_capped(&bolt11, 120, 130, key)
             .await
-            .expect_err("a buried attempt's record resolves nothing");
+            .expect_err("P1 cannot resolve possibly-live P3");
         assert_eq!(
             be.payment_status_by_key(key).await.unwrap(),
             PayStatus::Pending,
-            "drive {drive}: stale evidence must not mark a possibly-live payment terminal"
+            "drive {drive}: P3 must remain Pending even though P1 differs from remembered P2"
         );
         assert_eq!(
             ops.pay_calls().len(),
-            2,
-            "drive {drive}: NO third payinvoice may be issued over a possibly-live attempt"
+            3,
+            "drive {drive}: no P4 may be POSTed over possibly-live P3"
         );
         assert!(
-            format!("{err:#}").contains("already resolved"),
+            format!("{err:#}").contains("earlier or foreign POST may exist"),
             "drive {drive}: unexpected error: {err:#}"
         );
     }
-
-    // Positive control, so the test proves ATTRIBUTION and not merely "nothing after a retry ever
-    // resolves": once phoenixd reports a DIFFERENT payment terminating on this hash, the key resolves
-    // exactly as attempt 1 did.
-    ops.set_outgoing(PhoenixdOutgoing {
-        payment_id: "pay-attempt-2".into(),
-        payment_hash: hash,
-        is_paid: false,
-        fees_msat: 0,
-        completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
-    });
-    be.pay_refund_capped(&bolt11, 120, 130, key)
-        .await
-        .expect_err("still not a payment");
     assert_eq!(
         be.payment_status_by_key(key).await.unwrap(),
-        PayStatus::Failed,
-        "a record for an attempt this key has NOT already buried is real evidence"
+        PayStatus::Pending
     );
 }
 
@@ -1809,9 +1972,11 @@ async fn a_terminal_marker_on_an_unverified_release_stays_pending() {
         1,
         "and the fallback never re-POSTs either"
     );
+    let rendered = format!("{err:#}");
     assert!(
-        format!("{err:#}").contains("not the release that marker was measured against"),
-        "unexpected error: {err:#}"
+        rendered.contains("not the release that marker was measured against")
+            && !rendered.contains("version is unreadable"),
+        "unexpected version-mismatch error: {rendered}"
     );
 
     // Downgrade the claim, not the evidence: put the verified release back and the SAME record now
@@ -1848,7 +2013,8 @@ async fn a_terminal_marker_stays_pending_when_the_version_cannot_be_read() {
     });
     ops.fail_node_info_with_status(503);
 
-    be.pay_refund_capped(&bolt11, 120, 130, "refund:order:63:g1")
+    let err = be
+        .pay_refund_capped(&bolt11, 120, 130, "refund:order:63:g1")
         .await
         .expect_err("an unreadable version cannot resolve the marker");
     assert_eq!(
@@ -1856,6 +2022,12 @@ async fn a_terminal_marker_stays_pending_when_the_version_cannot_be_read() {
         PayStatus::Pending
     );
     assert_eq!(ops.pay_calls().len(), 1);
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("version is unreadable")
+            && !rendered.contains("not the release that marker was measured against"),
+        "unexpected unreadable-version error: {rendered}"
+    );
 }
 
 // --------------------------------------------------------------------------------------------------

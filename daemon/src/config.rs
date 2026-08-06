@@ -166,8 +166,9 @@ pub struct PhoenixdFeeSchedule {
     /// switches off and failed refunds go back to waiting for an operator. Setting this to your
     /// release turns it back on for that release — so verify `payments/outgoingbyhash` still marks a
     /// terminated payment with `completedAt`, and leaves it absent while one is in flight, before you
-    /// do. Leaving it unset is always safe: it costs a `RefundStuck` DM per failed refund, never a
-    /// wrong payment.
+    /// do. Leaving it unset uses the built-in schedule for the measured release, so terminal-failure
+    /// resolution is ON by default while that release is running; when the running release differs,
+    /// resolution falls back to `RefundStuck` rather than risking a wrong payment.
     pub version: String,
     pub base_msat: u64,
     pub ppm: u64,
