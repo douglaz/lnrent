@@ -41,12 +41,10 @@ docs/specs/gate1-operator-sweep.md.
 
 One small `alerts` module owned by the supervisor:
 
-- `Alert { kind: AlertKind, subject: String, detail: String }` with a closed `AlertKind` enum. The
-  kinds THIS spec landed: `RefundParked`, `RefundStuck`, `TeardownFailed`, `RelayBlackout`,
-  `HoldingsLow`. No free-form kinds — a kind is added only by an owning bead, and several have been
-  since; docs/specs/gate1-operator-sweep.md's `SweepFailed` is the one this spec sanctioned in
-  advance. So the SHIPPED set is
-  `AlertKind` in `daemon/src/alerts.rs`; per the Status header, the code wins on enumerations. (No `BalanceQueryFailed`: with §E there is no automatic balance query left to fail.)
+- `Alert { kind: AlertKind, subject: String, detail: String }` with a closed `AlertKind` enum:
+  `RefundParked`, `RefundStuck`, `TeardownFailed`, `RelayBlackout`, `HoldingsLow`. No free-form
+  kinds. (One sanctioned extension: docs/specs/gate1-operator-sweep.md adds `SweepFailed` to this
+  enum when it lands — the two specs land the enum together or the sweep spec appends.) (No `BalanceQueryFailed`: with §E there is no automatic balance query left to fail.)
 - **Sink = a NIP-17 DM via the existing outbox, to a configurable recipient.** This reuses the
   durable drain/retry/FAILED machinery and needs zero new infra. **Recipient (operator decision,
   2026-07-04 grill):** new optional config `alert_npub` — the operator's PERSONAL Nostr identity,
@@ -61,9 +59,7 @@ One small `alerts` module owned by the supervisor:
   `Msg::OperatorAlert { kind, subject, detail }` to `wire/src/` (an operator→operator-chosen-peer
   DM; buyers never receive or decode it, so no buyer-facing decode path changes) and set
   `payload_json` to that. The alert is a normal gift-wrapped DM to the configured recipient.
-  Config: `alerts_enabled` (default **true** for every real money backend, false for mock — the
-  shipped predicate is `payment_backend != PaymentMode::Mock` in `daemon/src/config.rs`, so phoenixd
-  alerts by default too; this line said "fedimint" back when that was the only one)
+  Config: `alerts_enabled` (default **true** when the payment backend is fedimint, false for mock)
   + `alert_npub` — and that is ALL the dispatcher/sink config (§D's `min_holdings_warn_msat` is a
   warning-condition knob, not a sink knob); no webhook/email/metrics sinks in this cut (they
   can be added behind the same dispatch seam later).

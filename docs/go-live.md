@@ -254,38 +254,6 @@ refuses orders it cannot service.
   outbox (edge-triggered, at most one per condition per 6h). One honest caveat: a total relay
   blackout is the one condition that cannot be delivered (it queues), so a prolonged silence from a
   daemon you know is up still warrants a direct check.
-- **A settlement lnrent cannot book (lnrent-gc7):** phoenixd fee credit can make a paid receipt
-  unrefundable (ADR-0019); fund the node's spendable balance and the retry books it. Because phoenixd
-  publishes no per-receipt fee-credit attribution, that judgement is made per WALLET, so one alert
-  covers every receipt being held back. A missing `phoenixd_index.db` row instead makes payment state
-  UNKNOWN — again one alert, however many invoices it hit. That one is the dangerous repair: stop the
-  daemon and restore the whole lnrent data dir from your **newest** backup with `lnrentd restore
-  --from <backup-dir> --data-dir <data-dir> --force` (`--force` because restore refuses a non-empty
-  target, and the live data dir is not empty; add `--passphrase-file` if the backup is encrypted).
-  Read the date twice. `restore` replaces the *whole* data dir, the state DB included, so it rolls
-  lnrent back to that backup's instant: **everything committed since is dropped** — later orders,
-  captures, refunds, ledger rows — while phoenixd still holds the sats. And a backup older than the
-  affected invoices does not repair the divergence in the first place: it drops exactly those paid
-  orders (no capture, no refund, no ledger row). So restore only a backup newer than the affected
-  invoices, then reconcile by hand — against phoenixd's payment history — everything phoenixd shows
-  after that backup's date. With no late-enough backup, do not restore at all; reconcile by hand
-  instead. Then verify phoenixd still points at the original wallet/payment history, and restart. An
-  index divergence DMs a `SettlementUnbookable` alert when lnrent detects it; a fee-credit refusal
-  DMs after it has stood for 15 minutes from lnrent's first local observation — that delay is there
-  because lnrent normally books the receipt itself on a retry seconds later, so it lapses once there
-  is no retry left to wait for. A receipt whose settlement window is within those 15 minutes of
-  running out (what you see after the daemon has been down or unable to reach phoenixd for about a
-  day) DMs immediately instead, and that alert says so: lnrent will stop re-checking it, and after
-  that only your own reconciliation against phoenixd's payment history recovers it. Each carries its
-  distinct remedy. `lnrent money` and `lnrent status` show deduplicated alert history from the last
-  12 hours (subject, remedy and timestamp), not live backend state: a repaired incident stays listed
-  until that window expires, and disabling the alert sink stops NEW entries without deleting or
-  hiding the ones already written — those age out on the same window. The number `lnrent money`
-  prints counts distinct *conditions*, not receipts or orders: both conditions are judged whole-wallet
-  or whole-index, so one of them can be holding back any number of receipts — which the detail beside
-  it does not enumerate; it names one as the example and tells you what to fix. If the durable
-  history cannot be read, both commands report it as
-  unknown rather than showing zero; fix the daemon's reported storage error and retry.
 - **Watch relay connectivity (GATE-1 PR-9c):** `lnrent relays` shows per-relay connected state +
   last-connected time (also summarized as `relays_connected/relays_total` in `lnrent status`). If
   ALL relays sit disconnected past 15min the daemon fires a `RelayBlackout` alert — but that alert
