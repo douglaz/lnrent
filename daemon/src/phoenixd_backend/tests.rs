@@ -800,13 +800,17 @@ async fn a_delivered_settlement_is_not_polled_or_delivered_again() {
     let ops_dyn: Arc<dyn PhoenixdOps> = ops.clone();
     let mut retired: HashSet<String> = HashSet::new();
 
-    assert!(poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &tx, &mut retired).await);
+    assert!(
+        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+    );
     let settlement = rx.recv().await.expect("the first poll delivers the payment");
     assert_eq!(settlement.invoice_id, inv.id);
     assert_eq!(settlement.received_msat, 2_723_000);
     let polls_after_delivery = ops.incoming_calls().len();
 
-    assert!(poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &tx, &mut retired).await);
+    assert!(
+        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+    );
     assert_eq!(
         ops.incoming_calls().len(),
         polls_after_delivery,
@@ -855,8 +859,12 @@ async fn an_expired_unpaid_invoice_retires_but_a_live_one_keeps_being_polled() {
     let clock_dyn: Arc<dyn Clock> = Arc::new(clock.clone());
     let mut retired: HashSet<String> = HashSet::new();
 
-    assert!(poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &tx, &mut retired).await);
-    assert!(poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &tx, &mut retired).await);
+    assert!(
+        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+    );
+    assert!(
+        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+    );
     let polls: Vec<String> = ops.incoming_calls();
     assert_eq!(
         polls.iter().filter(|e| *e == "ext:lapsed").count(),
@@ -884,7 +892,9 @@ async fn an_expired_unpaid_invoice_retires_but_a_live_one_keeps_being_polled() {
             expires_at_ms: None,
         }],
     );
-    assert!(poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &tx, &mut retired).await);
+    assert!(
+        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+    );
     let settlement = rx.recv().await.expect("the late payment still lands");
     assert_eq!(settlement.invoice_id, live.id);
     assert_eq!(settlement.settled_at, 1_019);
@@ -987,7 +997,9 @@ async fn a_receipt_no_spendable_balance_could_back_is_refused_not_booked() {
     let ops_dyn: Arc<dyn PhoenixdOps> = ops.clone();
     let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_000));
     let mut retired: HashSet<String> = HashSet::new();
-    assert!(poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &tx, &mut retired).await);
+    assert!(
+        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+    );
     assert!(
         rx.try_recv().is_err(),
         "a receipt with no provable spendable credit must not reach capture"
@@ -1000,7 +1012,9 @@ async fn a_receipt_no_spendable_balance_could_back_is_refused_not_booked() {
         be.received_amount_msat(&inv.id).await.unwrap(),
         Some(2_723_000)
     );
-    assert!(poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &tx, &mut retired).await);
+    assert!(
+        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+    );
     assert_eq!(
         rx.recv().await.expect("now deliverable").received_msat,
         2_723_000
@@ -1035,7 +1049,9 @@ async fn a_fee_credit_larger_than_the_receipt_does_not_wedge_a_funded_wallet() {
     let ops_dyn: Arc<dyn PhoenixdOps> = ops.clone();
     let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_000));
     let mut retired: HashSet<String> = HashSet::new();
-    assert!(poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &tx, &mut retired).await);
+    assert!(
+        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+    );
     assert_eq!(
         rx.recv().await.expect("the settlement reaches capture").received_msat,
         2_723_000
@@ -1140,7 +1156,9 @@ async fn the_measured_fee_credit_only_receive_is_refused_end_to_end() {
     let ops_dyn: Arc<dyn PhoenixdOps> = ops.clone();
     let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_000));
     let mut retired: HashSet<String> = HashSet::new();
-    assert!(poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &tx, &mut retired).await);
+    assert!(
+        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+    );
     assert!(
         rx.try_recv().is_err(),
         "a receipt the wallet demonstrably cannot refund must not reach capture"
@@ -1158,7 +1176,9 @@ async fn the_measured_fee_credit_only_receive_is_refused_end_to_end() {
         be.received_amount_msat(&inv.id).await.unwrap(),
         Some(1_000_000)
     );
-    assert!(poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &tx, &mut retired).await);
+    assert!(
+        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+    );
     let delivered = rx.recv().await.expect("now deliverable");
     assert_eq!(delivered.received_msat, 1_000_000);
     // Dated by the record's OWN `completedAt`, not the daemon clock (which this test holds at
@@ -2432,7 +2452,9 @@ async fn the_poll_retires_a_row_the_clock_says_can_no_longer_be_paid() {
     let clock_dyn: Arc<dyn Clock> = Arc::new(clock.clone());
     let mut retired: HashSet<String> = HashSet::new();
 
-    assert!(poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &tx, &mut retired).await);
+    assert!(
+        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+    );
     assert_eq!(
         ops.incoming_calls().len(),
         calls_after_create + 1,
@@ -2448,7 +2470,9 @@ async fn the_poll_retires_a_row_the_clock_says_can_no_longer_be_paid() {
     );
 
     clock.set(inv.expires_at + SETTLEMENT_POLL_GRACE_SECS + 1);
-    assert!(poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &tx, &mut retired).await);
+    assert!(
+        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+    );
     assert_eq!(
         ops.incoming_calls().len(),
         calls_after_create + 1,
@@ -2541,4 +2565,512 @@ async fn create_invoice_refuses_a_bolt11_whose_hash_disagrees_with_the_response(
         msg.contains("bolt11 encoding"),
         "the error must name the hash disagreement, got: {msg}"
     );
+}
+
+fn backend_with_alerts(
+    ops: Arc<FakePhoenixdOps>,
+    clock: Arc<TestClock>,
+) -> (PhoenixdPayment, crate::store::Store) {
+    let state = Connection::open_in_memory().expect("in-memory state db");
+    state.execute_batch(crate::store::SCHEMA).expect("state schema");
+    let store = crate::store::Store::spawn(state);
+    let clock: Arc<dyn Clock> = clock;
+    let alerts = Arc::new(crate::alerts::AlertDispatcher::new(
+        store.clone(),
+        clock.clone(),
+        "op-npub-hex".into(),
+    ));
+    let index = Connection::open_in_memory().expect("in-memory index");
+    index.execute_batch(INDEX_SCHEMA).expect("index schema");
+    let be = PhoenixdPayment::with_ops(ops, index, clock, FeeSchedule::default())
+        .with_alerts(alerts);
+    (be, store)
+}
+
+async fn operator_alerts(store: &crate::store::Store) -> Vec<lnrent_wire::OperatorAlert> {
+    let payloads: Vec<String> = store
+        .read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT payload_json FROM outbox WHERE msg_type='operator.alert' ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .expect("read the alert rows");
+    payloads
+        .into_iter()
+        .map(|p| {
+            match serde_json::from_str::<lnrent_wire::Msg>(&p).expect("a serialized Msg") {
+                lnrent_wire::Msg::OperatorAlert(a) => a,
+                other => panic!("expected an operator alert, got {other:?}"),
+            }
+        })
+        .collect()
+}
+
+/// The settle instant of the live-measured receive, in seconds. It is only a stable test-clock
+/// baseline now: the alert age deliberately starts at lnrent's first local refusal instead.
+fn measured_receive_settled_at() -> i64 {
+    epoch_secs_from_ms(live_measured_receive("h").completed_at_ms)
+        .expect("the measured record carries a completedAt")
+}
+
+/// Two ages that pin [`UNBOOKABLE_SETTLEMENT_ALERT_S`] from BOTH sides, and are deliberately NOT
+/// derived from it. A test clock offset by the constant itself is self-cancelling: it moves with the
+/// constant, so the boundary pair below stays green whether the threshold is 0 or 30 days — which is
+/// exactly how the round-2 version passed, re-proved by mutating the constant to `0`.
+///
+/// - [`STILL_THE_RETRY_S`]: the first refusal was a minute ago and lnrent's own settlement poll
+///   (`SETTLEMENT_POLL_INTERVAL`) has re-checked it a dozen times. Funding the wallet books it with
+///   no human involved, so this is not yet the operator's problem — no DM.
+/// - [`THE_OPERATORS_PROBLEM_S`]: it has stood for an hour. Automatic recovery has demonstrably not
+///   happened, the buyer's money is sitting in an order that is not progressing, and the whole point
+///   of this bead is that the operator's phone does not stay silent through that — DM.
+const STILL_THE_RETRY_S: i64 = 12 * SETTLEMENT_POLL_INTERVAL.as_secs() as i64;
+const THE_OPERATORS_PROBLEM_S: i64 = 60 * 60;
+
+/// Arrange the live-measured fee-credit refusal — 2_723 sat received into a wallet holding 3_000 sat
+/// of fee credit and 2_722 spendable — and return the invoice.
+async fn arrange_fee_credit_refusal(be: &PhoenixdPayment, ops: &Arc<FakePhoenixdOps>) -> Invoice {
+    let inv = be
+        .create_invoice(25_000, "memo", 600, "ext:1")
+        .await
+        .unwrap();
+    ops.set_incoming("ext:1", vec![live_measured_receive(&inv.payment_hash)]);
+    ops.set_balance(2_722, 3_000);
+    inv
+}
+
+#[tokio::test]
+async fn a_fee_credit_refusal_alerts_the_operator_with_its_reason_and_remedy() {
+    let ops = FakePhoenixdOps::new();
+    let clock = Arc::new(TestClock::new(measured_receive_settled_at()));
+    let (be, store) = backend_with_alerts(ops.clone(), clock.clone());
+    let inv = arrange_fee_credit_refusal(&be, &ops).await;
+
+    be.received_amount_msat(&inv.id)
+        .await
+        .expect_err("the first local refusal starts the threshold");
+    assert!(operator_alerts(&store).await.is_empty());
+    // A refusal that has stood an HOUR. Fixed rather than derived from the threshold, so this
+    // forbids the threshold from growing past an hour; the exact edge is pinned below.
+    clock.advance(THE_OPERATORS_PROBLEM_S);
+    be.received_amount_msat(&inv.id)
+        .await
+        .expect_err("the refusal itself is unchanged: an unbacked receipt is still not booked");
+
+    let alerts = operator_alerts(&store).await;
+    assert_eq!(alerts.len(), 1, "one durable operator DM: {alerts:?}");
+    assert_eq!(alerts[0].kind, "settlement_unbookable");
+    assert_eq!(alerts[0].subject, "fee_credit");
+    let detail = &alerts[0].detail;
+    assert!(
+        detail.contains("FEE-CREDIT REFUSAL")
+            && detail.contains("2723 sat received")
+            && detail.contains(&inv.id)
+            && detail.contains("REMEDY")
+            && detail.contains("SPENDABLE balance")
+            && !detail.contains("INDEX DIVERGENCE"),
+        "fee-credit reason and remedy must be self-contained: {detail}"
+    );
+}
+
+// The other half of the age gate. Without this the threshold is decorative: every refusal would DM
+// the operator the instant the payment lands, including the ordinary one lnrent books itself on the
+// next retry seconds later. Four instants, one refusal, nothing changing between them but the
+// clock — so what moves the alert is provably the AGE and nothing else.
+#[tokio::test]
+async fn a_fresh_fee_credit_refusal_does_not_alert_before_the_threshold() {
+    let ops = FakePhoenixdOps::new();
+    let first_refusal_at = measured_receive_settled_at();
+    let clock = Arc::new(TestClock::new(first_refusal_at));
+    let (be, store) = backend_with_alerts(ops.clone(), clock.clone());
+    let inv = arrange_fee_credit_refusal(&be, &ops).await;
+
+    // 1. First local observation: the durable threshold begins here.
+    be.received_amount_msat(&inv.id)
+        .await
+        .expect_err("the first local refusal starts the threshold");
+    assert!(operator_alerts(&store).await.is_empty());
+
+    // 2. A minute old. Fixed, NOT derived from the threshold — this is what forbids the threshold
+    //    from shrinking to zero and DMing the operator about every ordinary fee-credit receipt.
+    clock.set(first_refusal_at + STILL_THE_RETRY_S);
+    be.received_amount_msat(&inv.id).await.unwrap_err();
+    assert!(
+        operator_alerts(&store).await.is_empty(),
+        "a refusal {STILL_THE_RETRY_S}s old is still the automatic retry's, not the operator's"
+    );
+
+    // 3. One second short of the threshold: the edge itself, still silent...
+    clock.set(first_refusal_at + UNBOOKABLE_SETTLEMENT_ALERT_S - 1);
+    be.received_amount_msat(&inv.id)
+        .await
+        .expect_err("the refusal is the same one second early");
+    assert!(
+        operator_alerts(&store).await.is_empty(),
+        "a receipt that has not yet stood {UNBOOKABLE_SETTLEMENT_ALERT_S}s must not DM the operator"
+    );
+
+    // 4. ...and one second later — the SAME refusal — it does.
+    clock.set(first_refusal_at + UNBOOKABLE_SETTLEMENT_ALERT_S);
+    be.received_amount_msat(&inv.id).await.unwrap_err();
+    assert_eq!(
+        operator_alerts(&store).await.len(),
+        1,
+        "the threshold, not the refusal, is what held the alert back"
+    );
+}
+
+#[tokio::test]
+async fn a_remote_phoenixd_clock_ahead_cannot_silence_the_fee_credit_alert() {
+    let ops = FakePhoenixdOps::new();
+    let clock = Arc::new(TestClock::new(
+        measured_receive_settled_at() - 24 * 60 * 60,
+    ));
+    let (be, store) = backend_with_alerts(ops.clone(), clock.clone());
+    let inv = arrange_fee_credit_refusal(&be, &ops).await;
+
+    be.received_amount_msat(&inv.id).await.unwrap_err();
+    assert!(
+        operator_alerts(&store).await.is_empty(),
+        "the first local refusal starts the threshold"
+    );
+    clock.advance(UNBOOKABLE_SETTLEMENT_ALERT_S);
+    be.received_amount_msat(&inv.id).await.unwrap_err();
+    assert_eq!(
+        operator_alerts(&store).await.len(),
+        1,
+        "remote completedAt ahead of lnrent cannot suppress a locally old refusal"
+    );
+}
+
+#[tokio::test]
+async fn a_remote_phoenixd_clock_behind_cannot_make_a_fresh_fee_credit_refusal_alert() {
+    let ops = FakePhoenixdOps::new();
+    let clock = Arc::new(TestClock::new(
+        measured_receive_settled_at() + 24 * 60 * 60,
+    ));
+    let (be, store) = backend_with_alerts(ops.clone(), clock.clone());
+    let inv = arrange_fee_credit_refusal(&be, &ops).await;
+
+    be.received_amount_msat(&inv.id).await.unwrap_err();
+    assert!(
+        operator_alerts(&store).await.is_empty(),
+        "a remote completedAt behind lnrent cannot bypass the local threshold"
+    );
+    clock.advance(UNBOOKABLE_SETTLEMENT_ALERT_S);
+    be.received_amount_msat(&inv.id).await.unwrap_err();
+    assert_eq!(operator_alerts(&store).await.len(), 1, "the local threshold fires");
+}
+
+// The catch-up seam above is not the only observer. Once the local invoice EXPIRES, settlement
+// catch-up drops it (`status='OPEN'` only) and this poll — whose grace window exists to catch a LATE
+// payment — is all that is left. Before lnrent-gc7 this path only logged, so a late payment refused
+// by fee credit was silent forever.
+#[tokio::test]
+async fn the_settlement_poll_alerts_a_fee_credit_refusal_it_alone_observes() {
+    let ops = FakePhoenixdOps::new();
+    let settled_at = measured_receive_settled_at();
+    let clock = Arc::new(TestClock::new(settled_at - 600));
+    let (be, store) = backend_with_alerts(ops.clone(), clock.clone());
+    // A 10s window, paid late: lnrent's own expires_at is long past by the time the poll runs.
+    let inv = be
+        .create_invoice(25_000, "memo", 10, "ext:1")
+        .await
+        .unwrap();
+    ops.set_incoming("ext:1", vec![live_measured_receive(&inv.payment_hash)]);
+    ops.set_balance(2_722, 3_000);
+    clock.set(settled_at + 600);
+    assert!(
+        clock.now() > inv.expires_at,
+        "the scenario requires lnrent's local window to have lapsed"
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let ops_dyn: Arc<dyn PhoenixdOps> = ops.clone();
+    let clock_dyn: Arc<dyn Clock> = clock.clone();
+    let mut retired: HashSet<String> = HashSet::new();
+    assert!(
+        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+    );
+    assert!(operator_alerts(&store).await.is_empty(), "first refusal starts the threshold");
+    clock.advance(UNBOOKABLE_SETTLEMENT_ALERT_S);
+    assert!(
+        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+    );
+
+    assert!(
+        rx.try_recv().is_err(),
+        "the refusal is unchanged: the poll still emits no settlement"
+    );
+    assert!(
+        !retired.contains(&inv.id),
+        "and still re-checks the row, so funding the wallet books it"
+    );
+    let alerts = operator_alerts(&store).await;
+    assert_eq!(alerts.len(), 1, "the poll must report it too: {alerts:?}");
+    assert_eq!(alerts[0].subject, "fee_credit");
+    assert!(
+        alerts[0].detail.contains("FEE-CREDIT REFUSAL")
+            && alerts[0].detail.contains("REMEDY")
+            && alerts[0].detail.contains(&inv.id),
+        "same reason and remedy from either observer: {}",
+        alerts[0].detail
+    );
+}
+
+// The threshold is a delay before the NEXT retry, so it may only defer while there IS one — and
+// lnrent's observers do run out. Past `expires_at + SETTLEMENT_POLL_GRACE_SECS` the poll no longer
+// reads the row (`idx_pollable_invoices`), and catch-up gave up earlier still, when reconcile
+// expired the local invoice out of its `status='OPEN'` scan. A daemon blind across that window — a
+// day down, or a day unable to reach phoenixd — and looking again inside the last threshold of it
+// would otherwise record a first refusal, defer, and never speak again: the exact silence this bead
+// exists to end, reintroduced by the mechanism meant to end it.
+//
+// Two clocks either side of that boundary, one refusal, nothing else different. Deleting the
+// `last_look` arm fails the second half; hard-coding it true fails the first.
+#[tokio::test]
+async fn a_refusal_lnrent_is_about_to_stop_watching_alerts_without_waiting_out_the_threshold() {
+    for past_the_boundary in [false, true] {
+        let ops = FakePhoenixdOps::new();
+        let clock = Arc::new(TestClock::new(measured_receive_settled_at() - 600));
+        let (be, store) = backend_with_alerts(ops.clone(), clock.clone());
+        let inv = arrange_fee_credit_refusal(&be, &ops).await;
+
+        // The instant lnrent's LAST observer of this receipt gives up...
+        let observed_until = inv.expires_at + SETTLEMENT_POLL_GRACE_SECS;
+        // ...and the last instant at which a whole threshold still fits before it. One second past
+        // that, waiting the threshold out means never reporting at all.
+        clock.set(observed_until - UNBOOKABLE_SETTLEMENT_ALERT_S + i64::from(past_the_boundary));
+        assert!(
+            clock.now() > inv.expires_at,
+            "the scenario is a receipt lnrent's local window has long since lapsed on"
+        );
+
+        // FIRST local sighting in both halves: age 0, so the threshold alone decides.
+        be.received_amount_msat(&inv.id)
+            .await
+            .expect_err("the refusal itself is unchanged either side of the boundary");
+
+        let alerts = operator_alerts(&store).await;
+        if !past_the_boundary {
+            assert!(
+                alerts.is_empty(),
+                "a whole threshold still fits before {observed_until}, so the retry gets it first: \
+                 {alerts:?}"
+            );
+            continue;
+        }
+        assert_eq!(
+            alerts.len(),
+            1,
+            "lnrent stops watching at {observed_until}; deferring past that is silence, not delay: \
+             {alerts:?}"
+        );
+        assert_eq!(alerts[0].subject, "fee_credit");
+        let detail = &alerts[0].detail;
+        assert!(
+            detail.contains("FEE-CREDIT REFUSAL") && detail.contains("(0s ago"),
+            "the same reason, reported at age zero: {detail}"
+        );
+        // And the tail must not promise the automatic booking that is about to stop. An operator
+        // told "lnrent retries and books them automatically" funds the wallet, waits, and never
+        // learns this receipt needs reconciling by hand against phoenixd.
+        assert!(
+            detail.contains(&format!("stops re-checking this receipt at unix time {observed_until}"))
+                && detail.contains("hand-reconcile against phoenixd's own payment history"),
+            "the alert must say lnrent is about to stop, and what that costs: {detail}"
+        );
+        assert!(
+            !detail.contains("lnrent retries and books them automatically"),
+            "and must not also promise the retry it just said is ending: {detail}"
+        );
+        // This branch's tail is the longest of the three, and `MAX_ALERT_DETAIL_CHARS` truncates
+        // from the tail — where the hand-reconcile instruction lives.
+        assert!(
+            !detail.ends_with('…'),
+            "truncated at {} chars: {detail}",
+            detail.chars().count()
+        );
+    }
+}
+
+// The fee-credit sibling of `a_whole_diverged_index_is_one_alert_not_one_per_invoice`, and the
+// reason it exists: phoenixd publishes no per-receipt fee-credit attribution, so ADR-0019 judges
+// SPENDABILITY per WALLET. Two receipts refused by one unfunded wallet are two sightings of one
+// condition with one remedy. Keyed per invoice they would be two DMs — and, since catch-up
+// re-observes every OPEN invoice each tick and reconcile will not expire one the backend calls Paid,
+// two DMs every cooldown window for as long as the wallet stays unfunded, each a permanent row in
+// the outbox that also carries provision.ready/billing.*.
+#[tokio::test]
+async fn two_receipts_one_unfunded_wallet_is_one_alert_not_one_per_receipt() {
+    let ops = FakePhoenixdOps::new();
+    let settled_at = measured_receive_settled_at();
+    let clock = Arc::new(TestClock::new(settled_at + THE_OPERATORS_PROBLEM_S));
+    let (be, store) = backend_with_alerts(ops.clone(), clock.clone());
+
+    let first = arrange_fee_credit_refusal(&be, &ops).await;
+    let second = be
+        .create_invoice(25_000, "memo", 600, "ext:2")
+        .await
+        .unwrap();
+    ops.set_incoming("ext:2", vec![live_measured_receive(&second.payment_hash)]);
+    assert_ne!(first.id, second.id, "two distinct held-back receipts");
+
+    be.received_amount_msat(&first.id).await.unwrap_err();
+    be.received_amount_msat(&second.id).await.unwrap_err();
+    assert!(operator_alerts(&store).await.is_empty());
+    clock.advance(THE_OPERATORS_PROBLEM_S);
+    be.received_amount_msat(&first.id).await.unwrap_err();
+    be.received_amount_msat(&second.id).await.unwrap_err();
+
+    let alerts = operator_alerts(&store).await;
+    assert_eq!(
+        alerts.len(),
+        1,
+        "one wallet-level condition is one DM, however many receipts it holds back: {alerts:?}"
+    );
+    assert_eq!(alerts[0].subject, "fee_credit");
+    assert!(
+        alerts[0].detail.contains("WALLET-level")
+            && alerts[0].detail.contains("EVERY receipt currently held back"),
+        "and it must SAY it covers the others, or the operator fixes one receipt: {}",
+        alerts[0].detail
+    );
+}
+
+// Both details are written right up against `MAX_ALERT_DETAIL_CHARS` (1024), and the cap truncates
+// from the TAIL — which is where each remedy's final instruction lives ("do not recreate or expire
+// the invoice"; "the orders do not progress until you do"). A real invoice id is 73 chars
+// (`phoenixd-` + a 64-hex payment hash), not the short one the other tests use, so measure with one.
+#[tokio::test]
+async fn a_full_length_unbookable_detail_is_not_truncated() {
+    let ops = FakePhoenixdOps::new();
+    let settled_at = measured_receive_settled_at();
+    let clock = Arc::new(TestClock::new(settled_at + THE_OPERATORS_PROBLEM_S));
+    let (be, store) = backend_with_alerts(ops.clone(), clock.clone());
+
+    let inv = arrange_fee_credit_refusal(&be, &ops).await;
+    assert_eq!(inv.id.chars().count(), 73, "a real invoice id: {}", inv.id);
+    be.received_amount_msat(&inv.id).await.unwrap_err();
+    clock.advance(THE_OPERATORS_PROBLEM_S);
+    be.received_amount_msat(&inv.id).await.unwrap_err();
+    // A same-shape id the index has never seen — the divergence arm, with a full-length id too.
+    be.lookup_settlement(&format!("phoenixd-{}", "f".repeat(64)))
+        .await
+        .unwrap_err();
+
+    let alerts = operator_alerts(&store).await;
+    assert_eq!(alerts.len(), 2, "one of each reason: {alerts:?}");
+    for a in &alerts {
+        assert!(
+            !a.detail.ends_with('…'),
+            "{} was truncated at {} chars; shorten it or the remedy loses its tail: {}",
+            a.subject,
+            a.detail.chars().count(),
+            a.detail
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
+    let ops = FakePhoenixdOps::new();
+    let clock = Arc::new(TestClock::new(1_000));
+    let (be, store) = backend_with_alerts(ops, clock);
+
+    be.lookup_settlement("phoenixd-orphan").await.unwrap_err();
+
+    let alerts = operator_alerts(&store).await;
+    assert_eq!(alerts.len(), 1, "one durable operator DM: {alerts:?}");
+    assert_eq!(alerts[0].kind, "settlement_unbookable");
+    assert_eq!(alerts[0].subject, "index_diverged");
+    let detail = &alerts[0].detail;
+    assert!(
+        detail.contains("INDEX DIVERGENCE")
+            && detail.contains("phoenixd-orphan")
+            && detail.contains("UNKNOWN")
+            // The shipped command, with the flags it actually needs: `restore` REFUSES a non-empty
+            // target and REFUSES an encrypted backup without a passphrase (`backup::restore`), and
+            // this remedy restores over the live data dir.
+            && detail.contains("lnrentd restore --from <backup-dir> --data-dir <data-dir> --force")
+            && detail.contains("--passphrase-file")
+            && detail.contains("original wallet")
+            && !detail.contains("FEE-CREDIT REFUSAL"),
+        "index reason and shipped recovery remedy must be self-contained: {detail}"
+    );
+    // The remedy this alert gives can DESTROY the money it exists to protect, and only this text
+    // stands between the operator and that. `restore` swaps the WHOLE data dir including state.db
+    // (`backup::restore` step 4: staged then atomically installed, "the swap replaces the target
+    // wholesale"), while the condition being reported is that the state DB knows invoices the index
+    // does not — i.e. the state DB is the NEWER file.
+    //
+    // So the age criterion has TWO halves, and an alert giving only the first is unsafe: a backup
+    // older than the affected invoices does not repair the divergence at all, AND any backup at all
+    // rolls the state DB back to its own instant — an operator handed only "newer than the affected
+    // invoices" can satisfy it exactly and still drop every order committed since. An operator who
+    // has never read `backup.rs` must get both from the DM alone.
+    assert!(
+        detail.contains("your NEWEST backup") && detail.contains("newer than them"),
+        "the alert must state which backups are safe, not just say 'restore': {detail}"
+    );
+    assert!(
+        detail.contains("EVERYTHING lnrent committed after that backup is dropped")
+            && detail.contains("orders, captures, refunds, ledger rows")
+            && detail.contains("hand-reconcile whatever phoenixd's history shows after its date"),
+        "and must say the loss is everything newer than the BACKUP, not just the named invoices, \
+         plus what to do about it: {detail}"
+    );
+    assert!(
+        detail.contains("does not repair the divergence anyway"),
+        "and that an older backup does not even fix what it was reached for: {detail}"
+    );
+    assert!(
+        detail.contains("Have neither: do NOT restore"),
+        "including the case where the operator has no safe backup at all: {detail}"
+    );
+}
+
+// One lost `phoenixd_index.db` diverges EVERY open invoice, and catch-up re-observes each one every
+// tick. Keying the cooldown per invoice would put N copies of one identical remedy into the outbox
+// that also carries provision.ready/billing.* — every window, forever, since outbox rows are never
+// reaped. The condition is global, so the subject is.
+#[tokio::test]
+async fn a_whole_diverged_index_is_one_alert_not_one_per_invoice() {
+    let ops = FakePhoenixdOps::new();
+    let clock = Arc::new(TestClock::new(1_000));
+    let (be, store) = backend_with_alerts(ops, clock);
+
+    for id in ["phoenixd-orphan-a", "phoenixd-orphan-b", "phoenixd-orphan-c"] {
+        be.lookup_settlement(id).await.unwrap_err();
+        be.received_amount_msat(id).await.unwrap_err();
+    }
+
+    let alerts = operator_alerts(&store).await;
+    assert_eq!(
+        alerts.len(),
+        1,
+        "six sightings of ONE divergence are one DM: {alerts:?}"
+    );
+    assert_eq!(alerts[0].subject, "index_diverged");
+}
+
+#[tokio::test]
+async fn the_same_unbookable_settlement_alerts_once_per_cooldown_window() {
+    let ops = FakePhoenixdOps::new();
+    let clock = Arc::new(TestClock::new(1_000));
+    let (be, store) = backend_with_alerts(ops, clock.clone());
+
+    be.lookup_settlement("phoenixd-orphan").await.unwrap_err();
+    clock.set(1_000 + crate::alerts::ALERT_COOLDOWN_S - 1);
+    be.lookup_settlement("phoenixd-orphan").await.unwrap_err();
+    assert_eq!(operator_alerts(&store).await.len(), 1, "inside cooldown");
+
+    clock.set(1_000 + crate::alerts::ALERT_COOLDOWN_S);
+    be.lookup_settlement("phoenixd-orphan").await.unwrap_err();
+    assert_eq!(operator_alerts(&store).await.len(), 2, "after cooldown");
 }

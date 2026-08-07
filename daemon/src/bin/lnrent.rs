@@ -347,6 +347,55 @@ fn money_human_text(v: &serde_json::Value) -> String {
         "Outstanding liabilities: {gross} sat gross, {required} msat required"
     ));
     lines.push(format!("Parked count: {parked}"));
+    let unbookable = v
+        .get("recent_unbookable_settlement_alerts")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let unbookable_unknown = v
+        .get("recent_unbookable_settlement_alerts_unknown")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if unbookable_unknown {
+        lines.push(
+            "\x1b[1;31mUnbookable settlement alert history: UNKNOWN\x1b[0m — the daemon could not \
+             read its durable alert history, so it cannot say whether settlements are being held \
+             back. Check the daemon's storage error and retry `lnrent money`."
+                .to_string(),
+        );
+    } else if unbookable > 0 {
+        // CONDITIONS, not receipts. The daemon dedupes this history per alert subject
+        // (`alerts.rs`), and both unbookable-settlement subjects are deliberately global — one for
+        // the whole wallet's fee credit, one for the whole diverged index (`phoenixd_backend.rs`) —
+        // because neither judgement is per-receipt. So an unfunded wallet holding back fifty
+        // receipts is ONE incident here, and a bare number would read as one stuck order.
+        let noun = if unbookable == 1 {
+            "condition"
+        } else {
+            "conditions"
+        };
+        lines.push(format!(
+            // Deliberately NOT "the detail says which": neither detail enumerates the receipts it
+            // covers — both say outright that they cover more than the one invoice they name — so
+            // an operator sent looking for a list would find one example and fund for it alone.
+            "\x1b[1;31mUnbookable settlements: {unbookable} {noun} alerting\x1b[0m \
+             (alert history; may already be resolved. Each covers every receipt it holds back — \
+             the detail says what to do.)"
+        ));
+        let alerts = v
+            .get("recent_unbookable_settlement_alert_details")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for a in alerts {
+            let s = |k: &str| a.get(k).and_then(serde_json::Value::as_str).unwrap_or("?");
+            let at = a.get("at").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            lines.push(format!(
+                "  \u{b7} alerted_at={at} \u{b7} {} \u{b7} {}",
+                s("subject"),
+                s("detail")
+            ));
+        }
+    }
     // The degraded/read-only latch (lnrent-y4m.3) takes precedence over reserve readiness: the daemon
     // is refusing money writes after a fatal DB error, so a human operator must see it here — not only
     // in the daemon log — regardless of whether reserves are sufficient.
@@ -822,11 +871,21 @@ mod tests {
             "degraded_read_only": false,
             "readiness_failure_backend": "phoenixd",
             "readiness_failure_detail": detail,
+            "recent_unbookable_settlement_alerts": 1,
+            "recent_unbookable_settlement_alert_details": [{
+                "subject": "fee_credit",
+                "detail": "fee credit; REMEDY: fund SPENDABLE balance",
+                "at": 900
+            }],
         }));
 
         assert!(rendered.contains("Phoenixd node: not ok"), "{rendered}");
         assert!(rendered.contains("Refund pay: not ok"), "{rendered}");
         assert!(rendered.contains(detail), "{rendered}");
+        assert!(rendered.contains("Unbookable settlements: 1 condition alerting"));
+        assert!(rendered.contains("may already be resolved"));
+        assert!(rendered.contains("alerted_at=900"));
+        assert!(rendered.contains("fee_credit") && rendered.contains("REMEDY"));
         assert!(
             rendered.contains("[phoenixd] fee_schedule_version/fee_base_msat/fee_ppm"),
             "{rendered}"
@@ -837,6 +896,72 @@ mod tests {
                 "phoenixd money output named {wrong_subsystem}: {rendered}"
             );
         }
+    }
+
+    // The number counts CONDITIONS, and both of them can be alerting at once. Each carries a
+    // different reason and a different remedy, so rendering one and summarizing the rest — or
+    // labelling the count as receipts/orders — would send the operator to fix the wrong thing.
+    #[test]
+    fn money_human_lists_every_unbookable_condition_with_its_own_remedy() {
+        let rendered = money_human_text(&json!({
+            "expected_msat": 0,
+            "gross_liability_sat": 0,
+            "required_msat": 0,
+            "parked_count": 0,
+            "ready": true,
+            "degraded_read_only": false,
+            "recent_unbookable_settlement_alerts": 2,
+            "recent_unbookable_settlement_alert_details": [
+                {
+                    "subject": "fee_credit",
+                    "detail": "FEE-CREDIT REFUSAL; REMEDY: fund SPENDABLE balance",
+                    "at": 900
+                },
+                {
+                    "subject": "index_diverged",
+                    "detail": "INDEX DIVERGENCE; REMEDY: restore from your NEWEST backup",
+                    "at": 800
+                },
+            ],
+        }));
+
+        assert!(
+            rendered.contains("Unbookable settlements: 2 conditions alerting"),
+            "the count is of conditions, and reads as plural: {rendered}"
+        );
+        assert!(
+            rendered.contains("alerted_at=900 \u{b7} fee_credit \u{b7} FEE-CREDIT REFUSAL; REMEDY: \
+                               fund SPENDABLE balance"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("alerted_at=800 \u{b7} index_diverged \u{b7} INDEX DIVERGENCE; \
+                               REMEDY: restore from your NEWEST backup"),
+            "the second condition's OWN remedy, not a summary of the first: {rendered}"
+        );
+    }
+
+    #[test]
+    fn money_human_reports_unreadable_unbookable_history_as_unknown() {
+        let rendered = money_human_text(&json!({
+            "expected_msat": 0,
+            "gross_liability_sat": 0,
+            "required_msat": 0,
+            "parked_count": 0,
+            "ready": true,
+            "degraded_read_only": false,
+            "recent_unbookable_settlement_alerts_unknown": true,
+        }));
+
+        assert!(
+            rendered.contains("Unbookable settlement alert history: UNKNOWN"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("cannot say whether settlements are being held back"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Unbookable settlements: 0"), "{rendered}");
     }
 
     #[test]

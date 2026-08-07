@@ -7,10 +7,13 @@
 //! sinks). Each alert is additive to the existing `tracing` log line at its call site.
 //!
 //! Design points that are load-bearing:
-//! - [`AlertKind`] is a CLOSED enum. New kinds are added only by the owning bead (PR-6
-//!   `TeardownFailed`, PR-9c `RelayBlackout`, PR-16 `HoldingsLow`, gate1-operator-sweep (urw.3)
-//!   `SweepFailed`, PR-21 `PaidServiceDestroyed`). There is deliberately no `BalanceQueryFailed`: the ledger-authoritative
-//!   revision (ADR-0016) retires the automatic balance read, so nothing is left to fail.
+//! - [`AlertKind`] is a CLOSED enum. New kinds are added only by the owning bead, listed here in
+//!   DECLARATION order so this list and the enum below cannot drift apart: PR-6 `TeardownFailed`,
+//!   PR-9c `RelayBlackout`, PR-16 `HoldingsLow`, PR-21 `PaidServiceDestroyed`,
+//!   gate1-operator-sweep (urw.3) `SweepFailed`, lnrent-7di `SweepStuck`, lnrent-gc7
+//!   `SettlementUnbookable`. There is deliberately no `BalanceQueryFailed`: the
+//!   ledger-authoritative revision (ADR-0016) retires the automatic balance read, so nothing is
+//!   left to fail.
 //! - **Edge-triggered** with a per-`(kind, subject)` cooldown ([`ALERT_COOLDOWN_S`]), held in an
 //!   in-memory map. A restart resets it — worst case one duplicate alert per condition per restart,
 //!   which is why the map is deliberately NOT persisted.
@@ -19,11 +22,11 @@
 //!   cannot be delivered while the relay pool is down — it queues in the outbox like any DM, and
 //!   §C's out-of-band relay status query is how the operator reads that condition instead.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use rusqlite::params;
+use tokio::sync::Mutex;
 
 use lnrent_wire::{Msg, OperatorAlert};
 
@@ -102,6 +105,9 @@ pub enum AlertKind {
     SweepFailed,
     /// An operator sweep has sat PENDING past the stuck threshold without progressing.
     SweepStuck,
+    /// A receipt cannot be booked: either the backend observed it paid, or index divergence made its
+    /// payment state unknowable. The fail-closed decision is unchanged; `detail` gives the remedy.
+    SettlementUnbookable,
 }
 
 impl AlertKind {
@@ -116,8 +122,98 @@ impl AlertKind {
             AlertKind::PaidServiceDestroyed => "paid_service_destroyed",
             AlertKind::SweepFailed => "sweep_failed",
             AlertKind::SweepStuck => "sweep_stuck",
+            AlertKind::SettlementUnbookable => "settlement_unbookable",
         }
     }
+}
+
+/// The CLI shows recent alert history, not live backend state. Two cooldown windows keep the latest
+/// repeat visible while old, possibly resolved conditions age out.
+pub const ALERT_VIEW_WINDOW_S: i64 = 2 * ALERT_COOLDOWN_S;
+pub const ALERT_VIEW_LIMIT: usize = 20;
+
+/// One durable alert row as the operator CLI reports it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AlertView {
+    pub subject: String,
+    pub detail: String,
+    pub at: i64,
+}
+
+/// Recent durable alerts of ONE kind: how many distinct incidents the window holds, and the newest
+/// `limit` of them.
+///
+/// `total` is deliberately NOT capped by `limit`. The operator surface reports it as the incident
+/// count, and a count that silently saturates at the display cap reads as a total — for a kind whose
+/// subject is per-row (a refund id, say) 20 stuck refunds and 2000 would both print "20". Note what
+/// an incident IS, before a caller labels the number: one distinct SUBJECT, so a kind that keys its
+/// subject globally counts conditions, not the rows each one covers.
+#[derive(Debug, Clone, Default)]
+pub struct RecentAlerts {
+    /// Distinct `(kind, subject)` incidents at or after `since`.
+    pub total: usize,
+    /// The newest `limit` of them, most recent first. Shorter than `total` when capped.
+    pub shown: Vec<AlertView>,
+}
+
+/// Latest durable alert per `(kind, subject)` at or after `since`, most recent first. A recurring
+/// condition produces one row per cooldown; deduplication keeps the CLI count about incidents rather
+/// than DM deliveries. With alerts disabled there are no rows, so callers must label this as history.
+///
+/// The scan does not stop at `limit` — it must see every row to count incidents — and exactly ONE
+/// of the three predicates bounds it, which is worth stating because the other two look like they
+/// do. `outbox` carries a single index, `outbox_subscription_state_idx` (`store.rs`), so `msg_type`
+/// and `created_at` are index-free filters: `since` narrows the RESULT, not the scan. What bounds
+/// the scan is the id GLOB against the TEXT primary key, via SQLite's prefix optimization. Measured
+/// plan (sqlite 3.45.0, pattern bound as a parameter, 220k-row `outbox`):
+/// `SEARCH outbox USING INDEX sqlite_autoindex_outbox_1 (id>? AND id<?)` + `USE TEMP B-TREE FOR
+/// ORDER BY` — a range seek, not a table scan.
+///
+/// So the visited set is every alert OF THIS KIND ever written, `since` or no `since`, and `outbox`
+/// is never reaped (the only `DELETE FROM outbox` is the targeted refund one in `ipc.rs`). It stays
+/// small only because each kind has few subjects and the per-`(kind, subject)` cooldown caps each at
+/// one row per [`ALERT_COOLDOWN_S`]: at 20k rows of one kind — ~40 years of two subjects alerting
+/// every window — the query measured ~4ms in a debug build. A per-invoice subject would break that
+/// arithmetic, which is one reason the phoenixd fee-credit alert does not use one.
+///
+/// `limit` bounds only what is carried back to the operator.
+pub async fn recent_alerts(
+    store: &Store,
+    kind: AlertKind,
+    since: i64,
+    limit: usize,
+) -> Result<RecentAlerts> {
+    let wire = kind.wire_str();
+    let glob = format!("outbox:alert:{wire}:*");
+    store
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT payload_json, created_at FROM outbox
+                  WHERE msg_type='operator.alert' AND created_at >= ?1 AND id GLOB ?2
+                  ORDER BY created_at DESC, id DESC",
+            )?;
+            let mut rows = stmt.query(params![since, glob])?;
+            let mut seen = HashSet::new();
+            let mut shown = Vec::new();
+            while let Some(row) = rows.next()? {
+                let payload: String = row.get(0)?;
+                let at: i64 = row.get(1)?;
+                if let Ok(Msg::OperatorAlert(a)) = serde_json::from_str::<Msg>(&payload) {
+                    if a.kind == wire && seen.insert(a.subject.clone()) && shown.len() < limit {
+                        shown.push(AlertView {
+                            subject: a.subject,
+                            detail: a.detail,
+                            at,
+                        });
+                    }
+                }
+            }
+            Ok(RecentAlerts {
+                total: seen.len(),
+                shown,
+            })
+        })
+        .await
 }
 
 /// One alert instance: a `kind` plus human-readable `subject` (the cooldown key alongside `kind`,
@@ -208,14 +304,15 @@ impl AlertDispatcher {
         }
         let now = self.clock.now();
 
-        // Cooldown check under the lock (no await held). Do NOT stamp yet — a failed enqueue below
-        // must be retryable on the next drive, not suppressed for 6h.
-        {
-            let map = self.last_sent.lock().expect("alert cooldown map poisoned");
-            if let Some(&last) = map.get(&(alert.kind, alert.subject.clone())) {
-                if now - last < ALERT_COOLDOWN_S {
-                    return Ok(false);
-                }
+        // Serialize check -> commit -> stamp. Two reporters can observe one condition concurrently;
+        // releasing this lock before commit lets both pass the check and distinct-second outbox ids
+        // turn one sighting into two DMs. Do NOT stamp before commit — a failed enqueue must remain
+        // retryable on the next drive.
+        let key = (alert.kind, alert.subject.clone());
+        let mut map = self.last_sent.lock().await;
+        if let Some(&last) = map.get(&key) {
+            if now - last < ALERT_COOLDOWN_S {
+                return Ok(false);
             }
         }
 
@@ -244,10 +341,7 @@ impl AlertDispatcher {
             .await?;
 
         // Committed — now stamp the cooldown so repeats within the window are suppressed.
-        self.last_sent
-            .lock()
-            .expect("alert cooldown map poisoned")
-            .insert((alert.kind, alert.subject), now);
+        map.insert(key, now);
         Ok(true)
     }
 
@@ -289,6 +383,9 @@ mod tests {
     use crate::clock::TestClock;
     use crate::store::{Store, SCHEMA};
     use rusqlite::Connection;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn mem_store() -> Store {
         let conn = Connection::open_in_memory().expect("open memory db");
@@ -385,6 +482,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(alert_rows(&store).await, 3, "re-fires past the cooldown");
+        let recent = recent_alerts(&store, AlertKind::RefundStuck, 0, 20)
+            .await
+            .unwrap();
+        assert_eq!(recent.total, 2, "count incidents, not DM deliveries");
+        assert_eq!(recent.shown.len(), 2);
+        assert_eq!(
+            recent.shown[0].detail, "stuck again",
+            "keep the latest delivery"
+        );
+
+        // The display cap must not become the reported count: an operator reading "1" while two
+        // subjects are alerting would under-read the incident by half.
+        let capped = recent_alerts(&store, AlertKind::RefundStuck, 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(capped.total, 2, "the count survives the display cap");
+        assert_eq!(capped.shown.len(), 1, "the details are the capped half");
+        let none = recent_alerts(&store, AlertKind::RefundStuck, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(none.total, 2, "a zero cap still counts");
+        assert!(none.shown.is_empty(), "a zero cap shows nothing");
+    }
+
+    struct ObservedClock {
+        now: AtomicI64,
+        observed: mpsc::Sender<()>,
+    }
+
+    impl Clock for ObservedClock {
+        fn now(&self) -> i64 {
+            self.observed.send(()).expect("test still observes clock reads");
+            self.now.load(Ordering::SeqCst)
+        }
+    }
+
+    // Two real reporters can observe one recurring condition concurrently. Hold the store actor so
+    // both dispatches pass the cooldown check before either enqueue can commit, and give them
+    // different seconds so the outbox-id conflict guard cannot hide the race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_dispatches_share_one_atomic_cooldown() {
+        let store = mem_store();
+        let (store_entered_tx, store_entered_rx) = mpsc::channel();
+        let (release_store_tx, release_store_rx) = mpsc::channel();
+        let blocked_store = store.clone();
+        let blocker = tokio::spawn(async move {
+            blocked_store
+                .read(move |_| {
+                    store_entered_tx.send(()).expect("announce blocked store actor");
+                    release_store_rx.recv().expect("release blocked store actor");
+                    Ok(())
+                })
+                .await
+                .expect("blocker read completes");
+        });
+        store_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("store actor reached the blocker");
+
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let clock = Arc::new(ObservedClock {
+            now: AtomicI64::new(1_000),
+            observed: observed_tx,
+        });
+        let dispatcher = Arc::new(AlertDispatcher::new(
+            store.clone(),
+            clock.clone(),
+            "npub".into(),
+        ));
+
+        let first_dispatcher = dispatcher.clone();
+        let first = tokio::spawn(async move {
+            first_dispatcher
+                .dispatch(Alert::new(AlertKind::RefundStuck, "r1", "stuck"))
+                .await
+        });
+        observed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first dispatch read the clock");
+        tokio::task::yield_now().await;
+
+        clock.now.store(1_001, Ordering::SeqCst);
+        let second_dispatcher = dispatcher.clone();
+        let second = tokio::spawn(async move {
+            second_dispatcher
+                .dispatch(Alert::new(AlertKind::RefundStuck, "r1", "stuck"))
+                .await
+        });
+        observed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second dispatch read the clock");
+        tokio::task::yield_now().await;
+
+        release_store_tx.send(()).expect("release store actor");
+        blocker.await.expect("blocker task joins");
+        // WHICH task wins is not asserted, because nothing fixes it: `dispatch` reads the clock
+        // before it acquires `last_sent`, so the observed clock read proves only that a task got
+        // that far, and a deschedule in that gap would let the other take the lock first. Asserting
+        // "the first one wins" would be asserting a scheduling accident. The invariant this test
+        // exists for is unweakened, and is what the two lines below say: of two concurrent sightings
+        // inside the window, EXACTLY one enqueues. A dispatcher that released the lock before its
+        // commit fails both (two `true`s, two rows).
+        let sent = [
+            first.await.expect("first dispatch joins").unwrap(),
+            second.await.expect("second dispatch joins").unwrap(),
+        ];
+        assert_eq!(
+            sent.iter().filter(|s| **s).count(),
+            1,
+            "exactly one of the two concurrent dispatches reports having sent: {sent:?}"
+        );
+        assert_eq!(
+            alert_rows(&store).await,
+            1,
+            "concurrent sightings inside the window enqueue exactly one DM"
+        );
     }
 
     // codex xhigh: a detail carrying hostile-endpoint text (a structural refund-resolution error

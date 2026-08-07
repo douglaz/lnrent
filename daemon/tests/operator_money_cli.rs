@@ -111,6 +111,8 @@ async fn json_money_returns_reply_envelope() {
             "paid_out_msat",
             "parked_count",
             "ready",
+            "recent_unbookable_settlement_alert_details",
+            "recent_unbookable_settlement_alerts",
             "required_msat",
             "reserved_msat",
             "surplus_msat",
@@ -128,6 +130,8 @@ async fn json_money_returns_reply_envelope() {
     // The sweep surplus breakdown is 0 on a fresh store and no sweep has run yet.
     assert_eq!(data["surplus_msat"], serde_json::json!(0));
     assert_eq!(data["last_sweep"], Value::Null);
+    assert_eq!(data["recent_unbookable_settlement_alerts"], serde_json::json!(0));
+    assert_eq!(data["recent_unbookable_settlement_alert_details"], serde_json::json!([]));
 
     let _ = fs::remove_dir_all(&data_dir);
 }
