@@ -585,16 +585,15 @@ async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_i
         format!(
             "INDEX DIVERGENCE: invoice {invoice_id} is absent from {INDEX_DB_FILE} — and maybe \
              every other open invoice, which this one alert covers. Its payment state is UNKNOWN: \
-             lnrent cannot observe, book or expire it. REMEDY: stop the daemon and restore from \
-             your NEWEST backup: `lnrentd restore --from <backup-dir> --data-dir <data-dir> \
-             --force` (--force: restore refuses a non-empty target; add --passphrase-file if \
-             encrypted). The DATE is the dangerous part. Restore replaces the WHOLE data dir, \
-             state DB included, so EVERYTHING lnrent committed after that backup is dropped — \
-             orders, captures, refunds, ledger rows — while phoenixd keeps the sats; and one older \
-             than these invoices does not repair the divergence anyway. So restore only a backup \
-             newer than them, then hand-reconcile whatever phoenixd's history shows after its \
-             date. Have neither: do NOT restore, reconcile by hand. Keep phoenixd on its original \
-             wallet. Do not recreate or expire the invoice."
+             lnrent cannot observe, book or expire it. REMEDY: stop the daemon, then `lnrentd \
+             restore --from <backup-dir> --data-dir <data-dir> --force` (--force: restore refuses a \
+             non-empty target; add --passphrase-file if encrypted). PICK THE BACKUP BY CONTENTS, \
+             NOT DATE: its {INDEX_DB_FILE} must actually hold these invoices. An older backup never \
+             had their rows; a NEWER one still lacks them if the index was already lost when they \
+             were paid. Any restore replaces the WHOLE data dir, state DB included — every order, \
+             capture, refund and ledger row committed since THAT BACKUP is dropped, while phoenixd keeps \
+             sats. None qualifies: do NOT restore, reconcile by hand against phoenixd's history. \
+             Keep phoenixd on its original wallet. Do not recreate or expire the invoice."
         ),
     )
     .await;
@@ -641,42 +640,30 @@ async fn alert_fee_credit_refusal(
         }
     };
     let age = now.saturating_sub(timing.first_refusal_at);
-    // The threshold may only DEFER while lnrent will look at this receipt AGAIN, and both observers
-    // do stop. The poll drops the row once `expires_at + SETTLEMENT_POLL_GRACE_SECS` is past
-    // ([`idx_pollable_invoices`]), and catch-up dropped it earlier still — reconcile expired the
-    // local invoice out of the `status='OPEN'` set it scans (`supervisor.rs`). Past that instant a
-    // deferral is not a delay before the next retry, it is permanent silence about a receipt the
-    // buyer paid for: exactly the condition lnrent-gc7 exists to end. Reachable whenever lnrent was
-    // blind across the window — daemon down, phoenixd unreachable, `getbalance` failing — and looks
-    // again inside the last threshold of it. Nothing here changes WHICH settlements are emitted or
-    // when: the poll's row set and the refusal itself are untouched.
-    let last_look = match timing.observed_until {
-        Some(until) => now.saturating_add(UNBOOKABLE_SETTLEMENT_ALERT_S) > until,
-        // No index row left to poll, so there is provably no next look. Unreachable today (nothing
-        // deletes `phoenixd_invoice`; both callers reached here holding a row) — but lnrent-rpa's
-        // reaper is exactly what would make it reachable, and the safe default there is to speak.
-        None => true,
-    };
-    if age < UNBOOKABLE_SETTLEMENT_ALERT_S && !last_look {
+    // Defer only while the refusal is fresh: below the threshold this is a receipt lnrent may yet
+    // book on its own, and a DM per tick would be noise. Nothing here changes WHICH settlements are
+    // emitted or when — the poll's row set and the refusal itself are untouched.
+    if age < UNBOOKABLE_SETTLEMENT_ALERT_S {
         return;
     }
-    // What happens NEXT is where the two cases genuinely differ, and an operator acts on it: the
-    // default promise — fund the wallet and lnrent books it — is FALSE for a receipt whose observers
-    // have run out. Told only that, they would fund, wait, and never learn the receipt needs a hand.
-    let next = match (last_look, timing.observed_until) {
-        (false, _) => "lnrent retries and books them automatically; no money is lost meanwhile, \
-                       but the orders do not progress until you do."
-            .to_string(),
-        (true, Some(until)) => format!(
-            "That books the others, but NOT this one for much longer: lnrent stops re-checking \
-             this receipt at unix time {until}, and after that only a hand-reconcile against \
-             phoenixd's own payment history recovers it."
-        ),
-        (true, None) => "That books the others, but NOT this one: its row in the local index is \
-                         gone, so nothing re-checks it — only a hand-reconcile against phoenixd's \
-                         own payment history recovers it."
-            .to_string(),
-    };
+    // What the operator should DO. Funding the wallet books these automatically, and that is true
+    // for the case this alert overwhelmingly reports: a fee-credit refusal only exists while
+    // phoenixd calls the invoice PAID, and reconcile REFUSES to expire a backend-Paid invoice
+    // (`reconcile.rs` returns false for the order scan and `continue`s in the renewal scan), so the
+    // row stays `status='OPEN'` and catch-up re-observes it every tick — indefinitely.
+    //
+    // The one case where funding alone is not enough is a LATE payment: the local invoice expired
+    // unpaid, the payment landed afterwards, and the poll drops the row once
+    // `expires_at + SETTLEMENT_POLL_GRACE_SECS` passes. That is stated as a caveat rather than
+    // branched on, deliberately: an earlier revision computed a "last look" flag here and used it to
+    // tell the operator lnrent had STOPPED re-checking — which is false on the catch-up path, i.e.
+    // the common one, and would have sent them to hand-reconcile a receipt that funding still books
+    // automatically. Double-handling the buyer's money is worse than a sentence of nuance.
+    let next = "lnrent retries and books them automatically; no money is lost meanwhile, but the \
+                orders do not progress until you do. (Exception: an invoice that had already \
+                EXPIRED locally before the payment landed is only re-checked for a grace window \
+                after its expiry; past that it needs a hand-reconcile against phoenixd's own \
+                payment history.)";
     alert_unbookable(
         alerts,
         "fee_credit".to_string(),
@@ -2131,14 +2118,13 @@ fn idx_upsert(index: &Mutex<Connection>, inv: &Invoice) -> Result<()> {
     Ok(())
 }
 
-/// What decides whether a fee-credit refusal is the operator's problem yet.
+/// What decides whether a fee-credit refusal is the operator's problem yet: one durable instant,
+/// compared against a plain age threshold. An earlier revision also carried the moment lnrent's
+/// last observer would give up, to tell the operator re-checking had stopped — that claim was false
+/// on the catch-up path and the field went with it (see `alert_fee_credit_refusal`).
 struct RefusalTiming {
     /// lnrent's first durable LOCAL sighting of this refusal.
     first_refusal_at: i64,
-    /// The instant lnrent's last observer of this receipt gives up: `expires_at +
-    /// [`SETTLEMENT_POLL_GRACE_SECS`]`, past which [`idx_pollable_invoices`] no longer returns the
-    /// row. `None` when the index row is already gone.
-    observed_until: Option<i64>,
 }
 
 /// Record and return the timing of this fee-credit refusal. Both reads are reporting state only:
@@ -2164,18 +2150,7 @@ fn idx_record_fee_credit_refusal(
             |row| row.get(0),
         )
         .context("reading the first local fee-credit refusal")?;
-    let expires_at: Option<i64> = conn
-        .query_row(
-            "SELECT expires_at FROM phoenixd_invoice WHERE invoice_id=?1",
-            params![invoice_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .context("reading the refused invoice's settlement window")?;
-    Ok(RefusalTiming {
-        first_refusal_at,
-        observed_until: expires_at.map(|at| at.saturating_add(SETTLEMENT_POLL_GRACE_SECS)),
-    })
+    Ok(RefusalTiming { first_refusal_at })
 }
 
 /// A row needed by the polling `watch()` task. A row is NOT dropped the moment lnrent's own window

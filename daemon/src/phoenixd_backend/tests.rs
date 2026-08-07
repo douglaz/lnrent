@@ -2823,89 +2823,6 @@ async fn the_settlement_poll_alerts_a_fee_credit_refusal_it_alone_observes() {
     );
 }
 
-// The threshold is a delay before the NEXT retry, so it may only defer while there IS one — and
-// lnrent's observers do run out. Past `expires_at + SETTLEMENT_POLL_GRACE_SECS` the poll no longer
-// reads the row (`idx_pollable_invoices`), and catch-up gave up earlier still, when reconcile
-// expired the local invoice out of its `status='OPEN'` scan. A daemon blind across that window — a
-// day down, or a day unable to reach phoenixd — and looking again inside the last threshold of it
-// would otherwise record a first refusal, defer, and never speak again: the exact silence this bead
-// exists to end, reintroduced by the mechanism meant to end it.
-//
-// Two clocks either side of that boundary, one refusal, nothing else different. Deleting the
-// `last_look` arm fails the second half; hard-coding it true fails the first.
-#[tokio::test]
-async fn a_refusal_lnrent_is_about_to_stop_watching_alerts_without_waiting_out_the_threshold() {
-    for past_the_boundary in [false, true] {
-        let ops = FakePhoenixdOps::new();
-        let clock = Arc::new(TestClock::new(measured_receive_settled_at() - 600));
-        let (be, store) = backend_with_alerts(ops.clone(), clock.clone());
-        let inv = arrange_fee_credit_refusal(&be, &ops).await;
-
-        // The instant lnrent's LAST observer of this receipt gives up...
-        let observed_until = inv.expires_at + SETTLEMENT_POLL_GRACE_SECS;
-        // ...and the last instant at which a whole threshold still fits before it. One second past
-        // that, waiting the threshold out means never reporting at all.
-        clock.set(observed_until - UNBOOKABLE_SETTLEMENT_ALERT_S + i64::from(past_the_boundary));
-        assert!(
-            clock.now() > inv.expires_at,
-            "the scenario is a receipt lnrent's local window has long since lapsed on"
-        );
-
-        // FIRST local sighting in both halves: age 0, so the threshold alone decides.
-        be.received_amount_msat(&inv.id)
-            .await
-            .expect_err("the refusal itself is unchanged either side of the boundary");
-
-        let alerts = operator_alerts(&store).await;
-        if !past_the_boundary {
-            assert!(
-                alerts.is_empty(),
-                "a whole threshold still fits before {observed_until}, so the retry gets it first: \
-                 {alerts:?}"
-            );
-            continue;
-        }
-        assert_eq!(
-            alerts.len(),
-            1,
-            "lnrent stops watching at {observed_until}; deferring past that is silence, not delay: \
-             {alerts:?}"
-        );
-        assert_eq!(alerts[0].subject, "fee_credit");
-        let detail = &alerts[0].detail;
-        assert!(
-            detail.contains("FEE-CREDIT REFUSAL") && detail.contains("(0s ago"),
-            "the same reason, reported at age zero: {detail}"
-        );
-        // And the tail must not promise the automatic booking that is about to stop. An operator
-        // told "lnrent retries and books them automatically" funds the wallet, waits, and never
-        // learns this receipt needs reconciling by hand against phoenixd.
-        assert!(
-            detail.contains(&format!("stops re-checking this receipt at unix time {observed_until}"))
-                && detail.contains("hand-reconcile against phoenixd's own payment history"),
-            "the alert must say lnrent is about to stop, and what that costs: {detail}"
-        );
-        assert!(
-            !detail.contains("lnrent retries and books them automatically"),
-            "and must not also promise the retry it just said is ending: {detail}"
-        );
-        // This branch's tail is the longest of the three, and `MAX_ALERT_DETAIL_CHARS` truncates
-        // from the tail — where the hand-reconcile instruction lives.
-        assert!(
-            !detail.ends_with('…'),
-            "truncated at {} chars: {detail}",
-            detail.chars().count()
-        );
-    }
-}
-
-// The fee-credit sibling of `a_whole_diverged_index_is_one_alert_not_one_per_invoice`, and the
-// reason it exists: phoenixd publishes no per-receipt fee-credit attribution, so ADR-0019 judges
-// SPENDABILITY per WALLET. Two receipts refused by one unfunded wallet are two sightings of one
-// condition with one remedy. Keyed per invoice they would be two DMs — and, since catch-up
-// re-observes every OPEN invoice each tick and reconcile will not expire one the backend calls Paid,
-// two DMs every cooldown window for as long as the wallet stays unfunded, each a permanent row in
-// the outbox that also carries provision.ready/billing.*.
 #[tokio::test]
 async fn two_receipts_one_unfunded_wallet_is_one_alert_not_one_per_receipt() {
     let ops = FakePhoenixdOps::new();
@@ -3009,28 +2926,29 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
     // wholesale"), while the condition being reported is that the state DB knows invoices the index
     // does not — i.e. the state DB is the NEWER file.
     //
-    // So the age criterion has TWO halves, and an alert giving only the first is unsafe: a backup
-    // older than the affected invoices does not repair the divergence at all, AND any backup at all
-    // rolls the state DB back to its own instant — an operator handed only "newer than the affected
-    // invoices" can satisfy it exactly and still drop every order committed since. An operator who
+    // An AGE criterion cannot pick the backup at all, which is the trap this assertion guards: a
+    // backup older than the affected invoices never held their rows, and a NEWER one still lacks
+    // them if the index was already lost when they were paid. Only the contents settle it. On top of
+    // that, any restore rolls the state DB back to its own instant, so an operator handed only a
+    // date rule can satisfy it exactly and still drop every order committed since. An operator who
     // has never read `backup.rs` must get both from the DM alone.
     assert!(
-        detail.contains("your NEWEST backup") && detail.contains("newer than them"),
+        detail.contains("CONTENTS") && detail.contains("NEWER one still lacks them"),
         "the alert must state which backups are safe, not just say 'restore': {detail}"
     );
     assert!(
-        detail.contains("EVERYTHING lnrent committed after that backup is dropped")
-            && detail.contains("orders, captures, refunds, ledger rows")
-            && detail.contains("hand-reconcile whatever phoenixd's history shows after its date"),
+        detail.contains("committed since THAT BACKUP is dropped")
+            && detail.contains("order, capture, refund and ledger row")
+            && detail.contains("reconcile by hand against phoenixd's history"),
         "and must say the loss is everything newer than the BACKUP, not just the named invoices, \
          plus what to do about it: {detail}"
     );
     assert!(
-        detail.contains("does not repair the divergence anyway"),
+        detail.contains("An older backup never had their rows"),
         "and that an older backup does not even fix what it was reached for: {detail}"
     );
     assert!(
-        detail.contains("Have neither: do NOT restore"),
+        detail.contains("None qualifies: do NOT restore"),
         "including the case where the operator has no safe backup at all: {detail}"
     );
 }
