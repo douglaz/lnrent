@@ -577,7 +577,7 @@ async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_i
         // in the sibling test module is what holds that.
         //
         // "newer than the affected invoices" is NECESSARY but NOT sufficient, which is why the text
-        // says NEWEST backup and then names the loss: `restore` stages the backup's artifacts and
+        // tells the operator to pick by CONTENTS and then names the loss: `restore` stages the backup's artifacts and
         // swaps them in wholesale (`backup.rs`, step 4 — "the swap replaces the target wholesale"),
         // so it rolls the state DB back to the backup's instant and everything committed since is
         // gone, not merely the invoices this alert names. An operator who read only "after the
@@ -599,13 +599,23 @@ async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_i
     .await;
 }
 
-/// Report a fee-credit refusal that has stood for [`UNBOOKABLE_SETTLEMENT_ALERT_S`], **or** that
-/// lnrent is about to lose sight of. Age is measured from lnrent's first durable LOCAL observation:
-/// phoenixd may run on another host with an unrelated wall clock, while persistence keeps a daemon
-/// restart from resetting the threshold. The delay keeps a receipt lnrent books on its next retry
-/// out of the operator's DMs — so it lapses the moment there is no next retry to wait for (see
-/// `last_look` below), because a threshold that outlives its last observer converts the delay into
-/// permanent silence.
+/// Report a fee-credit refusal that has stood for [`UNBOOKABLE_SETTLEMENT_ALERT_S`], **or** that the
+/// settlement poll is about to retire. Age is measured from lnrent's first durable LOCAL
+/// observation: phoenixd may run on another host with an unrelated wall clock, while persistence
+/// keeps a daemon restart from resetting the threshold.
+///
+/// The delay keeps a receipt lnrent books on its next retry out of the operator's DMs. It must NOT
+/// outlive the last observer, though, or it converts that delay into permanent silence — the bead's
+/// own headline failure. That is reachable for a LATE payment (one that landed after the local
+/// invoice expired): catch-up scans `status='OPEN'` only, so the poll is its sole observer, and the
+/// poll retires the row past `expires_at + SETTLEMENT_POLL_GRACE_SECS`. First observed inside the
+/// last threshold of that window, a plain age gate would defer, the row would retire, and nobody
+/// would ever be told. So the threshold lapses there.
+///
+/// This is a TRIGGER only. An earlier revision also used it to tell the operator lnrent had stopped
+/// re-checking the receipt — false whenever catch-up is still watching, which is the common case,
+/// and it would have sent them to hand-reconcile a receipt funding still books. The remedy text is
+/// caller-independent for that reason; only the timing differs.
 ///
 /// ONE subject, like [`alert_index_divergence`] and for the same reason: the refusal is a WALLET-level
 /// judgement, not a per-invoice one. phoenixd publishes no per-receipt fee-credit attribution, so
@@ -640,10 +650,16 @@ async fn alert_fee_credit_refusal(
         }
     };
     let age = now.saturating_sub(timing.first_refusal_at);
-    // Defer only while the refusal is fresh: below the threshold this is a receipt lnrent may yet
-    // book on its own, and a DM per tick would be noise. Nothing here changes WHICH settlements are
-    // emitted or when — the poll's row set and the refusal itself are untouched.
-    if age < UNBOOKABLE_SETTLEMENT_ALERT_S {
+    // Defer only while the refusal is fresh AND something will look again. Below the threshold this
+    // is a receipt lnrent may yet book on its own and a DM per tick would be noise — but a deferral
+    // past the poll's retirement is not a delay, it is silence. `None` (no index row left) speaks:
+    // there is provably no next look. Nothing here changes WHICH settlements are emitted or when —
+    // the poll's row set and the refusal itself are untouched.
+    let last_look = match timing.poll_retires_at {
+        Some(retires_at) => now.saturating_add(UNBOOKABLE_SETTLEMENT_ALERT_S) > retires_at,
+        None => true,
+    };
+    if age < UNBOOKABLE_SETTLEMENT_ALERT_S && !last_look {
         return;
     }
     // What the operator should DO. Funding the wallet books these automatically, and that is true
@@ -2118,13 +2134,16 @@ fn idx_upsert(index: &Mutex<Connection>, inv: &Invoice) -> Result<()> {
     Ok(())
 }
 
-/// What decides whether a fee-credit refusal is the operator's problem yet: one durable instant,
-/// compared against a plain age threshold. An earlier revision also carried the moment lnrent's
-/// last observer would give up, to tell the operator re-checking had stopped — that claim was false
-/// on the catch-up path and the field went with it (see `alert_fee_credit_refusal`).
+/// What decides whether a fee-credit refusal is the operator's problem yet.
 struct RefusalTiming {
     /// lnrent's first durable LOCAL sighting of this refusal.
     first_refusal_at: i64,
+    /// The instant the settlement POLL retires this row: `expires_at +
+    /// [`SETTLEMENT_POLL_GRACE_SECS`]`. Used ONLY to stop the age threshold outliving the last
+    /// observer — never to tell the operator that re-checking has stopped, which is false whenever
+    /// catch-up is still watching (an earlier revision said exactly that, and it was wrong).
+    /// `None` when no index row remains.
+    poll_retires_at: Option<i64>,
 }
 
 /// Record and return the timing of this fee-credit refusal. Both reads are reporting state only:
@@ -2150,7 +2169,18 @@ fn idx_record_fee_credit_refusal(
             |row| row.get(0),
         )
         .context("reading the first local fee-credit refusal")?;
-    Ok(RefusalTiming { first_refusal_at })
+    let expires_at: Option<i64> = conn
+        .query_row(
+            "SELECT expires_at FROM phoenixd_invoice WHERE invoice_id=?1",
+            params![invoice_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("reading the refused invoice's settlement window")?;
+    Ok(RefusalTiming {
+        first_refusal_at,
+        poll_retires_at: expires_at.map(|at| at.saturating_add(SETTLEMENT_POLL_GRACE_SECS)),
+    })
 }
 
 /// A row needed by the polling `watch()` task. A row is NOT dropped the moment lnrent's own window

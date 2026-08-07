@@ -259,10 +259,10 @@ refuses orders it cannot service.
   publishes no per-receipt fee-credit attribution, that judgement is made per WALLET, so one alert
   covers every receipt being held back. A missing `phoenixd_index.db` row instead makes payment state
   UNKNOWN — again one alert, however many invoices it hit. That one is the dangerous repair: stop the
-  daemon and restore the whole lnrent data dir from your **newest** backup with `lnrentd restore
+  daemon and restore the whole lnrent data dir from a backup **whose `phoenixd_index.db` actually
+  holds the affected invoices** — pick it by CONTENTS, never by date — with `lnrentd restore
   --from <backup-dir> --data-dir <data-dir> --force` (`--force` because restore refuses a non-empty
-  target, and the live data dir is not empty; add `--passphrase-file` if the backup is encrypted).
-  Read the date twice. `restore` replaces the *whole* data dir, the state DB included, so it rolls
+  target, and the live data dir is not empty; add `--passphrase-file` if the backup is encrypted). `restore` replaces the *whole* data dir, the state DB included, so it rolls
   lnrent back to that backup's instant: **everything committed since is dropped** — later orders,
   captures, refunds, ledger rows — while phoenixd still holds the sats. And the DATE alone cannot pick one. A backup
   older than the affected invoices does not repair the divergence at all — it drops exactly those
@@ -273,8 +273,9 @@ refuses orders it cannot service.
   With no such backup, do not restore at all; reconcile by hand instead. Then verify phoenixd still points at the original wallet/payment history, and restart. An
   index divergence DMs a `SettlementUnbookable` alert when lnrent detects it; a fee-credit refusal
   DMs after it has stood for 15 minutes from lnrent's first local observation — that delay is there
-  because lnrent normally books the receipt itself on a retry seconds later, so it lapses once there
-  is no retry left to wait for. Funding the wallet books these automatically: a fee-credit refusal
+  because lnrent normally books the receipt itself on a retry seconds later, so it lapses when the
+  settlement poll is about to retire the invoice — a delay that outlived the last observer would be
+  permanent silence, not a delay. Funding the wallet books these automatically: a fee-credit refusal
   only exists while phoenixd calls the invoice PAID, and reconcile will not expire a backend-Paid
   invoice, so lnrent keeps re-observing it. The exception is a LATE payment — one that landed after
   your local invoice had already expired — which is only re-checked for a grace window past that

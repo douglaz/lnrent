@@ -2682,6 +2682,61 @@ async fn a_fee_credit_refusal_alerts_the_operator_with_its_reason_and_remedy() {
 // the operator the instant the payment lands, including the ordinary one lnrent books itself on the
 // next retry seconds later. Four instants, one refusal, nothing changing between them but the
 // clock — so what moves the alert is provably the AGE and nothing else.
+// The threshold must not outlive the LAST observer. A late payment — landed after the local invoice
+// expired — is watched only by the settlement poll, which retires the row past
+// `expires_at + SETTLEMENT_POLL_GRACE_SECS` (catch-up scans `status='OPEN'` only). First observed
+// inside the last threshold of that window, a plain age gate would defer, the row would retire, and
+// the operator would never be told: the exact permanent silence this bead exists to end.
+//
+// Two clocks either side of that boundary, one refusal, nothing else different. Deleting the
+// last-look arm fails the second half; hard-coding it true fails the first.
+#[tokio::test]
+async fn a_refusal_the_poll_is_about_to_retire_alerts_without_waiting_out_the_threshold() {
+    for past_the_boundary in [false, true] {
+        let ops = FakePhoenixdOps::new();
+        let clock = Arc::new(TestClock::new(measured_receive_settled_at() - 600));
+        let (be, store) = backend_with_alerts(ops.clone(), clock.clone());
+        let inv = arrange_fee_credit_refusal(&be, &ops).await;
+
+        // The instant the poll retires this row...
+        let retires_at = inv.expires_at + SETTLEMENT_POLL_GRACE_SECS;
+        // ...and the last instant at which a whole threshold still fits before it.
+        clock.set(retires_at - UNBOOKABLE_SETTLEMENT_ALERT_S + i64::from(past_the_boundary));
+
+        // FIRST local sighting in both halves: age 0, so the gate alone decides.
+        be.received_amount_msat(&inv.id)
+            .await
+            .expect_err("the refusal itself is unchanged either side of the boundary");
+
+        let alerts = operator_alerts(&store).await;
+        if past_the_boundary {
+            assert_eq!(
+                alerts.len(),
+                1,
+                "past the boundary the threshold would outlive the poll, so it must speak NOW"
+            );
+            assert!(
+                alerts[0].detail.contains("FEE-CREDIT REFUSAL"),
+                "and it is the fee-credit reason: {:?}",
+                alerts[0]
+            );
+            // The remedy is caller-independent: it must NOT claim re-checking has stopped, which is
+            // false whenever catch-up is still watching.
+            assert!(
+                !alerts[0].detail.contains("stops re-checking"),
+                "the trigger must not resurrect the refuted 'lnrent stopped looking' claim: {:?}",
+                alerts[0]
+            );
+        } else {
+            assert!(
+                alerts.is_empty(),
+                "a whole threshold still fits before {retires_at}, so the retry gets it first: \
+                 {alerts:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_fresh_fee_credit_refusal_does_not_alert_before_the_threshold() {
     let ops = FakePhoenixdOps::new();

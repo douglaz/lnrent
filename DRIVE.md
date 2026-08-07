@@ -10,7 +10,7 @@ through this line.
 **Phase:** HARDEN · **Bead:** lnrent-gc7 · **Branch:** feat/gc7-settlement-unbookable-alert
 **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'`
-· last green 2026-08-07 at 3f1fd5b (EXIT=0, 883 tests, 0 failed)
+· last green 2026-08-07 at HEAD (EXIT=0, 883 tests, 0 failed)
 
 ## Done (this session)
 - lnrent-m7g nix packages + container image — merged #80
