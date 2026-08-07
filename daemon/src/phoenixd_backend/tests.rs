@@ -2988,7 +2988,7 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
     // date rule can satisfy it exactly and still drop every order committed since. An operator who
     // has never read `backup.rs` must get both from the DM alone.
     assert!(
-        detail.contains("CONTENTS") && detail.contains("NEWER one still lacks them"),
+        detail.contains("CONTENTS") && detail.contains("newer one still lacks them"),
         "the alert must state which backups are safe, not just say 'restore': {detail}"
     );
     assert!(
@@ -2997,6 +2997,15 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
             && detail.contains("reconcile by hand against phoenixd's history"),
         "and must say the loss is everything newer than the BACKUP, not just the named invoices, \
          plus what to do about it: {detail}"
+    );
+    // The subject is GLOBAL and the cooldown dedups, so this alert names ONE affected invoice
+    // however many there are. An operator who verifies a candidate backup against the named id
+    // alone can pick one that omits the others, and the whole-dir restore then drops those orders.
+    // The text must say so and give the rule for finding the rest.
+    assert!(
+        detail.contains("ONE EXAMPLE, not the set")
+            && detail.contains("every OPEN invoice your state DB has"),
+        "the alert must say the named invoice is one example and how to enumerate the rest: {detail}"
     );
     assert!(
         detail.contains("An older backup never had their rows"),

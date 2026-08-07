@@ -583,17 +583,18 @@ async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_i
         // gone, not merely the invoices this alert names. An operator who read only "after the
         // newest affected invoice" could satisfy it exactly and still drop a day of orders.
         format!(
-            "INDEX DIVERGENCE: invoice {invoice_id} is absent from {INDEX_DB_FILE} — and maybe \
-             every other open invoice, which this one alert covers. Its payment state is UNKNOWN: \
-             lnrent cannot observe, book or expire it. REMEDY: stop the daemon, then `lnrentd \
-             restore --from <backup-dir> --data-dir <data-dir> --force` (--force: restore refuses a \
-             non-empty target; add --passphrase-file if encrypted). PICK THE BACKUP BY CONTENTS, \
-             NOT DATE: its {INDEX_DB_FILE} must actually hold these invoices. An older backup never \
-             had their rows; a NEWER one still lacks them if the index was already lost when they \
-             were paid. Any restore replaces the WHOLE data dir, state DB included — every order, \
-             capture, refund and ledger row committed since THAT BACKUP is dropped, while phoenixd keeps \
-             sats. None qualifies: do NOT restore, reconcile by hand against phoenixd's history. \
-             Keep phoenixd on its original wallet. Do not recreate or expire the invoice."
+            "INDEX DIVERGENCE: invoice {invoice_id} is absent from {INDEX_DB_FILE}, so its \
+             payment state is UNKNOWN: lnrent cannot observe, book or expire it. THAT IS ONE \
+             EXAMPLE, not the set — one alert covers all of them, so first enumerate every OPEN \
+             invoice your state DB has that {INDEX_DB_FILE} lacks. REMEDY: stop the daemon, then \
+             `lnrentd restore --from <backup-dir> --data-dir <data-dir> --force` (--force: target \
+             is non-empty; --passphrase-file if encrypted). PICK THE BACKUP BY CONTENTS, NOT DATE: \
+             its {INDEX_DB_FILE} must hold ALL of them. An older backup never had their rows; a \
+             newer one still lacks them if the index was lost before they were paid. Any restore \
+             replaces the WHOLE data dir — every order, capture, refund and ledger row committed \
+             since THAT BACKUP is dropped, while phoenixd keeps the sats. None qualifies: do NOT \
+             restore, reconcile by hand against phoenixd's history. Keep phoenixd on its original \
+             wallet. Do not recreate or expire it."
         ),
     )
     .await;

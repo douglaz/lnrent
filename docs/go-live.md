@@ -258,9 +258,12 @@ refuses orders it cannot service.
   unrefundable (ADR-0019); fund the node's spendable balance and the retry books it. Because phoenixd
   publishes no per-receipt fee-credit attribution, that judgement is made per WALLET, so one alert
   covers every receipt being held back. A missing `phoenixd_index.db` row instead makes payment state
-  UNKNOWN — again one alert, however many invoices it hit. That one is the dangerous repair: stop the
-  daemon and restore the whole lnrent data dir from a backup **whose `phoenixd_index.db` actually
-  holds the affected invoices** — pick it by CONTENTS, never by date — with `lnrentd restore
+  UNKNOWN — again one alert, however many invoices it hit. That one is the dangerous repair, and the
+  alert names only ONE affected invoice however many there are (the subject is global and the
+  cooldown dedups), so **enumerate the set first**: every invoice your state DB still has OPEN that
+  `phoenixd_index.db` no longer lists. Then stop the daemon and restore the whole lnrent data dir
+  from a backup **whose `phoenixd_index.db` holds ALL of them** — pick it by CONTENTS, never by
+  date — with `lnrentd restore
   --from <backup-dir> --data-dir <data-dir> --force` (`--force` because restore refuses a non-empty
   target, and the live data dir is not empty; add `--passphrase-file` if the backup is encrypted). `restore` replaces the *whole* data dir, the state DB included, so it rolls
   lnrent back to that backup's instant: **everything committed since is dropped** — later orders,

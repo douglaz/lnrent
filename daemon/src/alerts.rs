@@ -172,9 +172,11 @@ pub struct RecentAlerts {
 /// So the visited set is every alert OF THIS KIND ever written, `since` or no `since`, and `outbox`
 /// is never reaped (the only `DELETE FROM outbox` is the targeted refund one in `ipc.rs`). It stays
 /// small only because each kind has few subjects and the per-`(kind, subject)` cooldown caps each at
-/// one row per [`ALERT_COOLDOWN_S`]: at 20k rows of one kind — ~40 years of two subjects alerting
-/// every window — the query measured ~4ms in a debug build. A per-invoice subject would break that
-/// arithmetic, which is one reason the phoenixd fee-credit alert does not use one.
+/// one row per [`ALERT_COOLDOWN_S`] — so the growth rate is `86400 / ALERT_COOLDOWN_S` rows per
+/// subject per day, derived rather than restated here because the constant moves. At 20k rows of one
+/// kind the query measured ~4ms in a debug build, and a restart resets a cooldown, so treat that as
+/// a floor on the time to reach it rather than a guarantee. A per-invoice subject would break the
+/// arithmetic outright, which is one reason the phoenixd fee-credit alert does not use one.
 ///
 /// `limit` bounds only what is carried back to the operator.
 pub async fn recent_alerts(
