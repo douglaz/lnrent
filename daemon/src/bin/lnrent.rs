@@ -406,7 +406,21 @@ fn money_human_text(v: &serde_json::Value) -> String {
                 .to_string(),
         );
     } else if ready {
-        lines.push("Status: \x1b[1mREADY\x1b[0m".to_string());
+        // `ready` is REFUND-LIABILITY readiness: reserves cover the open refund liability. It says
+        // nothing about receipts lnrent could not BOOK, and the fee-credit case is exactly one where
+        // both hold at once — an unfunded wallet's first small sale leaves a paid receipt unbooked
+        // while the (tiny) refund liability is still covered. A bare READY printed under the red
+        // block above reads as an all-clear over a buyer's money sitting unbooked, so qualify the
+        // human line. The machine field is untouched.
+        if unbookable > 0 || unbookable_unknown {
+            lines.push(
+                "Status: \x1b[1mREADY (refund liability only)\x1b[0m — but see the unbookable \
+                 settlements above: those receipts are NOT booked, and this line does not cover them"
+                    .to_string(),
+            );
+        } else {
+            lines.push("Status: \x1b[1mREADY\x1b[0m".to_string());
+        }
     } else if let Some(detail) = phoenixd_detail {
         lines.push(format!(
             "Status: \x1b[1mNOT READY (phoenixd)\x1b[0m — {detail}"
