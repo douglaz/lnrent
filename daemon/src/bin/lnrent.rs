@@ -355,7 +355,21 @@ fn money_human_text(v: &serde_json::Value) -> String {
         .get("recent_unbookable_settlement_alerts_unknown")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    if unbookable_unknown {
+    let unbookable_disabled = v
+        .get("recent_unbookable_settlement_alerts_disabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if unbookable_disabled {
+        // A DIFFERENT remedy from the storage-failure case below, so it gets its own line: nothing
+        // is broken, the operator switched the recording off, and this view is derived from it.
+        lines.push(
+            "\x1b[1;31mUnbookable settlement alert history: UNAVAILABLE\x1b[0m — DM alerts are \
+             disabled (`LNRENT_ALERTS_ENABLED`), so nothing is recorded and this view cannot tell \
+             you whether a paid settlement is sitting unbooked. This is NOT a report of zero. \
+             Re-enable alerts, or check phoenixd's own records directly."
+                .to_string(),
+        );
+    } else if unbookable_unknown {
         lines.push(
             "\x1b[1;31mUnbookable settlement alert history: UNKNOWN\x1b[0m — the daemon could not \
              read its durable alert history, so it cannot say whether settlements are being held \
@@ -413,7 +427,7 @@ fn money_human_text(v: &serde_json::Value) -> String {
         // while the (tiny) refund liability is still covered. A bare READY printed under the red
         // block above reads as an all-clear over a buyer's money sitting unbooked, so qualify the
         // human line. The machine field is untouched.
-        if unbookable > 0 || unbookable_unknown {
+        if unbookable > 0 || unbookable_unknown || unbookable_disabled {
             lines.push(
                 "Status: \x1b[1mREADY (refund liability only)\x1b[0m — but see the unbookable \
                  settlements above; this line does not cover them. That block is alert HISTORY, so \
@@ -1029,6 +1043,46 @@ mod tests {
         assert!(
             clean.contains("Status: \u{1b}[1mREADY\u{1b}[0m"),
             "an all-clear stays an all-clear when nothing is held back: {clean}"
+        );
+    }
+
+    // With the DM sink off there are no outbox rows, so the view cannot see the condition — and
+    // the CLI is then the operator's ONLY surface. Reporting 0 there would be a bare all-clear over
+    // a buyer's unbooked receipt, which is the failure this whole bead exists to prevent. It gets
+    // its own line rather than reusing the storage-failure UNKNOWN because the remedy differs:
+    // re-enable alerts, not fix the database.
+    #[test]
+    fn money_human_reports_a_disabled_alert_sink_as_unavailable_not_zero() {
+        let rendered = money_human_text(&json!({
+            "expected_msat": 0,
+            "gross_liability_sat": 0,
+            "required_msat": 0,
+            "parked_count": 0,
+            "ready": true,
+            "degraded_read_only": false,
+            "recent_unbookable_settlement_alerts_disabled": true,
+        }));
+
+        assert!(
+            rendered.contains("Unbookable settlement alert history: UNAVAILABLE"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("NOT a report of zero"),
+            "it must refuse to be read as an all-clear: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Unbookable settlements: 0"),
+            "and must never print a count it cannot know: {rendered}"
+        );
+        // The remedy is re-enabling alerts, NOT chasing a storage error.
+        assert!(
+            !rendered.contains("could not read its durable alert history"),
+            "the storage-failure wording would send the operator to the wrong fix: {rendered}"
+        );
+        assert!(
+            rendered.contains("READY (refund liability only)"),
+            "and READY must be qualified when the view cannot see the condition: {rendered}"
         );
     }
 

@@ -368,6 +368,7 @@ pub async fn serve(
     relays: RelayStatusCell,
     listing_relay: listing::RelayHandle,
     path: impl AsRef<Path>,
+    alerts_enabled: bool,
 ) -> Result<()> {
     // A signal that never fires: the loop only ends on a listener error.
     let (_never, rx) = tokio::sync::watch::channel(false);
@@ -380,6 +381,7 @@ pub async fn serve(
         listing_relay,
         path,
         rx,
+        alerts_enabled,
     )
     .await
 }
@@ -398,6 +400,7 @@ pub async fn serve_with_shutdown(
     listing_relay: listing::RelayHandle,
     path: impl AsRef<Path>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    alerts_enabled: bool,
 ) -> Result<()> {
     let path = path.as_ref();
     if *shutdown.borrow() {
@@ -456,6 +459,7 @@ pub async fn serve_with_shutdown(
                         relays,
                         listing_relay,
                         token,
+                        alerts_enabled,
                     )
                     .await
                     {
@@ -502,6 +506,7 @@ async fn handle_conn(
     relays: RelayStatusCell,
     listing_relay: listing::RelayHandle,
     shutdown_token: CancellationToken,
+    alerts_enabled: bool,
 ) -> Result<()> {
     let (rd, mut wr) = stream.into_split();
     // Bounded read: cap the request frame so an over-long line can't exhaust memory, and put a
@@ -544,7 +549,17 @@ async fn handle_conn(
                 // easily fits; the exception is `Sweep`, whose fedimint pay can run to
                 // `PAY_AWAIT_TIMEOUT` (120s) and which we still don't cancel for money safety (see
                 // `Request::is_mutating` for the residual-gap reasoning).
-                dispatch(req, &store, &recipes, &clock, &payment, &relays, &listing_relay).await
+                dispatch_with_alert_visibility(
+                    req,
+                    &store,
+                    &recipes,
+                    &clock,
+                    &payment,
+                    &relays,
+                    &listing_relay,
+                    alerts_enabled,
+                )
+                .await
             }
             Ok(req) => {
                 // A READ-ONLY op is drain-EXEMPT (lnrent-j3c): if a graceful shutdown fires while it
@@ -554,8 +569,9 @@ async fn handle_conn(
                 // read / network probe loses nothing). The tiny error reply then goes out the
                 // unchanged write path below, exactly like any other `Reply`.
                 tokio::select! {
-                    r = dispatch(
+                    r = dispatch_with_alert_visibility(
                         req, &store, &recipes, &clock, &payment, &relays, &listing_relay,
+                        alerts_enabled,
                     ) => r,
                     _ = shutdown_token.cancelled() => Reply {
                         ok: false,
@@ -582,6 +598,9 @@ async fn handle_conn(
 
 /// Route a request to the store actor (reads) / a journaled transaction (admin mutations).
 #[allow(clippy::too_many_arguments)]
+/// Dispatch with the alert sink assumed ENABLED — the shape every caller but the live server
+/// wants. The server uses [`dispatch_with_alert_visibility`], because a disabled sink must not let
+/// the alert-derived views answer 0 to a question they cannot see.
 pub async fn dispatch(
     req: Request,
     store: &Store,
@@ -590,6 +609,30 @@ pub async fn dispatch(
     payment: &Arc<dyn PaymentBackend>,
     relays: &RelayStatusCell,
     listing_relay: &listing::RelayHandle,
+) -> Reply {
+    dispatch_with_alert_visibility(
+        req,
+        store,
+        recipes,
+        clock,
+        payment,
+        relays,
+        listing_relay,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_with_alert_visibility(
+    req: Request,
+    store: &Store,
+    recipes: &Arc<Vec<Recipe>>,
+    clock: &Arc<dyn Clock>,
+    payment: &Arc<dyn PaymentBackend>,
+    relays: &RelayStatusCell,
+    listing_relay: &listing::RelayHandle,
+    alerts_enabled: bool,
 ) -> Reply {
     match req {
         Request::Status => {
@@ -630,7 +673,7 @@ pub async fn dispatch(
                         "relays_connected": relays_connected,
                         "listing": listing,
                     });
-                    add_unbookable_settlement_alerts_view(store, clock.now(), &mut status).await;
+                    add_unbookable_settlement_alerts_view(store, clock.now(), alerts_enabled, &mut status).await;
                     Reply::ok(status)
                 }
                 (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
@@ -776,6 +819,7 @@ pub async fn dispatch(
                             add_unbookable_settlement_alerts_view(
                                 store,
                                 clock.now(),
+                                alerts_enabled,
                                 &mut money,
                             )
                             .await;
@@ -1248,7 +1292,27 @@ async fn listing_view(
 /// polls (`daemon/tests/supervisor.rs`). Failing either command on a history query would hide the
 /// balances and the daemon's health behind an `internal` for the sake of an alert list. On failure,
 /// omit the count/details rather than asserting a false zero and mark the history explicitly unknown.
-async fn add_unbookable_settlement_alerts_view(store: &Store, now: i64, response: &mut Value) {
+async fn add_unbookable_settlement_alerts_view(
+    store: &Store,
+    now: i64,
+    alerts_enabled: bool,
+    response: &mut Value,
+) {
+    // This view is DERIVED from delivered DMs, so with the sink disabled there are no rows to read
+    // and `recent_alerts` would answer a truthful-looking 0 to a question it cannot see. That zero
+    // is the worst possible answer here: the CLI is the ONLY operator surface left once DMs are
+    // off, and a bare READY over a buyer's unbooked receipt is exactly what this bead exists to
+    // prevent. Report unavailable instead — distinct from the storage-failure `_unknown`, because
+    // the remedy differs (re-enable alerts vs fix the DB).
+    if !alerts_enabled {
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert(
+                "recent_unbookable_settlement_alerts_disabled".to_string(),
+                serde_json::json!(true),
+            );
+        }
+        return;
+    }
     let since = now - crate::alerts::ALERT_VIEW_WINDOW_S;
     let view = crate::alerts::recent_alerts(
         store,
@@ -1915,6 +1979,7 @@ mod tests {
                 RelayStatusCell::new(),
                 no_listing_relay(),
                 &sock2,
+                true,
             )
             .await;
         });
@@ -2139,6 +2204,7 @@ mod tests {
                 RelayStatusCell::new(),
                 no_listing_relay(),
                 &sock2,
+                true,
             )
             .await;
         });
@@ -2293,6 +2359,7 @@ mod tests {
             no_listing_relay(),
             sock.clone(),
             shutdown_rx,
+            true,
         ));
         for _ in 0..50 {
             if sock.exists() {
@@ -2433,6 +2500,7 @@ mod tests {
             no_listing_relay(),
             sock.clone(),
             shutdown_rx,
+            true,
         ));
         for _ in 0..50 {
             if sock.exists() {
@@ -2523,6 +2591,7 @@ mod tests {
             no_listing_relay(),
             sock.clone(),
             shutdown_rx,
+            true,
         ));
         for _ in 0..50 {
             if sock.exists() {
@@ -2753,6 +2822,44 @@ mod tests {
                 data["recent_unbookable_settlement_alert_details"],
                 Value::Null,
                 "{cmd}: unknown must not masquerade as an empty detail list: {data}"
+            );
+        }
+    }
+
+    // The sink being OFF is not the same as nothing being wrong. With `alerts_enabled=false` the
+    // dispatcher writes no outbox rows, so the history read succeeds and truthfully reports zero
+    // rows — about a question it cannot see. Both operator commands must say so explicitly, because
+    // with DMs off the CLI is the only surface an unbooked receipt can reach.
+    #[tokio::test]
+    async fn a_disabled_alert_sink_reports_the_view_unavailable_rather_than_zero() {
+        let store = mem_store();
+        let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(VIEW_NOW));
+
+        for (cmd, req) in [("money", Request::Money), ("status", Request::Status)] {
+            let reply = dispatch_with_alert_visibility(
+                req,
+                &store,
+                &recipes,
+                &clock,
+                &payment,
+                &RelayStatusCell::new(),
+                &no_listing_relay(),
+                false,
+            )
+            .await;
+            assert!(reply.ok, "{cmd} stays ok: {:?}", reply.error);
+            let data = reply.data.expect("data");
+            assert_eq!(
+                data["recent_unbookable_settlement_alerts_disabled"],
+                json!(true),
+                "{cmd}: a disabled sink is explicit: {data}"
+            );
+            assert_eq!(
+                data["recent_unbookable_settlement_alerts"],
+                Value::Null,
+                "{cmd}: and must NOT answer 0 to a question it cannot see: {data}"
             );
         }
     }

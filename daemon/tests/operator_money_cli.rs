@@ -61,6 +61,7 @@ async fn json_money_returns_reply_envelope() {
             None,
             &sock_for_server,
             shutdown_rx,
+            true,
         )
         .await
     });

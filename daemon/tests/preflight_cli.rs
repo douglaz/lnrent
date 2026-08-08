@@ -196,6 +196,7 @@ async fn run_cli(
             None,
             &sock_for_server,
             shutdown_rx,
+            true,
         )
         .await
     });
