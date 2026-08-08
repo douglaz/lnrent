@@ -273,7 +273,7 @@ refuses orders it cannot service.
   same missing rows if the index was already lost when they were paid. Check the CONTENTS: restore
   only a backup whose `phoenixd_index.db` actually holds the affected invoice rows, then reconcile by
   hand — against phoenixd's payment history — everything phoenixd shows after that backup's date.
-  With no such backup, do not restore at all; reconcile by hand instead. Then verify phoenixd still points at the original wallet/payment history, and restart. An
+  With no such backup, **do not restore at all** — and be clear-eyed that there is then no supported repair: `lnrent reconcile` is report-only, no command reconstructs missing invoice/ledger/pay-index rows, and writing the DB by hand is forbidden (the daemon is the sole sqlite writer, ADR-0001). Leave the data dir and phoenixd's payment history intact, stop taking new orders, and settle the affected buyers out of band from phoenixd's own records. Recovery tooling for this state is tracked as lnrent-8scw. Then verify phoenixd still points at the original wallet/payment history, and restart. An
   index divergence DMs a `SettlementUnbookable` alert when lnrent detects it; a fee-credit refusal
   DMs after it has stood for 15 minutes from lnrent's first local observation — that delay is there
   because lnrent MAY book the receipt itself on a later retry — it clears only when the wallet's

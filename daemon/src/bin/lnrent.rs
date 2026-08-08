@@ -415,7 +415,9 @@ fn money_human_text(v: &serde_json::Value) -> String {
         if unbookable > 0 || unbookable_unknown {
             lines.push(
                 "Status: \x1b[1mREADY (refund liability only)\x1b[0m — but see the unbookable \
-                 settlements above: those receipts are NOT booked, and this line does not cover them"
+                 settlements above; this line does not cover them. That block is alert HISTORY, so \
+                 a listed incident may already be resolved (or, if the history could not be read, \
+                 unknown) — check before acting on it"
                     .to_string(),
             );
         } else {

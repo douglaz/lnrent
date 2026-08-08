@@ -200,14 +200,31 @@ pub async fn recent_alerts(
             while let Some(row) = rows.next()? {
                 let payload: String = row.get(0)?;
                 let at: i64 = row.get(1)?;
-                if let Ok(Msg::OperatorAlert(a)) = serde_json::from_str::<Msg>(&payload) {
-                    if a.kind == wire && seen.insert(a.subject.clone()) && shown.len() < limit {
-                        shown.push(AlertView {
-                            subject: a.subject,
-                            detail: a.detail,
-                            at,
-                        });
-                    }
+                // Do NOT swallow a row that will not decode. Dropping it silently would report
+                // FEWER incidents than exist — or zero — and the operator surface reads a zero as
+                // "nothing is wrong", which is the one thing this history must never say by
+                // accident. An unreadable history is `Err` here so the caller can mark it UNKNOWN,
+                // which is the contract docs/go-live.md states.
+                let msg = serde_json::from_str::<Msg>(&payload).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                let Msg::OperatorAlert(a) = msg else {
+                    // An `outbox:alert:<kind>:*` id whose payload is not an alert is corruption of
+                    // the same shape: refuse rather than under-count.
+                    return Err(anyhow::anyhow!(
+                        "outbox row under an alert id does not carry an operator.alert payload"
+                    ));
+                };
+                if a.kind == wire && seen.insert(a.subject.clone()) && shown.len() < limit {
+                    shown.push(AlertView {
+                        subject: a.subject,
+                        detail: a.detail,
+                        at,
+                    });
                 }
             }
             Ok(RecentAlerts {
