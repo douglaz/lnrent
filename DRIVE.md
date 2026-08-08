@@ -10,7 +10,9 @@ through this line.
 **Phase:** HARDEN · **Bead:** lnrent-gc7 · **Branch:** feat/gc7-settlement-unbookable-alert
 **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'`
-· last green 2026-08-07 at HEAD (EXIT=0, 883 tests, 0 failed)
+· last green at `653f9d4` (EXIT=0, 884 tests, 0 failed). NB this line names the commit it
+was run at, not "HEAD" — writing HEAD makes it silently stale on the next commit, which is
+exactly how it went wrong.
 
 ## Done (this session)
 - lnrent-m7g nix packages + container image — merged #80
