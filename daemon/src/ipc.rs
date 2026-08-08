@@ -1240,8 +1240,8 @@ async fn listing_view(
 
 /// Add recent durable alerts, latest per subject, to an operator response. This is history rather
 /// than a live backend query: a repaired condition remains visible until the window expires, and a
-/// disabled sink produces none. The count carries every incident in the window; only the DETAIL
-/// list is capped.
+/// disabled sink produces none. Every incident in the window is carried, count and detail alike —
+/// there is no display cap (see [`crate::alerts::RecentAlerts`]).
 ///
 /// DEGRADES rather than propagating: this read is decorative, while its two callers are not —
 /// `money` is the operator's money-safety surface and `status` is the liveness probe the harness
