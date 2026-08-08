@@ -283,15 +283,20 @@ refuses orders it cannot service.
        writer, ADR-0001):
 
        ```sh
-       sqlite3 "file:$LNRENT_DATA_DIR/state.db?mode=ro" \
+       DD=/path/to/your/data-dir          # the daemon's LNRENT_DATA_DIR
+       sqlite3 "file:$DD/lnrent.sqlite?mode=ro" \
          "SELECT id FROM invoice WHERE status='OPEN' ORDER BY id;" > /tmp/open.txt
-       sqlite3 "file:$LNRENT_DATA_DIR/phoenixd_index.db?mode=ro" \
+       sqlite3 "file:$DD/phoenixd_index.db?mode=ro" \
          "SELECT invoice_id FROM phoenixd_invoice ORDER BY invoice_id;" > /tmp/indexed.txt
        comm -23 /tmp/open.txt /tmp/indexed.txt      # the affected set
        ```
 
-       Run the second query against each candidate backup's `phoenixd_index.db` too: a backup
-       qualifies only when `comm -23 /tmp/open.txt <its indexed list>` is EMPTY.
+       (The state file is `lnrent.sqlite`, not `state.db`.) Run the second query against each
+       candidate backup's `phoenixd_index.db` too: a backup qualifies only when
+       `comm -23 /tmp/open.txt <its indexed list>` is EMPTY. **An ENCRYPTED backup dir holds only
+       `backup.age` and `MANIFEST.json`** — there is no `phoenixd_index.db` to query. Decrypt it to
+       a scratch dir first (`age -d -i <identity> backup.age | tar -x -C /tmp/cand`) and query the
+       copy there; never decrypt over the live data dir.
     2. **Choose a backup by CONTENTS, never by date** — its `phoenixd_index.db` must hold ALL of
        them. An older backup never had their rows. A newer one still lacks them if the index was
        already lost when they were paid. Date tells you nothing here.
@@ -309,7 +314,7 @@ refuses orders it cannot service.
        and the VM **keeps billing indefinitely**. With the daemon stopped, list what exists now:
 
        ```sh
-       sqlite3 "file:$LNRENT_DATA_DIR/state.db?mode=ro" \
+       sqlite3 "file:$DD/lnrent.sqlite?mode=ro" \
          "SELECT subscription_id, kind, handles_json FROM instance WHERE state <> 'DESTROYED';" \
          > /tmp/instances-before.txt
        ```
@@ -317,6 +322,23 @@ refuses orders it cannot service.
        Run the same query after the restore, diff the two, and for every resource present before
        but absent after, delete it at the provider yourself (for `do-vps`, the `droplet_id` in
        `handles_json`). lnrent will never do it for you — it no longer knows those rows existed.
+
+       **A backup that predates any outbound payment DISQUALIFIES itself.** `phoenixd_pay` is
+       lnrent's only defence against paying a refund twice — phoenixd's `payinvoice` takes no
+       idempotency parameter, so that durable local row IS the dedup, and the module says outright
+       that deleting it "is what would permit a double pay". A whole-dir restore rolls it back while
+       the original payment still stands at phoenixd, so restarting can re-drive a restored PENDING
+       refund, resolve a fresh bolt11, and **pay it again**. Check before restoring:
+
+       ```sh
+       sqlite3 "file:$DD/phoenixd_index.db?mode=ro" \
+         "SELECT idempotency_key, status FROM phoenixd_pay;" > /tmp/pay-now.txt
+       # and the same against the candidate backup's copy
+       ```
+
+       If the live map holds any payment the candidate does not, that backup is NOT usable: there is
+       no supported way to re-establish the witness (see step 4). Treat it exactly as "no backup
+       qualifies".
     4. **If no backup qualifies, do NOT restore.** There is no supported repair: `lnrent reconcile`
        is report-only, no command reconstructs the missing rows, and writing the DB by hand is
        forbidden (the daemon is the sole sqlite writer, ADR-0001). Keep the data dir and phoenixd's
