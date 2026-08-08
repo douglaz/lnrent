@@ -26,8 +26,17 @@ with data: sqlite queries, file I/O, sleeps, network calls.
 
 **In-memory `std::sync::Mutex` sections are a named exception, not an instance of the rule.**
 Holding one is the recommended tokio practice for short critical sections, and swapping
-`alerts.rs`, `relay_status.rs` and the Nostr engine's trackers for `tokio::sync::Mutex` would
-be slower and buy nothing. But do not claim a duration bound for them: a `std::sync::Mutex` has
+`relay_status.rs` and the Nostr engine's trackers for `tokio::sync::Mutex` would be slower and buy
+nothing.
+
+`alerts.rs` was on that list and is no longer (lnrent-gc7). Its cooldown is not a short critical
+section over data — it is a check-then-commit across an `await`: read `last_sent`, enqueue the DM,
+then stamp. With a `std::sync::Mutex` the guard cannot be held across the enqueue, so two
+concurrent observations of the same `(kind, subject)` both read "not sent recently" and both
+enqueue, which duplicates the alert the cooldown exists to suppress. It now uses a
+`tokio::sync::Mutex` held across the await deliberately — the exception traded for correctness, not
+performance. The section still does I/O (the outbox insert) while holding it, so it is bounded by
+one enqueue and by nothing else; that is a known cost, recorded here rather than left implicit. But do not claim a duration bound for them: a `std::sync::Mutex` has
 none when contended or when its holder is descheduled.
 
 The exception carries constraints rather than a guarantee: inside the critical section, no I/O,
@@ -36,7 +45,9 @@ code; three sections in the tree today do not meet them**, and saying so is the 
 exception list that quietly includes its own counterexamples is a false contract:
 
 - `relay_status.rs:77` clones the whole relay vector under the lock.
-- `alerts.rs:248` inserts into an unbounded `last_sent` map keyed by `(kind, subject)`.
+- `alerts.rs` inserts into an unbounded `last_sent` map keyed by `(kind, subject)` — now under
+  the `tokio::sync::Mutex` described above, so the unbounded-growth constraint still applies while
+  the duration one no longer does.
 - `nostr_engine.rs:1839` does a `retain()` scan over a vector sized by in-flight requests.
 
 No delivery bead changes them, and none of the three is a live hazard at current

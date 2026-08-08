@@ -134,6 +134,18 @@ pub trait PaymentBackend: Send + Sync {
     fn failed_refund_can_reuse_invoice(&self) -> bool {
         true
     }
+    /// Whether this backend can leave a settlement it has ALREADY observed as paid unbookable by
+    /// lnrent (lnrent-gc7). Only phoenixd can: its fee-credit refusal (ADR-0019) and its
+    /// index-divergence arm both refuse to book a receipt the node already holds. Every other
+    /// backend books or fails outright, so `AlertKind::SettlementUnbookable` is unreachable there.
+    ///
+    /// The operator views read this so a DISABLED alert sink is only reported as `unavailable` where
+    /// the condition it hides could actually occur — `alerts_enabled` defaults FALSE for `mock`
+    /// (`config.rs`), so gating on that alone made every `lnrent money` on the default backend print
+    /// a warning whose remedy names phoenixd records that do not exist.
+    fn can_leave_settlements_unbookable(&self) -> bool {
+        false
+    }
     /// Idempotent OUTLAY-capped pay for the operator sweep (gate1-operator-sweep, urw.3). Like
     /// [`pay_refund_capped`](Self::pay_refund_capped) it re-awaits an existing `SUCCEEDED`/`PENDING`
     /// operation for `idempotency_key`, but a NEW operation MUST refuse to start if
@@ -464,6 +476,10 @@ pub struct Settlement {
 #[derive(Default)]
 pub struct MockPayment {
     state: Mutex<MockState>,
+    /// Test-only: model a backend that CAN leave a settlement unbookable (phoenixd) without
+    /// standing up phoenixd. Defaults false, matching the real mock's inability to produce the
+    /// condition — which is the behaviour the operator views gate on.
+    unbookable_capable: bool,
 }
 
 #[derive(Default)]
@@ -480,6 +496,13 @@ struct MockState {
 impl MockPayment {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Model a backend that CAN leave an already-paid settlement unbookable, the way phoenixd can.
+    /// Only the operator views read this; nothing in the mock's payment behaviour changes.
+    pub fn unbookable_capable(mut self) -> Self {
+        self.unbookable_capable = true;
+        self
     }
 
     /// Advance the mock's clock (unix secs). `create_invoice` stamps `expires_at = now + expiry`,
@@ -540,6 +563,10 @@ fn settle_mock_invoice(
 
 #[async_trait]
 impl PaymentBackend for MockPayment {
+    fn can_leave_settlements_unbookable(&self) -> bool {
+        self.unbookable_capable
+    }
+
     async fn create_invoice(
         &self,
         amount_sat: u64,

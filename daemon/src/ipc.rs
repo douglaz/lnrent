@@ -673,7 +673,14 @@ pub async fn dispatch_with_alert_visibility(
                         "relays_connected": relays_connected,
                         "listing": listing,
                     });
-                    add_unbookable_settlement_alerts_view(store, clock.now(), alerts_enabled, &mut status).await;
+                    add_unbookable_settlement_alerts_view(
+                        store,
+                        clock.now(),
+                        alerts_enabled,
+                        payment.can_leave_settlements_unbookable(),
+                        &mut status,
+                    )
+                    .await;
                     Reply::ok(status)
                 }
                 (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
@@ -820,6 +827,7 @@ pub async fn dispatch_with_alert_visibility(
                                 store,
                                 clock.now(),
                                 alerts_enabled,
+                                payment.can_leave_settlements_unbookable(),
                                 &mut money,
                             )
                             .await;
@@ -1296,6 +1304,7 @@ async fn add_unbookable_settlement_alerts_view(
     store: &Store,
     now: i64,
     alerts_enabled: bool,
+    backend_can_be_unbookable: bool,
     response: &mut Value,
 ) {
     // This view is DERIVED from delivered DMs, so with the sink disabled there are no rows to read
@@ -1304,7 +1313,11 @@ async fn add_unbookable_settlement_alerts_view(
     // off, and a bare READY over a buyer's unbooked receipt is exactly what this bead exists to
     // prevent. Report unavailable instead — distinct from the storage-failure `_unknown`, because
     // the remedy differs (re-enable alerts vs fix the DB).
-    if !alerts_enabled {
+    // Only warn where the hidden condition could actually arise. `alerts_enabled` defaults FALSE
+    // for `mock` (config.rs), which is the DEFAULT backend and what the image smoke test runs, so
+    // gating on the sink alone made every `lnrent money` there print a red notice whose remedy names
+    // phoenixd records that do not exist.
+    if !alerts_enabled && backend_can_be_unbookable {
         if let Some(obj) = response.as_object_mut() {
             obj.insert(
                 "recent_unbookable_settlement_alerts_disabled".to_string(),
@@ -2833,7 +2846,10 @@ mod tests {
     #[tokio::test]
     async fn a_disabled_alert_sink_reports_the_view_unavailable_rather_than_zero() {
         let store = mem_store();
-        let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
+        // A backend that CAN produce the condition — otherwise there is nothing for a disabled sink
+        // to be hiding, which is the whole point of the second half of this test.
+        let payment: Arc<dyn PaymentBackend> =
+            Arc::new(MockPayment::new().unbookable_capable());
         let recipes = Arc::new(Vec::<Recipe>::new());
         let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(VIEW_NOW));
 
@@ -2862,6 +2878,37 @@ mod tests {
                 "{cmd}: and must NOT answer 0 to a question it cannot see: {data}"
             );
         }
+    }
+
+    // The other half: `alerts_enabled` defaults FALSE for `mock` (config.rs), which is the DEFAULT
+    // backend and the one AGENTS.md's image smoke test runs. Gating the notice on the sink alone
+    // made every `lnrent money` there print a red warning whose remedy names phoenixd records that
+    // do not exist. A backend that cannot produce the condition has nothing to be silent about.
+    #[tokio::test]
+    async fn a_backend_that_cannot_be_unbookable_gets_no_disabled_notice() {
+        let store = mem_store();
+        let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(VIEW_NOW));
+
+        let reply = dispatch_with_alert_visibility(
+            Request::Money,
+            &store,
+            &recipes,
+            &clock,
+            &payment,
+            &RelayStatusCell::new(),
+            &no_listing_relay(),
+            false,
+        )
+        .await;
+        assert!(reply.ok);
+        let data = reply.data.expect("data");
+        assert_eq!(
+            data["recent_unbookable_settlement_alerts_disabled"],
+            Value::Null,
+            "a backend that cannot leave a settlement unbookable must not warn about it: {data}"
+        );
     }
 
     #[tokio::test]

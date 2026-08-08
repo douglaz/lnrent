@@ -283,7 +283,13 @@ refuses orders it cannot service.
        daemon STOPPED, read both databases (read-only — never write them; the daemon is the sole
        writer, ADR-0001):
 
+       **Put every block below in ONE script and run it with `bash`, not pasted line by line.** The
+       header matters as much as the queries:
+
        ```sh
+       #!/usr/bin/env bash
+       set -euo pipefail                  # see "fail closed" below — this is load-bearing
+       export LC_ALL=C                    # sort AND comm must agree on collation; see below
        DD=/path/to/your/data-dir          # the daemon's LNRENT_DATA_DIR
        WORK=$(mktemp -d)                  # query COPIES, never the live files
        for db in lnrent.sqlite phoenixd_index.db; do
@@ -302,6 +308,14 @@ refuses orders it cannot service.
        comm -23 "$WORK/open.txt" "$WORK/indexed.txt" > "$WORK/affected.txt"
        cat "$WORK/affected.txt"                       # the affected set
        ```
+
+       **Fail closed.** Without `pipefail`, `sqlite3 ... | LC_ALL=C sort > file` reports *sort's*
+       exit status — so a query that dies on a corrupt or unreadable database exits 0 and leaves an
+       EMPTY file. Every `comm` check below then prints nothing, and "prints nothing" is exactly
+       what PASSING looks like here. A crashed query would silently qualify a backup, including in
+       step 3(a) where the consequence is paying a refund twice. `set -e` stops the script at the
+       first failure instead; if it stops, fix the failing read before going further — do not
+       interpret the absence of output as a cleared check.
 
        (The state file is `lnrent.sqlite`, not `state.db`.) Every scratch file goes under `$WORK`,
        the `mktemp -d` directory, and never a fixed `/tmp/<name>` path: on a multi-user host another
@@ -404,7 +418,13 @@ refuses orders it cannot service.
        comm -23 "$WORK/pay-now.txt" "$WORK/pay-cand.txt"      # must be EMPTY
        ```
 
-       Sort every file through `LC_ALL=C sort` and select the key ALONE. `comm` requires its inputs
+       Sort every file through `LC_ALL=C sort` and select the key ALONE — and note the
+       `export LC_ALL=C` in step 1, which is what makes `comm` ITSELF compare in that same
+       collation. Pinning only the sorts is not enough: GNU `comm` compares with `strcoll` in the
+       ambient locale, so on a UTF-8 host it would be reading C-ordered input under different rules
+       and could drop a line — here, one that disqualifies a candidate, which is the double pay this
+       step exists to prevent. The keys are not collation-safe data either: they embed the
+       buyer-supplied request id (`order_intake.rs`). `comm` requires its inputs
        in the collation it compares with, which is not sqlite's byte order, and appending `|status`
        makes them disagree on real keys: a gen-0 refund is `refund:<ext>` and a regenerated one
        `refund:<ext>:g<gen>` (`refund.rs:217-219`), and `|` (0x7C) sorts after `:` (0x3A). Unsorted
@@ -461,7 +481,10 @@ refuses orders it cannot service.
        reverse-proxy sub-path deployments are supported, and a hardcoded `127.0.0.1` would quietly
        check an unrelated node.
 
-       They must match. If they do not, STOP and do not restore: phoenixd has been re-seeded onto a
+       If the sqlite side prints NOTHING, lnrent has never paid out from this wallet (no refunds,
+       no sweeps — ordinary for an early-life operator). There is no recorded identity to contradict,
+       so the check is vacuous: continue to step 4. Otherwise they must match. If they do not, STOP
+       and do not restore: phoenixd has been re-seeded onto a
        different wallet and its payment history no longer describes your money, so no lnrent-side
        rollback can fix it. Go to step 7.
     4. **Inventory the provider resources.** Teardown is driven from the persisted subscription and
@@ -528,7 +551,8 @@ refuses orders it cannot service.
   (`alerts.rs`, derived as twice the alert cooldown — read it there rather than trusting a figure
   copied here)
   (subject, remedy, timestamp) — not live backend state. A repaired incident stays listed until the
-  window expires, and disabling the alert sink stops new entries without hiding written ones. The
+  window expires, and disabling the alert sink makes this view report UNAVAILABLE rather than a count — it is derived
+  from delivered DMs, so with the sink off it cannot see the condition and will not guess. The
   number counts distinct *conditions*, not receipts. If the history cannot be read, both commands
   report it as unknown rather than zero; fix the reported storage error and retry.
 

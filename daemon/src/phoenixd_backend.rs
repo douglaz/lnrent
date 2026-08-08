@@ -1967,6 +1967,9 @@ impl PaymentBackend for PhoenixdPayment {
         Ok(Some(sat_to_msat_u64(balance.balance_sat)))
     }
 
+    fn can_leave_settlements_unbookable(&self) -> bool {
+        true
+    }
     fn failed_refund_can_reuse_invoice(&self) -> bool {
         // TRUE, unlike lnv2. lnv2's `send` derives a deterministic attempt-0 operation from the
         // invoice, so once that reaches a terminal the SAME bolt11 can never be re-sent. phoenixd has
