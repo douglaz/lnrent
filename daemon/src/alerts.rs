@@ -7,11 +7,10 @@
 //! sinks). Each alert is additive to the existing `tracing` log line at its call site.
 //!
 //! Design points that are load-bearing:
-//! - [`AlertKind`] is a CLOSED enum. New kinds are added only by the owning bead, listed here in
-//!   DECLARATION order so this list and the enum below cannot drift apart: PR-6 `TeardownFailed`,
-//!   PR-9c `RelayBlackout`, PR-16 `HoldingsLow`, PR-21 `PaidServiceDestroyed`,
-//!   gate1-operator-sweep (urw.3) `SweepFailed`, lnrent-7di `SweepStuck`, lnrent-gc7
-//!   `SettlementUnbookable`. There is deliberately no `BalanceQueryFailed` for the FEDIMINT read
+//! - [`AlertKind`] is a CLOSED enum and is its own source of truth — read it for the current set,
+//!   which each owning bead extends. (A prose copy of the variants lived here and is deliberately
+//!   gone: it claimed the two "cannot drift apart", which nothing enforced.)
+//!   There is deliberately no `BalanceQueryFailed` for the FEDIMINT read
 //!   that name was coined for: the ledger-authoritative revision (ADR-0016) retired it, so that
 //!   one cannot fail. It is NOT a claim about phoenixd, which reads `getbalance` on every
 //!   settlement observation (`spendable_credit_msat`); a getbalance-only outage is deliberately

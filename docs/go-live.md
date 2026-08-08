@@ -284,15 +284,28 @@ refuses orders it cannot service.
 
        ```sh
        DD=/path/to/your/data-dir          # the daemon's LNRENT_DATA_DIR
-       sqlite3 "file:$DD/lnrent.sqlite?mode=ro" \
+       WORK=$(mktemp -d)                  # query COPIES, never the live files
+       for db in lnrent.sqlite phoenixd_index.db; do
+         cp "$DD/$db" "$WORK/"
+         cp "$DD/$db-wal" "$WORK/" 2>/dev/null    # may not exist; that is fine
+         cp "$DD/$db-shm" "$WORK/" 2>/dev/null
+       done
+       sqlite3 "$WORK/lnrent.sqlite" \
          "SELECT id FROM invoice WHERE status='OPEN' ORDER BY id;" > /tmp/open.txt
-       sqlite3 "file:$DD/phoenixd_index.db?mode=ro" \
+       sqlite3 "$WORK/phoenixd_index.db" \
          "SELECT invoice_id FROM phoenixd_invoice ORDER BY invoice_id;" > /tmp/indexed.txt
-       comm -23 /tmp/open.txt /tmp/indexed.txt      # the affected set
+       comm -23 /tmp/open.txt /tmp/indexed.txt > /tmp/affected.txt
+       cat /tmp/affected.txt                       # the affected set
        ```
 
-       (The state file is `lnrent.sqlite`, not `state.db`.) Every candidate backup must be checked
-       the same way — see step 2 for what qualifying means.
+       (The state file is `lnrent.sqlite`, not `state.db`.) Copy first, and query the copy WITHOUT
+       `mode=ro`: if the daemon did not exit cleanly the databases have a hot WAL, and a read-only
+       connection cannot replay it — the query fails outright, mid-incident. Recovering the WAL is a
+       write, which must never touch the live files (the daemon is the sole writer, ADR-0001), so it
+       happens on the copy. Bring `-wal` and `-shm` along or the copy loses the committed tail.
+
+       `/tmp/affected.txt` is the set the rest of this procedure is about. Every candidate backup is
+       judged against it — see step 2.
 
        **An ENCRYPTED backup dir holds only `backup.age` and `MANIFEST.json`**, so there is nothing
        to query until you decrypt one. Extract ONLY the two databases, into RAM:
@@ -320,9 +333,15 @@ refuses orders it cannot service.
          "SELECT invoice_id FROM phoenixd_invoice ORDER BY invoice_id;" > /tmp/cand-indexed.txt
        sqlite3 "file:$CAND/lnrent.sqlite?mode=ro" \
          "SELECT id FROM invoice ORDER BY id;" > /tmp/cand-invoices.txt
-       comm -23 /tmp/open.txt /tmp/cand-indexed.txt     # must be EMPTY
-       comm -23 /tmp/open.txt /tmp/cand-invoices.txt    # must ALSO be EMPTY
+       comm -23 /tmp/affected.txt /tmp/cand-indexed.txt     # must be EMPTY
+       comm -23 /tmp/affected.txt /tmp/cand-invoices.txt    # must ALSO be EMPTY
        ```
+
+       Both compare against `/tmp/affected.txt`, NOT the full OPEN list. Only the affected invoices
+       need their rows back; every other open order is either already correlated or newer than the
+       backup, and demanding those too makes the test unpassable by construction — one order placed
+       after the divergence would disqualify every backup ever taken, including the one that fixes
+       the incident.
 
        The second check is not redundant. `create_invoice` commits the index row and `order_intake`
        commits the invoice and subscription in a *separate* transaction, so a backup taken between
@@ -351,7 +370,7 @@ refuses orders it cannot service.
        ```
 
        If that is non-empty the backup is NOT usable — there is no supported way to re-establish
-       the witness. Treat it exactly as "no backup qualifies" (step 6).
+       the witness. Treat it exactly as "no backup qualifies" (step 7).
 
        **(b) It predates a paid subscription.** Step 1's enumeration is `status='OPEN'` and so is
        structurally blind to this: a captured, provisioned subscription has a settled invoice, and

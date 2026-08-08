@@ -10,7 +10,9 @@ through this line.
 **Phase:** HARDEN · **Bead:** lnrent-gc7 · **Branch:** feat/gc7-settlement-unbookable-alert
 **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'`
-· last green on the tree this commit records (EXIT=0, 884 tests, 0 failed).
+· last green on the tree this commit records (EXIT=0). No test COUNT here: it is derivable, it
+rots on the next test added, and two stale copies in this file already disagreed (AGENTS.md
+"do not hand-maintain a count the repo can derive").
 NB deliberately no SHA: writing one changes the commit it would name, so a self-referential
 gate record is always stale by construction — an earlier revision said `HEAD` and drifted four
 commits, and naming the SHA then went stale on the very next `--amend`.
@@ -26,7 +28,7 @@ lnrent-gc7 BUILD closed, entering HARDEN.
 BUILD did NOT end on rb-lite converging — I stopped it at round 9 under Guard 2. Evidence
 that closes the phase instead:
 - gate `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'`
-  → EXIT=0, 883 tests, 0 failed, run unpiped with the exit code captured.
+  → EXIT=0, run unpiped with the exit code captured.
 - break-tests, both directions: disabling the alert sink fails 11 tests; making the two
   reasons indistinguishable fails the suite (EXIT=101). Restored byte-identical each time.
 
