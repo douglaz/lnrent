@@ -691,4 +691,73 @@ mod tests {
             .unwrap();
         assert_eq!(alert_rows(&store).await, 2, "both long-subject alerts enqueue");
     }
+
+    /// Seed one raw outbox row under an `outbox:alert:settlement_unbookable:*` id and read the
+    /// history back. Bypasses `terminal_alert_row` deliberately: these arms exist for rows the
+    /// dispatcher would never write, so building them through it could not reach the branch.
+    async fn read_back_a_raw_alert_row(payload: &str) -> anyhow::Result<RecentAlerts> {
+        let store = mem_store();
+        let payload = payload.to_string();
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO outbox
+                        (id, recipient, subscription_id, msg_type, payload_json, state, attempts,
+                         created_at)
+                     VALUES ('outbox:alert:settlement_unbookable:s:1000', 'npub', NULL,
+                             'operator.alert', ?1, 'PENDING', 0, 1000)",
+                    rusqlite::params![payload],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        recent_alerts(&store, AlertKind::SettlementUnbookable, 0).await
+    }
+
+    // Both arms refuse rather than skip, because skipping is indistinguishable from a healthy empty
+    // history: the operator surface renders `total = 0` as "nothing is wrong", and an unreadable
+    // history saying that is the single failure this whole alert path exists to prevent. Neither arm
+    // is reachable through the dispatcher, so without these two tests deleting either `return Err`
+    // in favour of a `continue` leaves the suite green and silently under-counts live incidents.
+
+    #[tokio::test]
+    async fn a_non_alert_payload_under_an_alert_id_refuses_rather_than_under_counts() {
+        // Valid `Msg`, wrong variant — so it clears `from_str` and lands on the `else` arm.
+        let payload = serde_json::to_string(&Msg::SubCancel(lnrent_wire::SubCancel {
+            subscription_id: "sub-1".into(),
+        }))
+        .unwrap();
+
+        // `match`, not `expect_err`: the Ok type is deliberately not `Debug`.
+        let err = match read_back_a_raw_alert_row(&payload).await {
+            Ok(_) => panic!("a non-alert payload under an alert id must not read as a history"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("does not carry an operator.alert payload"),
+            "and must say which corruption it refused on: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kind_mismatch_under_an_alert_id_refuses_rather_than_under_counts() {
+        // A real, well-formed alert — just filed under another kind's id.
+        let payload = serde_json::to_string(&Msg::OperatorAlert(lnrent_wire::OperatorAlert {
+            kind: AlertKind::RefundParked.wire_str().to_string(),
+            subject: "s".into(),
+            detail: "d".into(),
+        }))
+        .unwrap();
+
+        let err = match read_back_a_raw_alert_row(&payload).await {
+            Ok(_) => panic!("a kind mismatch under an alert id must not read as a history"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("settlement_unbookable") && msg.contains("refund_parked"),
+            "and must name both the expected and the found kind: {msg}"
+        );
+    }
 }
