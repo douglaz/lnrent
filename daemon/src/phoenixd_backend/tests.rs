@@ -2718,6 +2718,32 @@ async fn a_fee_credit_refusal_alerts_the_operator_with_its_reason_and_remedy() {
     );
 }
 
+// A `getbalance` outage is EXCLUDED from this alert on purpose: the remedy for a node that will not
+// answer is not "fund the wallet", and the exclusion is by typed downcast so the decision can never
+// drift with an error string. Untested, it is a comment: rewriting the arm to alert on any
+// `spendable_credit_msat` error keeps the suite green. The cost is not just a wrong DM — the subject
+// is the shared `fee_credit` constant, so one mislabeled outage alert takes that subject's cooldown
+// and SUPPRESSES the next genuine refusal, turning a reporting bug into the silence this bead exists
+// to end.
+#[tokio::test]
+async fn a_getbalance_outage_does_not_masquerade_as_a_fee_credit_refusal() {
+    let ops = FakePhoenixdOps::new();
+    let clock = Arc::new(TestClock::new(measured_receive_settled_at()));
+    let (be, store) = backend_with_alerts(ops.clone(), clock.clone());
+    let inv = arrange_fee_credit_refusal(&be, &ops).await;
+    // Same settlement, same instant — the ONLY change is that the balance read now fails.
+    ops.fail_balance_with_status(503);
+
+    be.received_amount_msat(&inv.id)
+        .await
+        .expect_err("an unanswered getbalance still fails closed");
+
+    assert!(
+        operator_alerts(&store).await.is_empty(),
+        "a node outage must not DM the fee-credit remedy, nor burn that subject's cooldown"
+    );
+}
+
 // The threshold is measured from a row in the index. If that row cannot be WRITTEN, the age is
 // unmeasurable — and an unmeasurable age must not be read as "too fresh to mention". This is the
 // bead's own failure mode wearing a different hat: a read-only or corrupt index DB would otherwise
