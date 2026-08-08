@@ -3,44 +3,34 @@
 **Scope:** rb-lite-drainable operability/money-path beads ONLY — `gc7`, `yg0`, `7fx`, `4kg`,
 `3zt`, `799`, `x1u`, `epj`, `xr7`, `02t`, `yxg`. Explicitly OUT of scope: `nfj` (stop-list —
 cluster deploy + real sats), the live-verification beads (`cnf`, `rwv`, `kr1`, `u43`, `tof`,
-`e96`), upstream fedimint (`y32`, `7y1`, both legitimately in_progress), `ea1` (release),
-`5h4` (product design), `xov` (user deferred). `br ready` counts the whole repo — filter it
-through this line.
+`e96`), upstream fedimint (`y32`, `7y1`), `ea1` (release), `5h4` (product design), `xov` (user
+deferred). `br ready` counts the whole repo — filter it through this line.
 
 **Phase:** HARDEN · **Bead:** lnrent-gc7 · **Branch:** feat/gc7-settlement-unbookable-alert
 **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'`
-· last green on the tree this commit records (EXIT=0). No test COUNT here: it is derivable, it
-rots on the next test added, and two stale copies in this file already disagreed (AGENTS.md
-"do not hand-maintain a count the repo can derive").
-NB deliberately no SHA: writing one changes the commit it would name, so a self-referential
-gate record is always stale by construction — an earlier revision said `HEAD` and drifted four
-commits, and naming the SHA then went stale on the very next `--amend`.
+· last green on the tree this commit records (EXIT=0). Deliberately no SHA and no test count:
+each names something that the act of writing it changes or dates, and both drifted when this
+file carried them.
 
 ## Done (this session)
 - lnrent-m7g nix packages + container image — merged #80
-- lnrent-ole record the measured phoenixd completedAt shape — merged #81 (scope REDUCED;
-  the terminal-FAILED resolution was cut after 11 P1 double-pay findings)
+- lnrent-ole record the measured phoenixd `completedAt` shape — merged #81 (scope REDUCED: the
+  terminal-FAILED resolution was cut after 11 P1 double-pay findings)
 
 ## Now
-lnrent-gc7 BUILD closed, entering HARDEN.
+lnrent-gc7 — the `SettlementUnbookable` operator alert, plus the index-divergence repair runbook
+in `docs/go-live.md`. The code converged early; the review passes since have been almost entirely
+about the runbook, which AGENTS.md makes product surface — a stranger operator follows it
+mid-incident, so a command that cannot run as written is a defect, not a typo.
 
-BUILD did NOT end on rb-lite converging — I stopped it at round 9 under Guard 2. Evidence
-that closes the phase instead:
-- gate `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'`
-  → EXIT=0, run unpiped with the exit code captured.
-- break-tests, both directions: disabling the alert sink fails 11 tests; making the two
-  reasons indistinguishable fails the suite (EXIT=101). Restored byte-identical each time.
-
-Budget post-mortem (skills#31): my ~250 LOC figure was wrong, not the implementation — 545
-of ~1470 added lines are a test file, for a bead with five acceptance criteria. The genuine
-overrun was two docs files outside the file-lock, reverted. My first cut-back removed an
-acceptance criterion (the reason+remedy detail in money/status) and broke the build; both
-reverted at 3f1fd5b.
+Follow-ups filed rather than folded in: `lnrent-bdkh` (a deferred refusal lost across a restart
+window), `lnrent-kwr` (12-hour view window), `lnrent-yjtd` (getbalance-only outage),
+`lnrent-8scw` (no repair tooling for a lost index), `lnrent-ie4p`.
 
 ## Next
-Panel on this branch, then LAND. Then re-assess the scoped set — `yg0` is the natural pair,
-it also touches the alert surface and needs a `refund_attempt.last_error` migration.
+Panel to CLEAN on one tree, then LAND. Then `yg0` — it also touches the alert surface and needs a
+`refund_attempt.last_error` migration.
 
 ## Open questions for the human
 - `lnrent-nfj` is the sole P1 and the only gate on the nightly-run epic, but needs a cluster

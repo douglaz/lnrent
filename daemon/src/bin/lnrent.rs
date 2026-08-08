@@ -981,6 +981,57 @@ mod tests {
         assert!(!rendered.contains("Unbookable settlements: 0"), "{rendered}");
     }
 
+    // `ready` means only that reserves cover the open REFUND liability, so it can be true while a
+    // paid receipt sits unbooked — the unfunded-wallet first sale is exactly that case. A bare
+    // READY printed under the unbookable block reads as an all-clear over a buyer's money, so the
+    // human line is qualified. Nothing else in the suite asserts the Status line here: the two
+    // tests above render with `ready: true` and alerts present but check only the alert rows, so
+    // reverting the qualification to a bare "READY" left everything green.
+    #[test]
+    fn money_human_does_not_print_a_bare_ready_over_an_unbookable_settlement() {
+        let base = |extra: serde_json::Value| {
+            let mut v = json!({
+                "expected_msat": 0,
+                "gross_liability_sat": 0,
+                "required_msat": 0,
+                "parked_count": 0,
+                "ready": true,
+                "degraded_read_only": false,
+            });
+            let (obj, extra) = (v.as_object_mut().unwrap(), extra);
+            for (k, val) in extra.as_object().unwrap() {
+                obj.insert(k.clone(), val.clone());
+            }
+            v
+        };
+
+        // Both paths into the block: a counted condition, and an unreadable history.
+        for (label, payload) in [
+            ("counted", base(json!({ "recent_unbookable_settlement_alerts": 1 }))),
+            (
+                "unknown",
+                base(json!({ "recent_unbookable_settlement_alerts_unknown": true })),
+            ),
+        ] {
+            let rendered = money_human_text(&payload);
+            assert!(
+                rendered.contains("READY (refund liability only)"),
+                "{label}: READY must be qualified when a settlement may be unbooked: {rendered}"
+            );
+            assert!(
+                rendered.contains("this line does not cover them"),
+                "{label}: and must say what it does not cover: {rendered}"
+            );
+        }
+
+        // The control: with nothing unbookable, the plain READY is still what prints.
+        let clean = money_human_text(&base(json!({ "recent_unbookable_settlement_alerts": 0 })));
+        assert!(
+            clean.contains("Status: \u{1b}[1mREADY\u{1b}[0m"),
+            "an all-clear stays an all-clear when nothing is held back: {clean}"
+        );
+    }
+
     #[test]
     fn money_human_fedimint_wording_is_unchanged() {
         let rendered = money_human_text(&json!({

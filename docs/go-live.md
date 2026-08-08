@@ -291,28 +291,38 @@ refuses orders it cannot service.
          cp "$DD/$db-shm" "$WORK/" 2>/dev/null
        done
        sqlite3 "$WORK/lnrent.sqlite" \
-         "SELECT id FROM invoice WHERE status='OPEN' ORDER BY id;" > /tmp/open.txt
+         "SELECT id FROM invoice WHERE status='OPEN';" | LC_ALL=C sort > /tmp/open.txt
        sqlite3 "$WORK/phoenixd_index.db" \
-         "SELECT invoice_id FROM phoenixd_invoice ORDER BY invoice_id;" > /tmp/indexed.txt
+         "SELECT invoice_id FROM phoenixd_invoice;" | LC_ALL=C sort > /tmp/indexed.txt
        comm -23 /tmp/open.txt /tmp/indexed.txt > /tmp/affected.txt
        cat /tmp/affected.txt                       # the affected set
        ```
 
        (The state file is `lnrent.sqlite`, not `state.db`.) Copy first, and query the copy WITHOUT
-       `mode=ro`: if the daemon did not exit cleanly the databases have a hot WAL, and a read-only
-       connection cannot replay it — the query fails outright, mid-incident. Recovering the WAL is a
-       write, which must never touch the live files (the daemon is the sole writer, ADR-0001), so it
-       happens on the copy. Bring `-wal` and `-shm` along or the copy loses the committed tail.
+       `mode=ro`. If the daemon did not exit cleanly the databases have a hot WAL, and replaying it
+       needs to create a `-shm` file: that works when you own the data dir, and **fails to open the
+       database at all when you do not** — the daemon's service account owns it and you are querying
+       as yourself, or it is a read-only snapshot. Recovering a WAL is a write and must never touch
+       the live files anyway (the daemon is the sole writer, ADR-0001), so it happens on the copy.
+       Bring `-wal` and `-shm` along or the copy loses the committed tail.
 
        `/tmp/affected.txt` is the set the rest of this procedure is about. Every candidate backup is
        judged against it — see step 2.
 
-       **An ENCRYPTED backup dir holds only `backup.age` and `MANIFEST.json`**, so there is nothing
-       to query until you decrypt one. Extract ONLY the two databases, into RAM:
+       Point `CAND` at the candidate you are judging. A default `lnrentd backup --dest` is PLAINTEXT
+       (`backup.rs:175-178`), and its directory already holds both databases:
+
+       ```sh
+       CAND=/path/to/candidate-backup-dir
+       ```
+
+       **An ENCRYPTED backup dir instead holds only `backup.age` and `MANIFEST.json`**, so there is
+       nothing to query until you decrypt one. Then override `CAND`, extracting ONLY the two
+       databases, into RAM:
 
        ```sh
        CAND=$(mktemp -d -p /dev/shm lnrent-cand-XXXXXX)   # tmpfs, 0700, unique name
-       age -d backup.age | tar -x -C "$CAND" lnrent.sqlite phoenixd_index.db
+       age -d "$BACKUP/backup.age" | tar -x -C "$CAND" lnrent.sqlite phoenixd_index.db
        ```
 
        `age` prompts for the same passphrase you would pass `--passphrase-file`; these backups are
@@ -330,9 +340,9 @@ refuses orders it cannot service.
 
        ```sh
        sqlite3 "file:$CAND/phoenixd_index.db?mode=ro" \
-         "SELECT invoice_id FROM phoenixd_invoice ORDER BY invoice_id;" > /tmp/cand-indexed.txt
+         "SELECT invoice_id FROM phoenixd_invoice;" | LC_ALL=C sort > /tmp/cand-indexed.txt
        sqlite3 "file:$CAND/lnrent.sqlite?mode=ro" \
-         "SELECT id FROM invoice ORDER BY id;" > /tmp/cand-invoices.txt
+         "SELECT id FROM invoice;" | LC_ALL=C sort > /tmp/cand-invoices.txt
        comm -23 /tmp/affected.txt /tmp/cand-indexed.txt     # must be EMPTY
        comm -23 /tmp/affected.txt /tmp/cand-invoices.txt    # must ALSO be EMPTY
        ```
@@ -360,14 +370,21 @@ refuses orders it cannot service.
        bolt11, and **pay it again**.
 
        ```sh
-       sqlite3 "file:$DD/phoenixd_index.db?mode=ro" \
-         "SELECT idempotency_key, status FROM phoenixd_pay ORDER BY idempotency_key;" \
-         > /tmp/pay-now.txt
-       sqlite3 "file:$CAND/phoenixd_index.db?mode=ro" \
-         "SELECT idempotency_key, status FROM phoenixd_pay ORDER BY idempotency_key;" \
-         > /tmp/pay-cand.txt
+       sqlite3 "$WORK/phoenixd_index.db" "SELECT idempotency_key FROM phoenixd_pay;" \
+         | LC_ALL=C sort > /tmp/pay-now.txt
+       sqlite3 "file:$CAND/phoenixd_index.db?mode=ro" "SELECT idempotency_key FROM phoenixd_pay;" \
+         | LC_ALL=C sort > /tmp/pay-cand.txt
        comm -23 /tmp/pay-now.txt /tmp/pay-cand.txt      # must be EMPTY
        ```
+
+       Sort every file through `LC_ALL=C sort` and select the key ALONE. `comm` requires its inputs
+       in the collation it compares with, which is not sqlite's byte order, and appending `|status`
+       makes them disagree on real keys: a gen-0 refund is `refund:<ext>` and a regenerated one
+       `refund:<ext>:g<gen>` (`refund.rs:217-219`), and `|` (0x7C) sorts after `:` (0x3A). Unsorted
+       input makes `comm` warn and print lines that are present in BOTH files — a false
+       disqualification. That direction is safe for money (it pushes you to step 7 rather than into
+       a double pay), but a check that spews warnings and wrong output in the step guarding against
+       paying twice is useless exactly when it matters.
 
        If that is non-empty the backup is NOT usable — there is no supported way to re-establish
        the witness. Treat it exactly as "no backup qualifies" (step 7).
@@ -379,14 +396,14 @@ refuses orders it cannot service.
        keeps billing.
 
        ```sh
-       sqlite3 "file:$DD/lnrent.sqlite?mode=ro" \
-         "SELECT id, subscription_id FROM invoice
-            WHERE status='PAID' OR settled_at IS NOT NULL ORDER BY id;" \
-         > /tmp/paid-now.txt
+       Q="SELECT id FROM invoice WHERE status='PAID' OR settled_at IS NOT NULL;"
+       sqlite3 "$WORK/lnrent.sqlite" "$Q"                      | LC_ALL=C sort > /tmp/paid-now.txt
+       sqlite3 "file:$CAND/lnrent.sqlite?mode=ro" "$Q"         | LC_ALL=C sort > /tmp/paid-cand.txt
+       comm -23 /tmp/paid-now.txt /tmp/paid-cand.txt           # must be EMPTY
        ```
 
-       Compare against the candidate's copy the same way. A backup missing any of these is better
-       treated as disqualified: the orphaned VM is the *cheaper* loss, and honouring or refunding a
+       Any id printed there is a settled invoice the candidate does not have. A backup missing one
+       is better treated as disqualified: the orphaned VM is the *cheaper* loss, and honouring or refunding a
        term whose records you just deleted is the expensive one.
     4. **Inventory the provider resources.** Teardown is driven from the persisted subscription and
        its `instance.handles_json`; rolling the data dir back to an instant before a provision
@@ -394,7 +411,7 @@ refuses orders it cannot service.
        indefinitely**. With the daemon still stopped, record what exists now:
 
        ```sh
-       sqlite3 "file:$DD/lnrent.sqlite?mode=ro" \
+       sqlite3 "$WORK/lnrent.sqlite" \
          "SELECT subscription_id, kind, handles_json FROM instance WHERE state <> 'DESTROYED';" \
          > /tmp/instances-before.txt
        ```
@@ -421,10 +438,20 @@ refuses orders it cannot service.
        disagrees, so a mismatch here means the money path will fail closed rather than misfire:
 
        ```sh
-       curl -sS -u ":$PHOENIXD_PASSWORD" http://127.0.0.1:9740/getinfo | jq -r .nodeId
-       sqlite3 "file:$DD/phoenixd_index.db?mode=ro" \
+       # Same inputs lnrentd reads; use your config file's values if you set them there.
+       printf 'user = ":%s"\n' "$LNRENT_PHOENIXD_API_PASSWORD" \
+         | curl -sS --config - "${LNRENT_PHOENIXD_URL%/}/getinfo" | jq -r .nodeId
+       sqlite3 "$WORK/phoenixd_index.db" \
          "SELECT DISTINCT node_id FROM phoenixd_pay WHERE node_id IS NOT NULL;"
        ```
+
+       The password reaches curl through `--config` on stdin, never `-u`: an argument is readable in
+       `/proc` and `ps` by any local user for the life of the call, and that credential authorizes
+       wallet operations. It is the same reason `lnrentd` ships no password flag at all
+       (`main.rs:83-86`); `printf` is a shell builtin, so it forks nothing that could expose it
+       either. Use `$LNRENT_PHOENIXD_URL` rather than a loopback literal — remote-HTTPS and
+       reverse-proxy sub-path deployments are supported, and a hardcoded `127.0.0.1` would quietly
+       check an unrelated node.
 
        They must match. If they do not, stop: phoenixd has been re-seeded onto a different wallet
        and its payment history no longer describes your money — restoring lnrent cannot fix that.
