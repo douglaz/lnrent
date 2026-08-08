@@ -276,7 +276,9 @@ refuses orders it cannot service.
   With no such backup, do not restore at all; reconcile by hand instead. Then verify phoenixd still points at the original wallet/payment history, and restart. An
   index divergence DMs a `SettlementUnbookable` alert when lnrent detects it; a fee-credit refusal
   DMs after it has stood for 15 minutes from lnrent's first local observation — that delay is there
-  because lnrent normally books the receipt itself on a retry seconds later, so it lapses when the
+  because lnrent MAY book the receipt itself on a later retry — it clears only when the wallet's
+  spendable balance rises above the receipt, so a retry alone books nothing until you fund it — and
+  it lapses when the
   settlement poll is about to retire the invoice — a delay that outlived the last observer would be
   permanent silence, not a delay. Funding the wallet books these automatically: a fee-credit refusal
   only exists while phoenixd calls the invoice PAID, and reconcile will not expire a backend-Paid

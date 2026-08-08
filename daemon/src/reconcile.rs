@@ -1183,6 +1183,18 @@ impl Reconciler {
         }
         // A renewal paid at the backend but not yet captured will extend paid_through and move this
         // deadline — don't suspend a timely-paid sub out from under the pending capture (codex P1).
+        //
+        // This is ALSO what holds a settlement lnrent cannot BOOK, and lnrent-gc7's open question
+        // (comment 82: alert-only, or hold the suspend?) is answered here rather than left to a new
+        // coupling: the HOLD already exists. A phoenixd fee-credit refusal (ADR-0019) lives in
+        // `received_amount_msat`/`spendable_credit_msat`, NOT in `lookup` — which still reports the
+        // invoice `Paid` — so `renewal_settlement_pending` sees Paid and defers, indefinitely, for
+        // as long as the wallet stays unfunded. The cascade gc7's comment 79 feared (refused renewal
+        // -> paid_through frozen -> fire_suspend -> destroy) therefore cannot run: a buyer who paid
+        // is not suspended, and the alert's threshold does not race `effective_suspend_at` because
+        // that deadline never fires while the settlement is outstanding. The alert is what gets the
+        // wallet funded; this is what protects the buyer meanwhile. Verified by
+        // `a_fee_credit_refused_renewal_never_suspends_the_buyer_who_paid`.
         if self.renewal_settlement_pending(sub_id).await? {
             return Ok(false);
         }
@@ -1722,6 +1734,16 @@ mod tests {
 
     /// A reconciler over a caller-owned `MockPayment` (so a test can settle invoices mid-hook) with
     /// an ENABLED alert sink to `recipient`.
+    /// A reconciler over a caller-owned `MockPayment` (so a test can settle an invoice and have
+    /// `lookup` report it Paid) without an alert sink.
+    fn reconciler_with_payment(
+        store: Store,
+        payment: Arc<crate::backends::MockPayment>,
+        recipe: Recipe,
+    ) -> Reconciler {
+        Reconciler::new(store, payment, recipe)
+    }
+
     fn reconciler_with_payment_and_alerts(
         store: Store,
         payment: Arc<crate::backends::MockPayment>,
@@ -2193,6 +2215,62 @@ mod tests {
         // Cursor advanced to paid_through; the sub is still ACTIVE (paid_through is NOT extended).
         assert_eq!(sub_next_deadline(&store, "s1").await, Some(1000));
         assert_eq!(sub_state(&store, "s1").await, "ACTIVE");
+    }
+
+    // lnrent-gc7 comment 79 named a cascade: a renewal settlement lnrent REFUSES to book (phoenixd
+    // fee credit, ADR-0019) never reaches capture, so `paid_through` never advances, and
+    // `fire_suspend` then suspends — and after retention destroys — a Buyer who PAID. Comment 82
+    // asked whether reconcile should HOLD the suspend for that case, or whether the alert alone is
+    // the remedy.
+    //
+    // Neither, because the premise is false and this test is what says so. The refusal lives in
+    // `received_amount_msat`/`spendable_credit_msat`; `lookup` still reports the invoice PAID. So
+    // `renewal_settlement_pending` sees Paid and `fire_suspend` defers — the HOLD already exists,
+    // for as long as the wallet stays unfunded. The alert gets the wallet funded; this keeps the
+    // buyer's service up meanwhile, and the alert threshold therefore does not race
+    // `effective_suspend_at` at all.
+    //
+    // Modelled with the mock exactly as the real case presents to reconcile: an OPEN renewal invoice
+    // that the backend reports Paid and that nothing has captured.
+    #[tokio::test]
+    async fn a_fee_credit_refused_renewal_never_suspends_the_buyer_who_paid() {
+        let store = mem_store();
+        let (recipe, suspend_marker, _destroy_marker) = marker_recipe();
+        let payment = Arc::new(crate::backends::MockPayment::new());
+        let inv = payment
+            .create_invoice(100, "lnrent renewal s1", 100, "renewal:s1")
+            .await
+            .unwrap();
+        // Paid at the backend. lnrent cannot BOOK it (fee credit) so capture never runs and the
+        // local row stays OPEN — which is precisely the state reconcile must not suspend through.
+        payment.settle("renewal:s1", 900).unwrap();
+        seed_sub(&store, "s1", "ACTIVE", "buyerhex", Some(1000), 500, Some(1000)).await;
+        seed_invoice(
+            &store,
+            // `renewal_settlement_pending` looks the invoice up by its LOCAL id, so the row's id
+            // must be the one the backend knows — otherwise the test would pass by never finding it.
+            &inv.id,
+            "s1",
+            "renewal:s1",
+            "renewal",
+            "OPEN",
+            Some(inv.expires_at),
+        )
+        .await;
+        let r = reconciler_with_payment(store.clone(), payment, recipe);
+
+        let rep = r.reconcile_tick(1000).await.unwrap();
+
+        assert_eq!(rep.suspended, 0, "a buyer who PAID must not be suspended");
+        assert_eq!(
+            sub_state(&store, "s1").await,
+            "ACTIVE",
+            "the sub stays ACTIVE while its paid-but-unbookable renewal is outstanding"
+        );
+        assert!(
+            !suspend_marker.exists(),
+            "and the suspend hook must not have run"
+        );
     }
 
     // Test 1c: an ACTIVE sub past paid_through -> SUSPENDED, the suspend hook ran, a billing.notice
