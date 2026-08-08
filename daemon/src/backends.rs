@@ -134,16 +134,21 @@ pub trait PaymentBackend: Send + Sync {
     fn failed_refund_can_reuse_invoice(&self) -> bool {
         true
     }
-    /// Whether this backend can leave a settlement it has ALREADY observed as paid unbookable by
-    /// lnrent (lnrent-gc7). Only phoenixd can: its fee-credit refusal (ADR-0019) and its
-    /// index-divergence arm both refuse to book a receipt the node already holds. Every other
-    /// backend books or fails outright, so `AlertKind::SettlementUnbookable` is unreachable there.
+    /// Whether this backend's unbookable-settlement condition is WIRED to
+    /// `AlertKind::SettlementUnbookable` (lnrent-gc7) — deliberately not "can this backend leave a
+    /// settlement unbookable", which is a different and larger question.
     ///
-    /// The operator views read this so a DISABLED alert sink is only reported as `unavailable` where
-    /// the condition it hides could actually occur — `alerts_enabled` defaults FALSE for `mock`
-    /// (`config.rs`), so gating on that alone made every `lnrent money` on the default backend print
-    /// a warning whose remedy names phoenixd records that do not exist.
-    fn can_leave_settlements_unbookable(&self) -> bool {
+    /// phoenixd is wired: its fee-credit refusal (ADR-0019) and its index-divergence arm both
+    /// alert. lnv2 is NOT, and can still reach the condition — `PAID_UNRECOVERED`
+    /// (`lnv2_backend.rs`) is a Lightning payment the federation confirmed whose ecash minting
+    /// failed, returned as an error so callers defer forever while it surfaces only to logs. That
+    /// gap is lnrent-3p71; until it closes, saying "only phoenixd can be unbookable" would be false.
+    ///
+    /// The operator views read this so a DISABLED alert sink is reported as `unavailable` only
+    /// where the sink was actually hiding something. `alerts_enabled` defaults FALSE for `mock`
+    /// (`config.rs`), so gating on the sink alone made every `lnrent money` on the default backend
+    /// print a warning whose remedy names phoenixd records that do not exist.
+    fn reports_unbookable_settlements(&self) -> bool {
         false
     }
     /// Idempotent OUTLAY-capped pay for the operator sweep (gate1-operator-sweep, urw.3). Like
@@ -563,7 +568,7 @@ fn settle_mock_invoice(
 
 #[async_trait]
 impl PaymentBackend for MockPayment {
-    fn can_leave_settlements_unbookable(&self) -> bool {
+    fn reports_unbookable_settlements(&self) -> bool {
         self.unbookable_capable
     }
 

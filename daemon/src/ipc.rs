@@ -677,7 +677,7 @@ pub async fn dispatch_with_alert_visibility(
                         store,
                         clock.now(),
                         alerts_enabled,
-                        payment.can_leave_settlements_unbookable(),
+                        payment.reports_unbookable_settlements(),
                         &mut status,
                     )
                     .await;
@@ -827,7 +827,7 @@ pub async fn dispatch_with_alert_visibility(
                                 store,
                                 clock.now(),
                                 alerts_enabled,
-                                payment.can_leave_settlements_unbookable(),
+                                payment.reports_unbookable_settlements(),
                                 &mut money,
                             )
                             .await;

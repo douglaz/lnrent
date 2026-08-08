@@ -1967,7 +1967,7 @@ impl PaymentBackend for PhoenixdPayment {
         Ok(Some(sat_to_msat_u64(balance.balance_sat)))
     }
 
-    fn can_leave_settlements_unbookable(&self) -> bool {
+    fn reports_unbookable_settlements(&self) -> bool {
         true
     }
     fn failed_refund_can_reuse_invoice(&self) -> bool {
