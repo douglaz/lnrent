@@ -576,23 +576,23 @@ async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_i
         // is the "do not recreate it" instruction. `a_full_length_unbookable_detail_is_not_truncated`
         // in the sibling test module is what holds that.
         //
-        // This message deliberately does NOT carry an executable `restore` command. Choosing a
-        // backup has disqualifiers that cannot be checked from a DM — one predating an outbound
-        // payment rolls back the `phoenixd_pay` dedup witness and can pay a refund twice, and one
-        // predating a paid subscription drops the rows teardown and refunds are driven from — so a
-        // command here would be a money-losing shortcut past the only place those checks exist.
-        // It names the loss and the two disqualifiers, then sends the operator to the runbook.
+        // This message carries NO `restore` command because there is no safe one. Deciding a
+        // backup is safe needs to know which refunds already went out, and lnrent's only record of
+        // that is `phoenixd_pay` in the index whose loss IS the incident — reasoning from the
+        // corrupted evidence. The phoenixd WALLET is also excluded from the backup by design
+        // (`backup.rs:27-34`), so a restore leaves a clean dedup map over payments phoenixd still
+        // holds. Three schemes for proving a restore safe were refuted across eight review passes
+        // on lnrent-ole, every one a double pay; repair TOOLING is lnrent-8scw.
         format!(
             "INDEX DIVERGENCE: invoice {invoice_id} absent from {INDEX_DB_FILE} — payment state \
              UNKNOWN: lnrent can neither book nor expire it. THAT IS ONE EXAMPLE, not the set: one \
              alert covers them all, so enumerate every OPEN invoice your state DB has that \
              {INDEX_DB_FILE} lacks. REMEDY: stop the daemon, then follow the index-divergence \
-             steps in docs/go-live.md — do NOT restore from this message alone. Restore replaces \
-             the WHOLE data dir: every order, capture, refund and ledger row committed since that \
-             backup is dropped while phoenixd keeps the sats, and a backup predating any outbound \
-             payment or any paid subscription must NOT be used — it can pay a refund twice or end \
-             service a buyer paid for. The runbook carries those checks. If none qualifies there \
-             is no repair command: keep the data dir, stop orders, settle buyers from phoenixd's \
+             section in docs/go-live.md. There is NO safe repair and NO repair command: do NOT \
+             restore from a backup — it rolls back lnrent's only record of which refunds already \
+             paid, while phoenixd keeps that history, so the daemon can pay a refund a SECOND \
+             time. Keep the data dir and phoenixd's history intact, stop new orders (`lnrent \
+             listing withdraw`), and settle the affected buyers out of band from phoenixd's own \
              records. Keep phoenixd on its original wallet; do not recreate or expire it."
         ),
     )

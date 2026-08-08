@@ -296,7 +296,8 @@ refuses orders it cannot service.
          cp "$DD/$db" "$WORK/" || { echo "FAILED to copy $db"; exit 1; }
          for side in "$db-wal" "$db-shm"; do
            # Absent is normal (a clean exit checkpoints the WAL away). A copy that FAILS is not:
-           # it would silently drop committed transactions and could qualify a money-losing backup.
+           # it would silently drop committed transactions, so the affected set below would be
+           # WRONG -- and its job is telling you which buyers to settle by hand.
            [ -e "$DD/$side" ] || continue
            cp "$DD/$side" "$WORK/" || { echo "FAILED to copy $side"; exit 1; }
          done
@@ -310,12 +311,11 @@ refuses orders it cannot service.
        ```
 
        **Fail closed.** Without `pipefail`, `sqlite3 ... | LC_ALL=C sort > file` reports *sort's*
-       exit status — so a query that dies on a corrupt or unreadable database exits 0 and leaves an
-       EMPTY file. Every `comm` check below then prints nothing, and "prints nothing" is exactly
-       what PASSING looks like here. A crashed query would silently qualify a backup, including in
-       step 3(a) where the consequence is paying a refund twice. `set -e` stops the script at the
-       first failure instead; if it stops, fix the failing read before going further — do not
-       interpret the absence of output as a cleared check.
+       exit status — so a query that dies on the corrupt database this incident is about exits 0 and
+       leaves an EMPTY file. The `comm` then prints nothing, and an empty affected set reads exactly
+       like "nothing is wrong" — while the buyers you needed to settle are the ones missing from it.
+       `set -e` stops the script at the first failure instead; if it stops, fix the failing read
+       before going further, and do not read the absence of output as good news.
 
        (The state file is `lnrent.sqlite`, not `state.db`.) Every scratch file goes under `$WORK`,
        the `mktemp -d` directory, and never a fixed `/tmp/<name>` path: on a multi-user host another
@@ -328,222 +328,36 @@ refuses orders it cannot service.
        the live files anyway (the daemon is the sole writer, ADR-0001), so it happens on the copy.
        Bring `-wal` and `-shm` along or the copy loses the committed tail.
 
-       `"$WORK/affected.txt"` is what is broken RIGHT NOW — the invoices with no correlation. It tells
-       you the scope of the incident. It is NOT the bar a backup has to clear: candidates are judged
-       against the wider `"$WORK/open.txt"` in step 2, because a restore can strand an open invoice
-       that is currently fine.
+       `"$WORK/affected.txt"` is the scope of the incident: the invoices whose payment state
+       lnrent can no longer establish. You need it to settle those buyers by hand below.
+    2. **There is no safe repair — do NOT restore from a backup.** This is the whole remedy, and it
+       is deliberately short.
 
-       Name the candidate backup directory once — step 5 restores from this same path:
+       A whole-directory `lnrentd restore` looks like the fix and is not. Deciding whether a
+       candidate backup is safe means knowing which refunds already went out, and lnrent's only
+       record of that is `phoenixd_pay` in the very index whose loss IS this incident — so the
+       check would be reasoning from the corrupted evidence. Worse, the phoenixd WALLET is
+       deliberately not in lnrent's backup (`backup.rs:27-34`): restoring reinstates lnrent's
+       commitments without the wallet that fulfilled them, leaving a clean dedup map over payments
+       phoenixd still holds. The daemon can then re-drive a restored PENDING refund, resolve a fresh
+       bolt11, and **pay it a second time**. A restore can also resurrect a subscription that was
+       since terminated, and silently drop every order, capture and ledger row committed after the
+       backup.
 
-       ```sh
-       BACKUP=/path/to/candidate-backup-dir
-       ```
+       This is settled, not cautious: three schemes for proving a restore safe were refuted across
+       eight review passes on lnrent-ole, every one a double pay. Do not reconstruct them.
 
-       Point `CAND` at what you will QUERY. A default `lnrentd backup --dest` is PLAINTEXT
-       (`backup.rs:175-178`), and its directory already holds both databases:
+       Instead:
 
-       ```sh
-       CAND="$BACKUP"        # plaintext: query the backup dir itself, and NEVER delete it
-       ```
+       1. Keep the data directory and phoenixd's payment history exactly as they are.
+       2. Stop taking new orders: `lnrent listing withdraw`.
+       3. Settle the buyers in `"$WORK/affected.txt"` out of band, from phoenixd's own records of
+          what it received.
+       4. `lnrent reconcile` is report-only and no command reconstructs the missing rows; writing
+          the DB by hand is forbidden (the daemon is the sole sqlite writer, ADR-0001).
 
-       **An ENCRYPTED backup dir instead holds only `backup.age` and `MANIFEST.json`**, so there is
-       nothing to query until you decrypt one. Then override `CAND`, extracting ONLY the two
-       databases, into RAM:
-
-       ```sh
-       EXTRACT=$(mktemp -d -p /dev/shm lnrent-cand-XXXXXX)   # tmpfs, 0700, unique name
-       age -d "$BACKUP/backup.age" | tar -x -C "$EXTRACT" lnrent.sqlite phoenixd_index.db
-       CAND="$EXTRACT"
-       ```
-
-       `age` prompts for the same passphrase you would pass `--passphrase-file`; these backups are
-       passphrase-encrypted, so no identity file exists and `-i` does not apply.
-
-       Naming the two members matters: the archive also carries `operator.seed`, the plaintext BIP39
-       mnemonic that controls the funds, and a blanket extract writes it out. `/dev/shm` matters for
-       the same reason — on a disk-backed `/tmp`, `rm` only unlinks, and this repo already treats
-       unlinked plaintext as recoverable (`backup.rs:319-322`), so the mnemonic would survive in
-       free blocks and in any snapshot taken meanwhile. Remove the EXTRACTION directory when you are done —
-       `rm -rf "$EXTRACT"`, and only on this encrypted path. Never `rm -rf "$CAND"`: on the plaintext
-       branch `CAND` IS `$BACKUP`, so that command would delete the very backup you are recovering
-       from. On tmpfs the removal genuinely releases the pages, and a reboot clears them regardless.
-    2. **Choose a backup by CONTENTS, never by date.** An older backup never had their rows; a
-       newer one still lacks them if the index was already lost when they were paid. Date tells you
-       nothing here. A candidate qualifies only if BOTH of these hold:
-
-       ```sh
-       sqlite3 "file:$CAND/phoenixd_index.db?mode=ro" \
-         "SELECT invoice_id FROM phoenixd_invoice;" | LC_ALL=C sort > "$WORK/cand-indexed.txt"
-       sqlite3 "file:$CAND/lnrent.sqlite?mode=ro" \
-         "SELECT id FROM invoice;" | LC_ALL=C sort > "$WORK/cand-invoices.txt"
-       comm -23 "$WORK/open.txt" "$WORK/cand-indexed.txt"     # must be EMPTY
-       comm -23 "$WORK/open.txt" "$WORK/cand-invoices.txt"    # must ALSO be EMPTY
-       ```
-
-       Both compare against every OPEN invoice, not just `"$WORK/affected.txt"`. The narrower test
-       looks appealing and strands money: an invoice that is OPEN locally, already paid at phoenixd
-       and not yet booked, still HAS its index row — so it is not in `affected.txt` — and its status
-       is still OPEN, so it is not in step 3(b)'s settled list either. It falls through both. A
-       candidate predating it passes, the restore deletes its rows from both databases, phoenixd
-       keeps the sats, and afterwards neither catch-up nor the settlement poll can find the receipt.
-
-       This is a strict test, and it is meant to be. The daemon is stopped, so the OPEN set is
-       frozen — nothing new accrues while you work, and a candidate that fails is not failing on a
-       technicality: each missing id is an order whose receipt the restore could strand forever.
-       Either prove an omitted invoice was never paid AND can no longer be paid, or treat the
-       candidate as not qualifying and go to step 7. A backup too old to hold your open orders is
-       genuinely the wrong tool, not a test being pedantic.
-
-       The second check is not redundant. `create_invoice` commits the index row and `order_intake`
-       commits the invoice and subscription in a *separate* transaction, so a backup taken between
-       them holds the correlation but not the buyer's order. Restoring that one brings the index
-       back and still leaves capture unable to apply an already-paid receipt — an index-only test
-       would call it qualified.
-    3. **Disqualify the candidate BEFORE you restore.** Two conditions make a backup unusable no
-       matter how well it passed step 2, and both are unrecoverable once you have restored. Run
-       these with the daemon still stopped.
-
-       **(a) It predates an outbound payment.** `phoenixd_pay` is lnrent's only defence against
-       paying a refund twice — phoenixd's `payinvoice` takes no idempotency parameter, so that
-       durable local row IS the dedup, and the module says outright that deleting it "is what would
-       permit a double pay". A whole-dir restore rolls it back while the original payment still
-       stands at phoenixd, so restarting can re-drive a restored PENDING refund, resolve a fresh
-       bolt11, and **pay it again**.
-
-       ```sh
-       sqlite3 "$WORK/phoenixd_index.db" "SELECT idempotency_key FROM phoenixd_pay;" \
-         | LC_ALL=C sort > "$WORK/pay-now.txt"
-       sqlite3 "file:$CAND/phoenixd_index.db?mode=ro" "SELECT idempotency_key FROM phoenixd_pay;" \
-         | LC_ALL=C sort > "$WORK/pay-cand.txt"
-       comm -23 "$WORK/pay-now.txt" "$WORK/pay-cand.txt"      # must be EMPTY
-       ```
-
-       Sort every file through `LC_ALL=C sort` and select the key ALONE — and note the
-       `export LC_ALL=C` in step 1, which is what makes `comm` ITSELF compare in that same
-       collation. Pinning only the sorts is not enough: GNU `comm` compares with `strcoll` in the
-       ambient locale, so on a UTF-8 host it would be reading C-ordered input under different rules
-       and could drop a line — here, one that disqualifies a candidate, which is the double pay this
-       step exists to prevent. The keys are not collation-safe data either: they embed the
-       buyer-supplied request id (`order_intake.rs`). `comm` requires its inputs
-       in the collation it compares with, which is not sqlite's byte order, and appending `|status`
-       makes them disagree on real keys: a gen-0 refund is `refund:<ext>` and a regenerated one
-       `refund:<ext>:g<gen>` (`refund.rs:217-219`), and `|` (0x7C) sorts after `:` (0x3A). Unsorted
-       input makes `comm` warn and print lines that are present in BOTH files — a false
-       disqualification. That direction is safe for money (it pushes you to step 7 rather than into
-       a double pay), but a check that spews warnings and wrong output in the step guarding against
-       paying twice is useless exactly when it matters.
-
-       If that is non-empty the backup is NOT usable — there is no supported way to re-establish
-       the witness. Treat it exactly as "no backup qualifies" (step 7).
-
-       **(b) It predates a paid subscription.** Step 1's enumeration is `status='OPEN'` and so is
-       structurally blind to this: a captured, provisioned subscription has a settled invoice, and
-       a backup can qualify in step 2 while still predating it. Restoring drops the subscription,
-       its instance row and the ledger rows you would refund from, while the VM keeps running and
-       keeps billing.
-
-       ```sh
-       Q="SELECT id FROM invoice WHERE status='PAID' OR settled_at IS NOT NULL;"
-       sqlite3 "$WORK/lnrent.sqlite" "$Q"                      | LC_ALL=C sort > "$WORK/paid-now.txt"
-       sqlite3 "file:$CAND/lnrent.sqlite?mode=ro" "$Q"         | LC_ALL=C sort > "$WORK/paid-cand.txt"
-       comm -23 "$WORK/paid-now.txt" "$WORK/paid-cand.txt"           # must be EMPTY
-       ```
-
-       Any id printed there is a settled invoice the candidate does not have. A backup missing one
-       is better treated as disqualified: the orphaned VM is the *cheaper* loss, and honouring or refunding a
-       term whose records you just deleted is the expensive one.
-       **(c) phoenixd is no longer on the wallet lnrent paid from.** Everything this reads exists
-       now, which is why it runs here and not after: a restore is irreversible, and if phoenixd has
-       been re-seeded there is nothing on lnrent's side worth rolling back for. lnrent records the
-       wallet identity per payment (`phoenixd_pay.node_id` = `getinfo.nodeId`) and refuses a
-       recovery that disagrees, so a mismatch means the money path fails closed rather than
-       misfires:
-
-       ```sh
-       # Same inputs lnrentd reads; use your config file's values if you set them there.
-       esc=${LNRENT_PHOENIXD_API_PASSWORD//\\/\\\\}   # curl config: escape \ then "
-       esc=${esc//\"/\\\"}
-       printf 'user = ":%s"\n' "$esc" \
-         | curl -sS --config - "${LNRENT_PHOENIXD_URL%/}/getinfo" | jq -r .nodeId
-       sqlite3 "$WORK/phoenixd_index.db" \
-         "SELECT DISTINCT node_id FROM phoenixd_pay WHERE node_id IS NOT NULL;"
-       ```
-
-       The password reaches curl through `--config` on stdin, never `-u`: an argument is readable in
-       `/proc` and `ps` by any local user for the life of the call, and that credential authorizes
-       wallet operations. It is the same reason `lnrentd` ships no password flag at all
-       (`main.rs:83-86`); `printf` is a shell builtin, so it forks nothing that could expose it
-       either. The two expansions escape the password for curl's config grammar: a value there is
-       double-quoted, so a password containing `"` would otherwise close the string early and curl
-       would authenticate with a silently truncated credential — failing the identity check against
-       a perfectly healthy node and blocking recovery. Both are bash parameter expansions, so they
-       fork nothing. Use `$LNRENT_PHOENIXD_URL` rather than a loopback literal — remote-HTTPS and
-       reverse-proxy sub-path deployments are supported, and a hardcoded `127.0.0.1` would quietly
-       check an unrelated node.
-
-       If the sqlite side prints NOTHING, lnrent has never paid out from this wallet (no refunds,
-       no sweeps — ordinary for an early-life operator). There is no recorded identity to contradict,
-       so the check is vacuous: continue to step 4. Otherwise they must match. If they do not, STOP
-       and do not restore: phoenixd has been re-seeded onto a
-       different wallet and its payment history no longer describes your money, so no lnrent-side
-       rollback can fix it. Go to step 7.
-    4. **Inventory the provider resources.** Teardown is driven from the persisted subscription and
-       its `instance.handles_json`; rolling the data dir back to an instant before a provision
-       deletes those rows, so the daemon can no longer drive deletion and the VM **keeps billing
-       indefinitely**. With the daemon still stopped, record what exists now:
-
-       ```sh
-       sqlite3 "$WORK/lnrent.sqlite" \
-         "SELECT subscription_id, kind, handles_json FROM instance WHERE state <> 'DESTROYED';" \
-         | LC_ALL=C sort > "$WORK/instances-before.txt"
-       ```
-    5. **Copy the data dir aside, THEN restore — and do NOT restart yet.** `restore` deletes the
-       previous data dir once the swap succeeds (`backup.rs:1081`, `:1123`), and `$WORK` holds only
-       two databases in a `/tmp` scratch a reboot clears. Steps 2-3 are `comm` outputs judged by
-       hand under pressure; make a wrong judgement recoverable before you make it irreversible:
-
-       ```sh
-       cp -a "$DD" "$DD.pre-restore-$(date -u +%Y%m%dT%H%M%SZ)"   # or: lnrentd backup --dest ...
-       ```
-
-       Keep that copy until the incident is closed. Then: `lnrentd restore --from "$BACKUP"
-       --data-dir "$DD" --force` — `$BACKUP`, never `$CAND`: for an encrypted candidate `$CAND`
-       holds two extracted databases with no `MANIFEST.json`, which `restore` refuses. (`--force` because restore refuses a non-empty target and the
-       live data dir is not empty; add `--passphrase-file` for an encrypted backup). It replaces the
-       *whole* data dir, state DB included, rolling lnrent back to that backup's instant:
-       **everything committed since is dropped** — later orders, captures, refunds, ledger rows —
-       while phoenixd still holds the sats. Step 6 needs the daemon down.
-    6. **Reconcile what the rollback dropped, then restart.** Read the RESTORED data dir — not
-       `$WORK`, which is the pre-restore copy step 1 made and step 5 never touched. Re-running
-       step 4's command verbatim would compare that copy with itself, print an empty diff, and
-       report "nothing was dropped" while measuring nothing:
-
-       ```sh
-       sqlite3 "file:$DD/lnrent.sqlite?mode=ro" \
-         "SELECT subscription_id, kind, handles_json FROM instance WHERE state <> 'DESTROYED';" \
-         | LC_ALL=C sort > "$WORK/instances-after.txt"
-       comm -23 "$WORK/instances-before.txt" "$WORK/instances-after.txt"   # dropped by the rollback
-       ```
-
-       `mode=ro` is right here: `restore` installs `VACUUM INTO` artifacts, which carry no
-       `-wal`/`-shm` (`backup.rs:228-231`), so there is no journal to replay. Each line printed is a
-       resource lnrent no longer knows about. For every resource present before but absent
-       after, decide ONE of two things — never delete on sight:
-
-       - **The subscription was paid and its term has not run out.** Deleting it ends service the
-         buyer paid for, and the restore has already dropped the rows you would refund from. Do NOT
-         delete: either leave it running and honour the term by hand, or settle the buyer from
-         phoenixd's records first.
-       - **Nothing was paid, or the term is over.** Delete it at the provider yourself (for
-         `do-vps`, the `droplet_id` in `handles_json`). lnrent will never do it for you — it no
-         longer knows those rows existed, so the VM bills forever otherwise.
-
-       Then restart the daemon.
-    7. **If no backup qualifies, do NOT restore.** There is no supported repair: `lnrent reconcile`
-       is report-only, no command reconstructs the missing rows, and writing the DB by hand is
-       forbidden (the daemon is the sole sqlite writer, ADR-0001). Keep the data dir and phoenixd's
-       payment history intact, stop taking new orders (`lnrent listing withdraw`), and settle
-       affected buyers out of band from phoenixd's own records. Recovery tooling is tracked as lnrent-8scw.
+       Repair TOOLING — which can be sound, because it can enumerate phoenixd's outgoing payments
+       as the authority instead of trusting the local index — is tracked as lnrent-8scw.
 
     Never recreate or expire an affected invoice.
 
@@ -590,7 +404,9 @@ refuses orders it cannot service.
 
 - Wrong config, no funds yet: safe to wipe the data dir + re-bootstrap.
 - After funds exist: NEVER wipe or regenerate the seed. Restore from a cold backup:
-  `lnrentd restore --from <backup-dir>`.
+  `lnrentd restore --from <backup-dir>`. **Not for a diverged `phoenixd_index.db`** — see the
+  unbookable-settlement section above; a restore there can pay a refund twice, because it rolls back
+  lnrent's only dedup record while phoenixd keeps the payment.
 - Federation/gateway down: the daemon can't mint invoices or pay refunds until it recovers; existing subs
   keep running, and reconcile catches up when it's back.
 

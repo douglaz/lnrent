@@ -3066,46 +3066,40 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
         detail.contains("INDEX DIVERGENCE")
             && detail.contains("phoenixd-orphan")
             && detail.contains("UNKNOWN")
-            // This DM must NOT carry an executable restore command. Choosing a backup has two
-            // disqualifiers a DM cannot check — one predating an outbound payment rolls back the
-            // `phoenixd_pay` dedup witness (double pay), one predating a paid subscription drops
-            // the rows teardown and refunds run on — so the message names both and routes to the
-            // runbook that carries the checks. A pasteable command here is the money-losing
-            // shortcut past them, which is why its ABSENCE is asserted, not just the pointer.
+            // This DM must NOT carry a restore command, and must not imply a safe restore
+            // EXISTS. Deciding a backup is safe needs to know which refunds already paid, and
+            // lnrent's only record of that is `phoenixd_pay` in the index whose loss IS the
+            // incident. Three schemes for proving it were refuted on lnrent-ole, every one a
+            // double pay. So the ABSENCE of a command is asserted, not merely the pointer.
             && !detail.contains("lnrentd restore")
             && detail.contains("docs/go-live.md")
-            && detail.contains("pay a refund twice")
-            && detail.contains("end service a buyer paid for")
+            && detail.contains("pay a refund a SECOND")
             && detail.contains("original wallet")
             && !detail.contains("FEE-CREDIT REFUSAL"),
         "index reason and shipped recovery remedy must be self-contained: {detail}"
     );
-    // The remedy this alert gives can DESTROY the money it exists to protect, and only this text
-    // stands between the operator and that. `restore` swaps the WHOLE data dir including state.db
-    // (`backup::restore` step 4: staged then atomically installed, "the swap replaces the target
-    // wholesale"), while the condition being reported is that the state DB knows invoices the index
-    // does not — i.e. the state DB is the NEWER file.
-    //
-    // Picking the backup is DELEGATED to the runbook (no command here), so what the DM still owes
-    // the operator is the reason not to improvise: that a restore is not a targeted repair of the
-    // named invoices but a wholesale rollback. Without that a "just restore from last night" reflex
-    // looks free. The selection rules themselves — pick by CONTENTS, never by date — live in
-    // docs/go-live.md alongside the two disqualifiers, because only there can they be checked.
+    // "Just restore from last night" is the reflex this text exists to stop, and it must be
+    // stopped OUTRIGHT rather than deferred to a checklist: the runbook no longer has one. A DM
+    // that merely said "don't restore from this message alone" would still read as "there is a
+    // procedure, go find it".
     assert!(
-        detail.contains("do NOT restore from this message alone"),
-        "the alert must actively forbid restoring on the strength of the DM: {detail}"
+        detail.contains("do NOT \
+             restore from a backup"),
+        "the alert must forbid restoring outright, not defer it to a checklist: {detail}"
     );
     // The no-safe-backup branch must give an instruction the operator can actually CARRY OUT.
     // "reconcile by hand" was not one: `lnrent reconcile` is report-only, nothing reconstructs the
     // missing rows, and writing the DB by hand is forbidden (sole sqlite writer, ADR-0001). Naming a
     // procedure that does not exist is worse than naming none — it reads as a supported path.
+    // Saying "no repair" is only half an instruction. The operator is mid-incident with a buyer's
+    // money unbooked, so the DM must also name what they CAN do — and every verb here is real:
+    // `lnrent listing withdraw` exists, and phoenixd's own records are what settlement reads.
     assert!(
-        detail.contains("committed since that backup is dropped")
-            && detail.contains("order, capture, refund and ledger row")
-            && detail.contains("no repair command")
-            && detail.contains("settle buyers from phoenixd's records"),
-        "and must say the loss is everything newer than the BACKUP, plus an ACTIONABLE next step: \
-         {detail}"
+        detail.contains("NO safe repair and NO repair command")
+            && detail.contains("lnrent \
+             listing withdraw")
+            && detail.contains("settle the affected buyers out of band"),
+        "and must give an ACTIONABLE next step, not just a refusal: {detail}"
     );
     // The subject is GLOBAL and the cooldown dedups, so this alert names ONE affected invoice
     // however many there are. An operator who verifies a candidate backup against the named id
@@ -3116,17 +3110,15 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
             && detail.contains("every OPEN invoice your state DB has"),
         "the alert must say the named invoice is one example and how to enumerate the rest: {detail}"
     );
-    // Backup-selection rules moved to the runbook with the command, since the two disqualifiers
-    // that decide them are only checkable there. What the DM must still carry is the SATS half:
-    // a restore does not claw money back from phoenixd, so an operator cannot read the rollback
-    // as merely undoing the mistake.
+    // WHY a restore is unsafe, not just that it is. Without the mechanism an operator reads the
+    // refusal as excessive caution and restores anyway: the rollback drops lnrent's record of which
+    // refunds already paid while phoenixd keeps that history, so the second pay is not a risk but
+    // the expected outcome of re-driving a restored PENDING refund.
     assert!(
-        detail.contains("while phoenixd keeps the sats"),
-        "and that the rollback does not recover the money phoenixd already holds: {detail}"
-    );
-    assert!(
-        detail.contains("If none qualifies there is no repair command"),
-        "including the case where the operator has no safe backup at all: {detail}"
+        detail.contains("rolls back lnrent's only record of which refunds already \
+             paid")
+            && detail.contains("while phoenixd keeps that history"),
+        "and must give the MECHANISM, so the refusal does not read as mere caution: {detail}"
     );
 }
 
