@@ -1254,7 +1254,7 @@ async fn add_unbookable_settlement_alerts_view(store: &Store, now: i64, response
         store,
         crate::alerts::AlertKind::SettlementUnbookable,
         since,
-        crate::alerts::ALERT_VIEW_LIMIT,
+
     )
     .await;
     let Some(response) = response.as_object_mut() else {

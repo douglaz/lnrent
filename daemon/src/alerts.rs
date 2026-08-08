@@ -11,9 +11,12 @@
 //!   DECLARATION order so this list and the enum below cannot drift apart: PR-6 `TeardownFailed`,
 //!   PR-9c `RelayBlackout`, PR-16 `HoldingsLow`, PR-21 `PaidServiceDestroyed`,
 //!   gate1-operator-sweep (urw.3) `SweepFailed`, lnrent-7di `SweepStuck`, lnrent-gc7
-//!   `SettlementUnbookable`. There is deliberately no `BalanceQueryFailed`: the
-//!   ledger-authoritative revision (ADR-0016) retires the automatic balance read, so nothing is
-//!   left to fail.
+//!   `SettlementUnbookable`. There is deliberately no `BalanceQueryFailed` for the FEDIMINT read
+//!   that name was coined for: the ledger-authoritative revision (ADR-0016) retired it, so that
+//!   one cannot fail. It is NOT a claim about phoenixd, which reads `getbalance` on every
+//!   settlement observation (`spendable_credit_msat`); a getbalance-only outage is deliberately
+//!   excluded from `SettlementUnbookable` — different remedy — and no kind covers it yet
+//!   (lnrent-yjtd).
 //! - **Edge-triggered** with a per-`(kind, subject)` cooldown ([`ALERT_COOLDOWN_S`]), held in an
 //!   in-memory map. A restart resets it — worst case one duplicate alert per condition per restart,
 //!   which is why the map is deliberately NOT persisted.
@@ -130,7 +133,6 @@ impl AlertKind {
 /// The CLI shows recent alert history, not live backend state. Two cooldown windows keep the latest
 /// repeat visible while old, possibly resolved conditions age out.
 pub const ALERT_VIEW_WINDOW_S: i64 = 2 * ALERT_COOLDOWN_S;
-pub const ALERT_VIEW_LIMIT: usize = 20;
 
 /// One durable alert row as the operator CLI reports it.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -140,19 +142,18 @@ pub struct AlertView {
     pub at: i64,
 }
 
-/// Recent durable alerts of ONE kind: how many distinct incidents the window holds, and the newest
-/// `limit` of them.
+/// Recent durable alerts of ONE kind: how many distinct incidents the window holds, and each of
+/// them, newest first.
 ///
-/// `total` is deliberately NOT capped by `limit`. The operator surface reports it as the incident
-/// count, and a count that silently saturates at the display cap reads as a total — for a kind whose
-/// subject is per-row (a refund id, say) 20 stuck refunds and 2000 would both print "20". Note what
-/// an incident IS, before a caller labels the number: one distinct SUBJECT, so a kind that keys its
-/// subject globally counts conditions, not the rows each one covers.
-#[derive(Debug, Clone, Default)]
+/// There is deliberately NO display cap. An earlier revision carried one (plus `total`-vs-`shown`
+/// semantics and their tests) against a hypothetical kind with many subjects — but the only kind
+/// ever queried is `SettlementUnbookable`, whose subjects are two constants, so the cap could never
+/// bind through any shipped call site. Reintroduce it when a kind with unbounded subjects exists,
+/// not before.
 pub struct RecentAlerts {
     /// Distinct `(kind, subject)` incidents at or after `since`.
     pub total: usize,
-    /// The newest `limit` of them, most recent first. Shorter than `total` when capped.
+    /// Each of them, most recent first.
     pub shown: Vec<AlertView>,
 }
 
@@ -160,7 +161,7 @@ pub struct RecentAlerts {
 /// condition produces one row per cooldown; deduplication keeps the CLI count about incidents rather
 /// than DM deliveries. With alerts disabled there are no rows, so callers must label this as history.
 ///
-/// The scan does not stop at `limit` — it must see every row to count incidents — and exactly ONE
+/// Exactly ONE
 /// of the three predicates bounds it, which is worth stating because the other two look like they
 /// do. `outbox` carries a single index, `outbox_subscription_state_idx` (`store.rs`), so `msg_type`
 /// and `created_at` are index-free filters: `since` narrows the RESULT, not the scan. What bounds
@@ -178,12 +179,10 @@ pub struct RecentAlerts {
 /// a floor on the time to reach it rather than a guarantee. A per-invoice subject would break the
 /// arithmetic outright, which is one reason the phoenixd fee-credit alert does not use one.
 ///
-/// `limit` bounds only what is carried back to the operator.
 pub async fn recent_alerts(
     store: &Store,
     kind: AlertKind,
     since: i64,
-    limit: usize,
 ) -> Result<RecentAlerts> {
     let wire = kind.wire_str();
     let glob = format!("outbox:alert:{wire}:*");
@@ -228,7 +227,7 @@ pub async fn recent_alerts(
                         a.kind
                     ));
                 }
-                if seen.insert(a.subject.clone()) && shown.len() < limit {
+                if seen.insert(a.subject.clone()) {
                     shown.push(AlertView {
                         subject: a.subject,
                         detail: a.detail,
@@ -510,28 +509,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(alert_rows(&store).await, 3, "re-fires past the cooldown");
-        let recent = recent_alerts(&store, AlertKind::RefundStuck, 0, 20)
+        // The count is about INCIDENTS (distinct subjects), not DM deliveries: r1 alerted twice
+        // across the cooldown and must still count once, or a recurring condition reads as a
+        // spreading one. The rows carry the LATEST delivery per subject.
+        let recent = recent_alerts(&store, AlertKind::RefundStuck, 0)
             .await
             .unwrap();
         assert_eq!(recent.total, 2, "count incidents, not DM deliveries");
-        assert_eq!(recent.shown.len(), 2);
+        assert_eq!(recent.shown.len(), 2, "and every incident is carried");
         assert_eq!(
             recent.shown[0].detail, "stuck again",
             "keep the latest delivery"
         );
-
-        // The display cap must not become the reported count: an operator reading "1" while two
-        // subjects are alerting would under-read the incident by half.
-        let capped = recent_alerts(&store, AlertKind::RefundStuck, 0, 1)
-            .await
-            .unwrap();
-        assert_eq!(capped.total, 2, "the count survives the display cap");
-        assert_eq!(capped.shown.len(), 1, "the details are the capped half");
-        let none = recent_alerts(&store, AlertKind::RefundStuck, 0, 0)
-            .await
-            .unwrap();
-        assert_eq!(none.total, 2, "a zero cap still counts");
-        assert!(none.shown.is_empty(), "a zero cap shows nothing");
     }
 
     struct ObservedClock {

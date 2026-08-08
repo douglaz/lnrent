@@ -359,7 +359,8 @@ fn money_human_text(v: &serde_json::Value) -> String {
         lines.push(
             "\x1b[1;31mUnbookable settlement alert history: UNKNOWN\x1b[0m — the daemon could not \
              read its durable alert history, so it cannot say whether settlements are being held \
-             back. Check the daemon's storage error and retry `lnrent money`."
+             back — this is NOT a report of zero. Check the daemon's storage error, then re-run. \
+             (`lnrent status` carries the same fields as raw JSON, without this framing.)"
                 .to_string(),
         );
     } else if unbookable > 0 {
