@@ -278,8 +278,20 @@ refuses orders it cannot service.
   - *Missing `phoenixd_index.db` row.* Payment state becomes UNKNOWN: lnrent can neither observe,
     book, nor expire it. **This is the dangerous repair — read all of it before acting.**
 
-    1. **Enumerate the set.** The alert names one invoice however many are affected. The set is
-       every invoice your state DB still has OPEN that `phoenixd_index.db` no longer lists.
+    1. **Enumerate the set.** The alert names one invoice however many are affected. With the
+       daemon STOPPED, read both databases (read-only — never write them; the daemon is the sole
+       writer, ADR-0001):
+
+       ```sh
+       sqlite3 "file:$LNRENT_DATA_DIR/state.db?mode=ro" \
+         "SELECT id FROM invoice WHERE status='OPEN' ORDER BY id;" > /tmp/open.txt
+       sqlite3 "file:$LNRENT_DATA_DIR/phoenixd_index.db?mode=ro" \
+         "SELECT invoice_id FROM phoenixd_invoice ORDER BY invoice_id;" > /tmp/indexed.txt
+       comm -23 /tmp/open.txt /tmp/indexed.txt      # the affected set
+       ```
+
+       Run the second query against each candidate backup's `phoenixd_index.db` too: a backup
+       qualifies only when `comm -23 /tmp/open.txt <its indexed list>` is EMPTY.
     2. **Choose a backup by CONTENTS, never by date** — its `phoenixd_index.db` must hold ALL of
        them. An older backup never had their rows. A newer one still lacks them if the index was
        already lost when they were paid. Date tells you nothing here.
@@ -290,6 +302,21 @@ refuses orders it cannot service.
        **everything committed since is dropped** — later orders, captures, refunds, ledger rows —
        while phoenixd still holds the sats. Then verify phoenixd still points at its original
        wallet, and restart.
+
+       **Before you restore, inventory the provider resources.** Teardown is driven from the
+       persisted subscription and its `instance.handles_json`; rolling the data dir back to an
+       instant before a provision deletes those rows, so the daemon can no longer drive deletion
+       and the VM **keeps billing indefinitely**. With the daemon stopped, list what exists now:
+
+       ```sh
+       sqlite3 "file:$LNRENT_DATA_DIR/state.db?mode=ro" \
+         "SELECT subscription_id, kind, handles_json FROM instance WHERE state <> 'DESTROYED';" \
+         > /tmp/instances-before.txt
+       ```
+
+       Run the same query after the restore, diff the two, and for every resource present before
+       but absent after, delete it at the provider yourself (for `do-vps`, the `droplet_id` in
+       `handles_json`). lnrent will never do it for you — it no longer knows those rows existed.
     4. **If no backup qualifies, do NOT restore.** There is no supported repair: `lnrent reconcile`
        is report-only, no command reconstructs the missing rows, and writing the DB by hand is
        forbidden (the daemon is the sole sqlite writer, ADR-0001). Keep the data dir and phoenixd's
