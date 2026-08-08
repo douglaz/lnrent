@@ -2676,6 +2676,19 @@ async fn a_fee_credit_refusal_alerts_the_operator_with_its_reason_and_remedy() {
             && !detail.contains("INDEX DIVERGENCE"),
         "fee-credit reason and remedy must be self-contained: {detail}"
     );
+    // The REMEDY figure is the SHORTFALL, not the receipt. The refusal is
+    // `credit >= received && balance < received`, so it lifts the moment spendable reaches the
+    // receipt: here the wallet already holds 2722 against a 2723-sat receipt, so ONE sat clears it.
+    // Printing the receipt instead would tell a stranger operator to send 2723 — overfunding by
+    // nearly the whole amount on the very case this alert exists for (an unfunded first sale).
+    assert!(
+        detail.contains("1 sat more clears THIS one"),
+        "the remedy must name the shortfall (2723 received - 2722 spendable = 1): {detail}"
+    );
+    assert!(
+        !detail.contains("2723 sat more"),
+        "and must NOT ask for the whole receipt when most of it is already held: {detail}"
+    );
 }
 
 // The other half of the age gate. Without this the threshold is decorative: every refusal would DM
@@ -2909,7 +2922,7 @@ async fn two_receipts_one_unfunded_wallet_is_one_alert_not_one_per_receipt() {
     assert_eq!(alerts[0].subject, "fee_credit");
     assert!(
         alerts[0].detail.contains("WALLET-level")
-            && alerts[0].detail.contains("EVERY receipt currently held back"),
+            && alerts[0].detail.contains("EVERY receipt held back"),
         "and it must SAY it covers the others, or the operator fixes one receipt: {}",
         alerts[0].detail
     );

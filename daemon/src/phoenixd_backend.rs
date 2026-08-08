@@ -697,18 +697,22 @@ async fn alert_fee_credit_refusal(
         format!(
             "FEE-CREDIT REFUSAL: phoenixd invoice {} is PAID and was first refused locally at unix \
              time {} ({}s ago; {} sat received), but lnrent cannot book it: the wallet has {} sat of \
-             non-spendable LSP fee credit and only {} sat spendable, so no receipt can be proved \
-             refundable (ADR-0019). That is a WALLET-level condition, so this one alert covers \
-             EVERY receipt currently held back, not just the invoice named above. REMEDY: give \
-             phoenixd SPENDABLE balance — at least {} sat to clear this receipt, more if others \
-             are held back. {}",
+             non-spendable LSP fee credit and only {} sat spendable, so no receipt is provably \
+             refundable (ADR-0019). WALLET-level: this one alert covers EVERY receipt held back, \
+             not just the invoice named. REMEDY: give phoenixd SPENDABLE balance — {} sat more \
+             clears THIS one (the shortfall, not the full amount); more if others are held back. \
+             {}",
             refusal.invoice_id,
             first_refusal_at,
             age,
             refusal.received_sat,
             refusal.fee_credit_sat,
             refusal.balance_sat,
-            refusal.received_sat,
+            // The SHORTFALL, not the receipt. The refusal is `credit >= received && balance <
+            // received`, so it lifts the moment spendable reaches the receipt — telling a stranger
+            // operator to add the whole amount overfunds by whatever they already hold, which at
+            // the measured 2722-vs-2723 case is nearly the entire receipt.
+            refusal.received_sat.saturating_sub(refusal.balance_sat),
             next,
         ),
     )

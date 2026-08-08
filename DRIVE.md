@@ -10,9 +10,10 @@ through this line.
 **Phase:** HARDEN · **Bead:** lnrent-gc7 · **Branch:** feat/gc7-settlement-unbookable-alert
 **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'`
-· last green at `653f9d4` (EXIT=0, 884 tests, 0 failed). NB this line names the commit it
-was run at, not "HEAD" — writing HEAD makes it silently stale on the next commit, which is
-exactly how it went wrong.
+· last green on the tree this commit records (EXIT=0, 884 tests, 0 failed).
+NB deliberately no SHA: writing one changes the commit it would name, so a self-referential
+gate record is always stale by construction — an earlier revision said `HEAD` and drifted four
+commits, and naming the SHA then went stale on the very next `--amend`.
 
 ## Done (this session)
 - lnrent-m7g nix packages + container image — merged #80
