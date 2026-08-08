@@ -264,8 +264,9 @@ refuses orders it cannot service.
     SHORTFALL — how much more spendable is needed to clear the named receipt — not the receipt's
     full amount, because the refusal lifts as soon as spendable reaches it. (It also lifts if
     phoenixd converts the fee credit below the receipt: the refusal needs BOTH `credit >= receipt`
-    and `balance < receipt`, so either half falling away is enough.) The DM waits 15 minutes from
-    lnrent's first local sighting, because lnrent may book it on a later retry; that wait is skipped
+    and `balance < receipt`, so either half falling away is enough.) The DM waits `UNBOOKABLE_SETTLEMENT_ALERT_S`
+    (`phoenixd_backend.rs`) from lnrent's first local sighting, because lnrent may book it on a
+    later retry; that wait is skipped
     when the settlement poll is about to stop watching, since a delay outliving the last observer is
     silence rather than a delay.
 
@@ -306,14 +307,22 @@ refuses orders it cannot service.
        the live files anyway (the daemon is the sole writer, ADR-0001), so it happens on the copy.
        Bring `-wal` and `-shm` along or the copy loses the committed tail.
 
-       `/tmp/affected.txt` is the set the rest of this procedure is about. Every candidate backup is
-       judged against it — see step 2.
+       `/tmp/affected.txt` is what is broken RIGHT NOW — the invoices with no correlation. It tells
+       you the scope of the incident. It is NOT the bar a backup has to clear: candidates are judged
+       against the wider `/tmp/open.txt` in step 2, because a restore can strand an open invoice
+       that is currently fine.
 
-       Point `CAND` at the candidate you are judging. A default `lnrentd backup --dest` is PLAINTEXT
+       Name the candidate backup directory once — step 5 restores from this same path:
+
+       ```sh
+       BACKUP=/path/to/candidate-backup-dir
+       ```
+
+       Point `CAND` at what you will QUERY. A default `lnrentd backup --dest` is PLAINTEXT
        (`backup.rs:175-178`), and its directory already holds both databases:
 
        ```sh
-       CAND=/path/to/candidate-backup-dir
+       CAND="$BACKUP"
        ```
 
        **An ENCRYPTED backup dir instead holds only `backup.age` and `MANIFEST.json`**, so there is
@@ -343,15 +352,23 @@ refuses orders it cannot service.
          "SELECT invoice_id FROM phoenixd_invoice;" | LC_ALL=C sort > /tmp/cand-indexed.txt
        sqlite3 "file:$CAND/lnrent.sqlite?mode=ro" \
          "SELECT id FROM invoice;" | LC_ALL=C sort > /tmp/cand-invoices.txt
-       comm -23 /tmp/affected.txt /tmp/cand-indexed.txt     # must be EMPTY
-       comm -23 /tmp/affected.txt /tmp/cand-invoices.txt    # must ALSO be EMPTY
+       comm -23 /tmp/open.txt /tmp/cand-indexed.txt     # must be EMPTY
+       comm -23 /tmp/open.txt /tmp/cand-invoices.txt    # must ALSO be EMPTY
        ```
 
-       Both compare against `/tmp/affected.txt`, NOT the full OPEN list. Only the affected invoices
-       need their rows back; every other open order is either already correlated or newer than the
-       backup, and demanding those too makes the test unpassable by construction — one order placed
-       after the divergence would disqualify every backup ever taken, including the one that fixes
-       the incident.
+       Both compare against every OPEN invoice, not just `/tmp/affected.txt`. The narrower test
+       looks appealing and strands money: an invoice that is OPEN locally, already paid at phoenixd
+       and not yet booked, still HAS its index row — so it is not in `affected.txt` — and its status
+       is still OPEN, so it is not in step 3(b)'s settled list either. It falls through both. A
+       candidate predating it passes, the restore deletes its rows from both databases, phoenixd
+       keeps the sats, and afterwards neither catch-up nor the settlement poll can find the receipt.
+
+       This is a strict test, and it is meant to be. The daemon is stopped, so the OPEN set is
+       frozen — nothing new accrues while you work, and a candidate that fails is not failing on a
+       technicality: each missing id is an order whose receipt the restore could strand forever.
+       Either prove an omitted invoice was never paid AND can no longer be paid, or treat the
+       candidate as not qualifying and go to step 7. A backup too old to hold your open orders is
+       genuinely the wrong tool, not a test being pedantic.
 
        The second check is not redundant. `create_invoice` commits the index row and `order_intake`
        commits the invoice and subscription in a *separate* transaction, so a backup taken between
@@ -413,16 +430,30 @@ refuses orders it cannot service.
        ```sh
        sqlite3 "$WORK/lnrent.sqlite" \
          "SELECT subscription_id, kind, handles_json FROM instance WHERE state <> 'DESTROYED';" \
-         > /tmp/instances-before.txt
+         | LC_ALL=C sort > /tmp/instances-before.txt
        ```
-    5. **Restore — and do NOT restart yet.** `lnrentd restore --from <backup-dir>
-       --data-dir <data-dir> --force` (`--force` because restore refuses a non-empty target and the
+    5. **Restore — and do NOT restart yet.** `lnrentd restore --from "$BACKUP"
+       --data-dir "$DD" --force` — `$BACKUP`, never `$CAND`: for an encrypted candidate `$CAND`
+       holds two extracted databases with no `MANIFEST.json`, which `restore` refuses. (`--force` because restore refuses a non-empty target and the
        live data dir is not empty; add `--passphrase-file` for an encrypted backup). It replaces the
        *whole* data dir, state DB included, rolling lnrent back to that backup's instant:
        **everything committed since is dropped** — later orders, captures, refunds, ledger rows —
        while phoenixd still holds the sats. Step 6 needs the daemon down.
-    6. **Reconcile what the rollback dropped, then restart.** Re-run step 4's query into
-       `/tmp/instances-after.txt` and diff the two. For every resource present before but absent
+    6. **Reconcile what the rollback dropped, then restart.** Read the RESTORED data dir — not
+       `$WORK`, which is the pre-restore copy step 1 made and step 5 never touched. Re-running
+       step 4's command verbatim would compare that copy with itself, print an empty diff, and
+       report "nothing was dropped" while measuring nothing:
+
+       ```sh
+       sqlite3 "file:$DD/lnrent.sqlite?mode=ro" \
+         "SELECT subscription_id, kind, handles_json FROM instance WHERE state <> 'DESTROYED';" \
+         | LC_ALL=C sort > /tmp/instances-after.txt
+       comm -23 /tmp/instances-before.txt /tmp/instances-after.txt   # dropped by the rollback
+       ```
+
+       `mode=ro` is right here: `restore` installs `VACUUM INTO` artifacts, which carry no
+       `-wal`/`-shm` (`backup.rs:228-231`), so there is no journal to replay. Each line printed is a
+       resource lnrent no longer knows about. For every resource present before but absent
        after, decide ONE of two things — never delete on sight:
 
        - **The subscription was paid and its term has not run out.** Deleting it ends service the
@@ -464,7 +495,9 @@ refuses orders it cannot service.
 
     Never recreate or expire an affected invoice.
 
-  `lnrent money` and `lnrent status` show deduplicated alert HISTORY from the last 12 hours
+  `lnrent money` and `lnrent status` show deduplicated alert HISTORY over `ALERT_VIEW_WINDOW_S`
+  (`alerts.rs`, derived as twice the alert cooldown — read it there rather than trusting a figure
+  copied here)
   (subject, remedy, timestamp) — not live backend state. A repaired incident stays listed until the
   window expires, and disabling the alert sink stops new entries without hiding written ones. The
   number counts distinct *conditions*, not receipts. If the history cannot be read, both commands
