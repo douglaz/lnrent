@@ -583,18 +583,18 @@ async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_i
         // gone, not merely the invoices this alert names. An operator who read only "after the
         // newest affected invoice" could satisfy it exactly and still drop a day of orders.
         format!(
-            "INDEX DIVERGENCE: invoice {invoice_id} is absent from {INDEX_DB_FILE}, so its \
-             payment state is UNKNOWN: lnrent cannot observe, book or expire it. THAT IS ONE \
-             EXAMPLE, not the set — one alert covers all of them, so first enumerate every OPEN \
-             invoice your state DB has that {INDEX_DB_FILE} lacks. REMEDY: stop the daemon, then \
-             `lnrentd restore --from <backup-dir> --data-dir <data-dir> --force` (--force: target \
-             is non-empty; --passphrase-file if encrypted). PICK THE BACKUP BY CONTENTS, NOT DATE: \
-             its {INDEX_DB_FILE} must hold ALL of them. An older backup never had their rows; a \
-             newer one still lacks them if the index was lost before they were paid. Any restore \
-             replaces the WHOLE data dir — every order, capture, refund and ledger row committed \
-             since THAT BACKUP is dropped, while phoenixd keeps the sats. None qualifies: do NOT \
-             restore, reconcile by hand against phoenixd's history. Keep phoenixd on its original \
-             wallet. Do not recreate or expire it."
+            "INDEX DIVERGENCE: invoice {invoice_id} absent from {INDEX_DB_FILE} — payment state \
+             UNKNOWN: lnrent cannot book or expire it. THAT IS ONE EXAMPLE, not the set: one alert \
+             covers them all, so enumerate every OPEN invoice your state DB has that \
+             {INDEX_DB_FILE} lacks. REMEDY: stop the daemon; `lnrentd restore --from <backup-dir> \
+             --data-dir <data-dir> --force` (--force: target non-empty; --passphrase-file if \
+             encrypted). PICK IT BY CONTENTS, NOT DATE: its {INDEX_DB_FILE} must hold ALL of them. \
+             An older backup never had their rows; a newer one still lacks them if the index was \
+             lost before they were paid. Restore replaces the WHOLE data dir — every order, \
+             capture, refund and ledger row committed since THAT BACKUP is dropped, while phoenixd \
+             keeps the sats. None qualifies: do NOT restore — no repair command; keep the data dir, \
+             stop orders, settle buyers from phoenixd's records. Keep phoenixd on its original \
+             wallet; do not recreate or expire it."
         ),
     )
     .await;
@@ -639,24 +639,34 @@ async fn alert_fee_credit_refusal(
     if !dispatcher.is_enabled() {
         return;
     }
+    // The timing row is REPORTING-ONLY, so a failure to persist it must not silence the condition
+    // it exists to report — returning here would mean a read-only or corrupt index DB (while the
+    // outbox stays writable) suppresses every DM forever, re-warning to a log nobody reads. Fall
+    // back to alerting IMMEDIATELY: without a first-observation instant there is no threshold to
+    // wait out, and the cooldown still bounds the volume. Speaking early is the safe direction here;
+    // silence is not.
     let timing = match idx_record_fee_credit_refusal(index, &refusal.invoice_id, now) {
-        Ok(timing) => timing,
+        Ok(timing) => Some(timing),
         Err(e) => {
             tracing::warn!(
                 invoice_id = %refusal.invoice_id,
                 error = %format!("{e:#}"),
-                "failed to persist the local first observation of a fee-credit refusal"
+                "could not persist the first local observation of a fee-credit refusal; alerting \
+                 now rather than deferring on a threshold this cannot measure"
             );
-            return;
+            None
         }
     };
-    let age = now.saturating_sub(timing.first_refusal_at);
+    // With no timing row (the persistence fallback above) there is no measurable age, so nothing can
+    // be deferred: `first_refusal_at` reads as NOW and the threshold is skipped.
+    let first_refusal_at = timing.as_ref().map_or(now, |t| t.first_refusal_at);
+    let age = now.saturating_sub(first_refusal_at);
     // Defer only while the refusal is fresh AND something will look again. Below the threshold this
     // is a receipt lnrent may yet book on its own and a DM per tick would be noise — but a deferral
-    // past the poll's retirement is not a delay, it is silence. `None` (no index row left) speaks:
-    // there is provably no next look. Nothing here changes WHICH settlements are emitted or when —
-    // the poll's row set and the refusal itself are untouched.
-    let last_look = match timing.poll_retires_at {
+    // past the poll's retirement is not a delay, it is silence. `None` (no index row left, or no
+    // timing at all) speaks: there is provably no next look to wait for.  Nothing here changes WHICH
+    // settlements are emitted or when — the poll's row set and the refusal itself are untouched.
+    let last_look = match timing.as_ref().and_then(|t| t.poll_retires_at) {
         Some(retires_at) => now.saturating_add(UNBOOKABLE_SETTLEMENT_ALERT_S) > retires_at,
         None => true,
     };
@@ -679,8 +689,8 @@ async fn alert_fee_credit_refusal(
     let next = "lnrent retries and books them automatically; no money is lost meanwhile, but the \
                 orders do not progress until you do. (Exception: an invoice that had already \
                 EXPIRED locally before the payment landed is only re-checked for a grace window \
-                after its expiry; past that it needs a hand-reconcile against phoenixd's own \
-                payment history.)";
+                after its expiry; past that lnrent cannot book it at all and there is no repair \
+                command — settle that buyer from phoenixd's own records.)";
     alert_unbookable(
         alerts,
         "fee_credit".to_string(),
@@ -693,7 +703,7 @@ async fn alert_fee_credit_refusal(
              phoenixd SPENDABLE balance — at least {} sat to clear this receipt, more if others \
              are held back. {}",
             refusal.invoice_id,
-            timing.first_refusal_at,
+            first_refusal_at,
             age,
             refusal.received_sat,
             refusal.fee_credit_sat,

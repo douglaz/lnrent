@@ -2991,12 +2991,17 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
         detail.contains("CONTENTS") && detail.contains("newer one still lacks them"),
         "the alert must state which backups are safe, not just say 'restore': {detail}"
     );
+    // The no-safe-backup branch must give an instruction the operator can actually CARRY OUT.
+    // "reconcile by hand" was not one: `lnrent reconcile` is report-only, nothing reconstructs the
+    // missing rows, and writing the DB by hand is forbidden (sole sqlite writer, ADR-0001). Naming a
+    // procedure that does not exist is worse than naming none — it reads as a supported path.
     assert!(
         detail.contains("committed since THAT BACKUP is dropped")
             && detail.contains("order, capture, refund and ledger row")
-            && detail.contains("reconcile by hand against phoenixd's history"),
-        "and must say the loss is everything newer than the BACKUP, not just the named invoices, \
-         plus what to do about it: {detail}"
+            && detail.contains("no repair command")
+            && detail.contains("settle buyers from phoenixd's records"),
+        "and must say the loss is everything newer than the BACKUP, plus an ACTIONABLE next step: \
+         {detail}"
     );
     // The subject is GLOBAL and the cooldown dedups, so this alert names ONE affected invoice
     // however many there are. An operator who verifies a candidate backup against the named id

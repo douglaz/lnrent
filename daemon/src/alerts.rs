@@ -219,7 +219,16 @@ pub async fn recent_alerts(
                         "outbox row under an alert id does not carry an operator.alert payload"
                     ));
                 };
-                if a.kind == wire && seen.insert(a.subject.clone()) && shown.len() < limit {
+                // A kind mismatch under this id is the same corruption as a non-alert payload, and
+                // skipping it silently could return total=0 — a known-empty history, when the truth
+                // is that it could not be read. Refuse rather than under-count.
+                if a.kind != wire {
+                    return Err(anyhow::anyhow!(
+                        "outbox row under an alert id for kind {wire} carries kind {}",
+                        a.kind
+                    ));
+                }
+                if seen.insert(a.subject.clone()) && shown.len() < limit {
                     shown.push(AlertView {
                         subject: a.subject,
                         detail: a.detail,

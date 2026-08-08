@@ -276,8 +276,9 @@ refuses orders it cannot service.
   With no such backup, **do not restore at all** — and be clear-eyed that there is then no supported repair: `lnrent reconcile` is report-only, no command reconstructs missing invoice/ledger/pay-index rows, and writing the DB by hand is forbidden (the daemon is the sole sqlite writer, ADR-0001). Leave the data dir and phoenixd's payment history intact, stop taking new orders, and settle the affected buyers out of band from phoenixd's own records. Recovery tooling for this state is tracked as lnrent-8scw. Then verify phoenixd still points at the original wallet/payment history, and restart. An
   index divergence DMs a `SettlementUnbookable` alert when lnrent detects it; a fee-credit refusal
   DMs after it has stood for 15 minutes from lnrent's first local observation — that delay is there
-  because lnrent MAY book the receipt itself on a later retry — it clears only when the wallet's
-  spendable balance rises above the receipt, so a retry alone books nothing until you fund it — and
+  because lnrent MAY book the receipt itself on a later retry — it clears when the wallet's
+  spendable balance reaches the receipt, or if phoenixd converts the fee credit below it — the
+  refusal is the conjunction of both, so either half falling away is enough — and
   it lapses when the
   settlement poll is about to retire the invoice — a delay that outlived the last observer would be
   permanent silence, not a delay. Funding the wallet books these automatically: a fee-credit refusal

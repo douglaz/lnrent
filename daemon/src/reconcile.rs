@@ -1732,10 +1732,8 @@ mod tests {
         std::fs::write(dir.join(format!("{hook}-release")), b"go").unwrap();
     }
 
-    /// A reconciler over a caller-owned `MockPayment` (so a test can settle invoices mid-hook) with
-    /// an ENABLED alert sink to `recipient`.
     /// A reconciler over a caller-owned `MockPayment` (so a test can settle an invoice and have
-    /// `lookup` report it Paid) without an alert sink.
+    /// `lookup` report it Paid), with NO alert sink.
     fn reconciler_with_payment(
         store: Store,
         payment: Arc<crate::backends::MockPayment>,
@@ -1744,6 +1742,8 @@ mod tests {
         Reconciler::new(store, payment, recipe)
     }
 
+    /// A reconciler over a caller-owned `MockPayment` (so a test can settle invoices mid-hook) with
+    /// an ENABLED alert sink to `recipient`.
     fn reconciler_with_payment_and_alerts(
         store: Store,
         payment: Arc<crate::backends::MockPayment>,
