@@ -576,25 +576,24 @@ async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_i
         // is the "do not recreate it" instruction. `a_full_length_unbookable_detail_is_not_truncated`
         // in the sibling test module is what holds that.
         //
-        // "newer than the affected invoices" is NECESSARY but NOT sufficient, which is why the text
-        // tells the operator to pick by CONTENTS and then names the loss: `restore` stages the backup's artifacts and
-        // swaps them in wholesale (`backup.rs`, step 4 — "the swap replaces the target wholesale"),
-        // so it rolls the state DB back to the backup's instant and everything committed since is
-        // gone, not merely the invoices this alert names. An operator who read only "after the
-        // newest affected invoice" could satisfy it exactly and still drop a day of orders.
+        // This message deliberately does NOT carry an executable `restore` command. Choosing a
+        // backup has disqualifiers that cannot be checked from a DM — one predating an outbound
+        // payment rolls back the `phoenixd_pay` dedup witness and can pay a refund twice, and one
+        // predating a paid subscription drops the rows teardown and refunds are driven from — so a
+        // command here would be a money-losing shortcut past the only place those checks exist.
+        // It names the loss and the two disqualifiers, then sends the operator to the runbook.
         format!(
             "INDEX DIVERGENCE: invoice {invoice_id} absent from {INDEX_DB_FILE} — payment state \
-             UNKNOWN: lnrent cannot book or expire it. THAT IS ONE EXAMPLE, not the set: one alert \
-             covers them all, so enumerate every OPEN invoice your state DB has that \
-             {INDEX_DB_FILE} lacks. REMEDY: stop the daemon; `lnrentd restore --from <backup-dir> \
-             --data-dir <data-dir> --force` (--force: target non-empty; --passphrase-file if \
-             encrypted). PICK IT BY CONTENTS, NOT DATE: its {INDEX_DB_FILE} must hold ALL of them. \
-             An older backup never had their rows; a newer one still lacks them if the index was \
-             lost before they were paid. Restore replaces the WHOLE data dir — every order, \
-             capture, refund and ledger row committed since THAT BACKUP is dropped, while phoenixd \
-             keeps the sats. None qualifies: do NOT restore — no repair command; keep the data dir, \
-             stop orders, settle buyers from phoenixd's records. Keep phoenixd on its original \
-             wallet; do not recreate or expire it."
+             UNKNOWN: lnrent can neither book nor expire it. THAT IS ONE EXAMPLE, not the set: one \
+             alert covers them all, so enumerate every OPEN invoice your state DB has that \
+             {INDEX_DB_FILE} lacks. REMEDY: stop the daemon, then follow the index-divergence \
+             steps in docs/go-live.md — do NOT restore from this message alone. Restore replaces \
+             the WHOLE data dir: every order, capture, refund and ledger row committed since that \
+             backup is dropped while phoenixd keeps the sats, and a backup predating any outbound \
+             payment or any paid subscription must NOT be used — it can pay a refund twice or end \
+             service a buyer paid for. The runbook carries those checks. If none qualifies there \
+             is no repair command: keep the data dir, stop orders, settle buyers from phoenixd's \
+             records. Keep phoenixd on its original wallet; do not recreate or expire it."
         ),
     )
     .await;

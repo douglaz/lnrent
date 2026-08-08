@@ -294,9 +294,18 @@ refuses orders it cannot service.
        (The state file is `lnrent.sqlite`, not `state.db`.) Run the second query against each
        candidate backup's `phoenixd_index.db` too: a backup qualifies only when
        `comm -23 /tmp/open.txt <its indexed list>` is EMPTY. **An ENCRYPTED backup dir holds only
-       `backup.age` and `MANIFEST.json`** — there is no `phoenixd_index.db` to query. Decrypt it to
-       a scratch dir first (`age -d -i <identity> backup.age | tar -x -C /tmp/cand`) and query the
-       copy there; never decrypt over the live data dir.
+       `backup.age` and `MANIFEST.json`** — there is no `phoenixd_index.db` to query. Decrypt a
+       copy to a scratch dir first and query that; never decrypt over the live data dir:
+
+       ```sh
+       mkdir -m 700 /tmp/cand        # 700 FIRST: the archive carries operator.seed
+       age -d backup.age | tar -x -C /tmp/cand
+       ```
+
+       `age` prompts for the same passphrase you would pass `--passphrase-file`; the backup is
+       passphrase-encrypted, so there is no identity file and `-i` does not apply. **Shred the
+       scratch dir the moment you are done** (`rm -rf /tmp/cand`) — it holds the plaintext BIP39
+       `operator.seed`, which controls the funds.
     2. **Choose a backup by CONTENTS, never by date** — its `phoenixd_index.db` must hold ALL of
        them. An older backup never had their rows. A newer one still lacks them if the index was
        already lost when they were paid. Date tells you nothing here.
@@ -319,9 +328,28 @@ refuses orders it cannot service.
          > /tmp/instances-before.txt
        ```
 
-       Run the same query after the restore, diff the two, and for every resource present before
-       but absent after, delete it at the provider yourself (for `do-vps`, the `droplet_id` in
-       `handles_json`). lnrent will never do it for you — it no longer knows those rows existed.
+       Run the same query after the restore and diff the two. For every resource present before
+       but absent after, decide ONE of two things — never delete on sight:
+
+       - **The subscription was PAID and its term has not run out.** Deleting it ends service the
+         buyer paid for, and the restore has already dropped the rows you would refund from. Do
+         NOT delete. Either leave it running and honour the term by hand, or settle the buyer from
+         phoenixd's records first. A backup that predates any such subscription is better treated
+         as disqualified (see the payment check below) — the VM is the *cheaper* loss.
+       - **Nothing was paid, or the term is over.** Delete it at the provider yourself (for
+         `do-vps`, the `droplet_id` in `handles_json`). lnrent will never do it for you — it no
+         longer knows those rows existed, so the VM bills forever otherwise.
+
+       Step 1's enumeration is `status='OPEN'` and so is blind to this: a captured, provisioned
+       subscription has a PAID invoice, and a backup can qualify there while still predating it.
+       List those separately before you restore:
+
+       ```sh
+       sqlite3 "file:$DD/lnrent.sqlite?mode=ro" \
+         "SELECT id, subscription_id FROM invoice
+            WHERE status='PAID' OR settled_at IS NOT NULL ORDER BY id;" \
+         > /tmp/paid-before.txt
+       ```
 
        **A backup that predates any outbound payment DISQUALIFIES itself.** `phoenixd_pay` is
        lnrent's only defence against paying a refund twice — phoenixd's `payinvoice` takes no

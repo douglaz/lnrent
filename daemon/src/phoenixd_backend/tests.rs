@@ -2587,6 +2587,33 @@ fn backend_with_alerts(
     (be, store)
 }
 
+/// Same wiring as [`backend_with_alerts`], except the timing table is DROPPED after the schema
+/// runs — so `idx_record_fee_credit_refusal` fails for real (no such table) instead of through a
+/// seam that could drift from the production error path. Models a read-only or corrupt index DB
+/// whose outbox is still writable.
+fn backend_with_alerts_and_no_timing_table(
+    ops: Arc<FakePhoenixdOps>,
+    clock: Arc<TestClock>,
+) -> (PhoenixdPayment, crate::store::Store) {
+    let state = Connection::open_in_memory().expect("in-memory state db");
+    state.execute_batch(crate::store::SCHEMA).expect("state schema");
+    let store = crate::store::Store::spawn(state);
+    let clock: Arc<dyn Clock> = clock;
+    let alerts = Arc::new(crate::alerts::AlertDispatcher::new(
+        store.clone(),
+        clock.clone(),
+        "op-npub-hex".into(),
+    ));
+    let index = Connection::open_in_memory().expect("in-memory index");
+    index.execute_batch(INDEX_SCHEMA).expect("index schema");
+    index
+        .execute_batch("DROP TABLE phoenixd_unbookable_settlement;")
+        .expect("drop the timing table");
+    let be =
+        PhoenixdPayment::with_ops(ops, index, clock, FeeSchedule::default()).with_alerts(alerts);
+    (be, store)
+}
+
 async fn operator_alerts(store: &crate::store::Store) -> Vec<lnrent_wire::OperatorAlert> {
     let payloads: Vec<String> = store
         .read(|c| {
@@ -2688,6 +2715,40 @@ async fn a_fee_credit_refusal_alerts_the_operator_with_its_reason_and_remedy() {
     assert!(
         !detail.contains("2723 sat more"),
         "and must NOT ask for the whole receipt when most of it is already held: {detail}"
+    );
+}
+
+// The threshold is measured from a row in the index. If that row cannot be WRITTEN, the age is
+// unmeasurable — and an unmeasurable age must not be read as "too fresh to mention". This is the
+// bead's own failure mode wearing a different hat: a read-only or corrupt index DB would otherwise
+// suppress every DM forever while the outbox stayed perfectly writable, which is exactly the silence
+// gc7 exists to end. Contrast `a_fresh_fee_credit_refusal_does_not_alert_before_the_threshold`: same
+// instant, same refusal, no clock advance — the ONLY difference is whether the timing row can be
+// persisted, so what this pins is provably the fallback and nothing else.
+#[tokio::test]
+async fn a_settlement_alert_still_lands_when_its_timing_row_cannot_be_persisted() {
+    let ops = FakePhoenixdOps::new();
+    let clock = Arc::new(TestClock::new(measured_receive_settled_at()));
+    let (be, store) = backend_with_alerts_and_no_timing_table(ops.clone(), clock.clone());
+    let inv = arrange_fee_credit_refusal(&be, &ops).await;
+
+    be.received_amount_msat(&inv.id)
+        .await
+        .expect_err("the refusal itself is unchanged: an unbacked receipt is still not booked");
+
+    // No clock advance, deliberately. With a healthy index this instant is silent.
+    let alerts = operator_alerts(&store).await;
+    assert_eq!(
+        alerts.len(),
+        1,
+        "an unpersistable threshold must speak immediately, not fall silent: {alerts:?}"
+    );
+    assert_eq!(alerts[0].kind, "settlement_unbookable");
+    assert_eq!(alerts[0].subject, "fee_credit");
+    assert!(
+        alerts[0].detail.contains("REMEDY"),
+        "and it must still carry the remedy an operator acts on: {}",
+        alerts[0].detail
     );
 }
 
@@ -2979,11 +3040,16 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
         detail.contains("INDEX DIVERGENCE")
             && detail.contains("phoenixd-orphan")
             && detail.contains("UNKNOWN")
-            // The shipped command, with the flags it actually needs: `restore` REFUSES a non-empty
-            // target and REFUSES an encrypted backup without a passphrase (`backup::restore`), and
-            // this remedy restores over the live data dir.
-            && detail.contains("lnrentd restore --from <backup-dir> --data-dir <data-dir> --force")
-            && detail.contains("--passphrase-file")
+            // This DM must NOT carry an executable restore command. Choosing a backup has two
+            // disqualifiers a DM cannot check — one predating an outbound payment rolls back the
+            // `phoenixd_pay` dedup witness (double pay), one predating a paid subscription drops
+            // the rows teardown and refunds run on — so the message names both and routes to the
+            // runbook that carries the checks. A pasteable command here is the money-losing
+            // shortcut past them, which is why its ABSENCE is asserted, not just the pointer.
+            && !detail.contains("lnrentd restore")
+            && detail.contains("docs/go-live.md")
+            && detail.contains("pay a refund twice")
+            && detail.contains("end service a buyer paid for")
             && detail.contains("original wallet")
             && !detail.contains("FEE-CREDIT REFUSAL"),
         "index reason and shipped recovery remedy must be self-contained: {detail}"
@@ -2994,22 +3060,21 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
     // wholesale"), while the condition being reported is that the state DB knows invoices the index
     // does not — i.e. the state DB is the NEWER file.
     //
-    // An AGE criterion cannot pick the backup at all, which is the trap this assertion guards: a
-    // backup older than the affected invoices never held their rows, and a NEWER one still lacks
-    // them if the index was already lost when they were paid. Only the contents settle it. On top of
-    // that, any restore rolls the state DB back to its own instant, so an operator handed only a
-    // date rule can satisfy it exactly and still drop every order committed since. An operator who
-    // has never read `backup.rs` must get both from the DM alone.
+    // Picking the backup is DELEGATED to the runbook (no command here), so what the DM still owes
+    // the operator is the reason not to improvise: that a restore is not a targeted repair of the
+    // named invoices but a wholesale rollback. Without that a "just restore from last night" reflex
+    // looks free. The selection rules themselves — pick by CONTENTS, never by date — live in
+    // docs/go-live.md alongside the two disqualifiers, because only there can they be checked.
     assert!(
-        detail.contains("CONTENTS") && detail.contains("newer one still lacks them"),
-        "the alert must state which backups are safe, not just say 'restore': {detail}"
+        detail.contains("do NOT restore from this message alone"),
+        "the alert must actively forbid restoring on the strength of the DM: {detail}"
     );
     // The no-safe-backup branch must give an instruction the operator can actually CARRY OUT.
     // "reconcile by hand" was not one: `lnrent reconcile` is report-only, nothing reconstructs the
     // missing rows, and writing the DB by hand is forbidden (sole sqlite writer, ADR-0001). Naming a
     // procedure that does not exist is worse than naming none — it reads as a supported path.
     assert!(
-        detail.contains("committed since THAT BACKUP is dropped")
+        detail.contains("committed since that backup is dropped")
             && detail.contains("order, capture, refund and ledger row")
             && detail.contains("no repair command")
             && detail.contains("settle buyers from phoenixd's records"),
@@ -3025,12 +3090,16 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
             && detail.contains("every OPEN invoice your state DB has"),
         "the alert must say the named invoice is one example and how to enumerate the rest: {detail}"
     );
+    // Backup-selection rules moved to the runbook with the command, since the two disqualifiers
+    // that decide them are only checkable there. What the DM must still carry is the SATS half:
+    // a restore does not claw money back from phoenixd, so an operator cannot read the rollback
+    // as merely undoing the mistake.
     assert!(
-        detail.contains("An older backup never had their rows"),
-        "and that an older backup does not even fix what it was reached for: {detail}"
+        detail.contains("while phoenixd keeps the sats"),
+        "and that the rollback does not recover the money phoenixd already holds: {detail}"
     );
     assert!(
-        detail.contains("None qualifies: do NOT restore"),
+        detail.contains("If none qualifies there is no repair command"),
         "including the case where the operator has no safe backup at all: {detail}"
     );
 }
