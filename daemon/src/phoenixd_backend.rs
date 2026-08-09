@@ -1371,9 +1371,14 @@ impl PhoenixdPayment {
             None => {
                 let dest = parse_dest(bolt11)?;
                 match self.ops.outgoing_by_hash(&dest.payment_hash).await? {
-                    Some(record) if record.is_paid => {
-                        self.adopt_paid(idempotency_key, &record, amount_sat, cap)
-                    }
+                    Some(record) if record.is_paid => self.adopt_paid_without_row(
+                        idempotency_key,
+                        bolt11,
+                        &dest.payment_hash,
+                        &record,
+                        amount_sat,
+                        cap,
+                    ),
                     // Bind the record's shape, for the same reason the PREPARED arm does: an operator
                     // reading a stuck refund cannot see this file, and calling an in-flight payment
                     // "failed" would state something false about it.
@@ -1690,6 +1695,62 @@ impl PhoenixdPayment {
             idempotency_key,
             &record.payment_hash,
             Some(&record.payment_id),
+            self.clock.now(),
+        )?;
+        log_inv1_overrun(
+            idempotency_key,
+            sat_to_msat(amount_sat),
+            record.fees_msat,
+            cap,
+        );
+        Ok(record.payment_id.clone())
+    }
+
+    /// Adopt a paid record for a key that has NO local row (lnrent-qvjz).
+    ///
+    /// [`Self::adopt_paid`] cannot serve this case. Its CAS updates an existing `PREPARED` witness,
+    /// and a missing witness is precisely what an index loss leaves behind — so it fails closed on
+    /// the one shape this arm exists to handle. The terminal row is inserted directly, never via
+    /// `PREPARED`, which would transiently name a hash recovery could adopt (see the ordering note
+    /// in [`Self::start_pay`]).
+    ///
+    /// Two protections the vanished row would otherwise have supplied are therefore taken by hand:
+    /// the requested hash must match the record's own (the CAS did this through
+    /// `WHERE payment_hash = ?`), and no OTHER live key may already own that hash ([8A]).
+    ///
+    /// `node_id` stays NULL. This attempt was never prepared against a known wallet, and the schema
+    /// already defines NULL as "unknown identity, which recovery treats as unproven". Recording
+    /// whichever wallet happens to answer now would be writing a guess down as a fact.
+    fn adopt_paid_without_row(
+        &self,
+        idempotency_key: &str,
+        bolt11: &str,
+        expected_hash: &str,
+        record: &PhoenixdOutgoing,
+        amount_sat: u64,
+        cap: PayCap,
+    ) -> Result<String> {
+        if record.payment_hash != expected_hash {
+            bail!(
+                "phoenixd returned an outgoing record for hash {} when asked about {expected_hash}; \
+                 refusing to credit it to key {idempotency_key}",
+                record.payment_hash
+            );
+        }
+        if let Some(other) =
+            pay_other_key_for_hash(&self.index, expected_hash, idempotency_key)?
+        {
+            bail!(
+                "phoenixd pay key {idempotency_key} has no local row but hash {expected_hash} is \
+                 already owned by key {other}; adopting it here would credit ONE real payment to \
+                 two lnrent refunds"
+            );
+        }
+        pay_insert_adopted_succeeded(
+            &self.index,
+            idempotency_key,
+            bolt11,
+            record,
             self.clock.now(),
         )?;
         log_inv1_overrun(
@@ -2589,6 +2650,44 @@ fn pay_upsert_prepared(
 
 /// Terminal SUCCESS, CAS-guarded on the payment hash so a stale caller cannot overwrite a row that
 /// was rebound to a different destination.
+/// Insert a terminal `SUCCEEDED` row for a payment adopted with no prior witness (lnrent-qvjz).
+///
+/// `INSERT` rather than upsert, deliberately: the caller has just established there is no row, and a
+/// silent overwrite would be the one way this path could clobber real bookkeeping if that ever
+/// stopped being true. A conflict therefore fails closed rather than winning.
+fn pay_insert_adopted_succeeded(
+    index: &Mutex<Connection>,
+    key: &str,
+    bolt11: &str,
+    record: &PhoenixdOutgoing,
+    terminal_at: i64,
+) -> Result<()> {
+    let conn = index.lock().unwrap();
+    let changed = conn
+        .execute(
+            "INSERT INTO phoenixd_pay
+                 (idempotency_key, bolt11, payment_hash, node_id, payment_id, status, terminal_at)
+             VALUES (?1, ?2, ?3, NULL, ?4, 'SUCCEEDED', ?5)
+             ON CONFLICT(idempotency_key) DO NOTHING",
+            params![
+                key,
+                bolt11,
+                record.payment_hash,
+                record.payment_id,
+                terminal_at
+            ],
+        )
+        .context("recording an adopted phoenixd payment with no prior witness")?;
+    if changed != 1 {
+        bail!(
+            "phoenixd pay key {key} gained a row while its adopted payment for hash {} was being \
+             recorded; refusing to overwrite it",
+            record.payment_hash
+        );
+    }
+    Ok(())
+}
+
 fn pay_mark_succeeded(
     index: &Mutex<Connection>,
     key: &str,
