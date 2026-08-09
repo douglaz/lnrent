@@ -1370,6 +1370,20 @@ impl PhoenixdPayment {
             // residual the module header already accepts for an adopted foreign payment.
             None => {
                 let dest = parse_dest(bolt11)?;
+                // [8A] FIRST, and deliberately not re-implemented here. A hash some OTHER live key
+                // already owns must be refused by `start_pay`, because that refusal is recorded
+                // `FAILED` DIRECTLY — and for a collision `FAILED` is the correct outcome, not a
+                // hazard: it is what lets the Refunder re-resolve to an invoice that is actually
+                // ours. Refusing at the probe instead would leave the key `Unknown`, which is never
+                // re-quoted, and the refund would livelock on a destination it can never own.
+                // (`start_pay` refuses before funding, so this costs no POST.)
+                if pay_other_key_for_hash(&self.index, &dest.payment_hash, idempotency_key)?
+                    .is_some()
+                {
+                    return self
+                        .start_pay(bolt11, amount_sat, idempotency_key, cap)
+                        .await;
+                }
                 match self.ops.outgoing_by_hash(&dest.payment_hash).await? {
                     Some(record) if record.is_paid => self.adopt_paid_without_row(
                         idempotency_key,
@@ -1714,9 +1728,13 @@ impl PhoenixdPayment {
     /// `PREPARED`, which would transiently name a hash recovery could adopt (see the ordering note
     /// in [`Self::start_pay`]).
     ///
-    /// Two protections the vanished row would otherwise have supplied are therefore taken by hand:
+    /// The one protection the vanished row would otherwise have supplied is therefore taken by hand:
     /// the requested hash must match the record's own (the CAS did this through
-    /// `WHERE payment_hash = ?`), and no OTHER live key may already own that hash ([8A]).
+    /// `WHERE payment_hash = ?`). The other, [8A] cross-key ownership, is NOT re-checked here — the
+    /// caller runs it ahead of the probe and hands a collision to `start_pay`, which is the only
+    /// place allowed to record that refusal, and both run under `pay_start_lock` so nothing can
+    /// acquire an owner in between. A second copy of the check here could never fire, and a guard
+    /// that cannot fire is not a guard.
     ///
     /// `node_id` stays NULL. This attempt was never prepared against a known wallet, and the schema
     /// already defines NULL as "unknown identity, which recovery treats as unproven". Recording
@@ -1735,15 +1753,6 @@ impl PhoenixdPayment {
                 "phoenixd returned an outgoing record for hash {} when asked about {expected_hash}; \
                  refusing to credit it to key {idempotency_key}",
                 record.payment_hash
-            );
-        }
-        if let Some(other) =
-            pay_other_key_for_hash(&self.index, expected_hash, idempotency_key)?
-        {
-            bail!(
-                "phoenixd pay key {idempotency_key} has no local row but hash {expected_hash} is \
-                 already owned by key {other}; adopting it here would credit ONE real payment to \
-                 two lnrent refunds"
             );
         }
         pay_insert_adopted_succeeded(

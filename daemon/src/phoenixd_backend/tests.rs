@@ -99,6 +99,8 @@ struct FakeState {
     create_amount_override: Option<u64>,
     /// Force createinvoice to return a bolt11 that DISAGREES with its own paymentHash side-field.
     create_bolt11_hash_mismatch: bool,
+    /// A record that does not exist until the POST creates it, revealed by the next `pay_invoice`.
+    outgoing_after_pay: Option<PhoenixdOutgoing>,
     /// Make `GET /payments/outgoingbyhash/{hash}` fail at the transport, which is DIFFERENT from its
     /// 404: a 404 is phoenixd answering "no such payment", an error is phoenixd not answering at all.
     /// The no-row probe (lnrent-qvjz) must fail closed on the second, never read it as the first.
@@ -136,6 +138,10 @@ impl FakePhoenixdOps {
             .unwrap()
             .outgoing
             .insert(record.payment_hash.clone(), record);
+    }
+
+    fn set_outgoing_after_pay(&self, record: PhoenixdOutgoing) {
+        self.st.lock().unwrap().outgoing_after_pay = Some(record);
     }
 
     fn fail_outgoing_by_hash(&self) {
@@ -259,6 +265,12 @@ impl PhoenixdOps for FakePhoenixdOps {
     async fn pay_invoice(&self, bolt11: &str) -> Result<PayAttempt> {
         let mut st = self.st.lock().unwrap();
         st.pay_calls.push(bolt11.to_string());
+        // A record the POST itself brings into existence becomes visible only now — which is what
+        // lets a test exercise the receipt-less POST path at all, since the pre-POST probe
+        // (lnrent-qvjz) would otherwise find the record and never send anything.
+        if let Some(revealed) = st.outgoing_after_pay.take() {
+            st.outgoing.insert(revealed.payment_hash.clone(), revealed);
+        }
         if let Some(scripted) = st.pay_script.pop_front() {
             return scripted.map_err(|e| anyhow!(e));
         }
@@ -1280,8 +1292,10 @@ async fn a_receipt_less_duplicate_response_is_success_equivalent() {
     assert_eq!(id, "pay-live", "the real payment is adopted as this key's");
     assert_eq!(
         ops.pay_calls().len(),
-        1,
-        "the duplicate answer must not trigger another pay attempt"
+        0,
+        "the no-row probe (lnrent-qvjz) now sees the paid record BEFORE the POST, so the duplicate \
+         answer is never even solicited. Same money outcome as the old path, one fewer POST - what \
+         this pins is that a paid record for our hash is adopted and never paid a second time"
     );
     assert_eq!(
         be.payment_status_by_key("refund:order:2:g1").await.unwrap(),
@@ -1748,16 +1762,15 @@ async fn a_receipt_less_post_reports_terminal_and_in_flight_records_differently(
         let hash = hash_of(&bolt11);
         let key = "refund:order:41:g1";
 
-        ops.set_outgoing_for(
-            &hash,
-            PhoenixdOutgoing {
-                payment_id: "pay-receiptless".into(),
-                payment_hash: hash.clone(),
-                is_paid: false,
-                fees_msat: 0,
-                completed_at_ms,
-            },
-        );
+        // The record is what the POST creates, so it must not exist before it. Pre-setting it made
+        // the pre-POST probe (lnrent-qvjz) refuse and this path was never reached.
+        ops.set_outgoing_after_pay(PhoenixdOutgoing {
+            payment_id: "pay-receiptless".into(),
+            payment_hash: hash.clone(),
+            is_paid: false,
+            fees_msat: 0,
+            completed_at_ms,
+        });
         ops.script_pay(Ok(PayAttempt::NoReceipt {
             reason: Some("payment failed".into()),
         }));
