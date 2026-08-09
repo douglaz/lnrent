@@ -8,7 +8,7 @@ cluster deploy + real sats), the live-verification beads (`cnf`, `rwv`, `kr1`, `
 `e96`), upstream fedimint (`y32`, `7y1`), `ea1` (release), `5h4` (product design), `xov` (user
 deferred). `br ready` counts the whole repo — filter it through this line.
 
-**Phase:** BUILD · **Bead:** lnrent-qvjz · **Branch:** fix/qvjz-index-loss-double-pay
+**Phase:** BUILD · **Bead:** (next — see Now) · **Branch:** —
 **Pending:** —
 **Gate:** the full CI matrix in AGENTS.md "Building and testing" — the workspace clippy+test pair
 is the inner loop only; it omits both `--no-default-features` legs, wasm, and the two web E2E runs
@@ -17,6 +17,8 @@ each names something that the act of writing it changes or dates, and both drift
 file carried them.
 
 ## Done (this session)
+- lnrent-qvjz probe outgoingbyhash before a no-row phoenixd payment — merged #83, CLOSED.
+  Six panel rounds (round 4 INVERTED, cut 93 net lines). Six beads filed rather than folded in.
 - lnrent-gc7 SettlementUnbookable operator alert — merged #82, CLOSED. 47 commits. Two operator
   procedures DELETED on panel advice (482 lines); nine follow-ups filed rather than folded in.
 - lnrent-m7g nix packages + container image — merged #80
@@ -24,32 +26,29 @@ file carried them.
   terminal-FAILED resolution was cut after 11 P1 double-pay findings)
 
 ## Now
-Building **lnrent-qvjz** (P1) — a restart after a phoenixd index loss can pay a refund TWICE. The
-bead's original text named the wrong door and its proposed remedy cannot close it; the verified
-mechanism and the fix are in the bead's notes. Not yg0: that is DM-text quality (P2), this is money.
+qvjz is merged and closed. **Next: `lnrent-unbooked-settlement-condition-ledger-hwni` (P1, design/ADR)**
+— not another patch. lnrent has no durable record of an OPEN condition on the money-RECEIVE side:
+alerts are edge-triggered with an in-memory cooldown, the only durable artifact is the outbox DM row,
+and `money`/`status` reconstruct "unbookable" from a 12h delivery window. The repo already has the
+right pattern one table over (`teardown_failure`: `resolved_at NULL = still open`, plus a LIVE
+operator count). Both reviewers, independently: **do not ship bdkh/peri/kwr separately** — each
+hardens one symptom while preserving the architecture that produces them. The blocking edges are in
+`br` (`br dep tree`), so the drive cannot take the parts in the wrong order.
 
-An opus+codex panel (2026-08-09) recut the gc7 follow-up graph, and the edges are now in `br` so the
-drive cannot pick these up in the wrong order:
+The four questions that ADR must settle are in the bead. Answer them and bdkh/peri/kwr collapse into
+one implementation bead with 3p71/yjtd/ie4p as `reason` variants behind it.
 
-- **lnrent-unbooked-settlement-condition-ledger-hwni (P1, design/ADR)** — the missing concept behind
-  most of gc7's follow-ups. lnrent has no durable record of an OPEN condition on the money-RECEIVE
-  side: alerts are edge-triggered with an in-memory cooldown, the only durable artifact is the outbox
-  DM row, and `money`/`status` reconstruct "unbookable" from a 12h delivery window. The repo already
-  has the right pattern one table over (`teardown_failure`, with `resolved_at NULL = still open` and a
-  LIVE operator count). Both reviewers, independently: **do not ship bdkh/peri/kwr separately** —
-  each hardens one symptom while preserving the false architecture.
-- The blocking edges are in `br` — read them with `br dep tree`, not from a list here that can only
-  drift from it. In short: bdkh/peri/kwr are subsumed as acceptance criteria, 3p71/yjtd/ie4p are
-  producer adapters behind it, and hh4q now sits behind 8scw. Both 8scw and hh4q need an
-  authoritative phoenixd inventory over UNMEASURED endpoints, so both are out of drive scope until a
-  measurement task runs on the staging node. 7fx should follow the ADR — its latching remedy is the
-  same shape as a ledger row with an operator-cleared `resolved_at`.
+Money-path residuals qvjz surfaced, none of them regressions — all pre-existing, now named:
+**uxbd (P1)** a restore reinstates a STALE `FAILED`, which no probe in `pay_inner` can reach;
+**7wbo (P1)** the sweeper terminalizes an expired intent unprobed and the next pass pays a NEW hash;
+**sll4 (P2)** adoption skips the amount/INV-1 preflights and terminalizes at the wrong amount;
+**p2bl (P2)** the PREPARED CAS compares phoenixd's echoed hash casing — wants a MEASUREMENT, not a
+second hedge; **9yfn (P2)** the runbook explains the hazard with the mechanism qvjz closed, blocked
+on uxbd + 7wbo so it is resynced once, with a true story.
 
-Panel disagreements worth keeping: codex would raise **7fx to P1** and give **4kg** P1 consideration
-(reconcile can mint entitlement past the credited resumable boundary; xr7 compounds it). Opus rates
-**kwr** under-priced at P2 — with the store healthy, once the last alert ages out, `lnrent money`
-prints a bare `Status: READY` over a diverged index, and the divergence alert's own remedy ("stop the
-daemon") is what drains the window. Both flag **3zt** as a cheap, independent false-green CI gate.
+Panel disagreements worth keeping: codex would raise **7fx to P1** and give **4kg** P1 consideration.
+Both flag **3zt** as a cheap, independent false-green CI gate — it is the defect class this project
+keeps producing, sitting in the harness that guards everything else.
 
 ## Panel status — READ THIS BEFORE THE NEXT HARDEN
 Fable ran out of credits during gc7's pass 29 and HANGS rather than erroring (a one-token probe
