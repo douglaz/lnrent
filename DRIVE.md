@@ -6,7 +6,7 @@ cluster deploy + real sats), the live-verification beads (`cnf`, `rwv`, `kr1`, `
 `e96`), upstream fedimint (`y32`, `7y1`), `ea1` (release), `5h4` (product design), `xov` (user
 deferred). `br ready` counts the whole repo — filter it through this line.
 
-**Phase:** HARDEN · **Bead:** lnrent-gc7 · **Branch:** feat/gc7-settlement-unbookable-alert
+**Phase:** BUILD · **Bead:** (next — see Now) · **Branch:** —
 **Pending:** —
 **Gate:** the full CI matrix in AGENTS.md "Building and testing" — the workspace clippy+test pair
 is the inner loop only; it omits both `--no-default-features` legs, wasm, and the two web E2E runs
@@ -15,38 +15,33 @@ each names something that the act of writing it changes or dates, and both drift
 file carried them.
 
 ## Done (this session)
+- lnrent-gc7 SettlementUnbookable operator alert — merged #82, CLOSED. 47 commits. Two operator
+  procedures DELETED on panel advice (482 lines); nine follow-ups filed rather than folded in.
 - lnrent-m7g nix packages + container image — merged #80
 - lnrent-ole record the measured phoenixd `completedAt` shape — merged #81 (scope REDUCED: the
   terminal-FAILED resolution was cut after 11 P1 double-pay findings)
 
 ## Now
-lnrent-gc7 — the `SettlementUnbookable` operator alert, plus the index-divergence repair runbook
-in `docs/go-live.md`. The code converged early; the review passes since have been almost entirely
-about the runbook, which AGENTS.md makes product surface — a stranger operator follows it
-mid-incident, so a command that cannot run as written is a defect, not a typo.
+gc7 is merged and closed. Next scoped bead: **lnrent-yg0** — stuck-payment alerts carry no
+diagnosis, so the operator DM cannot say terminal vs in-flight. It is the natural pair (same alert
+surface) and needs a `refund_attempt.last_error` migration, which is why it was carved out of
+lnrent-ole rather than done there.
 
-Follow-ups filed rather than folded in: `lnrent-bdkh` (a deferred refusal lost across a restart
-window), `lnrent-kwr` (12-hour view window), `lnrent-yjtd` (getbalance-only outage),
-`lnrent-8scw` (no repair tooling for a lost index), `lnrent-ie4p`.
+Follow-ups gc7 filed, none blocking: **qvjz (P1)** restart re-pays PENDING refunds after an index
+loss — exists on master today, gc7 makes it visible; **8scw** the repair tool that replaces the cut
+runbook, with a seven-item acceptance list; **3p71** lnv2 PAID_UNRECOVERED unwired; **hh4q**
+late settlement on an EXPIRED invoice is owed but invisible; **peri**, **bdkh**, **kwr**, **yjtd**,
+**ie4p**.
 
-## Panel is DEGRADED — read before trusting the clearance
-Fable ran out of credits during pass 29 (it HANGS rather than erroring: a one-token probe returned
-RC=124 with `is_error`, no stderr — so exit-code guards do not catch it). The user decided to
-continue codex-only.
+## Panel status — READ THIS BEFORE THE NEXT HARDEN
+Fable ran out of credits during gc7's pass 29 and HANGS rather than erroring (a one-token probe
+returned RC=124 with `is_error`, empty stderr — exit-code guards do NOT catch it; absent output is
+the only reliable signal). gc7 was landed on a CODEX-ONLY clearance with the user's explicit
+decision, labelled as such in the PR body and in the merged DRIVE.md.
 
-This means the HARDEN gate was NOT met as written: `multi-reviewer-loop` reaches CLEAN only when
-BOTH reviewers are clean on the same tree, and a one-reviewer pass is CLEAN_DEGRADED. The clearance
-recorded for this branch is therefore a CODEX-ONLY clearance and must not be read as a two-reviewer
-result. It is written down here, in the PR body, and nowhere is it claimed otherwise.
-
-Worth weighing if this comes back: fable found the last three P1s on this branch — the degraded
-store silencing its own alert sink, the correlated-failure hole in the withhold guard, and the
-restart double-pay — while codex's final passes were 1 finding, then 3 already-filed. The reviewer
-that was dropped is the one that had been finding the money-path defects.
-
-## Next
-LAND on a codex-only clearance. Then `yg0` — it also touches the alert surface and needs a
-`refund_attempt.last_error` migration.
+Check fable before the next panel. If it is still down, either restore it or say plainly in the PR
+that the panel is degraded — do not let a one-reviewer pass be recorded as CLEAN. On gc7, fable
+found the last three P1s while codex's final passes went 4 -> 1 -> 1 -> 0.
 
 ## Open questions for the human
 - `lnrent-nfj` is the sole P1 and the only gate on the nightly-run epic, but needs a cluster
