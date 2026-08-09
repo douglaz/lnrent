@@ -386,13 +386,21 @@ fn money_human_text(v: &serde_json::Value) -> String {
         );
     }
     if unbookable_unknown {
-        lines.push(
-            "\x1b[1;31mUnbookable settlement alert history: UNKNOWN\x1b[0m — the daemon could not \
-             read its durable alert history, so it cannot say whether settlements are being held \
-             back — this is NOT a report of zero. Check the daemon's storage error, then re-run. \
-             (`lnrent status` carries the same fields as raw JSON, without this framing.)"
-                .to_string(),
-        );
+        // Two ways to be UNKNOWN, and they send the operator to different places. A daemon that
+        // never reported the view has no storage error to chase — telling them to look for one
+        // wastes the minutes that matter.
+        let cause = if reported_unbookable_view {
+            "the daemon could not read its durable alert history. Check the daemon's storage \
+             error, then re-run."
+        } else {
+            "this daemon did not report the view at all, which means it predates it — nothing is \
+             broken; upgrade the daemon, or read the condition from phoenixd directly."
+        };
+        lines.push(format!(
+            "\x1b[1;31mUnbookable settlement alert history: UNKNOWN\x1b[0m — {cause} It cannot say \
+             whether settlements are being held back, so this is NOT a report of zero. (`lnrent \
+             status` carries the same fields as raw JSON, without this framing.)"
+        ));
     } else if unbookable > 0 {
         // CONDITIONS, not receipts. The daemon dedupes this history per alert subject
         // (`alerts.rs`), and both unbookable-settlement subjects are deliberately global — one for
@@ -440,16 +448,31 @@ fn money_human_text(v: &serde_json::Value) -> String {
     // remedy is dangerous, not independent of it. "Restore from backup and restart" re-drives
     // already-paid PENDING refunds on a diverged index, and the Status line is the one an operator
     // acts on, so absence of evidence must not read as evidence of absence here.
-    if degraded && (index_diverged || unbookable_unknown || unbookable_disabled) {
-        // Three DIFFERENT states, three different things to tell the operator. Collapsing the
-        // last two into "could not be read" sent someone to diagnose corruption that does not
-        // exist: a disabled sink reads its history fine, it simply records nothing new.
+    // A degraded store REFUSES every write, and the alert dispatcher enqueues through exactly that
+    // choke — so once the latch trips no SettlementUnbookable can be recorded, while this view's
+    // read still succeeds and returns a clean-looking zero. On a backend that can produce the
+    // condition, a degraded daemon can therefore NEVER rule out a divergence, whatever the count
+    // says: the same latch that makes the remedy dangerous is what erases the evidence for it.
+    let unbookable_capable = v
+        .get("unbookable_capable_backend")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if degraded
+        && (index_diverged || unbookable_unknown || unbookable_disabled || unbookable_capable)
+    {
+        // Four states, four different things to tell the operator. Collapsing them sent someone to
+        // diagnose corruption that does not exist: a disabled sink reads its history fine, and a
+        // degraded one cannot write to it at all.
         let why = if index_diverged {
             "an index divergence is alerting above"
         } else if unbookable_unknown {
             "the alert history could not be READ here, so an index divergence cannot be ruled out"
+        } else if unbookable_disabled {
+            "alert recording is OFF, so a divergence since then would not appear above and cannot \
+             be ruled out"
         } else {
-            "alert recording is OFF, so a divergence since it was disabled would not appear here              and cannot be ruled out"
+            "this degraded store also refuses the alert WRITES, so a divergence since it latched \
+             could not have been recorded and cannot be ruled out from the empty list above"
         };
         lines.push(format!(
             "Status: \x1b[1;31mDEGRADED (read-only) — recovery remedy WITHHELD\x1b[0m — money \
@@ -1232,6 +1255,44 @@ mod tests {
         assert!(
             rendered.contains("could not be READ") || rendered.contains("cannot be ruled out"),
             "and must say so rather than printing an all-clear: {rendered}"
+        );
+    }
+
+    // The deepest form of the absence-of-evidence trap on this surface. A degraded store refuses
+    // every write, and the alert dispatcher enqueues through that same choke — so once the latch
+    // trips, no SettlementUnbookable can be recorded, while the history read still succeeds and
+    // returns a clean zero. On phoenixd that zero proves nothing, and the restore-and-restart
+    // remedy it would otherwise unlock is a double pay on a diverged index.
+    #[test]
+    fn a_degraded_phoenixd_daemon_never_unlocks_the_restore_remedy_on_an_empty_history() {
+        let rendered = money_human_text(&json!({
+            "expected_msat": 0, "gross_liability_sat": 0, "required_msat": 0,
+            "parked_count": 0, "ready": true, "degraded_read_only": true,
+            // Reported, readable, EMPTY — and worthless as evidence, because the same latch that
+            // degraded the store is what stops anything being written to it.
+            "recent_unbookable_settlement_alerts": 0,
+            "unbookable_capable_backend": true,
+        }));
+        assert!(
+            !rendered.contains("restore the state DB from backup and restart"),
+            "an empty history on a degraded phoenixd daemon is not evidence of no divergence: \
+             {rendered}"
+        );
+        assert!(
+            rendered.contains("refuses the alert WRITES"),
+            "and it must say WHY the empty list proves nothing: {rendered}"
+        );
+
+        // Control: a backend that cannot produce the condition keeps the ordinary remedy.
+        let other = money_human_text(&json!({
+            "expected_msat": 0, "gross_liability_sat": 0, "required_msat": 0,
+            "parked_count": 0, "ready": true, "degraded_read_only": true,
+            "recent_unbookable_settlement_alerts": 0,
+            "unbookable_capable_backend": false,
+        }));
+        assert!(
+            other.contains("restore the state DB from backup and restart"),
+            "the ordinary degraded remedy must survive where no divergence is possible: {other}"
         );
     }
 

@@ -1321,6 +1321,17 @@ async fn add_unbookable_settlement_alerts_view(
     // disabled are still durable, and returning early hid them while claiming nothing was recorded
     // — losing real incident history at the moment the CLI is the operator's only surface. The two
     // facts are independent: what WAS observed, and that nothing further WILL be.
+    // Always report the CAPABILITY, separately from any count. A degraded store refuses every
+    // `transaction`, which is how the dispatcher enqueues — so once the latch trips, no
+    // SettlementUnbookable can be recorded, while this view's `read` still succeeds and truthfully
+    // returns zero. On a backend that CAN be unbookable, that zero proves nothing, and the CLI needs
+    // to know which backend it is talking to in order to say so.
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert(
+            "unbookable_capable_backend".to_string(),
+            serde_json::json!(backend_can_be_unbookable),
+        );
+    }
     if !alerts_enabled && backend_can_be_unbookable {
         if let Some(obj) = response.as_object_mut() {
             obj.insert(
