@@ -298,17 +298,27 @@ refuses orders it cannot service.
        row committed after the backup. Three schemes for proving a restore safe were refuted across
        eight review passes on lnrent-ole, every one a double pay; do not reconstruct them.
 
-    3. **Do not restart the daemon either, and understand why.** The dedup map lives in the index
-       you just lost, so `pay_get` finds no row — indistinguishable from "never paid". The boot
-       drive then re-sends any `refund_attempt` still PENDING whose payment already went out, and
-       the same applies to `sweep_attempt` (that one pays the operator, so it costs routing fees
-       rather than a buyer's money — still a second payment). A payment that is merely IN FLIGHT is
-       not a negative answer either: it can still settle while a new one is posted alongside it.
-       The restore is not the hazard; the missing dedup map is, and the incident already handed you
-       that.
+    3. **Do not restart the daemon — and assume the double pays have ALREADY happened.** The dedup
+       map lives in the index you lost, so `pay_get` finds no row, which is indistinguishable from
+       "never paid". The refunder re-drives every PENDING `refund_attempt` at boot AND on each
+       maintenance pass (a few seconds apart, `supervisor.rs`), and the sweeper does the same for
+       `sweep_attempt` — so if the daemon has been running on the diverged index at all, any
+       PENDING row whose payment had already gone out was very likely re-sent within seconds of
+       that boot, long before this alert reached you. "Do not restart" is still right; it is not a
+       preventive measure so much as a way to stop the count rising.
 
-    4. **Settle the affected buyers out of band, from phoenixd's own records.** phoenixd knows what
-       it received; lnrent no longer does. Note that lnrent's own view is incomplete in two ways
+       A payment that is merely IN FLIGHT is not a negative answer either: it can still settle
+       while a new one is posted alongside it. The restore is not the hazard; the missing dedup map
+       is, and the incident already handed you that. (A sweep re-send pays the operator, so it
+       costs routing fees rather than a buyer's money — still a second payment.)
+
+    4. **Reconcile BOTH directions against phoenixd's own records.** phoenixd knows what it
+       received and what it sent; lnrent no longer does.
+
+       - *Incoming* — what buyers paid that lnrent never booked. These are the buyers to settle.
+       - *Outgoing* — refunds that may have been sent TWICE by the re-drive above. Money already
+         left; you cannot unsend it, but you need to know the real position before settling
+         anything else, and a buyer refunded twice is not owed a third. Note that lnrent's own view is incomplete in two ways
        that matter here: a settlement that landed after lnrent expired its invoice is owed but has
        no OPEN row (lnrent-hh4q), and `received_msat` is only written at capture, which never
        happened — so the net-of-fee figure exists only at phoenixd.
@@ -330,12 +340,18 @@ refuses orders it cannot service.
   (`alerts.rs`, derived as twice the alert cooldown — read it there rather than trusting a figure
   copied here)
   (subject, remedy, timestamp) — not live backend state. A repaired incident stays listed until the
-  window expires, and disabling the alert sink makes this view report UNAVAILABLE rather than a count — it is derived
-  from the durable alert RECORDS lnrent enqueued — not from proof of delivery, which it never
-  checks: a record appears here whether its DM reached a relay or is still queued behind a blackout.
-  With the sink off there are no records at all, so it cannot see the condition and will not guess. The
-  number counts distinct *conditions*, not receipts. If the history cannot be read, both commands
-  report it as unknown rather than zero; fix the reported storage error and retry.
+  window expires. It is derived from the durable alert RECORDS lnrent enqueued, NOT from proof of
+  delivery, which it never checks: a record appears here whether its DM reached a relay or is still
+  queued behind a blackout. The number counts distinct *conditions*, not receipts. If the history
+  cannot be read, both commands report it as unknown rather than zero; fix the reported storage
+  error and retry.
+
+  Disabling the alert sink (`LNRENT_ALERTS_ENABLED`) does NOT blank this view. Records enqueued
+  before it was switched off are durable and still listed; what stops is the recording of new ones,
+  which the view flags separately ("recording: OFF"). Read that pairing literally — the count is
+  real history, and the absence of NEW entries is not evidence that nothing is wrong. The flag is
+  raised only for a backend that can actually produce the condition (phoenixd today), so on another
+  backend a disabled sink simply shows the count with no notice.
 
 - **Watch relay connectivity (GATE-1 PR-9c):** `lnrent relays` shows per-relay connected state +
   last-connected time (also summarized as `relays_connected/relays_total` in `lnrent status`). If
