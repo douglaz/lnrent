@@ -27,7 +27,8 @@ with data: sqlite queries, file I/O, sleeps, network calls.
 **In-memory `std::sync::Mutex` sections are a named exception, not an instance of the rule.**
 Holding one is the recommended tokio practice for short critical sections, and swapping
 `relay_status.rs` and the Nostr engine's trackers for `tokio::sync::Mutex` would be slower and buy
-nothing.
+nothing. Do not claim a duration bound for THOSE TWO, though: a `std::sync::Mutex` has none when
+contended or when its holder is descheduled.
 
 `alerts.rs` was on that list and is no longer (lnrent-gc7). Its cooldown is not a short critical
 section over data — it is a check-then-commit across an `await`: read `last_sent`, enqueue the DM,
@@ -36,8 +37,7 @@ concurrent observations of the same `(kind, subject)` both read "not sent recent
 enqueue, which duplicates the alert the cooldown exists to suppress. It now uses a
 `tokio::sync::Mutex` held across the await deliberately — the exception traded for correctness, not
 performance. The section still does I/O (the outbox insert) while holding it, so it is bounded by
-one enqueue and by nothing else; that is a known cost, recorded here rather than left implicit. But do not claim a duration bound for them: a `std::sync::Mutex` has
-none when contended or when its holder is descheduled.
+one enqueue and by nothing else; that is a known cost, recorded here rather than left implicit.
 
 The exception carries constraints rather than a guarantee: inside the critical section, no I/O,
 no unbounded iteration, and nothing that grows with request volume. **Those constraints bind new

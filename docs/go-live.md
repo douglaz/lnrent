@@ -277,14 +277,15 @@ refuses orders it cannot service.
     expiry, and past it lnrent cannot book it at all — settle that buyer from phoenixd's records.
 
   - *Index divergence — a missing `phoenixd_index.db` row.* Payment state becomes UNKNOWN: lnrent can neither observe,
-    book, nor expire it. **This is the dangerous repair — read all of it before acting.**
+    book, nor expire it. **There is no safe repair for this one** — the section is short, and the second step
+    explains why rather than asking you to take it on trust.
 
     1. **Enumerate the set.** The alert names one invoice however many are affected. With the
        daemon STOPPED, read both databases (read-only — never write them; the daemon is the sole
        writer, ADR-0001):
 
-       **Put every block below in ONE script and run it with `bash`, not pasted line by line.** The
-       header matters as much as the queries:
+       **Run this as a script with `bash`, not pasted line by line.** Its header matters as much as
+       its queries:
 
        ```sh
        #!/usr/bin/env bash
@@ -294,8 +295,11 @@ refuses orders it cannot service.
        WORK=$(mktemp -d)                  # query COPIES, never the live files
        for db in lnrent.sqlite phoenixd_index.db; do
          cp "$DD/$db" "$WORK/" || { echo "FAILED to copy $db"; exit 1; }
-         for side in "$db-wal" "$db-shm"; do
-           # Absent is normal (a clean exit checkpoints the WAL away). A copy that FAILS is not:
+         # BOTH journal shapes: lnrent.sqlite runs WAL (-wal/-shm), phoenixd_index.db runs
+         # SQLite's default rollback journal (-journal). Copying only one shape leaves the other
+         # database's hot sidecar behind, and that failure is SILENT -- see below.
+         for side in "$db-wal" "$db-shm" "$db-journal"; do
+           # Absent is normal (a clean exit removes them). A copy that FAILS is not:
            # it would silently drop committed transactions, so the affected set below would be
            # WRONG -- and its job is telling you which buyers to settle by hand.
            [ -e "$DD/$side" ] || continue
@@ -320,13 +324,22 @@ refuses orders it cannot service.
        (The state file is `lnrent.sqlite`, not `state.db`.) Every scratch file goes under `$WORK`,
        the `mktemp -d` directory, and never a fixed `/tmp/<name>` path: on a multi-user host another
        user can pre-create such a name as a symlink, and a shell redirection run by the daemon's
-       owner would then truncate whatever it points at — including the stopped daemon's state DB. Copy first, and query the copy WITHOUT
-       `mode=ro`. If the daemon did not exit cleanly the databases have a hot WAL, and replaying it
-       needs to create a `-shm` file: that works when you own the data dir, and **fails to open the
-       database at all when you do not** — the daemon's service account owns it and you are querying
-       as yourself, or it is a read-only snapshot. Recovering a WAL is a write and must never touch
-       the live files anyway (the daemon is the sole writer, ADR-0001), so it happens on the copy.
-       Bring `-wal` and `-shm` along or the copy loses the committed tail.
+       owner would then truncate whatever it points at — including the stopped daemon's state DB.
+
+       **Why copies, and why every sidecar.** An unclean exit leaves a hot journal, and the two
+       databases use DIFFERENT journal shapes: `lnrent.sqlite` is WAL (`store.rs`, `journal_mode=WAL`)
+       so its sidecars are `-wal`/`-shm`, while `phoenixd_index.db` is opened plain
+       (`phoenixd_backend.rs`, no journal-mode pragma) and so uses SQLite's default rollback journal,
+       `-journal`. Leaving a sidecar behind does NOT raise an error: SQLite opens the lone main file,
+       finds nothing to roll back or replay, and hands you mid-transaction pages as though they were
+       committed. `set -euo pipefail` cannot catch that — nothing fails. An uncommitted
+       `phoenixd_invoice` row read as real would drop its invoice from the affected set, quietly
+       omitting a buyer from the list this whole procedure exists to produce.
+
+       Query the copy WITHOUT `mode=ro`: replaying a journal needs to write, which works when you own
+       the data dir and **fails to open the database at all when you do not** (the daemon's service
+       account owns it, or it is a read-only snapshot). That write must never touch the live files
+       anyway — the daemon is the sole writer, ADR-0001 — so it happens on the copy.
 
        `"$WORK/affected.txt"` is the scope of the incident: the invoices whose payment state
        lnrent can no longer establish. You need it to settle those buyers by hand below.
