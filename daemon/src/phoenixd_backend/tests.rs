@@ -99,6 +99,12 @@ struct FakeState {
     create_amount_override: Option<u64>,
     /// Force createinvoice to return a bolt11 that DISAGREES with its own paymentHash side-field.
     create_bolt11_hash_mismatch: bool,
+    /// A record that does not exist until the POST creates it, revealed by the next `pay_invoice`.
+    outgoing_after_pay: Option<PhoenixdOutgoing>,
+    /// Make `GET /payments/outgoingbyhash/{hash}` fail at the transport, which is DIFFERENT from its
+    /// 404: a 404 is phoenixd answering "no such payment", an error is phoenixd not answering at all.
+    /// The no-row probe (lnrent-qvjz) must fail closed on the second, never read it as the first.
+    outgoing_by_hash_errors: bool,
 }
 
 struct FakePhoenixdOps {
@@ -132,6 +138,14 @@ impl FakePhoenixdOps {
             .unwrap()
             .outgoing
             .insert(record.payment_hash.clone(), record);
+    }
+
+    fn set_outgoing_after_pay(&self, record: PhoenixdOutgoing) {
+        self.st.lock().unwrap().outgoing_after_pay = Some(record);
+    }
+
+    fn fail_outgoing_by_hash(&self) {
+        self.st.lock().unwrap().outgoing_by_hash_errors = true;
     }
 
     fn set_outgoing_for(&self, requested_hash: &str, record: PhoenixdOutgoing) {
@@ -251,6 +265,12 @@ impl PhoenixdOps for FakePhoenixdOps {
     async fn pay_invoice(&self, bolt11: &str) -> Result<PayAttempt> {
         let mut st = self.st.lock().unwrap();
         st.pay_calls.push(bolt11.to_string());
+        // A record the POST itself brings into existence becomes visible only now — which is what
+        // lets a test exercise the receipt-less POST path at all, since the pre-POST probe
+        // (lnrent-qvjz) would otherwise find the record and never send anything.
+        if let Some(revealed) = st.outgoing_after_pay.take() {
+            st.outgoing.insert(revealed.payment_hash.clone(), revealed);
+        }
         if let Some(scripted) = st.pay_script.pop_front() {
             return scripted.map_err(|e| anyhow!(e));
         }
@@ -289,7 +309,11 @@ impl PhoenixdOps for FakePhoenixdOps {
     }
 
     async fn outgoing_by_hash(&self, payment_hash: &str) -> Result<Option<PhoenixdOutgoing>> {
-        Ok(self.st.lock().unwrap().outgoing.get(payment_hash).cloned())
+        let st = self.st.lock().unwrap();
+        if st.outgoing_by_hash_errors {
+            bail!("phoenixd outgoingbyhash transport failure (test)");
+        }
+        Ok(st.outgoing.get(payment_hash).cloned())
     }
 
     async fn balance(&self) -> Result<PhoenixdBalance> {
@@ -1239,44 +1263,6 @@ async fn pay_records_the_key_and_never_pays_twice() {
     );
 }
 
-// Fact 2: phoenixd answers a repeated same-bolt11 payinvoice with HTTP 200 + `reason` and NO
-// paymentId/preimage. For a key we already own that is SUCCESS-equivalent — decided by re-reading
-// `outgoingbyhash`, never by the English string.
-#[tokio::test]
-async fn a_receipt_less_duplicate_response_is_success_equivalent() {
-    let ops = FakePhoenixdOps::new();
-    let be = backend(ops.clone(), TestClock::new(1_000));
-    let bolt11 = mint_bolt11(120_000, 2);
-    let hash = hash_of(&bolt11);
-
-    // phoenixd already paid this hash (e.g. our own POST landed but the response was lost).
-    ops.set_outgoing(PhoenixdOutgoing {
-        payment_id: "pay-live".into(),
-        payment_hash: hash.clone(),
-        is_paid: true,
-        fees_msat: 4_480,
-        completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
-    });
-    ops.script_pay(Ok(PayAttempt::NoReceipt {
-        reason: Some("this invoice has already been paid".into()),
-    }));
-
-    let id = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:2:g1")
-        .await
-        .unwrap();
-    assert_eq!(id, "pay-live", "the real payment is adopted as this key's");
-    assert_eq!(
-        ops.pay_calls().len(),
-        1,
-        "the duplicate answer must not trigger another pay attempt"
-    );
-    assert_eq!(
-        be.payment_status_by_key("refund:order:2:g1").await.unwrap(),
-        PayStatus::Succeeded
-    );
-}
-
 // A receipt-less answer with NO paid record proves nothing moved but also gives no proof it never
 // will: the key must stay PENDING with its witness intact, never be marked paid off the string.
 #[tokio::test]
@@ -1459,6 +1445,387 @@ async fn recovery_adopts_a_paid_record_without_paying_again() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// lnrent-qvjz: an index loss makes a key that already paid look like a fresh one.
+//
+// Every test below models the incident the same way: an EMPTY index (`phoenixd_pay` lives in
+// `phoenixd_index.db` and is gone) over an `ops` that already holds the payment record (phoenixd's
+// own wallet history survives, because the funds live under phoenixd's seed and not in lnrent's
+// correlation map). Seeding `ops` directly is equivalent to, and cheaper than, driving a first
+// backend to create the record and then discarding its index.
+//
+// `mint_bolt11` stamps t=1_000_000 with a 3600s expiry, so a clock past 1_003_600 is an EXPIRED
+// destination — see the module header for why expiry is what turns a false `FAILED` into a double
+// pay.
+// ---------------------------------------------------------------------------------------------
+
+/// THE double-pay door. Index lost, destination EXPIRED, and the money already left.
+///
+/// Without the no-row probe this returns a terminal `Failed`, and `Failed && expired` is precisely
+/// what sends the Refunder to `resolve_dest` for a fresh invoice (`daemon/src/refund.rs:614-644`) —
+/// a second real payment. The refund must instead be recognised as ALREADY COMPLETE.
+#[tokio::test]
+async fn index_loss_adopts_a_paid_record_instead_of_re_resolving_an_expired_destination() {
+    let ops = FakePhoenixdOps::new();
+    let bolt11 = mint_bolt11(120_000, 71);
+    let hash = hash_of(&bolt11);
+
+    // The payment really happened, and phoenixd still knows it.
+    ops.set_outgoing(PhoenixdOutgoing {
+        payment_id: "pay-before-the-index-was-lost".into(),
+        payment_hash: hash,
+        is_paid: true,
+        fees_msat: 4_480,
+        completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+    });
+
+    // A fresh index over the same wallet, well past the destination's expiry.
+    let recovered = backend(ops.clone(), TestClock::new(1_004_000));
+    let id = recovered
+        .pay_refund_capped(&bolt11, 120, 130, "refund:order:71:g1")
+        .await
+        .expect("a payment phoenixd reports as paid is adopted, not refused");
+
+    assert_eq!(id, "pay-before-the-index-was-lost");
+    assert!(
+        ops.pay_calls().is_empty(),
+        "the buyer was already paid; a second payinvoice is the double pay this closes"
+    );
+    assert_eq!(
+        recovered
+            .payment_status_by_key("refund:order:71:g1")
+            .await
+            .unwrap(),
+        PayStatus::Succeeded,
+        "must be SUCCEEDED, not Failed: `Failed` on an expired destination is exactly what unlocks \
+         re-resolution to a fresh payment hash"
+    );
+}
+
+/// Index lost while a payment is still IN FLIGHT. Nothing may be recorded as failed, because a
+/// recorded failure is what would let the refund re-resolve past a payment that can still settle.
+#[tokio::test]
+async fn index_loss_refuses_an_in_flight_record_and_records_no_failure() {
+    let ops = FakePhoenixdOps::new();
+    let bolt11 = mint_bolt11(120_000, 72);
+    let hash = hash_of(&bolt11);
+
+    ops.set_outgoing(PhoenixdOutgoing {
+        payment_id: "pay-still-in-flight".into(),
+        payment_hash: hash,
+        is_paid: false,
+        fees_msat: 0,
+        completed_at_ms: None, // the measured shape of a payment still in flight
+    });
+
+    let recovered = backend(ops.clone(), TestClock::new(1_000));
+    let err = recovered
+        .pay_refund_capped(&bolt11, 120, 130, "refund:order:72:g1")
+        .await
+        .expect_err("an in-flight payment must never be sent a second time");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("still IN FLIGHT") && !msg.contains("does carry a completion time"),
+        "the operator must be told the shape, and must not be handed the other shape's \
+         wording: {msg}"
+    );
+    assert!(
+        ops.pay_calls().is_empty(),
+        "refusing means refusing to POST, not POSTing and reporting an error"
+    );
+    assert_eq!(
+        recovered
+            .payment_status_by_key("refund:order:72:g1")
+            .await
+            .unwrap(),
+        PayStatus::Unknown,
+        "no row at all — the Refunder re-awaits an Unknown key and never re-quotes it"
+    );
+}
+
+/// Index lost over a record phoenixd reports terminal-but-unpaid, with the destination EXPIRED.
+///
+/// The tempting move is to call it failed and move on. That cannot be done: phoenixd returns one
+/// record per hash, so it cannot be proven to be this attempt — and writing `FAILED` on an expired
+/// destination re-resolves to a new hash. Refuse, and record nothing.
+#[tokio::test]
+async fn index_loss_refuses_a_terminal_unpaid_record_without_writing_failed() {
+    let ops = FakePhoenixdOps::new();
+    let bolt11 = mint_bolt11(120_000, 73);
+    let hash = hash_of(&bolt11);
+
+    ops.set_outgoing(PhoenixdOutgoing {
+        payment_id: "pay-looks-failed".into(),
+        payment_hash: hash,
+        is_paid: false,
+        fees_msat: 0,
+        completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+    });
+
+    let recovered = backend(ops.clone(), TestClock::new(1_004_000));
+    let err = recovered
+        .pay_refund_capped(&bolt11, 120, 130, "refund:order:73:g1")
+        .await
+        .expect_err("an unattributable terminal record is not a licence to pay again");
+
+    // Both directions, matching the PREPARED siblings: collapsing the shape conditional to emit one
+    // string on both branches would otherwise leave the suite green while the operator is told an
+    // in-flight payment failed, or a failed one is still running.
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("does carry a completion time")
+            && !rendered.contains("still IN FLIGHT"),
+        "the terminal shape must use its own wording and not borrow the in-flight one: {rendered}"
+    );
+    assert!(
+        rendered.contains("SweepFailed") && !rendered.contains("SweepStuck"),
+        "a no-row sweep parks FAILED; promising SweepStuck would name an alert that never \
+         arrives: {rendered}"
+    );
+    assert!(ops.pay_calls().is_empty());
+    assert_eq!(
+        recovered
+            .payment_status_by_key("refund:order:73:g1")
+            .await
+            .unwrap(),
+        PayStatus::Unknown,
+        "NO row, asserted exactly rather than merely `!= Failed`: a FAILED row would re-resolve the \
+         refund to a NEW payment hash that phoenixd's same-invoice dedup cannot catch, and a \
+         PREPARED row would name a hash phoenixd has a record for, which recovery then ADOPTS - \
+         the transient the module forbids outright"
+    );
+}
+
+/// And it must not wedge LEGITIMATE re-resolution: a fresh key whose destination expired, with no
+/// payment anywhere, still terminalizes so the Refunder can mint a new invoice. Losing this would
+/// strand every refund whose destination lapsed before it was driven.
+#[tokio::test]
+async fn a_clean_404_still_terminalizes_an_expired_destination() {
+    let ops = FakePhoenixdOps::new();
+    let bolt11 = mint_bolt11(120_000, 75);
+    let be = backend(ops.clone(), TestClock::new(1_004_000));
+
+    be.pay_refund_capped(&bolt11, 120, 130, "refund:order:75:g1")
+        .await
+        .expect_err("an expired destination cannot be paid");
+
+    assert!(ops.pay_calls().is_empty());
+    assert_eq!(
+        be.payment_status_by_key("refund:order:75:g1")
+            .await
+            .unwrap(),
+        PayStatus::Failed,
+        "with the hash proven clean, the expiry refusal is honest and must still unlock gen+1"
+    );
+}
+
+/// The no-row arm's hash bail, which stands in for the CAS the missing row would have supplied.
+/// Its `PREPARED` sibling is broken deliberately by
+/// `recovery_rejects_a_paid_record_for_a_different_hash`; without this, nothing shows the no-row
+/// copy ever fires, and a guard that cannot be shown to fire is not a guard.
+///
+/// Match wording unique to this bail rather than the shared "when asked about" phrasing, so the
+/// assertion still identifies which check fired if another gains a similar message.
+#[tokio::test]
+async fn index_loss_refuses_a_paid_record_naming_a_different_hash() {
+    let ops = FakePhoenixdOps::new();
+    let bolt11 = mint_bolt11(120_000, 77);
+    let asked = hash_of(&bolt11);
+
+    // The URL names our hash; the body names another. Without a row there is no CAS to catch it.
+    ops.set_outgoing_for(
+        &asked,
+        PhoenixdOutgoing {
+            payment_id: "pay-some-other-payment".into(),
+            payment_hash: "ff".repeat(32),
+            is_paid: true,
+            fees_msat: 4_480,
+            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+        },
+    );
+
+    let recovered = backend(ops.clone(), TestClock::new(1_000));
+    let err = recovered
+        .pay_refund_capped(&bolt11, 120, 130, "refund:order:77:g1")
+        .await
+        .expect_err("a record for a different hash is not ours to adopt");
+
+    assert!(
+        format!("{err:#}").contains("refusing to classify key"),
+        "must be the pre-classification bail specifically: {err:#}"
+    );
+    assert!(ops.pay_calls().is_empty());
+    assert_eq!(
+        recovered
+            .payment_status_by_key("refund:order:77:g1")
+            .await
+            .unwrap(),
+        PayStatus::Unknown,
+        "a mismatched record credits nothing and records nothing"
+    );
+}
+
+/// The paid receipt-less POST arm stays live even with the probe in front of it — a record can
+/// appear between the probe and the POST, and the `FAILED` and `PREPARED`-404 routes still reach it.
+/// Without this test that arm has no coverage: the no-row probe resolves the ordinary duplicate
+/// case before any POST is issued.
+#[tokio::test]
+async fn a_record_appearing_between_the_probe_and_the_post_is_adopted_not_paid_twice() {
+    let ops = FakePhoenixdOps::new();
+    let bolt11 = mint_bolt11(120_000, 78);
+    let hash = hash_of(&bolt11);
+
+    // Nothing to find at probe time; the POST itself brings the paid record into existence, and the
+    // node answers the duplicate shape rather than a receipt.
+    ops.set_outgoing_after_pay(PhoenixdOutgoing {
+        payment_id: "pay-appeared-late".into(),
+        payment_hash: hash,
+        is_paid: true,
+        fees_msat: 4_480,
+        completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+    });
+    ops.script_pay(Ok(PayAttempt::NoReceipt {
+        reason: Some("this invoice has already been paid".into()),
+    }));
+
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let id = be
+        .pay_refund_capped(&bolt11, 120, 130, "refund:order:78:g1")
+        .await
+        .expect("a receipt-less POST over a paid record is adopted");
+
+    assert_eq!(id, "pay-appeared-late");
+    assert_eq!(
+        ops.pay_calls().len(),
+        1,
+        "the probe found nothing, so exactly one POST is correct here"
+    );
+    assert_eq!(
+        be.payment_status_by_key("refund:order:78:g1").await.unwrap(),
+        PayStatus::Succeeded
+    );
+}
+
+/// An UPPER-CASE hash echoed by phoenixd must be stored canonically, or [8A] goes blind.
+///
+/// The probe compares case-insensitively because phoenixd's echo case is unmeasured. That makes it
+/// possible to adopt a record whose hash differs from ours in case only — and `pay_other_key_for_hash`
+/// matches with SQLite `=`, which is case-SENSITIVE. Store phoenixd's casing and a second key on the
+/// same bolt11 sails past the cross-key guard and adopts the SAME payment as its own success: one
+/// real payment, two lnrent refunds marked paid.
+#[tokio::test]
+async fn an_upper_case_adopted_hash_is_stored_canonically_so_8a_still_fires() {
+    let ops = FakePhoenixdOps::new();
+    let bolt11 = mint_bolt11(120_000, 79);
+    let ours = hash_of(&bolt11);
+    assert_eq!(ours, ours.to_lowercase(), "our parsed hash is canonical lowercase");
+
+    ops.set_outgoing_for(
+        &ours,
+        PhoenixdOutgoing {
+            payment_id: "pay-upper".into(),
+            payment_hash: ours.to_uppercase(),
+            is_paid: true,
+            fees_msat: 4_480,
+            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+        },
+    );
+
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let id = be
+        .pay_refund_capped(&bolt11, 120, 130, "refund:order:79:g1")
+        .await
+        .expect("a case-variant echo is still our payment");
+    assert_eq!(id, "pay-upper");
+    assert!(ops.pay_calls().is_empty());
+
+    // The load-bearing half: a DIFFERENT key on the same destination must now be refused by [8A].
+    let err = be
+        .pay_refund_capped(&bolt11, 120, 130, "refund:order:OTHER-79:g1")
+        .await
+        .expect_err("[8A] must see the adopted row despite phoenixd's casing");
+    assert!(
+        format!("{err:#}").contains("already owned by idempotency key"),
+        "must be the cross-key refusal, not some other failure: {err:#}"
+    );
+    assert!(
+        ops.pay_calls().is_empty(),
+        "and it must be caught before any payinvoice"
+    );
+}
+
+/// A 404 is a money-safety PROOF in the no-row arm, so it must come from phoenixd and not from
+/// whatever else can answer a URL with 404 (lnrent-qvjz).
+///
+/// phoenixd's measured miss is a 404 with a plain-text `Not found`. A reverse proxy with a path
+/// allowlist, a stale route, or a gateway with the service down answers 404 too — and reading that
+/// as "this wallet never paid this hash" is how a misconfigured proxy hands over a double pay.
+#[tokio::test]
+async fn only_phoenixds_own_404_body_counts_as_a_clean_miss() {
+    for (label, body, expect_clean) in [
+        ("phoenixd's measured answer", "Not found", true),
+        ("proxy path-allowlist page", "<html><body>404 Not Found</body></html>", false),
+        ("empty body from a dead gateway", "", false),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = body.to_string();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 404 Not Found\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{served}",
+                    served.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let ops = super::real::RealPhoenixdOps::new(&format!("http://{addr}/"), TEST_PASSWORD)
+            .expect("loopback ops build");
+        let got = ops.outgoing_by_hash(&"ab".repeat(32)).await;
+        if expect_clean {
+            assert!(
+                matches!(got, Ok(None)),
+                "{label}: must be the clean miss, got {got:?}"
+            );
+        } else {
+            let err = got.expect_err(&format!("{label}: must NOT be read as a clean miss"));
+            assert!(
+                format!("{err:#}").contains("unrecognised body"),
+                "{label}: unexpected error: {err:#}"
+            );
+        }
+    }
+}
+
+/// Fail closed on an unreadable probe. phoenixd not answering is not phoenixd saying "no payment".
+#[tokio::test]
+async fn an_unreadable_outgoing_probe_refuses_to_pay_a_no_row_key() {
+    let ops = FakePhoenixdOps::new();
+    let bolt11 = mint_bolt11(120_000, 76);
+    ops.fail_outgoing_by_hash();
+
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    be.pay_refund_capped(&bolt11, 120, 130, "refund:order:76:g1")
+        .await
+        .expect_err("an unanswered probe must never be read as a clean 404");
+
+    assert!(
+        ops.pay_calls().is_empty(),
+        "a transient stall is self-healing; a payment sent on an unread probe is not"
+    );
+    assert_eq!(
+        be.payment_status_by_key("refund:order:76:g1")
+            .await
+            .unwrap(),
+        PayStatus::Unknown,
+        "nothing durable is recorded, so the next drive simply retries the probe"
+    );
+}
+
 #[tokio::test]
 async fn recovery_rejects_a_paid_record_for_a_different_hash() {
     let ops = FakePhoenixdOps::new();
@@ -1535,16 +1902,15 @@ async fn a_receipt_less_post_reports_terminal_and_in_flight_records_differently(
         let hash = hash_of(&bolt11);
         let key = "refund:order:41:g1";
 
-        ops.set_outgoing_for(
-            &hash,
-            PhoenixdOutgoing {
-                payment_id: "pay-receiptless".into(),
-                payment_hash: hash.clone(),
-                is_paid: false,
-                fees_msat: 0,
-                completed_at_ms,
-            },
-        );
+        // The record is what the POST creates, so it must not exist before it. Pre-setting it made
+        // the pre-POST probe (lnrent-qvjz) refuse and this path was never reached.
+        ops.set_outgoing_after_pay(PhoenixdOutgoing {
+            payment_id: "pay-receiptless".into(),
+            payment_hash: hash.clone(),
+            is_paid: false,
+            fees_msat: 0,
+            completed_at_ms,
+        });
         ops.script_pay(Ok(PayAttempt::NoReceipt {
             reason: Some("payment failed".into()),
         }));
