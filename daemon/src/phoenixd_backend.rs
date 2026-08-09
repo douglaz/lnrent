@@ -562,6 +562,22 @@ async fn alert_unbookable(alerts: &Option<Arc<AlertDispatcher>>, subject: String
     }
 }
 
+impl PhoenixdPayment {
+    /// Test-only read of the durable first-sighting instant. The write happens before the
+    /// alert-sink enabled check, and only a direct read proves that ordering.
+    #[cfg(test)]
+    pub(crate) fn first_refusal_at_for_test(&self, invoice_id: &str) -> Option<i64> {
+        let conn = self.index.lock().unwrap();
+        conn.query_row(
+            "SELECT first_refusal_at FROM phoenixd_unbookable_settlement WHERE invoice_id = ?1",
+            rusqlite::params![invoice_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .expect("reading the timing row")
+    }
+}
+
 /// ONE subject for the whole condition, deliberately not one per invoice: the index and the state DB
 /// diverge as a UNIT (a lost or stale-restored `phoenixd_index.db`), every affected invoice carries
 /// the identical remedy, and catch-up re-observes each OPEN invoice every tick — so a per-invoice
@@ -638,10 +654,14 @@ async fn alert_fee_credit_refusal(
     let Some(dispatcher) = alerts.as_ref() else {
         return;
     };
-    if !dispatcher.is_enabled() {
-        return;
-    }
-    // The timing row is REPORTING-ONLY, so a failure to persist it must not silence the condition
+    // The timing row is written BEFORE the enabled check, deliberately. It is the FIRST LOCAL
+    // SIGHTING, and docs/go-live.md promises the threshold runs from that instant — but an operator
+    // running with the sink off and enabling it mid-incident would otherwise have the row created
+    // at ENABLE time, so the DM would print the enable instant as "first refused locally at N" and
+    // restart the 15-minute wait from there. The row is cheap and reporting-only; recording it
+    // regardless is what makes the printed timestamp true.
+    //
+    // A failure to persist it must not silence the condition
     // it exists to report — returning here would mean a read-only or corrupt index DB (while the
     // outbox stays writable) suppresses every DM forever, re-warning to a log nobody reads. Fall
     // back to alerting IMMEDIATELY: without a first-observation instant there is no threshold to
@@ -661,6 +681,11 @@ async fn alert_fee_credit_refusal(
     };
     // With no timing row (the persistence fallback above) there is no measurable age, so nothing can
     // be deferred: `first_refusal_at` reads as NOW and the threshold is skipped.
+    // Nothing below this point does anything but REPORT, so a disabled sink stops here — after the
+    // sighting has been recorded.
+    if !dispatcher.is_enabled() {
+        return;
+    }
     let first_refusal_at = timing.as_ref().map_or(now, |t| t.first_refusal_at);
     let age = now.saturating_sub(first_refusal_at);
     // Defer only while the refusal is fresh AND something will look again. Below the threshold this

@@ -254,9 +254,17 @@ refuses orders it cannot service.
   outbox (edge-triggered, at most one per condition per 6h). One honest caveat: a total relay
   blackout is the one condition that cannot be delivered (it queues), so a prolonged silence from a
   daemon you know is up still warrants a direct check.
-- **A settlement lnrent cannot book (lnrent-gc7):** phoenixd reports an invoice PAID and lnrent
-  refuses to book it. Two causes, one alert kind (`SettlementUnbookable`), different remedies. Both
-  are judged whole-wallet or whole-index, so **one alert covers every receipt it holds back** and
+- **A settlement lnrent cannot book (lnrent-gc7):** lnrent holds an invoice it will not book. Two
+  causes, one alert kind (`SettlementUnbookable`), different remedies — and they differ in what is
+  actually KNOWN about the money, which decides what you owe:
+
+  - after a *fee-credit refusal* phoenixd HAS reported the invoice paid, so each held-back item is a
+    real receipt and the buyer has certainly paid;
+  - after an *index divergence* the payment state is UNKNOWN — the correlation lnrent needs to ask
+    about that invoice is the thing that was lost, so an affected item may or may not have been
+    paid, and must be established from phoenixd's own records rather than assumed.
+
+  Both are judged whole-wallet or whole-index, so **one alert covers every item it holds back** and
   names only one as an example.
 
   - *Fee credit (ADR-0019).* phoenixd publishes no per-receipt fee-credit attribution, so the
@@ -288,6 +296,17 @@ refuses orders it cannot service.
        lnrent --data-dir /path/to/your/data-dir listing withdraw
        ```
 
+       **If this fails with "store is in degraded read-only mode", that is expected and not a
+       problem here** — the same fatal DB error can put the store in read-only mode, and withdrawing
+       persists a `WITHDRAWN` row, so the write is refused (`store.rs`). Nothing is lost: a degraded
+       store refuses money writes generally, so no new order can be booked while it lasts. Go
+       straight to stopping the daemon.
+
+       **Do NOT follow that error's own advice.** It ends "restore from backup and restart", which
+       is correct for an ordinary degraded store and is precisely what must not happen here — see
+       the next step. `lnrent money` withholds the same remedy for the same reason, but the error
+       text from a failed command does not know a divergence is in progress.
+
     2. **Do not restore from a backup.** Deciding a backup is safe means knowing which refunds
        already went out, and lnrent's only record of that is `phoenixd_pay` — inside the very index
        whose loss IS this incident. The phoenixd WALLET is also deliberately excluded from lnrent's
@@ -313,7 +332,14 @@ refuses orders it cannot service.
        costs routing fees rather than a buyer's money — still a second payment.)
 
     4. **Reconcile BOTH directions against phoenixd's own records.** phoenixd knows what it
-       received and what it sent; lnrent no longer does.
+       received and what it sent; lnrent no longer does. Read them through phoenixd's own HTTP API,
+       with the API password from your `phoenix.conf`. `phoenixd_backend.rs` documents the exact
+       endpoints lnrent depends on and has MEASURED — `GET /payments/incoming?externalId=…` and
+       `GET /payments/outgoingbyhash/{hash}` — which are per-item lookups. phoenixd also exposes a
+       list form for enumerating a whole history; lnrent has never called or measured it, so treat
+       its shape as unverified here (tracked with lnrent-8scw, which needs it). Naming phoenixd's
+       interface is safe where naming an lnrent query was not: it is an external service's own API,
+       not a second implementation of lnrent's state semantics.
 
        - *Incoming* — what buyers paid that lnrent never booked. These are the buyers to settle,
          and lnrent's own view of them is incomplete in two ways that matter here: a settlement

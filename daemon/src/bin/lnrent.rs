@@ -351,10 +351,21 @@ fn money_human_text(v: &serde_json::Value) -> String {
         .get("recent_unbookable_settlement_alerts")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    // A daemon that predates this view sends NONE of these keys, and `unwrap_or` would render that
+    // as the all-clear state: zero conditions, nothing unknown, nothing disabled — and, when
+    // degraded, the restore-and-restart remedy this file withholds whenever divergence cannot be
+    // ruled out. Absence of the fields is absence of EVIDENCE, which is what `_unknown` already
+    // means, so a socket-level version skew is reported as unknown rather than clean.
+    let reported_unbookable_view = ["recent_unbookable_settlement_alerts",
+        "recent_unbookable_settlement_alerts_unknown",
+        "recent_unbookable_settlement_alerts_disabled"]
+        .iter()
+        .any(|k| v.get(*k).is_some());
     let unbookable_unknown = v
         .get("recent_unbookable_settlement_alerts_unknown")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || !reported_unbookable_view;
     let mut index_diverged = false;
     let unbookable_disabled = v
         .get("recent_unbookable_settlement_alerts_disabled")
@@ -430,10 +441,15 @@ fn money_human_text(v: &serde_json::Value) -> String {
     // already-paid PENDING refunds on a diverged index, and the Status line is the one an operator
     // acts on, so absence of evidence must not read as evidence of absence here.
     if degraded && (index_diverged || unbookable_unknown || unbookable_disabled) {
+        // Three DIFFERENT states, three different things to tell the operator. Collapsing the
+        // last two into "could not be read" sent someone to diagnose corruption that does not
+        // exist: a disabled sink reads its history fine, it simply records nothing new.
         let why = if index_diverged {
             "an index divergence is alerting above"
+        } else if unbookable_unknown {
+            "the alert history could not be READ here, so an index divergence cannot be ruled out"
         } else {
-            "the alert history could not be read here, so an index divergence cannot be ruled out"
+            "alert recording is OFF, so a divergence since it was disabled would not appear here              and cannot be ruled out"
         };
         lines.push(format!(
             "Status: \x1b[1;31mDEGRADED (read-only) — recovery remedy WITHHELD\x1b[0m — money \
@@ -1187,13 +1203,35 @@ mod tests {
         );
 
         // Control: degraded WITHOUT divergence keeps the ordinary remedy.
+        // Explicitly REPORTED and empty — not "field absent", which now means unknown. That
+        // distinction is the point of `an_older_daemon_that_sends_no_alert_fields_...`.
         let plain = money_human_text(&json!({
             "expected_msat": 0, "gross_liability_sat": 0, "required_msat": 0,
             "parked_count": 0, "ready": true, "degraded_read_only": true,
+            "recent_unbookable_settlement_alerts": 0,
         }));
         assert!(
             plain.contains("restore the state DB from backup and restart"),
             "the ordinary degraded remedy must survive when nothing diverged: {plain}"
+        );
+    }
+
+    // A daemon older than this view sends none of the keys. `unwrap_or` rendered that as the
+    // all-clear state — and, when degraded, restored the very remedy b47d2e2 withholds. Absence of
+    // the fields is absence of evidence, not evidence of absence.
+    #[test]
+    fn an_older_daemon_that_sends_no_alert_fields_reads_as_unknown_not_clean() {
+        let rendered = money_human_text(&json!({
+            "expected_msat": 0, "gross_liability_sat": 0, "required_msat": 0,
+            "parked_count": 0, "ready": true, "degraded_read_only": true,
+        }));
+        assert!(
+            !rendered.contains("restore the state DB from backup and restart"),
+            "a daemon that never reported the view cannot rule out a divergence: {rendered}"
+        );
+        assert!(
+            rendered.contains("could not be READ") || rendered.contains("cannot be ruled out"),
+            "and must say so rather than printing an all-clear: {rendered}"
         );
     }
 
@@ -1209,6 +1247,9 @@ mod tests {
             "ready": false,
             "warning": "FederationDown",
             "degraded_read_only": false,
+            // Reported and empty. Omitting it now means "this daemon never sent the view", which
+            // renders as unknown — a different assertion than this test is making.
+            "recent_unbookable_settlement_alerts": 0,
         }));
 
         assert_eq!(

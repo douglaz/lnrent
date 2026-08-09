@@ -2744,6 +2744,57 @@ async fn a_getbalance_outage_does_not_masquerade_as_a_fee_credit_refusal() {
     );
 }
 
+// The capability flag decides whether the operator views bother telling anyone that a disabled sink
+// is hiding something. It is a per-backend constant with no other caller, so nothing else would go
+// red if phoenixd silently reverted to the trait default (false) — the CLI would simply stop warning
+// on the one backend that CAN produce the condition, which is a silent regression of the whole
+// disabled-sink surface.
+#[test]
+fn phoenixd_reports_that_it_can_leave_settlements_unbookable() {
+    let be = backend(FakePhoenixdOps::new(), TestClock::new(1_000));
+    assert!(
+        be.reports_unbookable_settlements(),
+        "phoenixd is the backend whose fee-credit refusal and index divergence produce \
+         SettlementUnbookable; the operator views gate their disabled-sink notice on this"
+    );
+}
+
+// A first sighting observed while the sink is OFF must still be recorded, because the DM promises
+// the threshold runs from the FIRST local sighting (docs/go-live.md). Enabling alerts mid-incident
+// would otherwise stamp the enable instant and restart the wait.
+#[tokio::test]
+async fn a_refusal_seen_while_alerts_are_disabled_still_records_its_first_sighting() {
+    let ops = FakePhoenixdOps::new();
+    let clock = Arc::new(TestClock::new(measured_receive_settled_at()));
+    let state = Connection::open_in_memory().expect("state");
+    state.execute_batch(crate::store::SCHEMA).expect("schema");
+    let store = crate::store::Store::spawn(state);
+    let clk: Arc<dyn Clock> = clock.clone();
+    // A DISABLED dispatcher: it writes no DM, and used to skip the timing row with it.
+    let alerts = Arc::new(crate::alerts::AlertDispatcher::disabled(store.clone(), clk.clone()));
+    let index = Connection::open_in_memory().expect("index");
+    index.execute_batch(INDEX_SCHEMA).expect("index schema");
+    let be = PhoenixdPayment::with_ops(ops.clone(), index, clk, FeeSchedule::default())
+        .with_alerts(alerts);
+    let inv = arrange_fee_credit_refusal(&be, &ops).await;
+
+    let seen_at = clock.now();
+    be.received_amount_msat(&inv.id)
+        .await
+        .expect_err("the refusal itself is unchanged");
+
+    assert!(
+        operator_alerts(&store).await.is_empty(),
+        "a disabled sink still sends nothing"
+    );
+    assert_eq!(
+        be.first_refusal_at_for_test(&inv.id),
+        Some(seen_at),
+        "but the FIRST SIGHTING must be recorded, or enabling alerts later restarts the threshold \
+         and the DM prints the enable time as the first refusal"
+    );
+}
+
 // The threshold is measured from a row in the index. If that row cannot be WRITTEN, the age is
 // unmeasurable — and an unmeasurable age must not be read as "too fresh to mention". This is the
 // bead's own failure mode wearing a different hat: a read-only or corrupt index DB would otherwise
