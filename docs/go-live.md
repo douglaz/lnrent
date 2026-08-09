@@ -315,13 +315,14 @@ refuses orders it cannot service.
     4. **Reconcile BOTH directions against phoenixd's own records.** phoenixd knows what it
        received and what it sent; lnrent no longer does.
 
-       - *Incoming* — what buyers paid that lnrent never booked. These are the buyers to settle.
+       - *Incoming* — what buyers paid that lnrent never booked. These are the buyers to settle,
+         and lnrent's own view of them is incomplete in two ways that matter here: a settlement
+         that landed after lnrent expired its invoice is owed but has no OPEN row (lnrent-hh4q),
+         and `received_msat` is only written at capture, which never happened — so the net-of-fee
+         figure exists only at phoenixd.
        - *Outgoing* — refunds that may have been sent TWICE by the re-drive above. Money already
          left; you cannot unsend it, but you need to know the real position before settling
-         anything else, and a buyer refunded twice is not owed a third. Note that lnrent's own view is incomplete in two ways
-       that matter here: a settlement that landed after lnrent expired its invoice is owed but has
-       no OPEN row (lnrent-hh4q), and `received_msat` is only written at capture, which never
-       happened — so the net-of-fee figure exists only at phoenixd.
+         anything else, and a buyer refunded twice is not owed a third.
 
     **Why this entry names no queries.** Enumerating the exposure and deciding whether a restart is
     safe depend on daemon-internal semantics — which column holds the paid invoice, which states
@@ -336,10 +337,10 @@ refuses orders it cannot service.
 
     Never recreate or expire an affected invoice.
 
-  `lnrent money` and `lnrent status` show deduplicated alert HISTORY over `ALERT_VIEW_WINDOW_S`
-  (`alerts.rs`, derived as twice the alert cooldown — read it there rather than trusting a figure
-  copied here)
-  (subject, remedy, timestamp) — not live backend state. A repaired incident stays listed until the
+  `lnrent money` and `lnrent status` show deduplicated alert HISTORY — one row per incident,
+  carrying its subject, remedy and timestamp — over `ALERT_VIEW_WINDOW_S` (`alerts.rs`, derived as
+  twice the alert cooldown; read it there rather than trusting a figure copied here). It is history,
+  not live backend state. A repaired incident stays listed until the
   window expires. It is derived from the durable alert RECORDS lnrent enqueued, NOT from proof of
   delivery, which it never checks: a record appears here whether its DM reached a relay or is still
   queued behind a blackout. The number counts distinct *conditions*, not receipts. If the history

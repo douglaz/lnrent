@@ -422,19 +422,25 @@ fn money_human_text(v: &serde_json::Value) -> String {
     // The degraded/read-only latch (lnrent-y4m.3) takes precedence over reserve readiness: the daemon
     // is refusing money writes after a fatal DB error, so a human operator must see it here — not only
     // in the daemon log — regardless of whether reserves are sufficient.
-    if degraded && index_diverged {
-        // The generic degraded remedy is "restore from backup and restart". During an index
-        // divergence that is the one thing that must NOT happen: `phoenixd_pay` went with the lost
-        // index, so recovery re-drives already-paid PENDING refunds. Printed below the divergence
-        // alert's own "do NOT restart / do NOT restore", it contradicted it — and the Status line
-        // is the one an operator acts on. Divergence takes precedence.
-        lines.push(
-            "Status: \x1b[1;31mDEGRADED (read-only) + INDEX DIVERGENCE\x1b[0m — money writes \
-             refused after a fatal DB error. Do NOT apply the usual remedy: restoring or \
-             restarting while the index is diverged can pay a refund twice (see the unbookable \
-             settlement above). Follow the index-divergence section of docs/go-live.md instead."
-                .to_string(),
-        );
+    // Withhold the generic remedy whenever a divergence cannot be RULED OUT — not only when one is
+    // proven. `index_diverged` is set from the details loop, which the unknown-history and
+    // disabled-sink branches never reach, and the history read and the degraded latch fail on the
+    // SAME state DB: the case where the CLI cannot tell is CORRELATED with the case where the
+    // remedy is dangerous, not independent of it. "Restore from backup and restart" re-drives
+    // already-paid PENDING refunds on a diverged index, and the Status line is the one an operator
+    // acts on, so absence of evidence must not read as evidence of absence here.
+    if degraded && (index_diverged || unbookable_unknown || unbookable_disabled) {
+        let why = if index_diverged {
+            "an index divergence is alerting above"
+        } else {
+            "the alert history could not be read here, so an index divergence cannot be ruled out"
+        };
+        lines.push(format!(
+            "Status: \x1b[1;31mDEGRADED (read-only) — recovery remedy WITHHELD\x1b[0m — money \
+             writes refused after a fatal DB error, and {why}. Do NOT apply the usual remedy: \
+             restoring or restarting while the index is diverged can pay a refund twice. Follow \
+             the index-divergence section of docs/go-live.md instead."
+        ));
     } else if degraded {
         lines.push(
             "Status: \x1b[1;31mDEGRADED (read-only)\x1b[0m — money writes refused after a fatal DB \
@@ -1149,9 +1155,32 @@ mod tests {
             "the generic degraded remedy contradicts the divergence alert above it: {rendered}"
         );
         assert!(
-            rendered.contains("INDEX DIVERGENCE") && rendered.contains("pay a refund twice"),
+            rendered.contains("remedy WITHHELD") && rendered.contains("pay a refund twice"),
             "and the combined status must say why the usual remedy is withheld: {rendered}"
         );
+
+        // The correlated-failure case: the history read and the degraded latch fail on the SAME
+        // state DB, so "cannot tell" and "remedy is dangerous" arrive together. Absence of evidence
+        // must not read as evidence of absence.
+        for (label, key) in [
+            ("unknown history", "recent_unbookable_settlement_alerts_unknown"),
+            ("disabled sink", "recent_unbookable_settlement_alerts_disabled"),
+        ] {
+            let mut j = json!({
+                "expected_msat": 0, "gross_liability_sat": 0, "required_msat": 0,
+                "parked_count": 0, "ready": true, "degraded_read_only": true,
+            });
+            j.as_object_mut().unwrap().insert(key.into(), json!(true));
+            let r = money_human_text(&j);
+            assert!(
+                !r.contains("restore the state DB from backup and restart"),
+                "{label}: divergence cannot be ruled out, so the remedy must be withheld: {r}"
+            );
+            assert!(
+                r.contains("cannot be ruled out"),
+                "{label}: and must say it cannot tell, rather than implying all-clear: {r}"
+            );
+        }
         assert!(
             rendered.contains("DEGRADED (read-only)"),
             "without hiding the degraded latch itself: {rendered}"
