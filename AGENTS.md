@@ -293,7 +293,11 @@ second untested while looking verified. If the test drives anything live — a r
 database, a running service, real money — do the red run in a disposable environment
 or not at all: a deliberately broken build can perform the harmful operation before
 any assertion notices.
-Gate for this repo: `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'`
+Gate for this repo: the CI matrix in "Building and testing" above — ALL of it. `cargo clippy
+--workspace --all-targets -- -D warnings && cargo test --workspace` is the inner loop, not the gate:
+it skips the `--no-default-features` legs (this repo ships a fedimint-disabled tree), the wasm
+target, and both browser E2E paths. A change can be green on the inner loop and red in CI. Run the
+full list before claiming a gate passed.
 <!-- end-agent-discipline -->
 
 <!-- br-agent-instructions-v1 -->

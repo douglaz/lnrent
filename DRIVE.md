@@ -8,7 +8,8 @@ deferred). `br ready` counts the whole repo — filter it through this line.
 
 **Phase:** HARDEN · **Bead:** lnrent-gc7 · **Branch:** feat/gc7-settlement-unbookable-alert
 **Pending:** —
-**Gate:** `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'`
+**Gate:** the full CI matrix in AGENTS.md "Building and testing" — the workspace clippy+test pair
+is the inner loop only; it omits both `--no-default-features` legs, wasm, and the two web E2E runs
 · last green on the tree this commit records (EXIT=0). Deliberately no SHA and no test count:
 each names something that the act of writing it changes or dates, and both drifted when this
 file carried them.

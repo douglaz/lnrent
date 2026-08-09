@@ -1326,10 +1326,19 @@ async fn add_unbookable_settlement_alerts_view(
     // SettlementUnbookable can be recorded, while this view's `read` still succeeds and truthfully
     // returns zero. On a backend that CAN be unbookable, that zero proves nothing, and the CLI needs
     // to know which backend it is talking to in order to say so.
+    // Both flags come from this ONE helper, so `money` and `status` cannot drift apart. `status`
+    // carries no `degraded_read_only` of its own, so without the second key it would report a clean
+    // zero during an unrecorded divergence — the same hole the money view just closed, one command
+    // over. `alerts_recording_unavailable` is the honest name: the sink is configured on, the store
+    // simply refuses the write.
     if let Some(obj) = response.as_object_mut() {
         obj.insert(
             "unbookable_capable_backend".to_string(),
             serde_json::json!(backend_can_be_unbookable),
+        );
+        obj.insert(
+            "alerts_recording_unavailable".to_string(),
+            serde_json::json!(store.is_degraded()),
         );
     }
     if !alerts_enabled && backend_can_be_unbookable {
@@ -2857,6 +2866,52 @@ mod tests {
     // dispatcher writes no outbox rows, so the history read succeeds and truthfully reports zero
     // rows — about a question it cannot see. Both operator commands must say so explicitly, because
     // with DMs off the CLI is the only surface an unbooked receipt can reach.
+    // `status` carries no `degraded_read_only`, so without this flag it reported a clean zero
+    // during an unrecorded divergence: the dispatcher's write is refused by the same latch, while
+    // this view's read succeeds. Both commands read the flag from THIS helper so they cannot drift.
+    #[tokio::test]
+    async fn a_degraded_store_reports_that_alert_recording_is_unavailable() {
+        let store = mem_store();
+        let payment: Arc<dyn PaymentBackend> =
+            Arc::new(MockPayment::new().unbookable_capable());
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(VIEW_NOW));
+
+        for (cmd, req) in [("money", Request::Money), ("status", Request::Status)] {
+            let before = dispatch_with_alert_visibility(
+                req, &store, &recipes, &clock, &payment,
+                &RelayStatusCell::new(), &no_listing_relay(), true,
+            )
+            .await
+            .data
+            .expect("data");
+            assert_eq!(
+                before["alerts_recording_unavailable"],
+                json!(false),
+                "{cmd}: a healthy store CAN record: {before}"
+            );
+        }
+
+        // Latch the store degraded exactly as a fatal DB error would.
+        store.mark_degraded_for_test();
+
+        for (cmd, req) in [("money", Request::Money), ("status", Request::Status)] {
+            let data = dispatch_with_alert_visibility(
+                req, &store, &recipes, &clock, &payment,
+                &RelayStatusCell::new(), &no_listing_relay(), true,
+            )
+            .await
+            .data
+            .expect("data");
+            assert_eq!(
+                data["alerts_recording_unavailable"],
+                json!(true),
+                "{cmd}: a degraded store refuses the alert WRITE, so its zero proves nothing: \
+                 {data}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_disabled_alert_sink_is_flagged_without_hiding_recorded_history() {
         let store = mem_store();

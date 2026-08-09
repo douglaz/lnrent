@@ -457,7 +457,13 @@ fn money_human_text(v: &serde_json::Value) -> String {
         .get("unbookable_capable_backend")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    if degraded
+    // The daemon says outright whether it can record alerts at all. `status` carries no
+    // `degraded_read_only`, so this is the only way that command can know.
+    let recording_unavailable = v
+        .get("alerts_recording_unavailable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if (degraded || recording_unavailable)
         && (index_diverged || unbookable_unknown || unbookable_disabled || unbookable_capable)
     {
         // Four states, four different things to tell the operator. Collapsing them sent someone to

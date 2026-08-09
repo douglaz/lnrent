@@ -99,6 +99,9 @@ async fn json_money_returns_reply_envelope() {
         vec![
             // lnrent-y4m.3: the degraded/read-only latch is surfaced so a status poll (not just the
             // daemon log) reveals a money daemon that is refusing writes after a fatal DB error.
+            // The store cannot record alerts at all while degraded, so an empty history proves
+            // nothing. Both `money` and `status` read this from one helper and fail closed on it.
+            "alerts_recording_unavailable",
             "degraded_read_only",
             // gate1-operator-sweep (urw.3): `money` also folds the operator-sweep surplus breakdown
             // (earned/reserved/paid_out/surplus) + last_sweep — all pure LOCAL ledger reads.
