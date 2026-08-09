@@ -1488,10 +1488,11 @@ async fn recovery_adopts_a_paid_record_without_paying_again() {
 // ---------------------------------------------------------------------------------------------
 // lnrent-qvjz: an index loss makes a key that already paid look like a fresh one.
 //
-// Every test below builds a SECOND backend over a fresh in-memory index while keeping the SAME
-// `ops`. That is exactly the incident: `phoenixd_pay` lives in `phoenixd_index.db` and is gone,
-// while phoenixd's own wallet history (the fake's `outgoing` map) survives — the funds live under
-// phoenixd's seed, not in lnrent's correlation map.
+// Every test below models the incident the same way: an EMPTY index (`phoenixd_pay` lives in
+// `phoenixd_index.db` and is gone) over an `ops` that already holds the payment record (phoenixd's
+// own wallet history survives, because the funds live under phoenixd's seed and not in lnrent's
+// correlation map). Seeding `ops` directly is equivalent to, and cheaper than, driving a first
+// backend to create the record and then discarding its index.
 //
 // `mint_bolt11` stamps t=1_000_000 with a 3600s expiry, so a clock past 1_003_600 is an EXPIRED
 // destination. That distinction is the whole bug: expiry is what turns a false `FAILED` into a
@@ -1609,14 +1610,16 @@ async fn index_loss_refuses_a_terminal_unpaid_record_without_writing_failed() {
         .expect_err("an unattributable terminal record is not a licence to pay again");
 
     assert!(ops.pay_calls().is_empty());
-    assert_ne!(
+    assert_eq!(
         recovered
             .payment_status_by_key("refund:order:73:g1")
             .await
             .unwrap(),
-        PayStatus::Failed,
-        "a FAILED row here would re-resolve the refund to a NEW payment hash, which phoenixd's \
-         same-invoice dedup cannot catch"
+        PayStatus::Unknown,
+        "NO row, asserted exactly rather than merely `!= Failed`: a FAILED row would re-resolve the \
+         refund to a NEW payment hash that phoenixd's same-invoice dedup cannot catch, and a \
+         PREPARED row would name a hash phoenixd has a record for, which recovery then ADOPTS - \
+         the transient the module forbids outright"
     );
 }
 
@@ -1658,6 +1661,90 @@ async fn a_clean_404_still_terminalizes_an_expired_destination() {
             .unwrap(),
         PayStatus::Failed,
         "with the hash proven clean, the expiry refusal is honest and must still unlock gen+1"
+    );
+}
+
+/// The hash guard `adopt_paid_without_row` takes by hand in place of the CAS the missing row would
+/// have supplied. Its `PREPARED` sibling is broken deliberately by
+/// `recovery_rejects_a_paid_record_for_a_different_hash`; without this, nothing shows the no-row
+/// copy ever fires, and a guard that cannot be shown to fire is not a guard.
+#[tokio::test]
+async fn index_loss_refuses_a_paid_record_naming_a_different_hash() {
+    let ops = FakePhoenixdOps::new();
+    let bolt11 = mint_bolt11(120_000, 77);
+    let asked = hash_of(&bolt11);
+
+    // The URL names our hash; the body names another. Without a row there is no CAS to catch it.
+    ops.set_outgoing_for(
+        &asked,
+        PhoenixdOutgoing {
+            payment_id: "pay-some-other-payment".into(),
+            payment_hash: "ff".repeat(32),
+            is_paid: true,
+            fees_msat: 4_480,
+            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+        },
+    );
+
+    let recovered = backend(ops.clone(), TestClock::new(1_000));
+    let err = recovered
+        .pay_refund_capped(&bolt11, 120, 130, "refund:order:77:g1")
+        .await
+        .expect_err("a record for a different hash is not ours to adopt");
+
+    assert!(
+        format!("{err:#}").contains("when asked about"),
+        "unexpected error: {err:#}"
+    );
+    assert!(ops.pay_calls().is_empty());
+    assert_eq!(
+        recovered
+            .payment_status_by_key("refund:order:77:g1")
+            .await
+            .unwrap(),
+        PayStatus::Unknown,
+        "a mismatched record credits nothing and records nothing"
+    );
+}
+
+/// The paid receipt-less POST arm stays live even with the probe in front of it — a record can
+/// appear between the probe and the POST, and the `FAILED` and `PREPARED`-404 routes still reach it.
+/// `a_receipt_less_duplicate_response_is_success_equivalent` used to cover this and now asserts the
+/// POST never happens, so without this test that arm has none.
+#[tokio::test]
+async fn a_record_appearing_between_the_probe_and_the_post_is_adopted_not_paid_twice() {
+    let ops = FakePhoenixdOps::new();
+    let bolt11 = mint_bolt11(120_000, 78);
+    let hash = hash_of(&bolt11);
+
+    // Nothing to find at probe time; the POST itself brings the paid record into existence, and the
+    // node answers the duplicate shape rather than a receipt.
+    ops.set_outgoing_after_pay(PhoenixdOutgoing {
+        payment_id: "pay-appeared-late".into(),
+        payment_hash: hash,
+        is_paid: true,
+        fees_msat: 4_480,
+        completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+    });
+    ops.script_pay(Ok(PayAttempt::NoReceipt {
+        reason: Some("this invoice has already been paid".into()),
+    }));
+
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let id = be
+        .pay_refund_capped(&bolt11, 120, 130, "refund:order:78:g1")
+        .await
+        .expect("a receipt-less POST over a paid record is adopted");
+
+    assert_eq!(id, "pay-appeared-late");
+    assert_eq!(
+        ops.pay_calls().len(),
+        1,
+        "the probe found nothing, so exactly one POST is correct here"
+    );
+    assert_eq!(
+        be.payment_status_by_key("refund:order:78:g1").await.unwrap(),
+        PayStatus::Succeeded
     );
 }
 
@@ -3359,13 +3446,30 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
     // stopped OUTRIGHT rather than deferred to a checklist: the runbook no longer has one. A DM
     // that merely said "don't restore from this message alone" would still read as "there is a
     // procedure, go find it".
-    // Both hazards, and both must be forbidden OUTRIGHT rather than deferred to a checklist: the
-    // runbook no longer has one. Restarting is the one an operator will reach for first — the
-    // service is down and unaffected subscribers are waiting — and it double-pays for the same
-    // reason a restore does, because the dedup record was in the index that was lost.
+    // RESTORE must still be forbidden OUTRIGHT rather than deferred to a checklist: the runbook no
+    // longer has one.
+    //
+    // RESTART is deliberately no longer forbidden (lnrent-qvjz). It used to double-pay for the same
+    // reason a restore does — the dedup record was in the lost index — but a key with no local row
+    // is now probed against phoenixd before anything is sent. Restarting is what an operator reaches
+    // for first, with the service down and unaffected subscribers waiting, so a prohibition that is
+    // no longer true is not a harmless leftover: it costs every one of them uptime. The two halves
+    // therefore make OPPOSITE assertions, and the second-payment warning must attach to the half
+    // that still carries it.
     assert!(
-        detail.contains("do NOT restart it") && detail.contains("do NOT restore a backup"),
-        "the alert must forbid BOTH restarting and restoring, outright: {detail}"
+        detail.contains("do NOT restore a backup")
+            && !detail.contains("do NOT restart"),
+        "restore must be forbidden and restart must NOT be, post-qvjz: {detail}"
+    );
+    let (before_restore, from_restore) = detail
+        .split_once("do NOT restore a backup")
+        .expect("checked just above");
+    assert!(
+        from_restore.contains("pay a refund a SECOND")
+            && !before_restore.contains("pay a refund a SECOND"),
+        "the second-payment warning must belong to the RESTORE half, not the restart half — an \
+         operator reading it against a restart would take an outage for a hazard that is closed: \
+         {detail}"
     );
     // The no-safe-backup branch must give an instruction the operator can actually CARRY OUT.
     // "reconcile by hand" was not one: `lnrent reconcile` is report-only, nothing reconstructs the
@@ -3411,13 +3515,20 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
          enumeration the runbook no longer provides: {detail}"
     );
     // WHY a restore is unsafe, not just that it is. Without the mechanism an operator reads the
-    // refusal as excessive caution and restores anyway: the rollback drops lnrent's record of which
-    // refunds already paid while phoenixd keeps that history, so the second pay is not a risk but
-    // the expected outcome of re-driving a restored PENDING refund.
+    // refusal as excessive caution and restores anyway.
+    //
+    // The mechanism CHANGED with lnrent-qvjz and this assertion changed with it. It used to be "the
+    // rollback drops lnrent's record of which refunds already paid while phoenixd keeps that
+    // history" — a missing row read as `never paid`. That shape is now probed, so quoting it here
+    // would pin a sentence the code has made false. What makes a RESTORE different from a fresh
+    // index loss is that it does not leave a missing row at all: `phoenixd_index.db` is captured in
+    // the backup, so it leaves a STALE one, and a key already retried into SUCCEEDED comes back
+    // FAILED. No probe reaches that — the Refunder re-resolves off `Failed && expired` without
+    // asking the backend again (lnrent-stale-failed-restore-double-pay-uxbd). The DM must name THAT.
     assert!(
-        detail.contains("the record of which refunds already \
-             paid lived in the lost index")
-            && detail.contains("while phoenixd keeps that history"),
+        detail.contains("STALE index")
+            && detail.contains("returns FAILED")
+            && detail.contains("re-resolves to a NEW hash phoenixd cannot dedup"),
         "and must give the MECHANISM, so the refusal does not read as mere caution: {detail}"
     );
 }

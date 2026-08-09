@@ -317,19 +317,35 @@ refuses orders it cannot service.
        row committed after the backup. Three schemes for proving a restore safe were refuted across
        eight review passes on lnrent-ole, every one a double pay; do not reconstruct them.
 
-    3. **Do not restart the daemon — and assume the double pays have ALREADY happened.** The dedup
-       map lives in the index you lost, so `pay_get` finds no row, which is indistinguishable from
-       "never paid". The refunder re-drives every PENDING `refund_attempt` at boot AND on each
-       maintenance pass (a few seconds apart, `supervisor.rs`), and the sweeper does the same for
-       `sweep_attempt` — so if the daemon has been running on the diverged index at all, any
-       PENDING row whose payment had already gone out was very likely re-sent within seconds of
-       that boot, long before this alert reached you. "Do not restart" is still right; it is not a
-       preventive measure so much as a way to stop the count rising.
+    3. **Restarting no longer re-sends a payment that already went out.** It used to. The dedup map
+       lives in the index you lost, so `pay_get` finds no row — and that used to be read as "never
+       paid", which is how a refund whose money had already left got sent a second time. It is not
+       read that way any more: with no local row, lnrent now asks phoenixd about the destination's
+       payment hash before sending anything (`lnrent-qvjz`), and either adopts the payment phoenixd
+       reports as already made or refuses and stalls the refund visibly. A payment that is merely
+       IN FLIGHT stalls too — it is not a negative answer, and lnrent no longer treats it as one.
 
-       A payment that is merely IN FLIGHT is not a negative answer either: it can still settle
-       while a new one is posted alongside it. The restore is not the hazard; the missing dedup map
-       is, and the incident already handed you that. (A sweep re-send pays the operator, so it
-       costs routing fees rather than a buyer's money — still a second payment.)
+       So do not spend the incident hunting duplicate refunds on the assumption they must exist.
+       Step 4 still has you reconcile, because the receive side is genuinely unknown and because a
+       stalled refund needs settling by hand — but the outbound side is now expected to be intact.
+
+       **Do NOT restore a backup.** That half of the old advice stands, and it is a different
+       mechanism from the one above. `phoenixd_index.db` IS captured in lnrent's backups, so a
+       restore does not give you a missing row that the probe would catch — it gives you a STALE
+       row, and a key that had already been retried into `SUCCEEDED` comes back as `FAILED`. The
+       refunder re-resolves a `FAILED` expired destination to a brand-new invoice with a brand-new
+       payment hash, which phoenixd's same-invoice dedup cannot recognise, so that one pays twice
+       and no probe can stop it (`lnrent-stale-failed-restore-double-pay-uxbd`). Restoring also
+       reinstates lnrent's commitments without the phoenixd WALLET, which is deliberately excluded
+       (`backup.rs:27-32`); it can resurrect a terminated subscription; and it drops every order,
+       capture and ledger row committed after the backup. Three schemes for proving a restore safe
+       were refuted across eight review passes on `lnrent-ole`, every one a double pay; do not
+       reconstruct them.
+
+       One outbound residual remains, and it costs bookkeeping rather than a buyer's money: an
+       index loss across an IN-FLIGHT sweep payment can park the sweep `FAILED` and return its
+       reserved cap to your surplus while the payment may still settle, so treat the surplus figure
+       as unverified until step 4 confirms it (`lnrent-sweep-failed-ledger-lie-7wbo`).
 
     4. **Reconcile BOTH directions against phoenixd's own records.** phoenixd knows what it
        received and what it sent; lnrent no longer does. Read them through phoenixd's own HTTP API,

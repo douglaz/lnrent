@@ -95,15 +95,26 @@
 //!    [`PaymentBackend::failed_refund_can_reuse_invoice`] can be `true` here and a retry of a
 //!    `FAILED` key simply re-runs the preflight.
 //!
-//!    That invariant is NOT free, and what pays for it is the `outgoingbyhash` probe on EVERY path
-//!    into `start_pay` — including the no-row path (lnrent-qvjz). Without it the invariant is false
-//!    after an index loss: `phoenixd_pay` lives in `phoenixd_index.db`, so losing that map makes a
-//!    key with a real outbound payment indistinguishable from a fresh one, and the expiry refusal
-//!    then writes `FAILED` over money that already left. Because `failed_refund_can_reuse_invoice`
-//!    is `true`, the Refunder reads that `FAILED` on an expired destination and re-resolves at
-//!    gen+1 to a NEW invoice with a NEW payment hash — which the node-wide same-invoice dedup
-//!    (fact 2) cannot catch, because it keys on the hash. A false `FAILED` here is therefore a
-//!    double pay, not a retry. Anyone adding a route into `start_pay` must probe the hash first.
+//!    That invariant is NOT free, and it is NOT universal. Read the next two paragraphs together;
+//!    the first is what the code guarantees, the second is what it does not.
+//!
+//!    WHY A FALSE `FAILED` IS A DOUBLE PAY, NOT A RETRY. Because `failed_refund_can_reuse_invoice`
+//!    is `true`, the Refunder reads `FAILED` on an EXPIRED destination and re-resolves at gen+1 to
+//!    a NEW invoice with a NEW payment hash (`daemon/src/refund.rs:614-644`) — which the node-wide
+//!    same-invoice dedup (fact 2) cannot catch, because it keys on the hash. So any path that can
+//!    write `FAILED` over money that already left pays the buyer twice.
+//!
+//!    WHICH PATHS ARE COVERED. `phoenixd_pay` lives in `phoenixd_index.db`, so a lost or restored
+//!    index makes a key with a real outbound payment look untouched. Of the four shapes that
+//!    reaches `pay_inner` with, three are safe: a stale `SUCCEEDED` never re-pays, a stale
+//!    `PREPARED` is resolved by the `outgoingbyhash` probe in its recovery arm, and NO ROW is
+//!    probed the same way (lnrent-qvjz). **A stale `FAILED` is neither probed nor fixable by
+//!    probing** — the Refunder re-resolves off `PayStatus::Failed && expired` alone and never asks
+//!    this backend about the old key again, so there is no call for a probe to sit in front of.
+//!    That residual is real and tracked as `lnrent-stale-failed-restore-double-pay-uxbd`; it needs
+//!    the `FAILED` status itself to carry evidence, which is a change above this layer. Until then:
+//!    anyone adding a route into `start_pay` must probe the hash first, and anyone making `FAILED`
+//!    reachable from a new place must read that bead before doing it.
 //!
 //! ## Cross-order same-invoice guard (ported [8A], lnrent-85t)
 //! phoenixd dedups by payment hash across the WHOLE node, so if some other idempotency key already
@@ -612,16 +623,16 @@ async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_i
         // on lnrent-ole, every one a double pay; repair TOOLING is lnrent-8scw.
         format!(
             "INDEX DIVERGENCE: invoice {invoice_id} absent from {INDEX_DB_FILE} — payment state \
-             UNKNOWN: lnrent can neither book nor expire it. ONE ALERT COVERS THEM ALL: every \
-             invoice whose index row is gone is affected, not only this one. REMEDY, IN THIS \
+             UNKNOWN: lnrent can neither book nor expire it. ONE ALERT COVERS THEM ALL: every invoice \
+             whose index row is gone is affected, not only this one. REMEDY, IN THIS \
              ORDER: run `lnrent --data-dir <this daemon's data dir> listing withdraw` FIRST, \
-             while the daemon is still up (it needs that daemon's socket; the flag defaults to \
-             ./data), THEN stop it — and do NOT restart it, and do NOT restore a \
-             backup. Either can pay a refund a SECOND time: the record of which refunds already \
-             paid lived in the lost index, while phoenixd keeps that history. Keep the data dir \
-             and phoenixd's history intact and settle the affected buyers out of band from \
-             phoenixd's own records. Full detail in the index-divergence section of \
-             docs/go-live.md. Leave phoenixd on its original wallet, and never recreate or expire \
+             while the daemon is still up (it needs that socket; the flag defaults to \
+             ./data), THEN stop it. A restart will NOT re-pay money that already left: with no \
+             local row lnrent asks phoenixd. But do NOT restore a backup — that CAN pay a \
+             refund a SECOND time: it reinstates a STALE index, a key already retried to \
+             SUCCEEDED returns FAILED, and it re-resolves to a NEW hash phoenixd cannot dedup. Keep \
+             the data dir and phoenixd's history intact; settle the affected buyers out of band from \
+             phoenixd's records. See docs/go-live.md, index-divergence. Leave phoenixd on its original wallet, and never recreate or expire \
              an affected invoice."
         ),
     )
@@ -1430,10 +1441,20 @@ impl PhoenixdPayment {
         }
     }
 
-    /// Fund a NEW phoenixd payment for `idempotency_key`. The caller has PROVEN no live attempt exists
-    /// for this key ([7A]): recovery just saw a clean `outgoingbyhash` 404 for its hash, or the row is
-    /// a FAILED refusal that never POSTed. Every refusal below is therefore safe to record as terminal
-    /// `FAILED` — it can never race a live payment.
+    /// Fund a NEW phoenixd payment for `idempotency_key`. The caller has established that no live
+    /// attempt exists for this key ([7A]) in one of two ways, and they are NOT equally strong:
+    ///
+    ///  * **Verified here and now** — recovery, or the no-row arm, just saw a clean `outgoingbyhash`
+    ///    404 for this hash. This is the proof; prefer routes that carry it.
+    ///  * **Inherited from an existing `FAILED` row** — trusted because of the module-header
+    ///    invariant, not because anything re-checked it on this call. A row restored from a backup
+    ///    taken before the key succeeded satisfies this arm while the money has already left; see
+    ///    `lnrent-stale-failed-restore-double-pay-uxbd`. Do not read this arm as equivalent to the
+    ///    first one.
+    ///
+    /// Every refusal below records terminal `FAILED`, which on an expired destination is what sends
+    /// the Refunder to a fresh invoice generation — so it is only safe to the extent the proof above
+    /// actually held.
     ///
     /// "There is no row" is NOT one of those proofs and must never be treated as one (lnrent-qvjz):
     /// the row lives in the index whose loss is the divergence incident, so its absence is equally
@@ -2657,8 +2678,6 @@ fn pay_upsert_prepared(
     Ok(())
 }
 
-/// Terminal SUCCESS, CAS-guarded on the payment hash so a stale caller cannot overwrite a row that
-/// was rebound to a different destination.
 /// Insert a terminal `SUCCEEDED` row for a payment adopted with no prior witness (lnrent-qvjz).
 ///
 /// `INSERT` rather than upsert, deliberately: the caller has just established there is no row, and a
@@ -2697,6 +2716,10 @@ fn pay_insert_adopted_succeeded(
     Ok(())
 }
 
+/// Terminal SUCCESS, CAS-guarded on the payment hash so a stale caller cannot overwrite a row that
+/// was rebound to a different destination. That CAS is also what
+/// [`PhoenixdPayment::adopt_paid_without_row`] has to replace by hand, since it has no row to CAS
+/// against.
 fn pay_mark_succeeded(
     index: &Mutex<Connection>,
     key: &str,

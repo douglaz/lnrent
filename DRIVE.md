@@ -1,7 +1,9 @@
 # DRIVE — drain the money-path operability beads that need no live infra or real money
 
-**Scope:** rb-lite-drainable operability/money-path beads ONLY — `gc7`, `yg0`, `7fx`, `4kg`,
-`3zt`, `799`, `x1u`, `epj`, `xr7`, `02t`, `yxg`. Explicitly OUT of scope: `nfj` (stop-list —
+**Scope:** rb-lite-drainable operability/money-path beads ONLY — `gc7`, `qvjz`, `yg0`, `7fx`, `4kg`,
+`3zt`, `799`, `x1u`, `epj`, `xr7`, `02t`, `yxg`, plus the beads this drive files itself:
+`unbooked-settlement-condition-ledger-hwni` (design), `stale-failed-restore-double-pay-uxbd`,
+`sweep-failed-ledger-lie-7wbo`. Explicitly OUT of scope: `nfj` (stop-list —
 cluster deploy + real sats), the live-verification beads (`cnf`, `rwv`, `kr1`, `u43`, `tof`,
 `e96`), upstream fedimint (`y32`, `7y1`), `ea1` (release), `5h4` (product design), `xov` (user
 deferred). `br ready` counts the whole repo — filter it through this line.
