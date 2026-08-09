@@ -376,9 +376,12 @@ refuses orders it cannot service.
   Disabling the alert sink (`LNRENT_ALERTS_ENABLED`) does NOT blank this view. Records enqueued
   before it was switched off are durable and still listed; what stops is the recording of new ones,
   which the view flags separately ("recording: OFF"). Read that pairing literally — the count is
-  real history, and the absence of NEW entries is not evidence that nothing is wrong. The flag is
-  raised only for a backend that can actually produce the condition (phoenixd today), so on another
-  backend a disabled sink simply shows the count with no notice.
+  real history, and the absence of NEW entries is not evidence that nothing is wrong. The flag is raised only where this
+  alert is WIRED — phoenixd today — which is narrower than "can produce the condition". lnv2 can
+  also strand a confirmed payment (`PAID_UNRECOVERED`: the Lightning leg settled, minting failed)
+  and is NOT wired to this alert, so on a fedimint deployment a disabled sink shows the count with
+  no notice AND that condition would not have raised one anyway. Until lnrent-3p71 wires it, treat
+  a quiet fedimint daemon as unmeasured for this, not clear.
 
 - **Watch relay connectivity (GATE-1 PR-9c):** `lnrent relays` shows per-relay connected state +
   last-connected time (also summarized as `relays_connected/relays_total` in `lnrent status`). If
