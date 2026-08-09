@@ -331,11 +331,20 @@ refuses orders it cannot service.
        # -json, NOT -column: on sqlite3 before 3.33 column mode truncates to fixed widths, which
        # would silently cut 73-char invoice ids and 64-hex pubkeys -- at exit 0, past every guard
        # above -- in the one output this whole procedure produces.
+       # Build the id list as its OWN checked step. A failure inside $(...) is DISCARDED -- the
+       # enclosing command's status comes from sqlite3, so `set -euo pipefail` would not abort, the
+       # IN list would be empty or partial, and the buyer file would come back short. Silently.
+       IDS=$(paste -sd, - < "$WORK/affected.txt" | sed "s/[^,]*/'&'/g") \
+         || { echo "FAILED to build the affected-id list"; exit 1; }
+       [ -s "$WORK/affected.txt" ] && [ -n "$IDS" ] \
+         || { echo "affected.txt empty or id list blank -- STOP and find out why"; exit 1; }
+       [ "$(printf '%s' "$IDS" | tr -cd , | wc -c)" -eq "$(( $(wc -l < "$WORK/affected.txt") - 1 ))" ] \
+         || { echo "id list does not match affected.txt line count"; exit 1; }
+
        sqlite3 -json "$WORK/lnrent.sqlite" "
          SELECT i.id, i.amount_sat, i.received_msat, s.buyer_pubkey, s.refund_dest
            FROM invoice i LEFT JOIN subscription s ON s.id = i.subscription_id
-          WHERE i.id IN ($(paste -sd, -           < "$WORK/affected.txt" \
-                          | sed "s/[^,]*/'&'/g"))
+          WHERE i.id IN ($IDS)
           ORDER BY i.id;" | tee "$WORK/affected-buyers.txt"
        ```
 
@@ -423,10 +432,11 @@ refuses orders it cannot service.
 
        ```sh
        sqlite3 -json "$WORK/lnrent.sqlite" \
-         "SELECT 'refund' AS kind, id, dest, amount_sat, idempotency_key
+         "SELECT 'refund' AS kind, id, dest, resolved_bolt11, resolution_gen, amount_sat,
+                 idempotency_key
             FROM refund_attempt WHERE status='PENDING'
           UNION ALL
-          SELECT 'sweep'  AS kind, id, dest, amount_sat, idempotency_key
+          SELECT 'sweep' AS kind, id, dest, NULL, NULL, amount_sat, idempotency_key
             FROM sweep_attempt  WHERE status='PENDING';"
        ```
 
@@ -435,12 +445,27 @@ refuses orders it cannot service.
        not a buyer, so it costs routing fees rather than a customer's money — but it is still a
        second payment, and a stuck sweep can sit PENDING indefinitely.
 
-       If that list is empty, nothing here can double-pay and you may restart. If it is not, each row is
-       a refund the daemon will re-send: confirm against phoenixd's own outgoing history whether it
-       already paid. There is no supported way to tell lnrent "this one is already done" — that is
-       exactly what lnrent-8scw's tool must provide — so if any already paid, leave the daemon down
-       and settle those buyers out of band too. Restarting to keep unaffected subscribers served is
-       a real pressure; it is also how the second payment happens.
+       Use `resolved_bolt11`, not `dest`. For the ordinary LN-address or LNURL refund `dest` is the
+       ADDRESS; the concrete invoice actually paid is the resolved bolt11, generation-bound by
+       `resolution_gen` (`refund.rs`), and its payment hash is what correlates a row to phoenixd's
+       outgoing history. A PENDING row whose `resolved_bolt11` is NULL was never resolved, so
+       nothing went out for it.
+
+       If the list is empty, nothing here can double-pay and you may restart. Otherwise look each
+       row's payment hash up in phoenixd's outgoing history. THREE outcomes, and only one of them
+       permits a restart:
+
+       - **No record** — nothing was sent; the daemon may drive it.
+       - **A record that already PAID** — restarting re-sends it.
+       - **A record still IN FLIGHT** (present, unpaid, no `completedAt`) — equally unsafe. It can
+         still settle, and after the index loss the daemon takes the no-row path and may POST again
+         while the first attempt is live. An in-flight payment is an unanswered question, not a
+         negative answer: wait for it to reach a terminal state before deciding.
+
+       For anything but "no record", leave the daemon down and settle those buyers out of band too.
+       There is no supported way to tell lnrent "this one is already done" — that is precisely what
+       lnrent-8scw's tool must provide. Restarting to keep unaffected subscribers served is a real
+       pressure; it is also how the second payment happens.
 
     Never recreate or expire an affected invoice.
 
