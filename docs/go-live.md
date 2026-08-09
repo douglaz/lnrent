@@ -295,12 +295,16 @@ refuses orders it cannot service.
 
        **Run this as a script with `bash`, not pasted line by line.** It needs the `sqlite3` CLI —
        lnrent does not ship it and nothing else in this runbook requires it, so install it first
-       (`sqlite3 --version` should print 3.x). Its header matters as much as its queries:
+       — the script probes for what it needs rather than trusting a version string, because `-json`
+       arrived in SQLite 3.33 and a 3.26 host would pass a bare "is it 3.x?" check and then fail
+       mid-incident. Its header matters as much as its queries:
 
        ```sh
        #!/usr/bin/env bash
        set -euo pipefail                  # see "fail closed" below — this is load-bearing
        export LC_ALL=C                    # sort AND comm must agree on collation; see below
+       sqlite3 -json ":memory:" "SELECT 1;" >/dev/null 2>&1 \
+         || { echo "this sqlite3 has no -json (needs 3.33+); install a newer one"; exit 1; }
        DD=/path/to/your/data-dir          # the daemon's LNRENT_DATA_DIR
        WORK=$(mktemp -d)                  # query COPIES, never the live files
        for db in lnrent.sqlite phoenixd_index.db; do
@@ -366,8 +370,10 @@ refuses orders it cannot service.
        longer establish, the buyer's pubkey, their refund destination, and what they paid. A row
        with an empty `buyer_pubkey` means the invoice never reached a subscription — nothing was
        provisioned, so there is no service to settle, but the receipt may still be at phoenixd.
-       `received_msat` is the NET wallet credit (receive fees already taken) and is what you can
-       actually return; `amount_sat` is what the buyer sent.
+       `received_msat` will be NULL on every row here and that is expected: it is written only when
+       a settlement is CAPTURED (`capture.rs`), which is precisely what never happened. Settle from
+       `amount_sat` — what the buyer's invoice asked for — cross-checked against what phoenixd
+       records as actually received, which is the only place the net-of-fee figure now exists.
     3. **There is no safe repair — do NOT restore from a backup.** This is the whole remedy, and it
        is deliberately short.
 
@@ -397,6 +403,28 @@ refuses orders it cannot service.
 
        Repair TOOLING — which can be sound, because it can enumerate phoenixd's outgoing payments
        as the authority instead of trusting the local index — is tracked as lnrent-8scw.
+
+       **Do NOT restart the daemon yet, and understand why.** The same map this section warns a
+       restore would roll back, `phoenixd_pay`, lives in the index you just lost — and a missing row
+       reads exactly like "never paid" (`pay_get` returns no row, so the next drive PREPARES and
+       sends a new payment). Any `refund_attempt` still in `PENDING` whose payment actually went out
+       before the loss will therefore be paid a SECOND time on the first drive after restart. The
+       restore is not the hazard; the missing dedup map is, and you already have that.
+
+       So before the daemon comes back, list what is at risk and check each one against phoenixd:
+
+       ```sh
+       sqlite3 -json "$WORK/lnrent.sqlite" \
+         "SELECT id, subscription_id, dest, amount_sat, idempotency_key
+            FROM refund_attempt WHERE status='PENDING';"
+       ```
+
+       If that list is empty, nothing can double-pay and you may restart. If it is not, each row is
+       a refund the daemon will re-send: confirm against phoenixd's own outgoing history whether it
+       already paid. There is no supported way to tell lnrent "this one is already done" — that is
+       exactly what lnrent-8scw's tool must provide — so if any already paid, leave the daemon down
+       and settle those buyers out of band too. Restarting to keep unaffected subscribers served is
+       a real pressure; it is also how the second payment happens.
 
     Never recreate or expire an affected invoice.
 
