@@ -105,8 +105,10 @@
 //!    write `FAILED` over money that already left pays the buyer twice.
 //!
 //!    WHICH PATHS ARE COVERED, AND WHICH ARE NOT. `phoenixd_pay` lives in `phoenixd_index.db`, so a
-//!    lost or restored index makes a key with a real outbound payment look untouched. Of the four
-//!    shapes that reaches `pay_inner` with:
+//!    lost or restored index makes a key with a real outbound payment look untouched. Four of the
+//!    shapes it reaches `pay_inner` with can write a terminal `FAILED`, and those are the ones that
+//!    matter here (the remaining arms — a `SUCCEEDED` row with no payment id, an invalid persisted
+//!    status — bail without recording one):
 //!
 //!      * stale `SUCCEEDED` — safe, never re-pays.
 //!      * stale `PREPARED` — resolved by the `outgoingbyhash` probe in its recovery arm.
@@ -1392,16 +1394,17 @@ impl PhoenixdPayment {
             None => {
                 let dest = parse_dest(bolt11)?;
                 // [8A] FIRST, and deliberately not re-implemented here: a hash some OTHER live key
-                // already owns is refused by `start_pay`, which records that refusal DIRECTLY and
-                // never funds. Probing first and refusing here instead would leave the key
-                // `Unknown`, and the module header's own account of the collision path
-                // (refuse identically each drive, then `RefundStuck`) lives on `start_pay`'s arm —
-                // duplicating it here would give one path two different behaviours.
+                // owns is refused by `start_pay`, which never funds. Probing and refusing here
+                // instead would leave the key `Unknown`, and the module header's account of the
+                // collision path lives on `start_pay`'s arm — duplicating it would give one path two
+                // different behaviours.
                 //
-                // NOTE, and it is the reason this is an EXIT from the probe rather than a step
-                // before it: this route reaches `start_pay` UNPROBED, so it is a fourth shape the
-                // header's coverage list must not claim. It behaves exactly as master did, so this
-                // PR neither opens nor widens it, but it is real — see the header's residual list.
+                // NOTE, and it is why this is an EXIT from the probe rather than a step before it:
+                // this reaches `start_pay` UNPROBED, so it is a FOURTH ROUTE into that function (not
+                // to be confused with the header's fourth SHAPE, which is stale `FAILED`). Whatever
+                // refusal it records there is terminal — on an expired destination the expiry check
+                // fires before [8A] does — so it carries the same re-resolution hazard. It behaves
+                // exactly as master did, so this PR neither opens nor widens it.
                 if pay_other_key_for_hash(&self.index, &dest.payment_hash, idempotency_key)?
                     .is_some()
                 {
@@ -1414,14 +1417,28 @@ impl PhoenixdPayment {
                 // destination, and letting it fall through to the unpaid arm would report OUR hash
                 // as an unresolved payment — sending the operator into withdraw/stop/settle-by-hand
                 // over a diagnosis that is not about their invoice at all.
+                //
+                // Case-INSENSITIVE, matching `reusable_incoming`'s comparison of a phoenixd-reported
+                // hash rather than the pay-path neighbour below. lnrent has not measured which case
+                // `outgoingbyhash` echoes, and the two directions fail very differently: a spurious
+                // match here is caught immediately by the [8A] check and the adopt path's own
+                // accounting, while a spurious MISMATCH would bail on every drive forever and strand
+                // a refund the wallet has already paid — the outcome the module header says must not
+                // happen. Where the answer is unmeasured, fail toward the recoverable side.
                 let probed = match self.ops.outgoing_by_hash(&dest.payment_hash).await? {
-                    Some(record) if record.payment_hash != dest.payment_hash => bail!(
+                    Some(record)
+                        if !record
+                            .payment_hash
+                            .eq_ignore_ascii_case(&dest.payment_hash) =>
+                    {
+                        bail!(
                         "phoenixd returned an outgoing record for hash {} when asked about {}; \
                          refusing to classify key {idempotency_key} on a record that is not about \
                          its destination",
                         record.payment_hash,
                         dest.payment_hash
-                    ),
+                        )
+                    }
                     other => other,
                 };
                 match probed {
@@ -1444,10 +1461,13 @@ impl PhoenixdPayment {
                          lnrent refuses to send this destination again and records NO failure for \
                          it: a recorded failure would let the refund re-resolve to a NEW invoice \
                          and pay a second time, which phoenixd's same-invoice dedup could not \
-                         catch. Expect a stuck-payment operator alert (RefundStuck for a refund, \
-                         SweepStuck for a sweep). Settling it needs a human who can read the \
-                         wallet's own payment list; do not pay this destination out of band while \
-                         a payment for it may still be in flight.",
+                         catch. For a REFUND this surfaces as a RefundStuck operator alert. For a \
+                         SWEEP it does not: with no row the next drive treats the intent as never \
+                         started and, once it expires, parks it FAILED with a SweepFailed alert \
+                         that overstates what is known (lnrent-sweep-failed-ledger-lie-7wbo). \
+                         Either way settling it needs a human who can read the wallet's own \
+                         payment list; do not pay this destination out of band while a payment for \
+                         it may still be in flight.",
                         dest.payment_hash,
                         if record.completed_at_ms.is_none() {
                             "and carries no completion time, which on the release lnrent measured \
@@ -1471,7 +1491,7 @@ impl PhoenixdPayment {
     }
 
     /// Fund a NEW phoenixd payment for `idempotency_key`. The caller has established that no live
-    /// attempt exists for this key ([7A]) in one of two ways, and they are NOT equally strong:
+    /// attempt exists for this key ([7A]) in one of three ways, and they are NOT equally strong:
     ///
     ///  * **Verified here and now** — recovery, or the no-row arm, just saw a clean `outgoingbyhash`
     ///    404 for this hash. This is the proof; prefer routes that carry it.
@@ -1481,9 +1501,11 @@ impl PhoenixdPayment {
     ///    `lnrent-stale-failed-restore-double-pay-uxbd`. Do not read this arm as equivalent to the
     ///    first one.
     ///  * **Nothing was established at all** — the no-row arm's [8A] exit hands over a key whose
-    ///    hash was never probed, because another key owns it and the refusal belongs here. This
-    ///    call relies entirely on the [8A] check below firing, so that check is load-bearing for
-    ///    money safety and not merely for bookkeeping.
+    ///    hash was never probed, because another key owns it and the refusal belongs here. Note what
+    ///    that does NOT buy: the refusal this call actually records is whichever fires first, and on
+    ///    an EXPIRED destination that is the expiry check above the [8A] check, not [8A] itself.
+    ///    Either way it is a terminal `FAILED`, so this route inherits the same re-resolution hazard
+    ///    as the bullet above without even the inherited invariant behind it.
     ///
     /// Every refusal below records terminal `FAILED`, which on an expired destination is what sends
     /// the Refunder to a fresh invoice generation — so it is only safe to the extent the proof above
@@ -1782,13 +1804,18 @@ impl PhoenixdPayment {
     /// `PREPARED`, which would transiently name a hash recovery could adopt (see the ordering note
     /// in [`Self::start_pay`]).
     ///
-    /// The one protection the vanished row would otherwise have supplied is therefore taken by hand:
-    /// the requested hash must match the record's own (the CAS did this through
-    /// `WHERE payment_hash = ?`). The other, [8A] cross-key ownership, is NOT re-checked here — the
-    /// caller runs it ahead of the probe and hands a collision to `start_pay`, which is the only
-    /// place allowed to record that refusal, and both run under `pay_start_lock` so nothing can
-    /// acquire an owner in between. A second copy of the check here could never fire, and a guard
-    /// that cannot fire is not a guard.
+    /// Both protections the vanished row would otherwise have supplied live at the CALL SITE, not
+    /// here, and neither is re-checked in this function: the requested hash must match the record's
+    /// own (what the CAS did through `WHERE payment_hash = ?`), and [8A] cross-key ownership must be
+    /// clear. `pay_inner`'s no-row arm runs both before calling this — the hash equality as a bail
+    /// ahead of classifying, so it protects the refuse path too, and [8A] as a hand-off to
+    /// `start_pay`, the only place allowed to record that refusal. All of it runs under
+    /// `pay_start_lock`, so nothing can change in between. Copies here could never fire, and a guard
+    /// that cannot fire is not a guard — which is exactly why they are not duplicated.
+    ///
+    /// `expected_hash` is therefore the contract itself, asserted rather than re-checked: a
+    /// `debug_assert!` that fires under test if a future caller reaches here without having cleared
+    /// the hash. It is not a release guard — the release guard is the caller's bail.
     ///
     /// `node_id` stays NULL. This attempt was never prepared against a known wallet, and the schema
     /// already defines NULL as "unknown identity, which recovery treats as unproven". Recording
@@ -1802,13 +1829,12 @@ impl PhoenixdPayment {
         amount_sat: u64,
         cap: PayCap,
     ) -> Result<String> {
-        if record.payment_hash != expected_hash {
-            bail!(
-                "phoenixd returned an outgoing record for hash {} when asked about {expected_hash}; \
-                 refusing to credit it to key {idempotency_key}",
-                record.payment_hash
-            );
-        }
+        debug_assert!(
+            record.payment_hash.eq_ignore_ascii_case(expected_hash),
+            "adopt_paid_without_row reached with an unvalidated hash: record {} vs expected \
+             {expected_hash} — the caller must bail before classifying",
+            record.payment_hash
+        );
         pay_insert_adopted_succeeded(
             &self.index,
             idempotency_key,

@@ -1263,9 +1263,15 @@ async fn pay_records_the_key_and_never_pays_twice() {
     );
 }
 
-// Fact 2: phoenixd answers a repeated same-bolt11 payinvoice with HTTP 200 + `reason` and NO
-// paymentId/preimage. For a key we already own that is SUCCESS-equivalent — decided by re-reading
-// `outgoingbyhash`, never by the English string.
+// A paid record for OUR hash is adopted with no POST at all (lnrent-qvjz).
+//
+// This used to be the Fact-2 test: phoenixd answers a repeated same-bolt11 payinvoice with HTTP 200
+// + `reason` and no paymentId/preimage, and lnrent resolved that by re-reading `outgoingbyhash`
+// rather than by parsing the English string. The no-row probe now settles this BEFORE any POST, so
+// the duplicate-response round-trip itself is exercised by
+// `a_record_appearing_between_the_probe_and_the_post_is_adopted_not_paid_twice`. What stays pinned
+// here is the money property, which did not change: a paid record for our hash is adopted once and
+// never paid again.
 #[tokio::test]
 async fn a_paid_record_for_our_hash_is_adopted_without_any_post() {
     let ops = FakePhoenixdOps::new();
@@ -1568,8 +1574,9 @@ async fn index_loss_refuses_an_in_flight_record_and_records_no_failure() {
 
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("IN FLIGHT"),
-        "the operator must be told the shape, not just that it refused: {msg}"
+        msg.contains("still IN FLIGHT") && !msg.contains("does carry a completion time"),
+        "the operator must be told the shape, and must not be handed the other shape's \
+         wording: {msg}"
     );
     assert!(
         ops.pay_calls().is_empty(),
@@ -1605,11 +1612,25 @@ async fn index_loss_refuses_a_terminal_unpaid_record_without_writing_failed() {
     });
 
     let recovered = backend(ops.clone(), TestClock::new(1_004_000));
-    recovered
+    let err = recovered
         .pay_refund_capped(&bolt11, 120, 130, "refund:order:73:g1")
         .await
         .expect_err("an unattributable terminal record is not a licence to pay again");
 
+    // Both directions, matching the PREPARED siblings: collapsing the shape conditional to emit one
+    // string on both branches would otherwise leave the suite green while the operator is told an
+    // in-flight payment failed, or a failed one is still running.
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("does carry a completion time")
+            && !rendered.contains("still IN FLIGHT"),
+        "the terminal shape must use its own wording and not borrow the in-flight one: {rendered}"
+    );
+    assert!(
+        rendered.contains("SweepFailed") && !rendered.contains("SweepStuck"),
+        "a no-row sweep parks FAILED; promising SweepStuck would name an alert that never \
+         arrives: {rendered}"
+    );
     assert!(ops.pay_calls().is_empty());
     assert_eq!(
         recovered
@@ -1665,10 +1686,14 @@ async fn a_clean_404_still_terminalizes_an_expired_destination() {
     );
 }
 
-/// The hash guard `adopt_paid_without_row` takes by hand in place of the CAS the missing row would
-/// have supplied. Its `PREPARED` sibling is broken deliberately by
+/// The no-row arm's hash bail, which stands in for the CAS the missing row would have supplied.
+/// Its `PREPARED` sibling is broken deliberately by
 /// `recovery_rejects_a_paid_record_for_a_different_hash`; without this, nothing shows the no-row
 /// copy ever fires, and a guard that cannot be shown to fire is not a guard.
+///
+/// The assertion must use wording UNIQUE to this bail. "when asked about" also appears in the adopt
+/// path's contract message, so matching on that would pass whichever fired — which is how this test
+/// read as green while the guard it was named for had become unreachable.
 #[tokio::test]
 async fn index_loss_refuses_a_paid_record_naming_a_different_hash() {
     let ops = FakePhoenixdOps::new();
@@ -1694,8 +1719,8 @@ async fn index_loss_refuses_a_paid_record_naming_a_different_hash() {
         .expect_err("a record for a different hash is not ours to adopt");
 
     assert!(
-        format!("{err:#}").contains("when asked about"),
-        "unexpected error: {err:#}"
+        format!("{err:#}").contains("refusing to classify key"),
+        "must be the pre-classification bail specifically: {err:#}"
     );
     assert!(ops.pay_calls().is_empty());
     assert_eq!(
