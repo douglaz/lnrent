@@ -588,8 +588,9 @@ async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_i
             "INDEX DIVERGENCE: invoice {invoice_id} absent from {INDEX_DB_FILE} — payment state \
              UNKNOWN: lnrent can neither book nor expire it. ONE ALERT COVERS THEM ALL: every \
              invoice whose index row is gone is affected, not only this one. REMEDY, IN THIS \
-             ORDER: run `lnrent listing withdraw` FIRST, while the daemon is still up (it needs \
-             the daemon's socket), THEN stop it — and do NOT restart it, and do NOT restore a \
+             ORDER: run `lnrent --data-dir <this daemon's data dir> listing withdraw` FIRST, \
+             while the daemon is still up (it needs that daemon's socket; the flag defaults to \
+             ./data), THEN stop it — and do NOT restart it, and do NOT restore a \
              backup. Either can pay a refund a SECOND time: the record of which refunds already \
              paid lived in the lost index, while phoenixd keeps that history. Keep the data dir \
              and phoenixd's history intact and settle the affected buyers out of band from \

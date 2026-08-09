@@ -3115,7 +3115,8 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
     // money unbooked, so the DM must also name what they CAN do — and every verb here is real:
     // `lnrent listing withdraw` exists, and phoenixd's own records are what settlement reads.
     assert!(
-        detail.contains("lnrent listing withdraw")
+        detail.contains("listing withdraw")
+            && detail.contains("--data-dir")
             && detail.contains("settle the affected buyers out of band"),
         "and must give an ACTIONABLE next step, not just a refusal: {detail}"
     );

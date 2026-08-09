@@ -1317,6 +1317,10 @@ async fn add_unbookable_settlement_alerts_view(
     // for `mock` (config.rs), which is the DEFAULT backend and what the image smoke test runs, so
     // gating on the sink alone made every `lnrent money` there print a red notice whose remedy names
     // phoenixd records that do not exist.
+    // Mark that recording is OFF, then read the history anyway. Rows enqueued before the sink was
+    // disabled are still durable, and returning early hid them while claiming nothing was recorded
+    // — losing real incident history at the moment the CLI is the operator's only surface. The two
+    // facts are independent: what WAS observed, and that nothing further WILL be.
     if !alerts_enabled && backend_can_be_unbookable {
         if let Some(obj) = response.as_object_mut() {
             obj.insert(
@@ -1324,7 +1328,6 @@ async fn add_unbookable_settlement_alerts_view(
                 serde_json::json!(true),
             );
         }
-        return;
     }
     let since = now - crate::alerts::ALERT_VIEW_WINDOW_S;
     let view = crate::alerts::recent_alerts(
@@ -2844,10 +2847,12 @@ mod tests {
     // rows — about a question it cannot see. Both operator commands must say so explicitly, because
     // with DMs off the CLI is the only surface an unbooked receipt can reach.
     #[tokio::test]
-    async fn a_disabled_alert_sink_reports_the_view_unavailable_rather_than_zero() {
+    async fn a_disabled_alert_sink_is_flagged_without_hiding_recorded_history() {
         let store = mem_store();
-        // A backend that CAN produce the condition — otherwise there is nothing for a disabled sink
-        // to be hiding, which is the whole point of the second half of this test.
+        // A row enqueued BEFORE the sink was switched off. It is durable and still worth showing:
+        // hiding it would lose real incident history exactly when the CLI is the only surface left.
+        seed_unbookable_alert(&store, VIEW_NOW - 9, "fee_credit", "REMEDY: fund it").await;
+        // A backend that CAN produce the condition — otherwise a disabled sink hides nothing.
         let payment: Arc<dyn PaymentBackend> =
             Arc::new(MockPayment::new().unbookable_capable());
         let recipes = Arc::new(Vec::<Recipe>::new());
@@ -2872,10 +2877,20 @@ mod tests {
                 json!(true),
                 "{cmd}: a disabled sink is explicit: {data}"
             );
+            // The flag says future incidents will not be observed. It must NOT also erase what
+            // already was: an early return here hid durable rows while claiming nothing was
+            // recorded. Both facts ship, and the CLI prints the OFF notice above the history.
             assert_eq!(
                 data["recent_unbookable_settlement_alerts"],
-                Value::Null,
-                "{cmd}: and must NOT answer 0 to a question it cannot see: {data}"
+                json!(1),
+                "{cmd}: history recorded before the sink was disabled must still be visible: {data}"
+            );
+            assert!(
+                data["recent_unbookable_settlement_alert_details"][0]["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("REMEDY: fund it"),
+                "{cmd}: including its remedy: {data}"
             );
         }
     }

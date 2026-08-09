@@ -359,17 +359,21 @@ fn money_human_text(v: &serde_json::Value) -> String {
         .get("recent_unbookable_settlement_alerts_disabled")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // A PREPENDED notice, not an exclusive arm: rows enqueued before the sink was turned off are
+    // still durable and still worth showing. What the operator loses is FUTURE observation, and
+    // saying that alongside the surviving history is strictly more informative than replacing it.
+    // Its remedy also differs from the storage-failure case below — nothing is broken here.
     if unbookable_disabled {
-        // A DIFFERENT remedy from the storage-failure case below, so it gets its own line: nothing
-        // is broken, the operator switched the recording off, and this view is derived from it.
         lines.push(
-            "\x1b[1;31mUnbookable settlement alert history: UNAVAILABLE\x1b[0m — DM alerts are \
-             disabled (`LNRENT_ALERTS_ENABLED`), so nothing is recorded and this view cannot tell \
-             you whether a paid settlement is sitting unbooked. This is NOT a report of zero. \
-             Re-enable alerts, or check phoenixd's own records directly."
+            "\x1b[1;31mUnbookable settlement recording: OFF\x1b[0m — DM alerts are disabled \
+             (`LNRENT_ALERTS_ENABLED`), so NO NEW unbookable settlement will be observed or listed \
+             here. Any history below was recorded before it was switched off; absence of new \
+             entries is NOT evidence that nothing is wrong. Re-enable alerts, or check phoenixd's \
+             own records directly."
                 .to_string(),
         );
-    } else if unbookable_unknown {
+    }
+    if unbookable_unknown {
         lines.push(
             "\x1b[1;31mUnbookable settlement alert history: UNKNOWN\x1b[0m — the daemon could not \
              read its durable alert history, so it cannot say whether settlements are being held \
@@ -1050,10 +1054,12 @@ mod tests {
     // the CLI is then the operator's ONLY surface. Reporting 0 there would be a bare all-clear over
     // a buyer's unbooked receipt, which is the failure this whole bead exists to prevent. It gets
     // its own line rather than reusing the storage-failure UNKNOWN because the remedy differs:
-    // re-enable alerts, not fix the database.
+    // re-enable alerts, not fix the database. And it is ADDITIVE: rows enqueued before the sink
+    // was switched off are still durable, so hiding them would lose real incident history at the
+    // moment the CLI is the operator's only surface.
     #[test]
-    fn money_human_reports_a_disabled_alert_sink_as_unavailable_not_zero() {
-        let rendered = money_human_text(&json!({
+    fn money_human_reports_a_disabled_alert_sink_without_hiding_its_history() {
+        let base = json!({
             "expected_msat": 0,
             "gross_liability_sat": 0,
             "required_msat": 0,
@@ -1061,19 +1067,16 @@ mod tests {
             "ready": true,
             "degraded_read_only": false,
             "recent_unbookable_settlement_alerts_disabled": true,
-        }));
+        });
 
+        let rendered = money_human_text(&base);
         assert!(
-            rendered.contains("Unbookable settlement alert history: UNAVAILABLE"),
+            rendered.contains("Unbookable settlement recording: OFF"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("NOT a report of zero"),
+            rendered.contains("NOT evidence that nothing is wrong"),
             "it must refuse to be read as an all-clear: {rendered}"
-        );
-        assert!(
-            !rendered.contains("Unbookable settlements: 0"),
-            "and must never print a count it cannot know: {rendered}"
         );
         // The remedy is re-enabling alerts, NOT chasing a storage error.
         assert!(
@@ -1082,7 +1085,24 @@ mod tests {
         );
         assert!(
             rendered.contains("READY (refund liability only)"),
-            "and READY must be qualified when the view cannot see the condition: {rendered}"
+            "and READY must be qualified when the view cannot see new conditions: {rendered}"
+        );
+
+        // The half that regressed: history written BEFORE the sink was disabled must still show.
+        let mut with_history = base.clone();
+        let obj = with_history.as_object_mut().unwrap();
+        obj.insert("recent_unbookable_settlement_alerts".into(), json!(1));
+        obj.insert(
+            "recent_unbookable_settlement_alert_details".into(),
+            json!([{ "subject": "fee_credit", "detail": "FEE-CREDIT REFUSAL; REMEDY: fund it",
+                     "at": 900 }]),
+        );
+        let rendered = money_human_text(&with_history);
+        assert!(
+            rendered.contains("Unbookable settlement recording: OFF")
+                && rendered.contains("fee_credit")
+                && rendered.contains("REMEDY: fund it"),
+            "a disabled sink must not hide the incidents already recorded: {rendered}"
         );
     }
 
