@@ -131,9 +131,11 @@
 //! are separate beads — all filed, none silently dropped. The exact per-receipt fee-credit exclusion
 //! is NOT one of them: lnrent-itw measured a live fee-credit receive on 2026-07-26 and found no
 //! per-receipt attribution to exclude, so the wallet-level rule in [`spendable_credit_msat`] is the
-//! whole of it. Index GC is also deferred, to lnrent-rpa: `phoenixd_invoice` grows one row per
-//! created invoice, the same unpaid-order flood surface lnv2 grew a throttled reaper for
-//! (lnrent-y4m.15/y4m.19). The poll reads only rows whose bolt11 can still be paid (an indexed
+//! whole of it. Index GC is also deferred, to lnrent-rpa, and TWO tables there are unreaped:
+//! `phoenixd_invoice` grows one row per created invoice, the same unpaid-order flood surface lnv2
+//! grew a throttled reaper for (lnrent-y4m.15/y4m.19), and `phoenixd_unbookable_settlement` grows
+//! one row per fee-credit-refused invoice — that one takes the OPPOSITE reaping rule, stated at its
+//! schema definition below. The poll reads only rows whose bolt11 can still be paid (an indexed
 //! `expires_at` range, not a table scan) and retires within that set, so the steady-state poll cost
 //! tracks LIVE invoices rather than the table; what GC still buys is disk. It is an operational
 //! bound, not a money-safety one — no row here is authoritative
@@ -151,9 +153,10 @@ use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::mpsc;
 
-use crate::backends::{BackendKind, 
-    safe_phoenixd_version, Invoice, PayStatus, PaymentBackend, PaymentStatus, PhoenixdProbe,
-    PhoenixdReadinessError, Settlement, REDACTED_PHOENIXD_VERSION,
+use crate::alerts::{Alert, AlertDispatcher, AlertKind};
+use crate::backends::{
+    safe_phoenixd_version, BackendKind, Invoice, PayStatus, PaymentBackend, PaymentStatus,
+    PhoenixdProbe, PhoenixdReadinessError, Settlement, REDACTED_PHOENIXD_VERSION,
 };
 use crate::clock::Clock;
 
@@ -279,6 +282,17 @@ CREATE INDEX IF NOT EXISTS phoenixd_invoice_by_external_id ON phoenixd_invoice (
 -- The settlement poll reads only rows whose bolt11 can still be paid, so its cost tracks LIVE
 -- invoices rather than the never-GC'd table (`idx_pollable_invoices`).
 CREATE INDEX IF NOT EXISTS phoenixd_invoice_by_expires_at ON phoenixd_invoice (expires_at);
+-- Reporting-only state: local first observation makes the alert threshold independent of clock
+-- skew on a remotely hosted phoenixd, and persistence keeps daemon restarts from resetting it.
+-- NOTE for lnrent-rpa, the deferred index-GC bead: this table takes the OPPOSITE rule to
+-- `phoenixd_invoice` above. A row is never read by a money decision, so reaping one costs at worst a
+-- re-started alert threshold — deleting a `phoenixd_invoice` row reconcile can still `lookup` turns
+-- a fail-closed arm into a permanent retry. Reap this one freely (a row outlives the receipt it
+-- describes: nothing deletes it once the receipt books).
+CREATE TABLE IF NOT EXISTS phoenixd_unbookable_settlement (
+    invoice_id         TEXT PRIMARY KEY,
+    first_refusal_at   INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS phoenixd_pay (
     idempotency_key TEXT PRIMARY KEY,
     bolt11          TEXT NOT NULL,
@@ -498,6 +512,240 @@ fn inv1_overrun_msat(
         .filter(|over| *over > 0)
 }
 
+/// How long a locally observed fee-credit refusal may retry before it becomes operator work.
+const UNBOOKABLE_SETTLEMENT_ALERT_S: i64 = 15 * 60;
+
+/// Typed only so reporting can distinguish this refusal from a failed balance read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FeeCreditRefusal {
+    invoice_id: String,
+    received_sat: u64,
+    fee_credit_sat: u64,
+    balance_sat: u64,
+}
+
+impl std::fmt::Display for FeeCreditRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "phoenixd invoice {} received {} sat while the wallet holds {} sat of non-spendable fee \
+             credit and only {} sat spendable, so its spendable credit is UNKNOWN and could not be \
+             refunded; refusing to book it",
+            self.invoice_id, self.received_sat, self.fee_credit_sat, self.balance_sat
+        )
+    }
+}
+
+impl std::error::Error for FeeCreditRefusal {}
+
+/// The operator sink for a settlement the backend calls PAID and lnrent will not book (lnrent-gc7).
+/// Free functions rather than methods: BOTH observers of that condition report it — the
+/// [`PaymentBackend::received_amount_msat`] seam settlement catch-up drives, and the settlement poll,
+/// which is the only one left once the local invoice has EXPIRED (catch-up scans `status='OPEN'`
+/// rows only, `supervisor.rs`). Reporting only; no money decision reads the sink.
+async fn alert_unbookable(alerts: &Option<Arc<AlertDispatcher>>, subject: String, detail: String) {
+    let Some(alerts) = alerts.as_ref() else {
+        return;
+    };
+    if let Err(e) = alerts
+        .dispatch(Alert::new(
+            AlertKind::SettlementUnbookable,
+            subject,
+            detail,
+        ))
+        .await
+    {
+        tracing::warn!(
+            error = %format!("{e:#}"),
+            "failed to enqueue the unbookable-settlement operator alert"
+        );
+    }
+}
+
+impl PhoenixdPayment {
+    /// Test-only read of the durable first-sighting instant. The write happens before the
+    /// alert-sink enabled check, and only a direct read proves that ordering.
+    #[cfg(test)]
+    pub(crate) fn first_refusal_at_for_test(&self, invoice_id: &str) -> Option<i64> {
+        let conn = self.index.lock().unwrap();
+        conn.query_row(
+            "SELECT first_refusal_at FROM phoenixd_unbookable_settlement WHERE invoice_id = ?1",
+            rusqlite::params![invoice_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .expect("reading the timing row")
+    }
+}
+
+/// ONE subject for the whole condition, deliberately not one per invoice: the index and the state DB
+/// diverge as a UNIT (a lost or stale-restored `phoenixd_index.db`), every affected invoice carries
+/// the identical remedy, and catch-up re-observes each OPEN invoice every tick — so a per-invoice
+/// subject would put N copies of one message into the outbox that carries `provision.ready` and
+/// `billing.*`, every cooldown, forever (outbox rows are never reaped, `store.rs`).
+async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_id: &str) {
+    alert_unbookable(
+        alerts,
+        "index_diverged".to_string(),
+        // Kept deliberately under `MAX_ALERT_DETAIL_CHARS` with a REAL invoice id (73 chars:
+        // `phoenixd-` + a 64-hex payment hash) — the cap truncates from the tail, and the tail here
+        // is the "never recreate or expire an affected INVOICE" instruction (the invoice, not the
+        // wallet: an earlier wording left "it" attached to the wallet, which cannot be expired). `a_full_length_unbookable_detail_is_not_truncated`
+        // in the sibling test module is what holds that.
+        //
+        // This message carries NO `restore` command because there is no safe one. Deciding a
+        // backup is safe needs to know which refunds already went out, and lnrent's only record of
+        // that is `phoenixd_pay` in the index whose loss IS the incident — reasoning from the
+        // corrupted evidence. The phoenixd WALLET is also excluded from the backup by design
+        // (`backup.rs:27-34`), so a restore leaves a clean dedup map over payments phoenixd still
+        // holds. Three schemes for proving a restore safe were refuted across eight review passes
+        // on lnrent-ole, every one a double pay; repair TOOLING is lnrent-8scw.
+        format!(
+            "INDEX DIVERGENCE: invoice {invoice_id} absent from {INDEX_DB_FILE} — payment state \
+             UNKNOWN: lnrent can neither book nor expire it. ONE ALERT COVERS THEM ALL: every \
+             invoice whose index row is gone is affected, not only this one. REMEDY, IN THIS \
+             ORDER: run `lnrent --data-dir <this daemon's data dir> listing withdraw` FIRST, \
+             while the daemon is still up (it needs that daemon's socket; the flag defaults to \
+             ./data), THEN stop it — and do NOT restart it, and do NOT restore a \
+             backup. Either can pay a refund a SECOND time: the record of which refunds already \
+             paid lived in the lost index, while phoenixd keeps that history. Keep the data dir \
+             and phoenixd's history intact and settle the affected buyers out of band from \
+             phoenixd's own records. Full detail in the index-divergence section of \
+             docs/go-live.md. Leave phoenixd on its original wallet, and never recreate or expire \
+             an affected invoice."
+        ),
+    )
+    .await;
+}
+
+/// Report a fee-credit refusal that has stood for [`UNBOOKABLE_SETTLEMENT_ALERT_S`], **or** that the
+/// settlement poll is about to retire. Age is measured from lnrent's first durable LOCAL
+/// observation: phoenixd may run on another host with an unrelated wall clock, while persistence
+/// keeps a daemon restart from resetting the threshold.
+///
+/// The delay keeps a receipt lnrent books on its next retry out of the operator's DMs. It must NOT
+/// outlive the last observer, though, or it converts that delay into permanent silence — the bead's
+/// own headline failure. That is reachable for a LATE payment (one that landed after the local
+/// invoice expired): catch-up scans `status='OPEN'` only, so the poll is its sole observer, and the
+/// poll retires the row past `expires_at + SETTLEMENT_POLL_GRACE_SECS`. First observed inside the
+/// last threshold of that window, a plain age gate would defer, the row would retire, and nobody
+/// would ever be told. So the threshold lapses there.
+///
+/// This is a TRIGGER only. An earlier revision also used it to tell the operator lnrent had stopped
+/// re-checking the receipt — false whenever catch-up is still watching, which is the common case,
+/// and it would have sent them to hand-reconcile a receipt funding still books. The remedy text is
+/// caller-independent for that reason; only the timing differs.
+///
+/// ONE subject, like [`alert_index_divergence`] and for the same reason: the refusal is a WALLET-level
+/// judgement, not a per-invoice one. phoenixd publishes no per-receipt fee-credit attribution, so
+/// ADR-0019 rejects at the wallet level on purpose ("wallet-level rejection is MAXIMAL precision"),
+/// which means N held-back receipts are N sightings of ONE condition with ONE remedy. A per-invoice
+/// subject would defeat the cooldown the whole sink is built on: catch-up re-observes every OPEN
+/// invoice each tick, and reconcile will not expire one the backend reports Paid, so an unfunded
+/// wallet would DM N times per window forever — each a permanent row in the outbox that also carries
+/// `provision.ready`/`billing.*` (outbox rows are never reaped, `store.rs`). The observed invoice
+/// stays in the detail as the concrete example; the text says outright that it covers the rest.
+async fn alert_fee_credit_refusal(
+    alerts: &Option<Arc<AlertDispatcher>>,
+    index: &Mutex<Connection>,
+    refusal: &FeeCreditRefusal,
+    now: i64,
+) {
+    let Some(dispatcher) = alerts.as_ref() else {
+        return;
+    };
+    // The timing row is written BEFORE the enabled check, deliberately. It is the FIRST LOCAL
+    // SIGHTING, and docs/go-live.md promises the threshold runs from that instant — but an operator
+    // running with the sink off and enabling it mid-incident would otherwise have the row created
+    // at ENABLE time, so the DM would print the enable instant as "first refused locally at N" and
+    // restart the 15-minute wait from there. The row is cheap and reporting-only; recording it
+    // regardless is what makes the printed timestamp true.
+    //
+    // A failure to persist it must not silence the condition
+    // it exists to report — returning here would mean a read-only or corrupt index DB (while the
+    // outbox stays writable) suppresses every DM forever, re-warning to a log nobody reads. Fall
+    // back to alerting IMMEDIATELY: without a first-observation instant there is no threshold to
+    // wait out, and the cooldown still bounds the volume. Speaking early is the safe direction here;
+    // silence is not.
+    let timing = match idx_record_fee_credit_refusal(index, &refusal.invoice_id, now) {
+        Ok(timing) => Some(timing),
+        Err(e) => {
+            tracing::warn!(
+                invoice_id = %refusal.invoice_id,
+                error = %format!("{e:#}"),
+                "could not persist the first local observation of a fee-credit refusal; alerting \
+                 now rather than deferring on a threshold this cannot measure"
+            );
+            None
+        }
+    };
+    // With no timing row (the persistence fallback above) there is no measurable age, so nothing can
+    // be deferred: `first_refusal_at` reads as NOW and the threshold is skipped.
+    // Nothing below this point does anything but REPORT, so a disabled sink stops here — after the
+    // sighting has been recorded.
+    if !dispatcher.is_enabled() {
+        return;
+    }
+    let first_refusal_at = timing.as_ref().map_or(now, |t| t.first_refusal_at);
+    let age = now.saturating_sub(first_refusal_at);
+    // Defer only while the refusal is fresh AND something will look again. Below the threshold this
+    // is a receipt lnrent may yet book on its own and a DM per tick would be noise — but a deferral
+    // past the poll's retirement is not a delay, it is silence. `None` (no index row left, or no
+    // timing at all) speaks: there is provably no next look to wait for.  Nothing here changes WHICH
+    // settlements are emitted or when — the poll's row set and the refusal itself are untouched.
+    let last_look = match timing.as_ref().and_then(|t| t.poll_retires_at) {
+        Some(retires_at) => now.saturating_add(UNBOOKABLE_SETTLEMENT_ALERT_S) > retires_at,
+        None => true,
+    };
+    if age < UNBOOKABLE_SETTLEMENT_ALERT_S && !last_look {
+        return;
+    }
+    // What the operator should DO. Funding the wallet books these automatically, and that is true
+    // for the case this alert overwhelmingly reports: a fee-credit refusal only exists while
+    // phoenixd calls the invoice PAID, and reconcile REFUSES to expire a backend-Paid invoice
+    // (`reconcile.rs` returns false for the order scan and `continue`s in the renewal scan), so the
+    // row stays `status='OPEN'` and catch-up re-observes it every tick — indefinitely.
+    //
+    // The one case where funding alone is not enough is a LATE payment: the local invoice expired
+    // unpaid, the payment landed afterwards, and the poll drops the row once
+    // `expires_at + SETTLEMENT_POLL_GRACE_SECS` passes. That is stated as a caveat rather than
+    // branched on, deliberately: an earlier revision computed a "last look" flag here and used it to
+    // tell the operator lnrent had STOPPED re-checking — which is false on the catch-up path, i.e.
+    // the common one, and would have sent them to hand-reconcile a receipt that funding still books
+    // automatically. Double-handling the buyer's money is worse than a sentence of nuance.
+    let next = "lnrent retries and books them automatically; no money is lost meanwhile, but the \
+                orders do not progress until you do. (Exception: an invoice that had already \
+                EXPIRED locally before the payment landed is only re-checked for a grace window \
+                after its expiry; past that lnrent cannot book it at all and there is no repair \
+                command — settle that buyer from phoenixd's own records.)";
+    alert_unbookable(
+        alerts,
+        "fee_credit".to_string(),
+        format!(
+            "FEE-CREDIT REFUSAL: phoenixd invoice {} is PAID and was first refused locally at unix \
+             time {} ({}s ago; {} sat received), but lnrent cannot book it: the wallet has {} sat of \
+             non-spendable LSP fee credit and only {} sat spendable, so no receipt is provably \
+             refundable (ADR-0019). WALLET-level: this one alert covers EVERY receipt held back, \
+             not just the invoice named. REMEDY: give phoenixd SPENDABLE balance — {} sat more \
+             clears THIS one (the shortfall, not the full amount); more if others are held back. \
+             {}",
+            refusal.invoice_id,
+            first_refusal_at,
+            age,
+            refusal.received_sat,
+            refusal.fee_credit_sat,
+            refusal.balance_sat,
+            // The SHORTFALL, not the receipt. The refusal is `credit >= received && balance <
+            // received`, so it lifts the moment spendable reaches the receipt — telling a stranger
+            // operator to add the whole amount overfunds by whatever they already hold, which at
+            // the measured 2722-vs-2723 case is nearly the entire receipt.
+            refusal.received_sat.saturating_sub(refusal.balance_sat),
+            next,
+        ),
+    )
+    .await;
+}
+
 /// How much of a PAID receipt the wallet's own fee credit could account for. phoenixd's fee credit
 /// is the LSP crediting a receive it would not open a channel for: `receivedSat` counts it, but
 /// `balanceSat` does not, so it is NOT spendable (ADR-0019's phoenixd caveat).
@@ -663,14 +911,16 @@ async fn spendable_credit_msat(
                  Refusing to book it as refundable liability (ADR-0019). Fund the wallet (or let \
                  phoenixd convert the fee credit) and the retry books it."
             );
-            bail!(
-                "phoenixd invoice {invoice_id} received {} sat while the wallet holds {} sat of \
-                 non-spendable fee credit and only {} sat spendable, so its spendable credit is \
-                 UNKNOWN and could not be refunded; refusing to book it",
-                record.received_sat,
+            // Same refusal, same message (`FeeCreditRefusal`'s Display) — typed so the caller can
+            // recognise THIS condition and report it to the operator (lnrent-gc7) without
+            // mislabelling an unrelated `getbalance` failure as a fee-credit refusal.
+            return Err(FeeCreditRefusal {
+                invoice_id: invoice_id.to_string(),
+                received_sat: record.received_sat,
                 fee_credit_sat,
-                balance_sat
-            );
+                balance_sat,
+            }
+            .into());
         }
     }
     Ok(sat_to_msat_u64(record.received_sat))
@@ -812,6 +1062,8 @@ pub struct PhoenixdPayment {
     /// pay lock provides; a per-key lock registry would only be worth its mechanism if refund volume
     /// ever made serial pays the bottleneck.
     pay_start_lock: tokio::sync::Mutex<()>,
+    /// Optional durable operator-alert sink; no money decision reads it.
+    alerts: Option<Arc<AlertDispatcher>>,
 }
 
 impl PhoenixdPayment {
@@ -852,7 +1104,14 @@ impl PhoenixdPayment {
             fee_schedule,
             create_lock: tokio::sync::Mutex::new(()),
             pay_start_lock: tokio::sync::Mutex::new(()),
+            alerts: None,
         }
+    }
+
+    /// Inject the GATE-1 alert sink; reporting remains additive to the fail-closed paths.
+    pub fn with_alerts(mut self, alerts: Arc<AlertDispatcher>) -> Self {
+        self.alerts = Some(alerts);
+        self
     }
 
     /// Fail closed unless the running node is the release whose trampoline fee schedule was verified
@@ -1572,6 +1831,10 @@ impl PaymentBackend for PhoenixdPayment {
             // `received_amount_msat` below. NOTE for lnrent-rpa, the deferred index-GC bead: a
             // reaper that deletes rows must keep any invoice reconcile can still `lookup`
             // (y4m.15's rule), or it turns this fail-closed arm into a permanent retry.
+            //
+            // The refusal is right and stays; what it lacked was an operator (lnrent-gc7). Logs are
+            // not a notification, and only a human can reconcile the two files.
+            alert_index_divergence(&self.alerts, id).await;
             bail!(
                 "phoenixd has no index row for invoice {id}; its payment state is UNKNOWN (the \
                  lnrent index and state DB have diverged), so it must not be treated as expired"
@@ -1605,6 +1868,10 @@ impl PaymentBackend for PhoenixdPayment {
         // (fact 1). When the exact credit cannot be read we fail CLOSED with `Err`, which settlement
         // catch-up treats as "skip and retry" rather than booking a guess.
         let Some((row, records)) = self.incoming_for_invoice(invoice_id).await? else {
+            // The same index/state divergence `lookup_settlement` fails closed on, reached from the
+            // credit seam instead (lnrent-gc7). Both share the one subject, so the two sightings of
+            // one divergence collapse into one DM.
+            alert_index_divergence(&self.alerts, invoice_id).await;
             bail!("phoenixd has no invoice row for {invoice_id}; refusing to guess its credit");
         };
         match find_incoming_by_hash(&records, &row.payment_hash) {
@@ -1613,9 +1880,26 @@ impl PaymentBackend for PhoenixdPayment {
                 // invoice's face value. This is the headline money-safety property of this backend.
                 // `spendable_credit_msat` additionally refuses a receipt the wallet's fee credit
                 // could account for in full (ADR-0019).
-                Ok(Some(
-                    spendable_credit_msat(&self.ops, invoice_id, record).await?,
-                ))
+                match spendable_credit_msat(&self.ops, invoice_id, record).await {
+                    Ok(received_msat) => Ok(Some(received_msat)),
+                    Err(e) => {
+                        // Only the ADR-0019 refusal is an unbookable SETTLEMENT (lnrent-gc7). The
+                        // other way that call fails is a `getbalance` that did not answer — a node
+                        // outage, with a different remedy — so the typed error decides, never the
+                        // error text. `?`-equivalent: the refusal itself is untouched and still
+                        // propagates.
+                        if let Some(refusal) = e.downcast_ref::<FeeCreditRefusal>() {
+                            alert_fee_credit_refusal(
+                                &self.alerts,
+                                &self.index,
+                                refusal,
+                                self.clock.now(),
+                            )
+                            .await;
+                        }
+                        Err(e)
+                    }
+                }
             }
             _ => bail!(
                 "phoenixd reports no paid incoming payment for invoice {invoice_id} (hash {}); \
@@ -1711,6 +1995,9 @@ impl PaymentBackend for PhoenixdPayment {
         Ok(Some(sat_to_msat_u64(balance.balance_sat)))
     }
 
+    fn reports_unbookable_settlements(&self) -> bool {
+        true
+    }
     fn failed_refund_can_reuse_invoice(&self) -> bool {
         // TRUE, unlike lnv2. lnv2's `send` derives a deterministic attempt-0 operation from the
         // invoice, so once that reaches a terminal the SAME bolt11 can never be re-sent. phoenixd has
@@ -1790,13 +2077,14 @@ impl PaymentBackend for PhoenixdPayment {
         let ops = self.ops.clone();
         let index = self.index.clone();
         let clock = self.clock.clone();
+        let alerts = self.alerts.clone();
         tokio::spawn(async move {
             // Rows this task is done with (see `poll_settlements_once`). Process-local ON PURPOSE:
             // a restart re-arms every row, which is what re-delivers a settlement whose capture
             // never committed.
             let mut retired: HashSet<String> = HashSet::new();
             loop {
-                if !poll_settlements_once(&ops, &index, &clock, &tx, &mut retired).await {
+                if !poll_settlements_once(&ops, &index, &clock, &alerts, &tx, &mut retired).await {
                     break;
                 }
                 tokio::select! {
@@ -1891,6 +2179,55 @@ fn idx_upsert(index: &Mutex<Connection>, inv: &Invoice) -> Result<()> {
     Ok(())
 }
 
+/// What decides whether a fee-credit refusal is the operator's problem yet.
+struct RefusalTiming {
+    /// lnrent's first durable LOCAL sighting of this refusal.
+    first_refusal_at: i64,
+    /// The instant the settlement POLL retires this row: `expires_at +
+    /// [`SETTLEMENT_POLL_GRACE_SECS`]`. Used ONLY to stop the age threshold outliving the last
+    /// observer — never to tell the operator that re-checking has stopped, which is false whenever
+    /// catch-up is still watching (an earlier revision said exactly that, and it was wrong).
+    /// `None` when no index row remains.
+    poll_retires_at: Option<i64>,
+}
+
+/// Record and return the timing of this fee-credit refusal. Both reads are reporting state only:
+/// callers still propagate the original refusal if this fails, and no booking decision reads either
+/// one.
+fn idx_record_fee_credit_refusal(
+    index: &Mutex<Connection>,
+    invoice_id: &str,
+    now: i64,
+) -> Result<RefusalTiming> {
+    let conn = index.lock().unwrap();
+    conn.execute(
+        "INSERT INTO phoenixd_unbookable_settlement (invoice_id, first_refusal_at)
+         VALUES (?1, ?2)
+         ON CONFLICT(invoice_id) DO NOTHING",
+        params![invoice_id, now],
+    )
+    .context("recording the first local fee-credit refusal")?;
+    let first_refusal_at = conn
+        .query_row(
+            "SELECT first_refusal_at FROM phoenixd_unbookable_settlement WHERE invoice_id=?1",
+            params![invoice_id],
+            |row| row.get(0),
+        )
+        .context("reading the first local fee-credit refusal")?;
+    let expires_at: Option<i64> = conn
+        .query_row(
+            "SELECT expires_at FROM phoenixd_invoice WHERE invoice_id=?1",
+            params![invoice_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("reading the refused invoice's settlement window")?;
+    Ok(RefusalTiming {
+        first_refusal_at,
+        poll_retires_at: expires_at.map(|at| at.saturating_add(SETTLEMENT_POLL_GRACE_SECS)),
+    })
+}
+
 /// A row needed by the polling `watch()` task. A row is NOT dropped the moment lnrent's own window
 /// ends — a settlement that lands late must still reach capture — only once its bolt11 can no longer
 /// be paid at all; see [`idx_pollable_invoices`] and [`poll_settlements_once`].
@@ -1967,6 +2304,7 @@ async fn poll_settlements_once(
     ops: &Arc<dyn PhoenixdOps>,
     index: &Arc<Mutex<Connection>>,
     clock: &Arc<dyn Clock>,
+    alerts: &Option<Arc<AlertDispatcher>>,
     tx: &mpsc::Sender<Settlement>,
     retired: &mut HashSet<String>,
 ) -> bool {
@@ -2029,6 +2367,15 @@ async fn poll_settlements_once(
                     "phoenixd settlement poll is holding back a paid invoice whose spendable credit \
                      could not be established"
                 );
+                // lnrent-gc7. This poll is not a second reporter of what catch-up already sees: once
+                // the local invoice is EXPIRED — the LATE payment this poll's grace window exists to
+                // catch — `settlement_catch_up`'s `status='OPEN'` scan drops the row and this is the
+                // ONLY observer left. The subject matches the credit seam's, so when both do see the
+                // same refusal the cooldown still yields one DM. Typed downcast, never error text: a
+                // `getbalance` outage fails here too and has a different remedy.
+                if let Some(refusal) = e.downcast_ref::<FeeCreditRefusal>() {
+                    alert_fee_credit_refusal(alerts, index, refusal, clock.now()).await;
+                }
                 continue;
             }
         };

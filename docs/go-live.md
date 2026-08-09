@@ -254,6 +254,135 @@ refuses orders it cannot service.
   outbox (edge-triggered, at most one per condition per 6h). One honest caveat: a total relay
   blackout is the one condition that cannot be delivered (it queues), so a prolonged silence from a
   daemon you know is up still warrants a direct check.
+- **A settlement lnrent cannot book (lnrent-gc7):** lnrent holds an invoice it will not book. Two
+  causes, one alert kind (`SettlementUnbookable`), different remedies — and they differ in what is
+  actually KNOWN about the money, which decides what you owe:
+
+  - after a *fee-credit refusal* phoenixd HAS reported the invoice paid, so each held-back item is a
+    real receipt and the buyer has certainly paid;
+  - after an *index divergence* the payment state is UNKNOWN — the correlation lnrent needs to ask
+    about that invoice is the thing that was lost, so an affected item may or may not have been
+    paid, and must be established from phoenixd's own records rather than assumed.
+
+  Both are judged whole-wallet or whole-index, so **one alert covers every item it holds back** and
+  names only one as an example.
+
+  - *Fee credit (ADR-0019).* phoenixd publishes no per-receipt fee-credit attribution, so the
+    judgement is per WALLET. **Remedy: give the node spendable balance.** The DM names the
+    SHORTFALL — how much more spendable is needed to clear the named receipt — not the receipt's
+    full amount, because the refusal lifts as soon as spendable reaches it. (It also lifts if
+    phoenixd converts the fee credit below the receipt: the refusal needs BOTH `credit >= receipt`
+    and `balance < receipt`, so either half falling away is enough.) The DM waits `UNBOOKABLE_SETTLEMENT_ALERT_S`
+    (`phoenixd_backend.rs`) from lnrent's first local sighting, because lnrent may book it on a
+    later retry; that wait is skipped
+    when the settlement poll is about to stop watching, since a delay outliving the last observer is
+    silence rather than a delay.
+
+    Funding fixes it without further action: the refusal only exists while phoenixd calls the
+    invoice PAID, and reconcile will not expire a backend-Paid invoice, so lnrent keeps re-observing
+    it — and will not suspend the buyer meanwhile. The exception is a LATE payment, one that landed
+    after your local invoice had already expired: that is watched only for a grace window past the
+    expiry, and past it lnrent cannot book it at all — settle that buyer from phoenixd's records.
+
+  - *Index divergence — a missing `phoenixd_index.db` row.* Payment state becomes UNKNOWN: lnrent
+    can neither observe, book, nor expire it. **There is no safe repair.** Read this whole entry
+    before touching anything; the only command in it is the first one.
+
+    1. **Stop new orders, while the daemon is still up.** `listing withdraw` reaches the daemon over
+       `<data-dir>/lnrent.sock`, so it cannot run once you have stopped it — and every order taken
+       from here is another buyer you will have to settle by hand:
+
+       ```sh
+       lnrent --data-dir /path/to/your/data-dir listing withdraw
+       ```
+
+       **If this fails with "store is in degraded read-only mode", that is expected and not a
+       problem here** — the same fatal DB error can put the store in read-only mode, and withdrawing
+       persists a `WITHDRAWN` row, so the write is refused (`store.rs`). Nothing is lost: a degraded
+       store refuses money writes generally, so no new order can be booked while it lasts. Go
+       straight to stopping the daemon.
+
+       **Do NOT follow that error's own advice.** It ends "restore from backup and restart", which
+       is correct for an ordinary degraded store and is precisely what must not happen here — see
+       the next step. `lnrent money` withholds the same remedy for the same reason, but the error
+       text from a failed command does not know a divergence is in progress.
+
+    2. **Do not restore from a backup.** Deciding a backup is safe means knowing which refunds
+       already went out, and lnrent's only record of that is `phoenixd_pay` — inside the very index
+       whose loss IS this incident. The phoenixd WALLET is also deliberately excluded from lnrent's
+       backups (`backup.rs:27-34`), so restoring reinstates lnrent's commitments without the wallet
+       that fulfilled them: a clean dedup map over payments phoenixd still holds. The daemon can
+       then re-drive a restored PENDING refund and **pay it a second time**. A restore can also
+       resurrect a subscription that was since terminated, and drops every order, capture and ledger
+       row committed after the backup. Three schemes for proving a restore safe were refuted across
+       eight review passes on lnrent-ole, every one a double pay; do not reconstruct them.
+
+    3. **Do not restart the daemon — and assume the double pays have ALREADY happened.** The dedup
+       map lives in the index you lost, so `pay_get` finds no row, which is indistinguishable from
+       "never paid". The refunder re-drives every PENDING `refund_attempt` at boot AND on each
+       maintenance pass (a few seconds apart, `supervisor.rs`), and the sweeper does the same for
+       `sweep_attempt` — so if the daemon has been running on the diverged index at all, any
+       PENDING row whose payment had already gone out was very likely re-sent within seconds of
+       that boot, long before this alert reached you. "Do not restart" is still right; it is not a
+       preventive measure so much as a way to stop the count rising.
+
+       A payment that is merely IN FLIGHT is not a negative answer either: it can still settle
+       while a new one is posted alongside it. The restore is not the hazard; the missing dedup map
+       is, and the incident already handed you that. (A sweep re-send pays the operator, so it
+       costs routing fees rather than a buyer's money — still a second payment.)
+
+    4. **Reconcile BOTH directions against phoenixd's own records.** phoenixd knows what it
+       received and what it sent; lnrent no longer does. Read them through phoenixd's own HTTP API,
+       with the API password from your `phoenix.conf`. `phoenixd_backend.rs` documents the exact
+       endpoints lnrent depends on and has MEASURED — `GET /payments/incoming?externalId=…` and
+       `GET /payments/outgoingbyhash/{hash}` — which are per-item lookups. phoenixd also exposes a
+       list form for enumerating a whole history; lnrent has never called or measured it, so treat
+       its shape as unverified here (tracked with lnrent-8scw, which needs it). Naming phoenixd's
+       interface is safe where naming an lnrent query was not: it is an external service's own API,
+       not a second implementation of lnrent's state semantics.
+
+       - *Incoming* — what buyers paid that lnrent never booked. These are the buyers to settle,
+         and lnrent's own view of them is incomplete in two ways that matter here: a settlement
+         that landed after lnrent expired its invoice is owed but has no OPEN row (lnrent-hh4q),
+         and `received_msat` is only written at capture, which never happened — so the net-of-fee
+         figure exists only at phoenixd.
+       - *Outgoing* — refunds that may have been sent TWICE by the re-drive above. Money already
+         left; you cannot unsend it, but you need to know the real position before settling
+         anything else, and a buyer refunded twice is not owed a third.
+
+    **Why this entry names no queries.** Enumerating the exposure and deciding whether a restart is
+    safe depend on daemon-internal semantics — which column holds the paid invoice, which states
+    count as unsafe, which tables hold pending money, which journal each database uses. A shell
+    procedure is a second implementation of that, in a medium with no test harness, maintained
+    beside the code rather than with it; every revision is an unverified claim, and its failure mode
+    is an empty result that reads like good news. ADR-0001 keeps those semantics in one audited
+    codebase, which is also why `lnrent reconcile` is deliberately report-only. The enumeration and
+    the pre-restart safety gate belong in the repair tool tracked as **lnrent-8scw**, where each
+    check is code a test can deliberately break. Until it exists, this incident is handled by
+    stopping, not by improvising.
+
+    Never recreate or expire an affected invoice.
+
+  `lnrent money` and `lnrent status` show deduplicated alert HISTORY — one row per incident,
+  carrying its subject, remedy and timestamp — over `ALERT_VIEW_WINDOW_S` (`alerts.rs`, derived as
+  twice the alert cooldown; read it there rather than trusting a figure copied here). It is history,
+  not live backend state. A repaired incident stays listed until the
+  window expires. It is derived from the durable alert RECORDS lnrent enqueued, NOT from proof of
+  delivery, which it never checks: a record appears here whether its DM reached a relay or is still
+  queued behind a blackout. The number counts distinct *conditions*, not receipts. If the history
+  cannot be read, both commands report it as unknown rather than zero; fix the reported storage
+  error and retry.
+
+  Disabling the alert sink (`LNRENT_ALERTS_ENABLED`) does NOT blank this view. Records enqueued
+  before it was switched off are durable and still listed; what stops is the recording of new ones,
+  which the view flags separately ("recording: OFF"). Read that pairing literally — the count is
+  real history, and the absence of NEW entries is not evidence that nothing is wrong. The flag is raised only where this
+  alert is WIRED — phoenixd today — which is narrower than "can produce the condition". lnv2 can
+  also strand a confirmed payment (`PAID_UNRECOVERED`: the Lightning leg settled, minting failed)
+  and is NOT wired to this alert, so on a fedimint deployment a disabled sink shows the count with
+  no notice AND that condition would not have raised one anyway. Until lnrent-3p71 wires it, treat
+  a quiet fedimint daemon as unmeasured for this, not clear.
+
 - **Watch relay connectivity (GATE-1 PR-9c):** `lnrent relays` shows per-relay connected state +
   last-connected time (also summarized as `relays_connected/relays_total` in `lnrent status`). If
   ALL relays sit disconnected past 15min the daemon fires a `RelayBlackout` alert — but that alert
@@ -288,7 +417,9 @@ refuses orders it cannot service.
 
 - Wrong config, no funds yet: safe to wipe the data dir + re-bootstrap.
 - After funds exist: NEVER wipe or regenerate the seed. Restore from a cold backup:
-  `lnrentd restore --from <backup-dir>`.
+  `lnrentd restore --from <backup-dir>`. **Not for a diverged `phoenixd_index.db`** — see the
+  unbookable-settlement section above; a restore there can pay a refund twice, because it rolls back
+  lnrent's only dedup record while phoenixd keeps the payment.
 - Federation/gateway down: the daemon can't mint invoices or pay refunds until it recovers; existing subs
   keep running, and reconcile catches up when it's back.
 

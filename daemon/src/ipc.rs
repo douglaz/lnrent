@@ -368,6 +368,7 @@ pub async fn serve(
     relays: RelayStatusCell,
     listing_relay: listing::RelayHandle,
     path: impl AsRef<Path>,
+    alerts_enabled: bool,
 ) -> Result<()> {
     // A signal that never fires: the loop only ends on a listener error.
     let (_never, rx) = tokio::sync::watch::channel(false);
@@ -380,6 +381,7 @@ pub async fn serve(
         listing_relay,
         path,
         rx,
+        alerts_enabled,
     )
     .await
 }
@@ -398,6 +400,7 @@ pub async fn serve_with_shutdown(
     listing_relay: listing::RelayHandle,
     path: impl AsRef<Path>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    alerts_enabled: bool,
 ) -> Result<()> {
     let path = path.as_ref();
     if *shutdown.borrow() {
@@ -456,6 +459,7 @@ pub async fn serve_with_shutdown(
                         relays,
                         listing_relay,
                         token,
+                        alerts_enabled,
                     )
                     .await
                     {
@@ -502,6 +506,7 @@ async fn handle_conn(
     relays: RelayStatusCell,
     listing_relay: listing::RelayHandle,
     shutdown_token: CancellationToken,
+    alerts_enabled: bool,
 ) -> Result<()> {
     let (rd, mut wr) = stream.into_split();
     // Bounded read: cap the request frame so an over-long line can't exhaust memory, and put a
@@ -544,7 +549,17 @@ async fn handle_conn(
                 // easily fits; the exception is `Sweep`, whose fedimint pay can run to
                 // `PAY_AWAIT_TIMEOUT` (120s) and which we still don't cancel for money safety (see
                 // `Request::is_mutating` for the residual-gap reasoning).
-                dispatch(req, &store, &recipes, &clock, &payment, &relays, &listing_relay).await
+                dispatch_with_alert_visibility(
+                    req,
+                    &store,
+                    &recipes,
+                    &clock,
+                    &payment,
+                    &relays,
+                    &listing_relay,
+                    alerts_enabled,
+                )
+                .await
             }
             Ok(req) => {
                 // A READ-ONLY op is drain-EXEMPT (lnrent-j3c): if a graceful shutdown fires while it
@@ -554,8 +569,9 @@ async fn handle_conn(
                 // read / network probe loses nothing). The tiny error reply then goes out the
                 // unchanged write path below, exactly like any other `Reply`.
                 tokio::select! {
-                    r = dispatch(
+                    r = dispatch_with_alert_visibility(
                         req, &store, &recipes, &clock, &payment, &relays, &listing_relay,
+                        alerts_enabled,
                     ) => r,
                     _ = shutdown_token.cancelled() => Reply {
                         ok: false,
@@ -582,6 +598,9 @@ async fn handle_conn(
 
 /// Route a request to the store actor (reads) / a journaled transaction (admin mutations).
 #[allow(clippy::too_many_arguments)]
+/// Dispatch with the alert sink assumed ENABLED — the shape every caller but the live server
+/// wants. The server uses [`dispatch_with_alert_visibility`], because a disabled sink must not let
+/// the alert-derived views answer 0 to a question they cannot see.
 pub async fn dispatch(
     req: Request,
     store: &Store,
@@ -590,6 +609,30 @@ pub async fn dispatch(
     payment: &Arc<dyn PaymentBackend>,
     relays: &RelayStatusCell,
     listing_relay: &listing::RelayHandle,
+) -> Reply {
+    dispatch_with_alert_visibility(
+        req,
+        store,
+        recipes,
+        clock,
+        payment,
+        relays,
+        listing_relay,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_with_alert_visibility(
+    req: Request,
+    store: &Store,
+    recipes: &Arc<Vec<Recipe>>,
+    clock: &Arc<dyn Clock>,
+    payment: &Arc<dyn PaymentBackend>,
+    relays: &RelayStatusCell,
+    listing_relay: &listing::RelayHandle,
+    alerts_enabled: bool,
 ) -> Reply {
     match req {
         Request::Status => {
@@ -620,15 +663,26 @@ pub async fn dispatch(
             // are live and is not (or the reverse) — `published` is the one field that settles it.
             let listing_status = listing_view(store, recipes, listing_relay).await;
             match (subs, open_teardowns, listing_status) {
-                (Ok(n), Ok(t), Ok(listing)) => Reply::ok(json!({
-                    "daemon": "ok",
-                    "recipes": recipes.len(),
-                    "subscriptions": n,
-                    "open_teardowns": t,
-                    "relays_total": relay_rows.len(),
-                    "relays_connected": relays_connected,
-                    "listing": listing,
-                })),
+                (Ok(n), Ok(t), Ok(listing)) => {
+                    let mut status = json!({
+                        "daemon": "ok",
+                        "recipes": recipes.len(),
+                        "subscriptions": n,
+                        "open_teardowns": t,
+                        "relays_total": relay_rows.len(),
+                        "relays_connected": relays_connected,
+                        "listing": listing,
+                    });
+                    add_unbookable_settlement_alerts_view(
+                        store,
+                        clock.now(),
+                        alerts_enabled,
+                        payment.reports_unbookable_settlements(),
+                        &mut status,
+                    )
+                    .await;
+                    Reply::ok(status)
+                }
                 (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
                     Reply::err("internal", e.to_string())
                 }
@@ -769,6 +823,14 @@ pub async fn dispatch(
                                     serde_json::json!(store.is_degraded()),
                                 );
                             }
+                            add_unbookable_settlement_alerts_view(
+                                store,
+                                clock.now(),
+                                alerts_enabled,
+                                payment.reports_unbookable_settlements(),
+                                &mut money,
+                            )
+                            .await;
                             Reply::ok(money)
                         }
                         Err(e) => Reply::err("internal", e.to_string()),
@@ -1226,6 +1288,104 @@ async fn listing_view(
         }),
         None => json!({"published": false, "state": Value::Null}),
     })
+}
+
+/// Add recent durable alerts, latest per subject, to an operator response. This is history rather
+/// than a live backend query: a repaired condition remains visible until the window expires, and a
+/// disabled sink produces none. Every incident in the window is carried, count and detail alike —
+/// there is no display cap (see [`crate::alerts::RecentAlerts`]).
+///
+/// DEGRADES rather than propagating: this read is decorative, while its two callers are not —
+/// `money` is the operator's money-safety surface and `status` is the liveness probe the harness
+/// polls (`daemon/tests/supervisor.rs`). Failing either command on a history query would hide the
+/// balances and the daemon's health behind an `internal` for the sake of an alert list. On failure,
+/// omit the count/details rather than asserting a false zero and mark the history explicitly unknown.
+async fn add_unbookable_settlement_alerts_view(
+    store: &Store,
+    now: i64,
+    alerts_enabled: bool,
+    backend_can_be_unbookable: bool,
+    response: &mut Value,
+) {
+    // This view is DERIVED from delivered DMs, so with the sink disabled there are no rows to read
+    // and `recent_alerts` would answer a truthful-looking 0 to a question it cannot see. That zero
+    // is the worst possible answer here: the CLI is the ONLY operator surface left once DMs are
+    // off, and a bare READY over a buyer's unbooked receipt is exactly what this bead exists to
+    // prevent. Report unavailable instead — distinct from the storage-failure `_unknown`, because
+    // the remedy differs (re-enable alerts vs fix the DB).
+    // Only warn where the hidden condition could actually arise. `alerts_enabled` defaults FALSE
+    // for `mock` (config.rs), which is the DEFAULT backend and what the image smoke test runs, so
+    // gating on the sink alone made every `lnrent money` there print a red notice whose remedy names
+    // phoenixd records that do not exist.
+    // Mark that recording is OFF, then read the history anyway. Rows enqueued before the sink was
+    // disabled are still durable, and returning early hid them while claiming nothing was recorded
+    // — losing real incident history at the moment the CLI is the operator's only surface. The two
+    // facts are independent: what WAS observed, and that nothing further WILL be.
+    // Report whether the alert is WIRED for this backend — deliberately not "can this backend
+    // become unbookable", which is a larger and different question. lnv2 CAN (its
+    // `PAID_UNRECOVERED` leaves a confirmed payment unbookable) and is NOT wired; that gap is
+    // lnrent-3p71. Naming the key for the capability would have made it assert something false
+    // about lnv2, so it is named for what it actually knows. A degraded store refuses every
+    // `transaction`, which is how the dispatcher enqueues — so once the latch trips, no
+    // SettlementUnbookable can be recorded, while this view's `read` still succeeds and truthfully
+    // returns zero. On a backend that CAN be unbookable, that zero proves nothing, and the CLI needs
+    // to know which backend it is talking to in order to say so.
+    // Both flags come from this ONE helper, so `money` and `status` cannot drift apart. `status`
+    // carries no `degraded_read_only` of its own, so without the second key it would report a clean
+    // zero during an unrecorded divergence — the same hole the money view just closed, one command
+    // over. `alerts_recording_unavailable` is the honest name: the sink is configured on, the store
+    // simply refuses the write.
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert(
+            "unbookable_alerts_wired".to_string(),
+            serde_json::json!(backend_can_be_unbookable),
+        );
+        obj.insert(
+            "alerts_recording_unavailable".to_string(),
+            serde_json::json!(store.is_degraded()),
+        );
+    }
+    if !alerts_enabled && backend_can_be_unbookable {
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert(
+                "recent_unbookable_settlement_alerts_disabled".to_string(),
+                serde_json::json!(true),
+            );
+        }
+    }
+    let since = now - crate::alerts::ALERT_VIEW_WINDOW_S;
+    let view = crate::alerts::recent_alerts(
+        store,
+        crate::alerts::AlertKind::SettlementUnbookable,
+        since,
+
+    )
+    .await;
+    let Some(response) = response.as_object_mut() else {
+        return;
+    };
+    match view {
+        Ok(view) => {
+            response.insert(
+                "recent_unbookable_settlement_alerts".to_string(),
+                serde_json::json!(view.total),
+            );
+            response.insert(
+                "recent_unbookable_settlement_alert_details".to_string(),
+                serde_json::json!(view.shown),
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "reading recent unbookable-settlement alerts failed; reporting history as unknown"
+            );
+            response.insert(
+                "recent_unbookable_settlement_alerts_unknown".to_string(),
+                serde_json::json!(true),
+            );
+        }
+    }
 }
 
 /// `(id, state, event_id)` for a `listing` row, shared by both lookups above.
@@ -1706,8 +1866,12 @@ mod tests {
     }
 
     async fn money_data(store: &Store, payment: &Arc<dyn PaymentBackend>) -> Value {
+        money_data_at(store, payment, 1_000).await
+    }
+
+    async fn money_data_at(store: &Store, payment: &Arc<dyn PaymentBackend>, now: i64) -> Value {
         let recipes = Arc::new(Vec::<Recipe>::new());
-        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(now));
         let reply =
             dispatch(
                 Request::Money,
@@ -1855,6 +2019,7 @@ mod tests {
                 RelayStatusCell::new(),
                 no_listing_relay(),
                 &sock2,
+                true,
             )
             .await;
         });
@@ -2079,6 +2244,7 @@ mod tests {
                 RelayStatusCell::new(),
                 no_listing_relay(),
                 &sock2,
+                true,
             )
             .await;
         });
@@ -2233,6 +2399,7 @@ mod tests {
             no_listing_relay(),
             sock.clone(),
             shutdown_rx,
+            true,
         ));
         for _ in 0..50 {
             if sock.exists() {
@@ -2373,6 +2540,7 @@ mod tests {
             no_listing_relay(),
             sock.clone(),
             shutdown_rx,
+            true,
         ));
         for _ in 0..50 {
             if sock.exists() {
@@ -2463,6 +2631,7 @@ mod tests {
             no_listing_relay(),
             sock.clone(),
             shutdown_rx,
+            true,
         ));
         for _ in 0..50 {
             if sock.exists() {
@@ -2541,6 +2710,290 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, "SUSPENDED");
+    }
+
+    async fn status_data(store: &Store, payment: &Arc<dyn PaymentBackend>, now: i64) -> Value {
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(now));
+        let reply = dispatch(
+            Request::Status,
+            store,
+            &recipes,
+            &clock,
+            payment,
+            &RelayStatusCell::new(),
+            &no_listing_relay(),
+        )
+        .await;
+        assert!(reply.ok, "status reply should be ok: {:?}", reply.error);
+        reply.data.expect("status returns data")
+    }
+
+    async fn seed_unbookable_alert(store: &Store, at: i64, subject: &str, detail: &str) {
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(at));
+        crate::alerts::AlertDispatcher::new(store.clone(), clock, "op-npub-hex".into())
+            .dispatch(crate::alerts::Alert::new(
+                crate::alerts::AlertKind::SettlementUnbookable,
+                subject,
+                detail,
+            ))
+            .await
+            .expect("enqueue the alert");
+    }
+
+    /// Now, for the alert-view tests. A month in, so every age below stays a positive unix time.
+    const VIEW_NOW: i64 = 30 * 24 * 3600;
+    /// Two ages that pin [`crate::alerts::ALERT_VIEW_WINDOW_S`] from BOTH sides. Neither is derived
+    /// from it: an offset built out of the constant under test moves WITH the constant and therefore
+    /// bounds nothing — the trap `UNBOOKABLE_SETTLEMENT_ALERT_S` fell into in round 2, and the reason
+    /// the `at_the_edge`/`past_the_edge` pair below is an edge test rather than a bound. A first
+    /// attempt at the lower pin used a flat 4h and was ALSO vacuous, which mutating the window down
+    /// to one cooldown proved: 4h is inside 6h, so the seed stayed listed and nothing failed.
+    ///
+    /// - [`JUST_OVER_ONE_COOLDOWN_S`]: the rule the window exists to satisfy (`alerts.rs`: "two
+    ///   cooldown windows keep the latest repeat visible"). A still-live condition re-DMs every
+    ///   [`crate::alerts::ALERT_COOLDOWN_S`], so at an arbitrary instant its most recent delivery is
+    ///   up to one cooldown old — a window that does not OUTLAST one cooldown can therefore show an
+    ///   operator nothing at all for a condition that is still firing. Relative to the cooldown, not
+    ///   to the window, which is what makes it catch the window's multiplier shrinking to 1.
+    /// - [`ALERTED_LONG_AGO_S`]: a week-old incident is history, not "recent", and an operator who
+    ///   already fixed it must not still be reading it. Flat, so it forbids the window from growing.
+    const JUST_OVER_ONE_COOLDOWN_S: i64 = crate::alerts::ALERT_COOLDOWN_S + 1;
+    const ALERTED_LONG_AGO_S: i64 = 7 * 24 * 3600;
+
+    #[tokio::test]
+    async fn money_and_status_surface_recent_unbookable_settlement_alerts() {
+        let store = mem_store();
+        let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
+        let window = crate::alerts::ALERT_VIEW_WINDOW_S;
+
+        // Two deliveries of ONE incident: the view keeps the latest and counts the incident once.
+        seed_unbookable_alert(&store, VIEW_NOW - 10, "fee_credit", "old delivery").await;
+        seed_unbookable_alert(
+            &store,
+            VIEW_NOW - 9,
+            "fee_credit",
+            "REMEDY: give phoenixd SPENDABLE balance — at least 2723 sat",
+        )
+        .await;
+        seed_unbookable_alert(
+            &store,
+            VIEW_NOW - JUST_OVER_ONE_COOLDOWN_S,
+            "index_diverged",
+            "INDEX DIVERGENCE; REMEDY: restore from your NEWEST backup ...",
+        )
+        .await;
+        // The window's own edge, inclusive side and exclusive side. These DO move with the constant
+        // (that is what makes them an edge test, not a bound), so they prove `>=` rather than `>`.
+        seed_unbookable_alert(&store, VIEW_NOW - window, "at_the_edge", "in").await;
+        seed_unbookable_alert(&store, VIEW_NOW - window - 1, "past_the_edge", "out").await;
+        // And a week-old one, fixed: this is what forbids the window from growing to swallow it.
+        seed_unbookable_alert(&store, VIEW_NOW - ALERTED_LONG_AGO_S, "last_week", "out").await;
+
+        let expected: Vec<Value> = vec![
+            json!("fee_credit"),
+            json!("index_diverged"),
+            json!("at_the_edge"),
+        ];
+        for (cmd, data) in [
+            ("money", money_data_at(&store, &payment, VIEW_NOW).await),
+            // `status` carries the same detail as `money`, not a bare count: the runbook sends
+            // operators to either command, and a number alone names no reason and no remedy.
+            ("status", status_data(&store, &payment, VIEW_NOW).await),
+        ] {
+            assert_eq!(
+                data["recent_unbookable_settlement_alerts"],
+                json!(3),
+                "{cmd}: three incidents in the window, six deliveries: {data}"
+            );
+            let listed = data["recent_unbookable_settlement_alert_details"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{cmd} lists the alerts"));
+            assert_eq!(
+                listed.iter().map(|a| a["subject"].clone()).collect::<Vec<_>>(),
+                expected,
+                "{cmd}: newest incident first, and NOTHING older than the window: {listed:?}"
+            );
+            assert!(
+                listed[0]["detail"]
+                    .as_str()
+                    .expect("a detail")
+                    .contains("REMEDY"),
+                "{cmd}: the remedy must reach the CLI verbatim, and be the LATEST delivery's: \
+                 {listed:?}"
+            );
+            assert_eq!(listed[0]["at"], json!(VIEW_NOW - 9), "{cmd}: latest wins");
+        }
+    }
+
+    // The alert history is decorative; `money` is the operator's money-safety surface and `status`
+    // is the liveness probe. A failure of the former must not take out the latter, but it also must
+    // not assert the known-empty state: the operator surface reports that history is unknown.
+    #[tokio::test]
+    async fn a_failing_alert_history_read_does_not_fail_money_or_status() {
+        let store = mem_store();
+        let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
+        seed_unbookable_alert(&store, VIEW_NOW - 9, "fee_credit", "REMEDY: fund it").await;
+        // Break exactly the table the history read needs, and nothing else `money`/`status` reads.
+        store
+            .transaction(|tx| {
+                tx.execute_batch("DROP TABLE outbox")?;
+                Ok(())
+            })
+            .await
+            .expect("drop the outbox table");
+
+        for (cmd, data) in [
+            ("money", money_data_at(&store, &payment, VIEW_NOW).await),
+            ("status", status_data(&store, &payment, VIEW_NOW).await),
+        ] {
+            // `money_data_at`/`status_data` already assert `reply.ok`: history failure is degraded.
+            assert_eq!(
+                data["recent_unbookable_settlement_alerts_unknown"],
+                json!(true),
+                "{cmd}: an unreadable history is explicit: {data}"
+            );
+            assert_eq!(
+                data["recent_unbookable_settlement_alerts"],
+                Value::Null,
+                "{cmd}: unknown must not masquerade as a zero count: {data}"
+            );
+            assert_eq!(
+                data["recent_unbookable_settlement_alert_details"],
+                Value::Null,
+                "{cmd}: unknown must not masquerade as an empty detail list: {data}"
+            );
+        }
+    }
+
+    // The sink being OFF is not the same as nothing being wrong. With `alerts_enabled=false` the
+    // dispatcher writes no outbox rows, so the history read succeeds and truthfully reports zero
+    // rows — about a question it cannot see. Both operator commands must say so explicitly, because
+    // with DMs off the CLI is the only surface an unbooked receipt can reach.
+    // `status` carries no `degraded_read_only`, so without this flag it reported a clean zero
+    // during an unrecorded divergence: the dispatcher's write is refused by the same latch, while
+    // this view's read succeeds. Both commands read the flag from THIS helper so they cannot drift.
+    #[tokio::test]
+    async fn a_degraded_store_reports_that_alert_recording_is_unavailable() {
+        let store = mem_store();
+        let payment: Arc<dyn PaymentBackend> =
+            Arc::new(MockPayment::new().unbookable_capable());
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(VIEW_NOW));
+
+        for (cmd, req) in [("money", Request::Money), ("status", Request::Status)] {
+            let before = dispatch_with_alert_visibility(
+                req, &store, &recipes, &clock, &payment,
+                &RelayStatusCell::new(), &no_listing_relay(), true,
+            )
+            .await
+            .data
+            .expect("data");
+            assert_eq!(
+                before["alerts_recording_unavailable"],
+                json!(false),
+                "{cmd}: a healthy store CAN record: {before}"
+            );
+        }
+
+        // Latch the store degraded exactly as a fatal DB error would.
+        store.mark_degraded_for_test();
+
+        for (cmd, req) in [("money", Request::Money), ("status", Request::Status)] {
+            let data = dispatch_with_alert_visibility(
+                req, &store, &recipes, &clock, &payment,
+                &RelayStatusCell::new(), &no_listing_relay(), true,
+            )
+            .await
+            .data
+            .expect("data");
+            assert_eq!(
+                data["alerts_recording_unavailable"],
+                json!(true),
+                "{cmd}: a degraded store refuses the alert WRITE, so its zero proves nothing: \
+                 {data}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_disabled_alert_sink_is_flagged_without_hiding_recorded_history() {
+        let store = mem_store();
+        // A row enqueued BEFORE the sink was switched off. It is durable and still worth showing:
+        // hiding it would lose real incident history exactly when the CLI is the only surface left.
+        seed_unbookable_alert(&store, VIEW_NOW - 9, "fee_credit", "REMEDY: fund it").await;
+        // A backend that CAN produce the condition — otherwise a disabled sink hides nothing.
+        let payment: Arc<dyn PaymentBackend> =
+            Arc::new(MockPayment::new().unbookable_capable());
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(VIEW_NOW));
+
+        for (cmd, req) in [("money", Request::Money), ("status", Request::Status)] {
+            let reply = dispatch_with_alert_visibility(
+                req,
+                &store,
+                &recipes,
+                &clock,
+                &payment,
+                &RelayStatusCell::new(),
+                &no_listing_relay(),
+                false,
+            )
+            .await;
+            assert!(reply.ok, "{cmd} stays ok: {:?}", reply.error);
+            let data = reply.data.expect("data");
+            assert_eq!(
+                data["recent_unbookable_settlement_alerts_disabled"],
+                json!(true),
+                "{cmd}: a disabled sink is explicit: {data}"
+            );
+            // The flag says future incidents will not be observed. It must NOT also erase what
+            // already was: an early return here hid durable rows while claiming nothing was
+            // recorded. Both facts ship, and the CLI prints the OFF notice above the history.
+            assert_eq!(
+                data["recent_unbookable_settlement_alerts"],
+                json!(1),
+                "{cmd}: history recorded before the sink was disabled must still be visible: {data}"
+            );
+            assert!(
+                data["recent_unbookable_settlement_alert_details"][0]["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("REMEDY: fund it"),
+                "{cmd}: including its remedy: {data}"
+            );
+        }
+    }
+
+    // The other half: `alerts_enabled` defaults FALSE for `mock` (config.rs), which is the DEFAULT
+    // backend and the one AGENTS.md's image smoke test runs. Gating the notice on the sink alone
+    // made every `lnrent money` there print a red warning whose remedy names phoenixd records that
+    // do not exist. A backend that cannot produce the condition has nothing to be silent about.
+    #[tokio::test]
+    async fn a_backend_that_cannot_be_unbookable_gets_no_disabled_notice() {
+        let store = mem_store();
+        let payment: Arc<dyn PaymentBackend> = Arc::new(MockPayment::new());
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(VIEW_NOW));
+
+        let reply = dispatch_with_alert_visibility(
+            Request::Money,
+            &store,
+            &recipes,
+            &clock,
+            &payment,
+            &RelayStatusCell::new(),
+            &no_listing_relay(),
+            false,
+        )
+        .await;
+        assert!(reply.ok);
+        let data = reply.data.expect("data");
+        assert_eq!(
+            data["recent_unbookable_settlement_alerts_disabled"],
+            Value::Null,
+            "a backend that cannot leave a settlement unbookable must not warn about it: {data}"
+        );
     }
 
     #[tokio::test]

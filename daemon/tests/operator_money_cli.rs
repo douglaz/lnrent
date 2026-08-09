@@ -61,6 +61,7 @@ async fn json_money_returns_reply_envelope() {
             None,
             &sock_for_server,
             shutdown_rx,
+            true,
         )
         .await
     });
@@ -98,6 +99,9 @@ async fn json_money_returns_reply_envelope() {
         vec![
             // lnrent-y4m.3: the degraded/read-only latch is surfaced so a status poll (not just the
             // daemon log) reveals a money daemon that is refusing writes after a fatal DB error.
+            // The store cannot record alerts at all while degraded, so an empty history proves
+            // nothing. Both `money` and `status` read this from one helper and fail closed on it.
+            "alerts_recording_unavailable",
             "degraded_read_only",
             // gate1-operator-sweep (urw.3): `money` also folds the operator-sweep surplus breakdown
             // (earned/reserved/paid_out/surplus) + last_sweep — all pure LOCAL ledger reads.
@@ -111,9 +115,15 @@ async fn json_money_returns_reply_envelope() {
             "paid_out_msat",
             "parked_count",
             "ready",
+            "recent_unbookable_settlement_alert_details",
+            "recent_unbookable_settlement_alerts",
             "required_msat",
             "reserved_msat",
             "surplus_msat",
+            // Always present, independently of any count: a degraded store silences the alert sink
+            // through the same latch that refuses money writes, so on a capable backend an empty
+            // history is not evidence of no divergence and the CLI must be able to say so.
+            "unbookable_alerts_wired",
             "warning",
         ]
     );
@@ -128,6 +138,8 @@ async fn json_money_returns_reply_envelope() {
     // The sweep surplus breakdown is 0 on a fresh store and no sweep has run yet.
     assert_eq!(data["surplus_msat"], serde_json::json!(0));
     assert_eq!(data["last_sweep"], Value::Null);
+    assert_eq!(data["recent_unbookable_settlement_alerts"], serde_json::json!(0));
+    assert_eq!(data["recent_unbookable_settlement_alert_details"], serde_json::json!([]));
 
     let _ = fs::remove_dir_all(&data_dir);
 }

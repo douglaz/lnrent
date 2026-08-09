@@ -429,6 +429,9 @@ impl Supervisor {
             );
             let payment = self.payment.clone();
             let relays = self.relays.clone();
+            // The alert-derived money/status views must report UNAVAILABLE, not 0, when the sink
+            // is off — with DMs disabled the CLI is the operator's only surface.
+            let alerts_enabled = self.alerts.is_enabled();
             // The publication seam for `lnrent listing publish|withdraw` (lnrent-i23).
             let listing_relay: listing::RelayHandle = Some(self.listing_relay());
             tasks.push(tokio::spawn(supervise(
@@ -455,6 +458,7 @@ impl Supervisor {
                             listing_relay,
                             &sock,
                             sd,
+                            alerts_enabled,
                         )
                         .await
                     }

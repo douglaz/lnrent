@@ -421,6 +421,27 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
     );
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    // GATE-1 alert sink (lnrent-urw.1, PR-5): resolve the recipient — the operator's personal
+    // `alert_npub` if set, else a self-DM to the operator key — and honor the enabled default (on
+    // for the real money paths, off for mock). Built BEFORE the payment backend because the phoenixd
+    // backend takes a clone (lnrent-gc7), and before `store`/`clock` are moved into the supervisor.
+    // A malformed `LNRENT_ALERT_NPUB` fails startup loudly rather than silently muting.
+    let alerts = if lnrentd::config::alerts_enabled(operator.config.payment_backend) {
+        let recipient_hex = match lnrentd::config::alert_npub() {
+            Some(npub) => lnrent_wire::PublicKey::parse(&npub)
+                .with_context(|| format!("parsing LNRENT_ALERT_NPUB `{npub}`"))?
+                .to_hex(),
+            None => operator.identity.public_key().to_hex(),
+        };
+        tracing::info!(recipient = %recipient_hex, "operator alert sink enabled (GATE-1 PR-5)");
+        Arc::new(AlertDispatcher::new(
+            store.clone(),
+            clock.clone(),
+            recipient_hex,
+        ))
+    } else {
+        Arc::new(AlertDispatcher::disabled(store.clone(), clock.clone()))
+    };
     // Select the payment backend. `mock` (the default) keeps an internal clock the supervisor syncs to
     // SystemClock (`set_now` is mock-only, not on the trait) + is seeded NOW so the first invoice (before
     // the first maintenance tick) stamps a live expiry rather than a 1970 one. `fedimint` (lnrent-o6p,
@@ -442,7 +463,7 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
             // is where the refusal lives so nothing is persisted before it fires. It uses real time ->
             // NO clock-sync.
             PaymentMode::Phoenixd => {
-                let backend = build_phoenixd_backend(&operator, clock.clone())?;
+                let backend = build_phoenixd_backend(&operator, clock.clone(), alerts.clone())?;
                 (backend, None)
             }
         };
@@ -465,27 +486,6 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
         lnrentd::config::inbound_rate_capacity(),
         lnrentd::config::inbound_rate_refill_per_min(),
     );
-
-    // GATE-1 alert sink (lnrent-urw.1, PR-5): resolve the recipient — the operator's personal
-    // `alert_npub` if set, else a self-DM to the operator key — and honor the enabled default (on
-    // for the fedimint money path, off for mock). Built before `store`/`clock` are moved into the
-    // supervisor. A malformed `LNRENT_ALERT_NPUB` fails startup loudly rather than silently muting.
-    let alerts = if lnrentd::config::alerts_enabled(operator.config.payment_backend) {
-        let recipient_hex = match lnrentd::config::alert_npub() {
-            Some(npub) => lnrent_wire::PublicKey::parse(&npub)
-                .with_context(|| format!("parsing LNRENT_ALERT_NPUB `{npub}`"))?
-                .to_hex(),
-            None => operator.identity.public_key().to_hex(),
-        };
-        tracing::info!(recipient = %recipient_hex, "operator alert sink enabled (GATE-1 PR-5)");
-        Arc::new(AlertDispatcher::new(
-            store.clone(),
-            clock.clone(),
-            recipient_hex,
-        ))
-    } else {
-        Arc::new(AlertDispatcher::disabled(store.clone(), clock.clone()))
-    };
 
     let sock = operator.config.data_dir.join("lnrent.sock");
     let mut supervisor = Supervisor::build(
@@ -560,6 +560,7 @@ async fn build_fedimint_backend(
 fn build_phoenixd_backend(
     operator: &config::Operator,
     clock: Arc<dyn Clock>,
+    alerts: Arc<AlertDispatcher>,
 ) -> Result<Arc<dyn PaymentBackend>> {
     // Reaching this function AT ALL means `accept_unsupported` was in force (bootstrap refuses to
     // resolve a phoenixd config otherwise — lnrent-9gi), so say so on EVERY start at warn level: an
@@ -594,7 +595,9 @@ fn build_phoenixd_backend(
         &operator.config.data_dir,
         clock,
     )
-    .context("opening the phoenixd payment backend")?;
+    .context("opening the phoenixd payment backend")?
+    // lnrent-gc7: report fee-credit refusal and index/state divergence through the durable sink.
+    .with_alerts(alerts);
     tracing::info!(
         url = %phoenixd.url,
         fee_schedule_version = %fee_schedule.verified_version,

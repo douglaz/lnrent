@@ -779,6 +779,13 @@ impl Store {
         self.degraded.load(Ordering::Acquire)
     }
 
+    /// Test-only: latch degraded without staging a real disk failure. The operator views must fail
+    /// closed when the store cannot record alerts, and that is only observable from this state.
+    #[cfg(test)]
+    pub fn mark_degraded_for_test(&self) {
+        self.degraded.store(true, Ordering::Release);
+    }
+
     /// Run `f` inside ONE transaction: **commit** if it returns `Ok`, **roll back** if it
     /// returns `Err`. This is how the handshake gets its atomic multi-row transitions.
     pub async fn transaction<T, F>(&self, f: F) -> Result<T>
