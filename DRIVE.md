@@ -38,13 +38,12 @@ drive cannot pick these up in the wrong order:
   has the right pattern one table over (`teardown_failure`, with `resolved_at NULL = still open` and a
   LIVE operator count). Both reviewers, independently: **do not ship bdkh/peri/kwr separately** —
   each hardens one symptom while preserving the false architecture.
-- **BLOCKED on that design:** bdkh, peri, kwr (subsumed as its acceptance criteria); 3p71, yjtd, ie4p
-  (producer adapters — each becomes a `reason` variant, not a feature).
-- **hh4q is now blocked on 8scw** — it is 8scw's acceptance item 1, not an independent alert. Both
-  need an authoritative phoenixd inventory over UNMEASURED endpoints, so both are out of drive scope
-  until a measurement task runs on the staging node.
-- **Unrelated to all of the above:** qvjz (outbound side). 7fx should follow the ADR — its latching
-  remedy is the same shape as a ledger row with an operator-cleared `resolved_at`.
+- The blocking edges are in `br` — read them with `br dep tree`, not from a list here that can only
+  drift from it. In short: bdkh/peri/kwr are subsumed as acceptance criteria, 3p71/yjtd/ie4p are
+  producer adapters behind it, and hh4q now sits behind 8scw. Both 8scw and hh4q need an
+  authoritative phoenixd inventory over UNMEASURED endpoints, so both are out of drive scope until a
+  measurement task runs on the staging node. 7fx should follow the ADR — its latching remedy is the
+  same shape as a ledger row with an operator-cleared `resolved_at`.
 
 Panel disagreements worth keeping: codex would raise **7fx to P1** and give **4kg** P1 consideration
 (reconcile can mint entitlement past the credited resumable boundary; xr7 compounds it). Opus rates

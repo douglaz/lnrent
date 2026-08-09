@@ -1263,52 +1263,6 @@ async fn pay_records_the_key_and_never_pays_twice() {
     );
 }
 
-// A paid record for OUR hash is adopted with no POST at all (lnrent-qvjz).
-//
-// This used to be the Fact-2 test: phoenixd answers a repeated same-bolt11 payinvoice with HTTP 200
-// + `reason` and no paymentId/preimage, and lnrent resolved that by re-reading `outgoingbyhash`
-// rather than by parsing the English string. The no-row probe now settles this BEFORE any POST, so
-// the duplicate-response round-trip itself is exercised by
-// `a_record_appearing_between_the_probe_and_the_post_is_adopted_not_paid_twice`. What stays pinned
-// here is the money property, which did not change: a paid record for our hash is adopted once and
-// never paid again.
-#[tokio::test]
-async fn a_paid_record_for_our_hash_is_adopted_without_any_post() {
-    let ops = FakePhoenixdOps::new();
-    let be = backend(ops.clone(), TestClock::new(1_000));
-    let bolt11 = mint_bolt11(120_000, 2);
-    let hash = hash_of(&bolt11);
-
-    // phoenixd already paid this hash (e.g. our own POST landed but the response was lost).
-    ops.set_outgoing(PhoenixdOutgoing {
-        payment_id: "pay-live".into(),
-        payment_hash: hash.clone(),
-        is_paid: true,
-        fees_msat: 4_480,
-        completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
-    });
-    // No `script_pay` here on purpose. The probe resolves this before any POST, so a scripted
-    // answer would sit unconsumed and the name would promise a round-trip that never happens. The
-    // receipt-less duplicate answer itself is exercised by
-    // `a_record_appearing_between_the_probe_and_the_post_is_adopted_not_paid_twice`.
-
-    let id = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:2:g1")
-        .await
-        .unwrap();
-    assert_eq!(id, "pay-live", "the real payment is adopted as this key's");
-    assert_eq!(
-        ops.pay_calls().len(),
-        0,
-        "the no-row probe (lnrent-qvjz) now sees the paid record BEFORE the POST, so the duplicate \
-         answer is never even solicited. Same money outcome as the old path, one fewer POST - what \
-         this pins is that a paid record for our hash is adopted and never paid a second time"
-    );
-    assert_eq!(
-        be.payment_status_by_key("refund:order:2:g1").await.unwrap(),
-        PayStatus::Succeeded
-    );
-}
 
 // A receipt-less answer with NO paid record proves nothing moved but also gives no proof it never
 // will: the key must stay PENDING with its witness intact, never be marked paid off the string.
@@ -1502,9 +1456,8 @@ async fn recovery_adopts_a_paid_record_without_paying_again() {
 // backend to create the record and then discarding its index.
 //
 // `mint_bolt11` stamps t=1_000_000 with a 3600s expiry, so a clock past 1_003_600 is an EXPIRED
-// destination. That distinction is the whole bug: expiry is what turns a false `FAILED` into a
-// re-resolution at gen+1, and a re-resolution mints a NEW payment hash that phoenixd's same-invoice
-// dedup cannot catch.
+// destination — see the module header for why expiry is what turns a false `FAILED` into a double
+// pay.
 // ---------------------------------------------------------------------------------------------
 
 /// THE double-pay door. Index lost, destination EXPIRED, and the money already left.
@@ -1645,23 +1598,6 @@ async fn index_loss_refuses_a_terminal_unpaid_record_without_writing_failed() {
     );
 }
 
-/// The probe must not wedge the ordinary case: a genuinely new key pays exactly once.
-#[tokio::test]
-async fn a_clean_404_still_pays_a_fresh_key_exactly_once() {
-    let ops = FakePhoenixdOps::new();
-    let bolt11 = mint_bolt11(120_000, 74);
-    let be = backend(ops.clone(), TestClock::new(1_000));
-
-    be.pay_refund_capped(&bolt11, 120, 130, "refund:order:74:g1")
-        .await
-        .expect("a hash phoenixd has never seen is safe to pay");
-
-    assert_eq!(
-        ops.pay_calls().len(),
-        1,
-        "the probe adds a read, it must not add or remove a payment"
-    );
-}
 
 /// And it must not wedge LEGITIMATE re-resolution: a fresh key whose destination expired, with no
 /// payment anywhere, still terminalizes so the Refunder can mint a new invoice. Losing this would
@@ -1691,9 +1627,8 @@ async fn a_clean_404_still_terminalizes_an_expired_destination() {
 /// `recovery_rejects_a_paid_record_for_a_different_hash`; without this, nothing shows the no-row
 /// copy ever fires, and a guard that cannot be shown to fire is not a guard.
 ///
-/// The assertion must use wording UNIQUE to this bail. "when asked about" also appears in the adopt
-/// path's contract message, so matching on that would pass whichever fired — which is how this test
-/// read as green while the guard it was named for had become unreachable.
+/// Match wording UNIQUE to this bail: "when asked about" appears in the adopt path's message too, so
+/// matching on that would pass whichever fired.
 #[tokio::test]
 async fn index_loss_refuses_a_paid_record_naming_a_different_hash() {
     let ops = FakePhoenixdOps::new();
@@ -1735,8 +1670,8 @@ async fn index_loss_refuses_a_paid_record_naming_a_different_hash() {
 
 /// The paid receipt-less POST arm stays live even with the probe in front of it — a record can
 /// appear between the probe and the POST, and the `FAILED` and `PREPARED`-404 routes still reach it.
-/// `a_paid_record_for_our_hash_is_adopted_without_any_post` used to cover this and now asserts the
-/// POST never happens, so without this test that arm has none.
+/// Without this test that arm has no coverage: the no-row probe resolves the ordinary duplicate
+/// case before any POST is issued.
 #[tokio::test]
 async fn a_record_appearing_between_the_probe_and_the_post_is_adopted_not_paid_twice() {
     let ops = FakePhoenixdOps::new();
@@ -1771,6 +1706,54 @@ async fn a_record_appearing_between_the_probe_and_the_post_is_adopted_not_paid_t
     assert_eq!(
         be.payment_status_by_key("refund:order:78:g1").await.unwrap(),
         PayStatus::Succeeded
+    );
+}
+
+/// An UPPER-CASE hash echoed by phoenixd must be stored canonically, or [8A] goes blind.
+///
+/// The probe compares case-insensitively because phoenixd's echo case is unmeasured. That makes it
+/// possible to adopt a record whose hash differs from ours in case only — and `pay_other_key_for_hash`
+/// matches with SQLite `=`, which is case-SENSITIVE. Store phoenixd's casing and a second key on the
+/// same bolt11 sails past the cross-key guard and adopts the SAME payment as its own success: one
+/// real payment, two lnrent refunds marked paid.
+#[tokio::test]
+async fn an_upper_case_adopted_hash_is_stored_canonically_so_8a_still_fires() {
+    let ops = FakePhoenixdOps::new();
+    let bolt11 = mint_bolt11(120_000, 79);
+    let ours = hash_of(&bolt11);
+    assert_eq!(ours, ours.to_lowercase(), "our parsed hash is canonical lowercase");
+
+    ops.set_outgoing_for(
+        &ours,
+        PhoenixdOutgoing {
+            payment_id: "pay-upper".into(),
+            payment_hash: ours.to_uppercase(),
+            is_paid: true,
+            fees_msat: 4_480,
+            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+        },
+    );
+
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let id = be
+        .pay_refund_capped(&bolt11, 120, 130, "refund:order:79:g1")
+        .await
+        .expect("a case-variant echo is still our payment");
+    assert_eq!(id, "pay-upper");
+    assert!(ops.pay_calls().is_empty());
+
+    // The load-bearing half: a DIFFERENT key on the same destination must now be refused by [8A].
+    let err = be
+        .pay_refund_capped(&bolt11, 120, 130, "refund:order:OTHER-79:g1")
+        .await
+        .expect_err("[8A] must see the adopted row despite phoenixd's casing");
+    assert!(
+        format!("{err:#}").contains("already owned by idempotency key"),
+        "must be the cross-key refusal, not some other failure: {err:#}"
+    );
+    assert!(
+        ops.pay_calls().is_empty(),
+        "and it must be caught before any payinvoice"
     );
 }
 

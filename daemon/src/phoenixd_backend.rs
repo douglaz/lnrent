@@ -95,38 +95,27 @@
 //!    [`PaymentBackend::failed_refund_can_reuse_invoice`] can be `true` here and a retry of a
 //!    `FAILED` key simply re-runs the preflight.
 //!
-//!    That invariant is NOT free, and it is NOT universal. Read the next two paragraphs together;
-//!    the first is what the code guarantees, the second is what it does not.
+//!    WHY A FALSE `FAILED` IS A DOUBLE PAY, NOT A RETRY — the one statement of this chain in this
+//!    file; elsewhere, point here. Because `failed_refund_can_reuse_invoice` is `true`, the Refunder
+//!    reads `FAILED` on an EXPIRED destination and re-resolves at gen+1 to a NEW invoice with a NEW
+//!    payment hash (`daemon/src/refund.rs:614-644`), which the node-wide same-invoice dedup (fact 2)
+//!    cannot catch because it keys on the hash. So any path that can write `FAILED` over money that
+//!    already left pays the buyer twice.
 //!
-//!    WHY A FALSE `FAILED` IS A DOUBLE PAY, NOT A RETRY. Because `failed_refund_can_reuse_invoice`
-//!    is `true`, the Refunder reads `FAILED` on an EXPIRED destination and re-resolves at gen+1 to
-//!    a NEW invoice with a NEW payment hash (`daemon/src/refund.rs:614-644`) — which the node-wide
-//!    same-invoice dedup (fact 2) cannot catch, because it keys on the hash. So any path that can
-//!    write `FAILED` over money that already left pays the buyer twice.
+//!    `phoenixd_pay` lives in `phoenixd_index.db`, so a lost or restored index makes a key with a
+//!    real outbound payment look untouched. `PREPARED` and NO ROW are both resolved by an
+//!    `outgoingbyhash` probe before `start_pay` (the latter is lnrent-qvjz) — **except** on the
+//!    no-row [8A] exit, where a hash another live key owns short-circuits to `start_pay` unprobed.
+//!    That exit predates lnrent-qvjz. A stale `FAILED` is **neither probed nor fixable by probing**:
+//!    the Refunder re-resolves off `PayStatus::Failed && expired` alone and never asks this backend
+//!    about the old key again, so there is no call for a probe to sit in front of. Tracked as
+//!    `lnrent-stale-failed-restore-double-pay-uxbd`; closing it needs the `FAILED` status itself to
+//!    carry evidence, which is a change above this layer. Anyone adding a route into `start_pay`
+//!    must probe the hash first.
 //!
-//!    WHICH PATHS ARE COVERED, AND WHICH ARE NOT. `phoenixd_pay` lives in `phoenixd_index.db`, so a
-//!    lost or restored index makes a key with a real outbound payment look untouched. Four of the
-//!    shapes it reaches `pay_inner` with can write a terminal `FAILED`, and those are the ones that
-//!    matter here (the remaining arms — a `SUCCEEDED` row with no payment id, an invalid persisted
-//!    status — bail without recording one):
-//!
-//!      * stale `SUCCEEDED` — safe, never re-pays.
-//!      * stale `PREPARED` — resolved by the `outgoingbyhash` probe in its recovery arm.
-//!      * NO ROW — probed the same way (lnrent-qvjz), **except** on its [8A] exit: a hash another
-//!        live key owns short-circuits to `start_pay` unprobed, so a `FAILED` can be written there
-//!        without the hash ever being checked. Unchanged from before lnrent-qvjz, and reachable
-//!        only through the same-bolt11-across-keys residual this header accepts below.
-//!      * stale `FAILED` — **neither probed nor fixable by probing.** The Refunder re-resolves off
-//!        `PayStatus::Failed && expired` alone and never asks this backend about the old key again,
-//!        so there is no call for a probe to sit in front of. Tracked as
-//!        `lnrent-stale-failed-restore-double-pay-uxbd`; closing it needs the `FAILED` status itself
-//!        to carry evidence, which is a change above this layer.
-//!
-//!    So: anyone adding a route into `start_pay` must probe the hash first, and anyone making
-//!    `FAILED` reachable from a new place must read that bead before doing it. Do NOT read this list
-//!    as "restarting on a diverged index is safe" — the sweeper reaches its own terminal decision
-//!    without any of this (`daemon/src/sweep.rs:489-502`), and `docs/go-live.md` is authoritative for
-//!    what an operator should do.
+//!    None of this makes restarting on a diverged index safe — the sweeper reaches its own terminal
+//!    decision without any of it (`daemon/src/sweep.rs:489-502`). `docs/go-live.md` is authoritative
+//!    for what an operator should do.
 //!
 //! ## Cross-order same-invoice guard (ported [8A], lnrent-85t)
 //! phoenixd dedups by payment hash across the WHOLE node, so if some other idempotency key already
@@ -1356,55 +1345,31 @@ impl PhoenixdPayment {
                 "phoenixd pay key {idempotency_key} has invalid persisted status {:?}",
                 row.status
             ),
-            // NO ROW (lnrent-qvjz). This is the ordinary first attempt for a fresh key — and it is
-            // ALSO exactly what an index loss looks like, because `phoenixd_pay` lives in
-            // `phoenixd_index.db`, the map whose loss IS the divergence incident. The money that map
-            // described left from phoenixd's own WALLET, and that wallet's history survives lnrent's
-            // index independently (`daemon/src/backup.rs:27-34`: the funds live under phoenixd's own
-            // seed; the index is only lnrent's correlation map). So "no row" is the ABSENCE OF
-            // EVIDENCE, never evidence of absence, and local state cannot tell the two cases apart.
+            // NO ROW (lnrent-qvjz). Either an ordinary first attempt, or an index loss — and local
+            // state cannot tell them apart, because `phoenixd_pay` lives in the very map the incident
+            // loses while the money it described left from phoenixd's own wallet, whose history
+            // survives independently (`daemon/src/backup.rs:27-34`). "No row" is the absence of
+            // evidence. Left unprobed it writes a false `FAILED`; see the module header for why that
+            // is a double pay rather than a retry.
             //
-            // Left unprobed, the damage is not merely a redundant POST. A destination whose invoice
-            // has since EXPIRED takes `start_pay`'s expiry refusal, which records `FAILED` — and a
-            // `FAILED` row asserts "no outbound payment was ever started under that key", which is
-            // false here. The Refunder then reads `Failed && expired` and RE-RESOLVES at gen+1
-            // (`daemon/src/refund.rs:614-644`), minting a fresh invoice with a FRESH PAYMENT HASH.
-            // phoenixd's node-wide dedup is by hash (fact 2), so it cannot catch that one: the buyer
-            // is paid twice. Probing here is what keeps that `FAILED` honest.
+            // Why this is NOT the attribution the `PREPARED` arm above refuses. That arm must prove a
+            // record belongs to THIS attempt in order to UNLOCK a re-POST, and every scheme for it
+            // was refuted because a wrong answer double pays. This arm only ever refuses, or adopts a
+            // record phoenixd itself reports PAID for the hash we were about to send to — which the
+            // header already documents as ours when absent from the local map. It also asks phoenixd
+            // rather than reasoning from lnrent's own ledger, which is why the second refuted
+            // scheme's failure mode does not apply.
             //
-            // Why this is NOT the attribution the `PREPARED` arm above refuses to do. That arm must
-            // prove a record belongs to THIS attempt in order to UNLOCK a re-POST of the same hash,
-            // and each scheme for doing so was refuted because a wrong answer DOUBLE PAYS. This arm
-            // moves only in the safe direction: it never resolves anything to `FAILED`, it refuses on
-            // any record it cannot call paid, and the one thing it accepts — a record phoenixd itself
-            // reports PAID for the very hash we were about to send to — is already documented as ours
-            // when it is absent from the local map, "because that is exactly the shape a legitimate
-            // restore-from-backup takes and refusing it would strand a completed refund" (module
-            // header). It also asks phoenixd rather than reasoning from lnrent's own ledger, which is
-            // precisely why the second refuted scheme's failure mode does not apply.
-            //
-            // Cost, accepted deliberately: one `outgoingbyhash` GET before every genuinely new
-            // payment, and a transient error on it now STALLS a refund instead of paying it. The
-            // stall is self-healing (the key keeps no row, so the Refunder re-awaits and retries) and
-            // surfaces as `RefundStuck`; the alternative is a silent double pay. `require_prepared_node`
-            // is deliberately NOT reused: it bails when a key has no recorded node identity, which is
-            // true of every fresh key, so applying it here would refuse every first payment. The
-            // residual it guards — the wallet being swapped under us — stays open here and is the same
-            // residual the module header already accepts for an adopted foreign payment.
+            // `require_prepared_node` is deliberately NOT reused: it bails when a key has no recorded
+            // node identity, which is true of every fresh key, so it would refuse every first
+            // payment. The residual it guards — the wallet swapped under us — stays open here, as the
+            // header already accepts for an adopted foreign payment.
             None => {
                 let dest = parse_dest(bolt11)?;
-                // [8A] FIRST, and deliberately not re-implemented here: a hash some OTHER live key
-                // owns is refused by `start_pay`, which never funds. Probing and refusing here
-                // instead would leave the key `Unknown`, and the module header's account of the
-                // collision path lives on `start_pay`'s arm — duplicating it would give one path two
-                // different behaviours.
-                //
-                // NOTE, and it is why this is an EXIT from the probe rather than a step before it:
-                // this reaches `start_pay` UNPROBED, so it is a FOURTH ROUTE into that function (not
-                // to be confused with the header's fourth SHAPE, which is stale `FAILED`). Whatever
-                // refusal it records there is terminal — on an expired destination the expiry check
-                // fires before [8A] does — so it carries the same re-resolution hazard. It behaves
-                // exactly as master did, so this PR neither opens nor widens it.
+                // [8A] first, and not re-implemented here: a hash some OTHER live key owns is
+                // refused by `start_pay`, which never funds. Refusing here instead would leave the
+                // key `Unknown` and give one path two behaviours. This exit reaches `start_pay`
+                // UNPROBED — the residual the header names.
                 if pay_other_key_for_hash(&self.index, &dest.payment_hash, idempotency_key)?
                     .is_some()
                 {
@@ -1412,19 +1377,15 @@ impl PhoenixdPayment {
                         .start_pay(bolt11, amount_sat, idempotency_key, cap)
                         .await;
                 }
-                // Validate the hash BEFORE classifying, not only inside the adopt path. A record
-                // whose body names a different hash than the URL asked about says nothing about our
-                // destination, and letting it fall through to the unpaid arm would report OUR hash
-                // as an unresolved payment — sending the operator into withdraw/stop/settle-by-hand
-                // over a diagnosis that is not about their invoice at all.
+                // Validate the hash BEFORE classifying, so it protects the refuse path too: a
+                // record naming another hash would otherwise report OUR destination as unresolved
+                // and send the operator into withdraw/stop/settle-by-hand over someone else's
+                // invoice.
                 //
-                // Case-INSENSITIVE, matching `reusable_incoming`'s comparison of a phoenixd-reported
-                // hash rather than the pay-path neighbour below. lnrent has not measured which case
-                // `outgoingbyhash` echoes, and the two directions fail very differently: a spurious
-                // match here is caught immediately by the [8A] check and the adopt path's own
-                // accounting, while a spurious MISMATCH would bail on every drive forever and strand
-                // a refund the wallet has already paid — the outcome the module header says must not
-                // happen. Where the answer is unmeasured, fail toward the recoverable side.
+                // Case-INSENSITIVE, like `reusable_incoming` and unlike the pay-path neighbour
+                // below: lnrent has NOT measured which case `outgoingbyhash` echoes, and a spurious
+                // mismatch would bail every drive forever and strand a refund the wallet already
+                // paid, while a spurious match is caught by [8A] and the adopt path's accounting.
                 let probed = match self.ops.outgoing_by_hash(&dest.payment_hash).await? {
                     Some(record)
                         if !record
@@ -1490,33 +1451,15 @@ impl PhoenixdPayment {
         }
     }
 
-    /// Fund a NEW phoenixd payment for `idempotency_key`. The caller has established that no live
-    /// attempt exists for this key ([7A]) in one of three ways, and they are NOT equally strong:
-    ///
-    ///  * **Verified here and now** — recovery, or the no-row arm, just saw a clean `outgoingbyhash`
-    ///    404 for this hash. This is the proof; prefer routes that carry it.
-    ///  * **Inherited from an existing `FAILED` row** — trusted because of the module-header
-    ///    invariant, not because anything re-checked it on this call. A row restored from a backup
-    ///    taken before the key succeeded satisfies this arm while the money has already left; see
-    ///    `lnrent-stale-failed-restore-double-pay-uxbd`. Do not read this arm as equivalent to the
-    ///    first one.
-    ///  * **Nothing was established at all** — the no-row arm's [8A] exit hands over a key whose
-    ///    hash was never probed, because another key owns it and the refusal belongs here. Note what
-    ///    that does NOT buy: the refusal this call actually records is whichever fires first, and on
-    ///    an EXPIRED destination that is the expiry check above the [8A] check, not [8A] itself.
-    ///    Either way it is a terminal `FAILED`, so this route inherits the same re-resolution hazard
-    ///    as the bullet above without even the inherited invariant behind it.
+    /// Fund a NEW phoenixd payment for `idempotency_key`.
     ///
     /// Every refusal below records terminal `FAILED`, which on an expired destination is what sends
-    /// the Refunder to a fresh invoice generation — so it is only safe to the extent the proof above
-    /// actually held.
-    ///
-    /// "There is no row" is NOT one of those proofs and must never be treated as one (lnrent-qvjz):
-    /// the row lives in the index whose loss is the divergence incident, so its absence is equally
-    /// consistent with a payment that already left. `pay_inner`'s no-row arm therefore probes the hash
-    /// before delegating here, exactly as its `PREPARED` arm does. Recording `FAILED` for a key that
-    /// did pay is a DOUBLE PAY once the destination expires, not a harmless retry — see the module
-    /// header. Do not add a caller that skips the probe.
+    /// the Refunder to a fresh invoice generation — so callers must have cleared the hash first, and
+    /// they do so with unequal strength. A clean `outgoingbyhash` 404 is the proof (recovery, and
+    /// the no-row arm, lnrent-qvjz). An existing `FAILED` row is only the module-header invariant,
+    /// which a restore can falsify — `lnrent-stale-failed-restore-double-pay-uxbd`. The no-row arm's
+    /// [8A] exit establishes neither and is pre-existing. "There is no row" is never a proof.
+    /// Do not add a caller that skips the probe.
     async fn start_pay(
         &self,
         bolt11: &str,
@@ -1749,11 +1692,8 @@ impl PhoenixdPayment {
     /// the terminal row DIRECTLY (never via `PREPARED`), which is what keeps a refused key from ever
     /// naming a hash recovery could adopt (see the ordering note in [`Self::start_pay`]).
     ///
-    /// Read that second sentence as the hazard it is: "advance to a fresh invoice generation" mints a
-    /// NEW payment hash, which is the one thing phoenixd's same-invoice dedup cannot protect. So this
-    /// is only ever safe while the "provably never POSTed" premise actually holds, and after an index
-    /// loss it holds ONLY because `pay_inner` probed `outgoingbyhash` first (lnrent-qvjz). Never call
-    /// this on a key whose hash has not been cleared by that probe.
+    /// "Advance to a fresh invoice generation" is the hazard — see the module header, WHY A FALSE
+    /// `FAILED` IS A DOUBLE PAY. Never call this on a key whose hash the probe has not cleared.
     fn refuse(
         &self,
         idempotency_key: &str,
@@ -1804,18 +1744,17 @@ impl PhoenixdPayment {
     /// `PREPARED`, which would transiently name a hash recovery could adopt (see the ordering note
     /// in [`Self::start_pay`]).
     ///
-    /// Both protections the vanished row would otherwise have supplied live at the CALL SITE, not
-    /// here, and neither is re-checked in this function: the requested hash must match the record's
-    /// own (what the CAS did through `WHERE payment_hash = ?`), and [8A] cross-key ownership must be
-    /// clear. `pay_inner`'s no-row arm runs both before calling this — the hash equality as a bail
-    /// ahead of classifying, so it protects the refuse path too, and [8A] as a hand-off to
-    /// `start_pay`, the only place allowed to record that refusal. All of it runs under
-    /// `pay_start_lock`, so nothing can change in between. Copies here could never fire, and a guard
-    /// that cannot fire is not a guard — which is exactly why they are not duplicated.
+    /// Both protections the vanished row would have supplied live at the CALL SITE and are NOT
+    /// duplicated here: `pay_inner`'s no-row arm bails on a hash mismatch (what the CAS did through
+    /// `WHERE payment_hash = ?`) and hands an [8A] collision to `start_pay`, all under
+    /// `pay_start_lock`. A copy here could never fire, and a guard that cannot fire is not a guard.
     ///
-    /// `expected_hash` is therefore the contract itself, asserted rather than re-checked: a
-    /// `debug_assert!` that fires under test if a future caller reaches here without having cleared
-    /// the hash. It is not a release guard — the release guard is the caller's bail.
+    /// `canonical_hash` is the hash WE parsed from the bolt11, and it is what gets stored — never
+    /// `record.payment_hash`. The two are equal only up to ASCII case (the probe compares them
+    /// case-insensitively, since phoenixd's echo case is unmeasured), and storing phoenixd's casing
+    /// would be a money bug: `pay_other_key_for_hash` matches with SQLite `=`, which IS
+    /// case-sensitive, so an upper-case row would be invisible to [8A] and a second key on the same
+    /// bolt11 could adopt the same payment as its own success.
     ///
     /// `node_id` stays NULL. This attempt was never prepared against a known wallet, and the schema
     /// already defines NULL as "unknown identity, which recovery treats as unproven". Recording
@@ -1824,21 +1763,16 @@ impl PhoenixdPayment {
         &self,
         idempotency_key: &str,
         bolt11: &str,
-        expected_hash: &str,
+        canonical_hash: &str,
         record: &PhoenixdOutgoing,
         amount_sat: u64,
         cap: PayCap,
     ) -> Result<String> {
-        debug_assert!(
-            record.payment_hash.eq_ignore_ascii_case(expected_hash),
-            "adopt_paid_without_row reached with an unvalidated hash: record {} vs expected \
-             {expected_hash} — the caller must bail before classifying",
-            record.payment_hash
-        );
         pay_insert_adopted_succeeded(
             &self.index,
             idempotency_key,
             bolt11,
+            canonical_hash,
             record,
             self.clock.now(),
         )?;
@@ -2739,13 +2673,12 @@ fn pay_upsert_prepared(
 
 /// Insert a terminal `SUCCEEDED` row for a payment adopted with no prior witness (lnrent-qvjz).
 ///
-/// `INSERT` rather than upsert, deliberately: the caller has just established there is no row, and a
-/// silent overwrite would be the one way this path could clobber real bookkeeping if that ever
-/// stopped being true. A conflict therefore fails closed rather than winning.
+/// `INSERT`, not upsert: a conflict fails closed rather than clobbering real bookkeeping.
 fn pay_insert_adopted_succeeded(
     index: &Mutex<Connection>,
     key: &str,
     bolt11: &str,
+    canonical_hash: &str,
     record: &PhoenixdOutgoing,
     terminal_at: i64,
 ) -> Result<()> {
@@ -2756,13 +2689,7 @@ fn pay_insert_adopted_succeeded(
                  (idempotency_key, bolt11, payment_hash, node_id, payment_id, status, terminal_at)
              VALUES (?1, ?2, ?3, NULL, ?4, 'SUCCEEDED', ?5)
              ON CONFLICT(idempotency_key) DO NOTHING",
-            params![
-                key,
-                bolt11,
-                record.payment_hash,
-                record.payment_id,
-                terminal_at
-            ],
+            params![key, bolt11, canonical_hash, record.payment_id, terminal_at],
         )
         .context("recording an adopted phoenixd payment with no prior witness")?;
     if changed != 1 {
@@ -2776,9 +2703,7 @@ fn pay_insert_adopted_succeeded(
 }
 
 /// Terminal SUCCESS, CAS-guarded on the payment hash so a stale caller cannot overwrite a row that
-/// was rebound to a different destination. That CAS is also what
-/// [`PhoenixdPayment::adopt_paid_without_row`] has to replace by hand, since it has no row to CAS
-/// against.
+/// was rebound to a different destination.
 fn pay_mark_succeeded(
     index: &Mutex<Connection>,
     key: &str,
