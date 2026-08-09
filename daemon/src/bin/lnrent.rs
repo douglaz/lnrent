@@ -456,8 +456,10 @@ fn money_human_text(v: &serde_json::Value) -> String {
     // read still succeeds and returns a clean-looking zero. On a backend that can produce the
     // condition, a degraded daemon can therefore NEVER rule out a divergence, whatever the count
     // says: the same latch that makes the remedy dangerous is what erases the evidence for it.
+    // "alerts wired", not "can be unbookable": lnv2 can be, and is not wired (lnrent-3p71). The
+    // withhold below is about phoenixd's `phoenixd_pay` dedup, which only the wired backend has.
     let unbookable_capable = v
-        .get("unbookable_capable_backend")
+        .get("unbookable_alerts_wired")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     // The daemon says outright whether it can record alerts at all. `status` carries no
@@ -1302,7 +1304,7 @@ mod tests {
             // Reported, readable, EMPTY — and worthless as evidence, because the same latch that
             // degraded the store is what stops anything being written to it.
             "recent_unbookable_settlement_alerts": 0,
-            "unbookable_capable_backend": true,
+            "unbookable_alerts_wired": true,
         }));
         assert!(
             !rendered.contains("restore the state DB from backup and restart"),
@@ -1319,7 +1321,7 @@ mod tests {
             "expected_msat": 0, "gross_liability_sat": 0, "required_msat": 0,
             "parked_count": 0, "ready": true, "degraded_read_only": true,
             "recent_unbookable_settlement_alerts": 0,
-            "unbookable_capable_backend": false,
+            "unbookable_alerts_wired": false,
         }));
         assert!(
             other.contains("restore the state DB from backup and restart"),

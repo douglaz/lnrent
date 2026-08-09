@@ -123,7 +123,7 @@ async fn json_money_returns_reply_envelope() {
             // Always present, independently of any count: a degraded store silences the alert sink
             // through the same latch that refuses money writes, so on a capable backend an empty
             // history is not evidence of no divergence and the CLI must be able to say so.
-            "unbookable_capable_backend",
+            "unbookable_alerts_wired",
             "warning",
         ]
     );

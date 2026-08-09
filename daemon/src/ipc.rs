@@ -1321,7 +1321,11 @@ async fn add_unbookable_settlement_alerts_view(
     // disabled are still durable, and returning early hid them while claiming nothing was recorded
     // — losing real incident history at the moment the CLI is the operator's only surface. The two
     // facts are independent: what WAS observed, and that nothing further WILL be.
-    // Always report the CAPABILITY, separately from any count. A degraded store refuses every
+    // Report whether the alert is WIRED for this backend — deliberately not "can this backend
+    // become unbookable", which is a larger and different question. lnv2 CAN (its
+    // `PAID_UNRECOVERED` leaves a confirmed payment unbookable) and is NOT wired; that gap is
+    // lnrent-3p71. Naming the key for the capability would have made it assert something false
+    // about lnv2, so it is named for what it actually knows. A degraded store refuses every
     // `transaction`, which is how the dispatcher enqueues — so once the latch trips, no
     // SettlementUnbookable can be recorded, while this view's `read` still succeeds and truthfully
     // returns zero. On a backend that CAN be unbookable, that zero proves nothing, and the CLI needs
@@ -1333,7 +1337,7 @@ async fn add_unbookable_settlement_alerts_view(
     // simply refuses the write.
     if let Some(obj) = response.as_object_mut() {
         obj.insert(
-            "unbookable_capable_backend".to_string(),
+            "unbookable_alerts_wired".to_string(),
             serde_json::json!(backend_can_be_unbookable),
         );
         obj.insert(

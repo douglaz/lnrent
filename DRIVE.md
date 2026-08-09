@@ -29,8 +29,23 @@ Follow-ups filed rather than folded in: `lnrent-bdkh` (a deferred refusal lost a
 window), `lnrent-kwr` (12-hour view window), `lnrent-yjtd` (getbalance-only outage),
 `lnrent-8scw` (no repair tooling for a lost index), `lnrent-ie4p`.
 
+## Panel is DEGRADED — read before trusting the clearance
+Fable ran out of credits during pass 29 (it HANGS rather than erroring: a one-token probe returned
+RC=124 with `is_error`, no stderr — so exit-code guards do not catch it). The user decided to
+continue codex-only.
+
+This means the HARDEN gate was NOT met as written: `multi-reviewer-loop` reaches CLEAN only when
+BOTH reviewers are clean on the same tree, and a one-reviewer pass is CLEAN_DEGRADED. The clearance
+recorded for this branch is therefore a CODEX-ONLY clearance and must not be read as a two-reviewer
+result. It is written down here, in the PR body, and nowhere is it claimed otherwise.
+
+Worth weighing if this comes back: fable found the last three P1s on this branch — the degraded
+store silencing its own alert sink, the correlated-failure hole in the withhold guard, and the
+restart double-pay — while codex's final passes were 1 finding, then 3 already-filed. The reviewer
+that was dropped is the one that had been finding the money-path defects.
+
 ## Next
-Panel to CLEAN on one tree, then LAND. Then `yg0` — it also touches the alert surface and needs a
+LAND on a codex-only clearance. Then `yg0` — it also touches the alert surface and needs a
 `refund_attempt.last_error` migration.
 
 ## Open questions for the human
