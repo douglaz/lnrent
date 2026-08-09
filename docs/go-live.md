@@ -293,8 +293,9 @@ refuses orders it cannot service.
        daemon now STOPPED, read both databases (read-only — never write them; the daemon is the
        sole writer, ADR-0001):
 
-       **Run this as a script with `bash`, not pasted line by line.** Its header matters as much as
-       its queries:
+       **Run this as a script with `bash`, not pasted line by line.** It needs the `sqlite3` CLI —
+       lnrent does not ship it and nothing else in this runbook requires it, so install it first
+       (`sqlite3 --version` should print 3.x). Its header matters as much as its queries:
 
        ```sh
        #!/usr/bin/env bash
@@ -323,7 +324,10 @@ refuses orders it cannot service.
 
        # An invoice id is not a buyer. Resolve who to pay, where, and how much -- this is the
        # ONLY output of the whole procedure, and settling out of band needs all three.
-       sqlite3 -header -column "$WORK/lnrent.sqlite" "
+       # -json, NOT -column: on sqlite3 before 3.33 column mode truncates to fixed widths, which
+       # would silently cut 73-char invoice ids and 64-hex pubkeys -- at exit 0, past every guard
+       # above -- in the one output this whole procedure produces.
+       sqlite3 -json "$WORK/lnrent.sqlite" "
          SELECT i.id, i.amount_sat, i.received_msat, s.buyer_pubkey, s.refund_dest
            FROM invoice i LEFT JOIN subscription s ON s.id = i.subscription_id
           WHERE i.id IN ($(paste -sd, -           < "$WORK/affected.txt" \
@@ -401,7 +405,9 @@ refuses orders it cannot service.
   copied here)
   (subject, remedy, timestamp) — not live backend state. A repaired incident stays listed until the
   window expires, and disabling the alert sink makes this view report UNAVAILABLE rather than a count — it is derived
-  from delivered DMs, so with the sink off it cannot see the condition and will not guess. The
+  from the durable alert RECORDS lnrent enqueued — not from proof of delivery, which it never
+  checks: a record appears here whether its DM reached a relay or is still queued behind a blackout.
+  With the sink off there are no records at all, so it cannot see the condition and will not guess. The
   number counts distinct *conditions*, not receipts. If the history cannot be read, both commands
   report it as unknown rather than zero; fix the reported storage error and retry.
 

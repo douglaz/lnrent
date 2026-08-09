@@ -3091,6 +3091,23 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
     // "reconcile by hand" was not one: `lnrent reconcile` is report-only, nothing reconstructs the
     // missing rows, and writing the DB by hand is forbidden (sole sqlite writer, ADR-0001). Naming a
     // procedure that does not exist is worse than naming none — it reads as a supported path.
+    // ORDER, not just presence. Both reviewers found the same defect independently: the DM used to
+    // say "stop the daemon, then ... stop new orders (`lnrent listing withdraw`)", and withdraw
+    // talks to the daemon over its socket — so followed literally, the one step that halts new
+    // orders could not run, and every order taken meanwhile is another buyer to settle by hand.
+    // Asserting only that the command APPEARS would have passed on the broken version.
+    {
+        let withdraw = detail.find("listing withdraw").expect("names the withdraw verb");
+        let stop_daemon = detail.find("stop the daemon").expect("names stopping the daemon");
+        assert!(
+            withdraw < stop_daemon,
+            "withdraw must come BEFORE stopping the daemon — it needs the socket: {detail}"
+        );
+        assert!(
+            detail.contains("IN THIS ORDER"),
+            "and the remedy must flag that its order is load-bearing: {detail}"
+        );
+    }
     // Saying "no repair" is only half an instruction. The operator is mid-incident with a buyer's
     // money unbooked, so the DM must also name what they CAN do — and every verb here is real:
     // `lnrent listing withdraw` exists, and phoenixd's own records are what settlement reads.

@@ -573,7 +573,8 @@ async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_i
         "index_diverged".to_string(),
         // Kept deliberately under `MAX_ALERT_DETAIL_CHARS` with a REAL invoice id (73 chars:
         // `phoenixd-` + a 64-hex payment hash) — the cap truncates from the tail, and the tail here
-        // is the "do not recreate it" instruction. `a_full_length_unbookable_detail_is_not_truncated`
+        // is the "never recreate or expire an affected INVOICE" instruction (the invoice, not the
+        // wallet: an earlier wording left "it" attached to the wallet, which cannot be expired). `a_full_length_unbookable_detail_is_not_truncated`
         // in the sibling test module is what holds that.
         //
         // This message carries NO `restore` command because there is no safe one. Deciding a
@@ -587,13 +588,14 @@ async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_i
             "INDEX DIVERGENCE: invoice {invoice_id} absent from {INDEX_DB_FILE} — payment state \
              UNKNOWN: lnrent can neither book nor expire it. THAT IS ONE EXAMPLE, not the set: one \
              alert covers them all, so enumerate every OPEN invoice your state DB has that \
-             {INDEX_DB_FILE} lacks. REMEDY: stop the daemon, then follow the index-divergence \
-             section in docs/go-live.md. There is NO safe repair and NO repair command: do NOT \
-             restore from a backup — it rolls back lnrent's only record of which refunds already \
-             paid, while phoenixd keeps that history, so the daemon can pay a refund a SECOND \
-             time. Keep the data dir and phoenixd's history intact, stop new orders (`lnrent \
-             listing withdraw`), and settle the affected buyers out of band from phoenixd's own \
-             records. Keep phoenixd on its original wallet; do not recreate or expire it."
+             {INDEX_DB_FILE} lacks. REMEDY, IN THIS ORDER: run `lnrent listing withdraw` FIRST, \
+             while the daemon is still up — it needs the daemon's socket — then stop the daemon, \
+             then follow the index-divergence section in docs/go-live.md. There is NO safe repair \
+             and NO repair command: do NOT restore from a backup — it rolls back lnrent's only \
+             record of which refunds already paid, while phoenixd keeps that history, so the \
+             daemon can pay a refund a SECOND time. Keep the data dir and phoenixd's history \
+             intact and settle the affected buyers out of band from phoenixd's own records. Leave \
+             phoenixd on its original wallet, and never recreate or expire an affected invoice."
         ),
     )
     .await;
