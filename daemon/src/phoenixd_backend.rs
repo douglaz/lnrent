@@ -95,6 +95,16 @@
 //!    [`PaymentBackend::failed_refund_can_reuse_invoice`] can be `true` here and a retry of a
 //!    `FAILED` key simply re-runs the preflight.
 //!
+//!    That invariant is NOT free, and what pays for it is the `outgoingbyhash` probe on EVERY path
+//!    into `start_pay` — including the no-row path (lnrent-qvjz). Without it the invariant is false
+//!    after an index loss: `phoenixd_pay` lives in `phoenixd_index.db`, so losing that map makes a
+//!    key with a real outbound payment indistinguishable from a fresh one, and the expiry refusal
+//!    then writes `FAILED` over money that already left. Because `failed_refund_can_reuse_invoice`
+//!    is `true`, the Refunder reads that `FAILED` on an expired destination and re-resolves at
+//!    gen+1 to a NEW invoice with a NEW payment hash — which the node-wide same-invoice dedup
+//!    (fact 2) cannot catch, because it keys on the hash. A false `FAILED` here is therefore a
+//!    double pay, not a retry. Anyone adding a route into `start_pay` must probe the hash first.
+//!
 //! ## Cross-order same-invoice guard (ported [8A], lnrent-85t)
 //! phoenixd dedups by payment hash across the WHOLE node, so if some other idempotency key already
 //! owns a bolt11, adopting phoenixd's dedup answer as OUR key's success would silently under-refund
@@ -1323,17 +1333,95 @@ impl PhoenixdPayment {
                 "phoenixd pay key {idempotency_key} has invalid persisted status {:?}",
                 row.status
             ),
+            // NO ROW (lnrent-qvjz). This is the ordinary first attempt for a fresh key — and it is
+            // ALSO exactly what an index loss looks like, because `phoenixd_pay` lives in
+            // `phoenixd_index.db`, the map whose loss IS the divergence incident. The money that map
+            // described left from phoenixd's own WALLET, and that wallet's history survives lnrent's
+            // index independently (`daemon/src/backup.rs:27-34`: the funds live under phoenixd's own
+            // seed; the index is only lnrent's correlation map). So "no row" is the ABSENCE OF
+            // EVIDENCE, never evidence of absence, and local state cannot tell the two cases apart.
+            //
+            // Left unprobed, the damage is not merely a redundant POST. A destination whose invoice
+            // has since EXPIRED takes `start_pay`'s expiry refusal, which records `FAILED` — and a
+            // `FAILED` row asserts "no outbound payment was ever started under that key", which is
+            // false here. The Refunder then reads `Failed && expired` and RE-RESOLVES at gen+1
+            // (`daemon/src/refund.rs:614-644`), minting a fresh invoice with a FRESH PAYMENT HASH.
+            // phoenixd's node-wide dedup is by hash (fact 2), so it cannot catch that one: the buyer
+            // is paid twice. Probing here is what keeps that `FAILED` honest.
+            //
+            // Why this is NOT the attribution the `PREPARED` arm above refuses to do. That arm must
+            // prove a record belongs to THIS attempt in order to UNLOCK a re-POST of the same hash,
+            // and each scheme for doing so was refuted because a wrong answer DOUBLE PAYS. This arm
+            // moves only in the safe direction: it never resolves anything to `FAILED`, it refuses on
+            // any record it cannot call paid, and the one thing it accepts — a record phoenixd itself
+            // reports PAID for the very hash we were about to send to — is already documented as ours
+            // when it is absent from the local map, "because that is exactly the shape a legitimate
+            // restore-from-backup takes and refusing it would strand a completed refund" (module
+            // header). It also asks phoenixd rather than reasoning from lnrent's own ledger, which is
+            // precisely why the second refuted scheme's failure mode does not apply.
+            //
+            // Cost, accepted deliberately: one `outgoingbyhash` GET before every genuinely new
+            // payment, and a transient error on it now STALLS a refund instead of paying it. The
+            // stall is self-healing (the key keeps no row, so the Refunder re-awaits and retries) and
+            // surfaces as `RefundStuck`; the alternative is a silent double pay. `require_prepared_node`
+            // is deliberately NOT reused: it bails when a key has no recorded node identity, which is
+            // true of every fresh key, so applying it here would refuse every first payment. The
+            // residual it guards — the wallet being swapped under us — stays open here and is the same
+            // residual the module header already accepts for an adopted foreign payment.
             None => {
-                self.start_pay(bolt11, amount_sat, idempotency_key, cap)
-                    .await
+                let dest = parse_dest(bolt11)?;
+                match self.ops.outgoing_by_hash(&dest.payment_hash).await? {
+                    Some(record) if record.is_paid => {
+                        self.adopt_paid(idempotency_key, &record, amount_sat, cap)
+                    }
+                    // Bind the record's shape, for the same reason the PREPARED arm does: an operator
+                    // reading a stuck refund cannot see this file, and calling an in-flight payment
+                    // "failed" would state something false about it.
+                    Some(record) => bail!(
+                        "phoenixd has an outgoing record for hash {} that it does not report as \
+                         paid ({}), but lnrent holds no local payment row for key \
+                         {idempotency_key} — the record and the bookkeeping that would explain it \
+                         disagree, which is the shape of a lost or restored {INDEX_DB_FILE}. \
+                         lnrent refuses to send this destination again and records NO failure for \
+                         it: a recorded failure would let the refund re-resolve to a NEW invoice \
+                         and pay a second time, which phoenixd's same-invoice dedup could not \
+                         catch. Expect a stuck-payment operator alert (RefundStuck for a refund, \
+                         SweepStuck for a sweep). Settling it needs a human who can read the \
+                         wallet's own payment list; do not pay this destination out of band while \
+                         a payment for it may still be in flight.",
+                        dest.payment_hash,
+                        if record.completed_at_ms.is_none() {
+                            "and carries no completion time, which on the release lnrent measured \
+                             is the shape of a payment still IN FLIGHT"
+                        } else {
+                            "but does carry a completion time, which on the release lnrent measured \
+                             means it failed — though phoenixd returns only one record per hash, so \
+                             that failure cannot be proven to be this attempt"
+                        }
+                    ),
+                    // A clean 404 proves this wallet has no payment for this hash, so sending it now
+                    // cannot be a second payment AT THIS WALLET. `start_pay`'s precondition is
+                    // genuinely met, expiry refusals included.
+                    None => {
+                        self.start_pay(bolt11, amount_sat, idempotency_key, cap)
+                            .await
+                    }
+                }
             }
         }
     }
 
     /// Fund a NEW phoenixd payment for `idempotency_key`. The caller has PROVEN no live attempt exists
-    /// for this key ([7A]): either there is no row, or recovery just saw a clean 404 for its hash, or
-    /// the row is a FAILED refusal that never POSTed. Every refusal below is therefore safe to record
-    /// as terminal `FAILED` — it can never race a live payment.
+    /// for this key ([7A]): recovery just saw a clean `outgoingbyhash` 404 for its hash, or the row is
+    /// a FAILED refusal that never POSTed. Every refusal below is therefore safe to record as terminal
+    /// `FAILED` — it can never race a live payment.
+    ///
+    /// "There is no row" is NOT one of those proofs and must never be treated as one (lnrent-qvjz):
+    /// the row lives in the index whose loss is the divergence incident, so its absence is equally
+    /// consistent with a payment that already left. `pay_inner`'s no-row arm therefore probes the hash
+    /// before delegating here, exactly as its `PREPARED` arm does. Recording `FAILED` for a key that
+    /// did pay is a DOUBLE PAY once the destination expires, not a harmless retry — see the module
+    /// header. Do not add a caller that skips the probe.
     async fn start_pay(
         &self,
         bolt11: &str,
@@ -1565,6 +1653,12 @@ impl PhoenixdPayment {
     /// to a fresh invoice generation instead of re-awaiting a payment that will never exist. Writes
     /// the terminal row DIRECTLY (never via `PREPARED`), which is what keeps a refused key from ever
     /// naming a hash recovery could adopt (see the ordering note in [`Self::start_pay`]).
+    ///
+    /// Read that second sentence as the hazard it is: "advance to a fresh invoice generation" mints a
+    /// NEW payment hash, which is the one thing phoenixd's same-invoice dedup cannot protect. So this
+    /// is only ever safe while the "provably never POSTed" premise actually holds, and after an index
+    /// loss it holds ONLY because `pay_inner` probed `outgoingbyhash` first (lnrent-qvjz). Never call
+    /// this on a key whose hash has not been cleared by that probe.
     fn refuse(
         &self,
         idempotency_key: &str,
