@@ -1267,7 +1267,7 @@ async fn pay_records_the_key_and_never_pays_twice() {
 // paymentId/preimage. For a key we already own that is SUCCESS-equivalent — decided by re-reading
 // `outgoingbyhash`, never by the English string.
 #[tokio::test]
-async fn a_receipt_less_duplicate_response_is_success_equivalent() {
+async fn a_paid_record_for_our_hash_is_adopted_without_any_post() {
     let ops = FakePhoenixdOps::new();
     let be = backend(ops.clone(), TestClock::new(1_000));
     let bolt11 = mint_bolt11(120_000, 2);
@@ -1281,9 +1281,10 @@ async fn a_receipt_less_duplicate_response_is_success_equivalent() {
         fees_msat: 4_480,
         completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
     });
-    ops.script_pay(Ok(PayAttempt::NoReceipt {
-        reason: Some("this invoice has already been paid".into()),
-    }));
+    // No `script_pay` here on purpose. The probe resolves this before any POST, so a scripted
+    // answer would sit unconsumed and the name would promise a round-trip that never happens. The
+    // receipt-less duplicate answer itself is exercised by
+    // `a_record_appearing_between_the_probe_and_the_post_is_adopted_not_paid_twice`.
 
     let id = be
         .pay_refund_capped(&bolt11, 120, 130, "refund:order:2:g1")
@@ -1709,7 +1710,7 @@ async fn index_loss_refuses_a_paid_record_naming_a_different_hash() {
 
 /// The paid receipt-less POST arm stays live even with the probe in front of it — a record can
 /// appear between the probe and the POST, and the `FAILED` and `PREPARED`-404 routes still reach it.
-/// `a_receipt_less_duplicate_response_is_success_equivalent` used to cover this and now asserts the
+/// `a_paid_record_for_our_hash_is_adopted_without_any_post` used to cover this and now asserts the
 /// POST never happens, so without this test that arm has none.
 #[tokio::test]
 async fn a_record_appearing_between_the_probe_and_the_post_is_adopted_not_paid_twice() {
@@ -3446,30 +3447,13 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
     // stopped OUTRIGHT rather than deferred to a checklist: the runbook no longer has one. A DM
     // that merely said "don't restore from this message alone" would still read as "there is a
     // procedure, go find it".
-    // RESTORE must still be forbidden OUTRIGHT rather than deferred to a checklist: the runbook no
-    // longer has one.
-    //
-    // RESTART is deliberately no longer forbidden (lnrent-qvjz). It used to double-pay for the same
-    // reason a restore does — the dedup record was in the lost index — but a key with no local row
-    // is now probed against phoenixd before anything is sent. Restarting is what an operator reaches
-    // for first, with the service down and unaffected subscribers waiting, so a prohibition that is
-    // no longer true is not a harmless leftover: it costs every one of them uptime. The two halves
-    // therefore make OPPOSITE assertions, and the second-payment warning must attach to the half
-    // that still carries it.
+    // Both hazards, and both must be forbidden OUTRIGHT rather than deferred to a checklist: the
+    // runbook no longer has one. Restarting is the one an operator will reach for first — the
+    // service is down and unaffected subscribers are waiting — and it double-pays for the same
+    // reason a restore does, because the dedup record was in the index that was lost.
     assert!(
-        detail.contains("do NOT restore a backup")
-            && !detail.contains("do NOT restart"),
-        "restore must be forbidden and restart must NOT be, post-qvjz: {detail}"
-    );
-    let (before_restore, from_restore) = detail
-        .split_once("do NOT restore a backup")
-        .expect("checked just above");
-    assert!(
-        from_restore.contains("pay a refund a SECOND")
-            && !before_restore.contains("pay a refund a SECOND"),
-        "the second-payment warning must belong to the RESTORE half, not the restart half — an \
-         operator reading it against a restart would take an outage for a hazard that is closed: \
-         {detail}"
+        detail.contains("do NOT restart it") && detail.contains("do NOT restore a backup"),
+        "the alert must forbid BOTH restarting and restoring, outright: {detail}"
     );
     // The no-safe-backup branch must give an instruction the operator can actually CARRY OUT.
     // "reconcile by hand" was not one: `lnrent reconcile` is report-only, nothing reconstructs the
@@ -3515,20 +3499,13 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
          enumeration the runbook no longer provides: {detail}"
     );
     // WHY a restore is unsafe, not just that it is. Without the mechanism an operator reads the
-    // refusal as excessive caution and restores anyway.
-    //
-    // The mechanism CHANGED with lnrent-qvjz and this assertion changed with it. It used to be "the
-    // rollback drops lnrent's record of which refunds already paid while phoenixd keeps that
-    // history" — a missing row read as `never paid`. That shape is now probed, so quoting it here
-    // would pin a sentence the code has made false. What makes a RESTORE different from a fresh
-    // index loss is that it does not leave a missing row at all: `phoenixd_index.db` is captured in
-    // the backup, so it leaves a STALE one, and a key already retried into SUCCEEDED comes back
-    // FAILED. No probe reaches that — the Refunder re-resolves off `Failed && expired` without
-    // asking the backend again (lnrent-stale-failed-restore-double-pay-uxbd). The DM must name THAT.
+    // refusal as excessive caution and restores anyway: the rollback drops lnrent's record of which
+    // refunds already paid while phoenixd keeps that history, so the second pay is not a risk but
+    // the expected outcome of re-driving a restored PENDING refund.
     assert!(
-        detail.contains("STALE index")
-            && detail.contains("returns FAILED")
-            && detail.contains("re-resolves to a NEW hash phoenixd cannot dedup"),
+        detail.contains("the record of which refunds already \
+             paid lived in the lost index")
+            && detail.contains("while phoenixd keeps that history"),
         "and must give the MECHANISM, so the refusal does not read as mere caution: {detail}"
     );
 }
