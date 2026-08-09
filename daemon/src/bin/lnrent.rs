@@ -393,8 +393,11 @@ fn money_human_text(v: &serde_json::Value) -> String {
             "the daemon could not read its durable alert history. Check the daemon's storage \
              error, then re-run."
         } else {
-            "this daemon did not report the view at all, which means it predates it — nothing is \
-             broken; upgrade the daemon, or read the condition from phoenixd directly."
+            // Backend-NEUTRAL on purpose. A daemon this old sends no capability key either, and
+            // `federation_ok`/`gateway_ok` are emitted by every backend — so there is nothing in
+            // this response that says which one it is. Naming phoenixd here would be a guess.
+            "this daemon predates the view and reports nothing either way — nothing is broken; \
+             upgrade it, or read the condition from your payment backend directly."
         };
         lines.push(format!(
             "\x1b[1;31mUnbookable settlement alert history: UNKNOWN\x1b[0m — {cause} It cannot say \
@@ -471,6 +474,13 @@ fn money_human_text(v: &serde_json::Value) -> String {
         // degraded one cannot write to it at all.
         let why = if index_diverged {
             "an index divergence is alerting above"
+        } else if !reported_unbookable_view {
+            // BEFORE the generic unknown arm: skew sets `unbookable_unknown`, so testing that
+            // first would swallow this case and claim a read failure that never happened.
+            "this daemon predates the unbookable-settlement view, so it cannot say whether one is \
+             held back. If it runs the phoenixd backend, restoring or restarting can pay a refund \
+             twice; if it runs another backend the usual remedy is safe. Check which, or upgrade \
+             it, before deciding"
         } else if unbookable_unknown {
             "the alert history could not be READ here, so an index divergence cannot be ruled out"
         } else if unbookable_disabled {
@@ -1259,8 +1269,23 @@ mod tests {
             "a daemon that never reported the view cannot rule out a divergence: {rendered}"
         );
         assert!(
-            rendered.contains("could not be READ") || rendered.contains("cannot be ruled out"),
-            "and must say so rather than printing an all-clear: {rendered}"
+            rendered.contains("cannot say whether one is held back"),
+            "and must say it cannot tell, rather than printing an all-clear: {rendered}"
+        );
+        // Backend-NEUTRAL: an old daemon sends no capability key, and federation_ok/gateway_ok come
+        // from every backend, so nothing here identifies one. Asserting phoenixd would be a guess,
+        // and telling a fedimint operator to inspect phoenixd wastes the minutes that matter.
+        assert!(
+            rendered.contains("predates"),
+            "the skew case must name the real cause — an old daemon, not a broken one: {rendered}"
+        );
+        assert!(
+            rendered.contains("If it runs the phoenixd backend"),
+            "and must say how to DECIDE rather than asserting a backend it cannot know: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Check the daemon's storage error"),
+            "and must not send them chasing a storage error that does not exist: {rendered}"
         );
     }
 
