@@ -1263,7 +1263,6 @@ async fn pay_records_the_key_and_never_pays_twice() {
     );
 }
 
-
 // A receipt-less answer with NO paid record proves nothing moved but also gives no proof it never
 // will: the key must stay PENDING with its witness intact, never be marked paid off the string.
 #[tokio::test]
@@ -1598,7 +1597,6 @@ async fn index_loss_refuses_a_terminal_unpaid_record_without_writing_failed() {
     );
 }
 
-
 /// And it must not wedge LEGITIMATE re-resolution: a fresh key whose destination expired, with no
 /// payment anywhere, still terminalizes so the Refunder can mint a new invoice. Losing this would
 /// strand every refund whose destination lapsed before it was driven.
@@ -1627,8 +1625,8 @@ async fn a_clean_404_still_terminalizes_an_expired_destination() {
 /// `recovery_rejects_a_paid_record_for_a_different_hash`; without this, nothing shows the no-row
 /// copy ever fires, and a guard that cannot be shown to fire is not a guard.
 ///
-/// Match wording UNIQUE to this bail: "when asked about" appears in the adopt path's message too, so
-/// matching on that would pass whichever fired.
+/// Match wording unique to this bail rather than the shared "when asked about" phrasing, so the
+/// assertion still identifies which check fired if another gains a similar message.
 #[tokio::test]
 async fn index_loss_refuses_a_paid_record_naming_a_different_hash() {
     let ops = FakePhoenixdOps::new();
@@ -1755,6 +1753,52 @@ async fn an_upper_case_adopted_hash_is_stored_canonically_so_8a_still_fires() {
         ops.pay_calls().is_empty(),
         "and it must be caught before any payinvoice"
     );
+}
+
+/// A 404 is a money-safety PROOF in the no-row arm, so it must come from phoenixd and not from
+/// whatever else can answer a URL with 404 (lnrent-qvjz).
+///
+/// phoenixd's measured miss is a 404 with a plain-text `Not found`. A reverse proxy with a path
+/// allowlist, a stale route, or a gateway with the service down answers 404 too — and reading that
+/// as "this wallet never paid this hash" is how a misconfigured proxy hands over a double pay.
+#[tokio::test]
+async fn only_phoenixds_own_404_body_counts_as_a_clean_miss() {
+    for (label, body, expect_clean) in [
+        ("phoenixd's measured answer", "Not found", true),
+        ("proxy path-allowlist page", "<html><body>404 Not Found</body></html>", false),
+        ("empty body from a dead gateway", "", false),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = body.to_string();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 404 Not Found\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{served}",
+                    served.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let ops = super::real::RealPhoenixdOps::new(&format!("http://{addr}/"), TEST_PASSWORD)
+            .expect("loopback ops build");
+        let got = ops.outgoing_by_hash(&"ab".repeat(32)).await;
+        if expect_clean {
+            assert!(
+                matches!(got, Ok(None)),
+                "{label}: must be the clean miss, got {got:?}"
+            );
+        } else {
+            let err = got.expect_err(&format!("{label}: must NOT be read as a clean miss"));
+            assert!(
+                format!("{err:#}").contains("unrecognised body"),
+                "{label}: unexpected error: {err:#}"
+            );
+        }
+    }
 }
 
 /// Fail closed on an unreadable probe. phoenixd not answering is not phoenixd saying "no payment".

@@ -106,9 +106,12 @@
 //!    real outbound payment look untouched. `PREPARED` and NO ROW are both resolved by an
 //!    `outgoingbyhash` probe before `start_pay` (the latter is lnrent-qvjz) — **except** on the
 //!    no-row [8A] exit, where a hash another live key owns short-circuits to `start_pay` unprobed.
-//!    That exit predates lnrent-qvjz. A stale `FAILED` is **neither probed nor fixable by probing**:
-//!    the Refunder re-resolves off `PayStatus::Failed && expired` alone and never asks this backend
-//!    about the old key again, so there is no call for a probe to sit in front of. Tracked as
+//!    That exit predates lnrent-qvjz. A stale `FAILED` is NOT probed, and no probe in `pay_inner`
+//!    can reach it: the Refunder decides on `PayStatus::Failed && expired` and never calls `pay` for
+//!    that key again. It does still call `payment_status_by_key` (`daemon/src/refund.rs:583`), which
+//!    is a pure DB read today — so making that read consult `outgoingbyhash` before answering
+//!    `Failed` is one shape the fix could take, and this layer is not the wrong place for it.
+//!    Tracked as
 //!    `lnrent-stale-failed-restore-double-pay-uxbd`; closing it needs the `FAILED` status itself to
 //!    carry evidence, which is a change above this layer. Anyone adding a route into `start_pay`
 //!    must probe the hash first.
@@ -3111,8 +3114,26 @@ mod real {
                 .context("phoenixd payments/outgoingbyhash request failed")?;
             // The live-verified "this hash never paid" answer: a 404 with a plain-text `Not found`
             // body (so the status must be checked BEFORE any JSON decode).
+            //
+            // The BODY is checked, not just the status, because this `None` is a money-safety proof
+            // and a bare 404 is trivially forgeable by something that is not phoenixd. A reverse
+            // proxy with a path allowlist, a stale route, or a gateway with the service down all
+            // answer 404 — and `pay_inner`'s no-row arm reads `None` as "this wallet never paid this
+            // hash" and proceeds to send (lnrent-qvjz). For an expired destination that writes a
+            // terminal `FAILED`, which re-resolves to a fresh hash: a double pay, handed over by a
+            // misconfigured proxy. Any 404 that is not phoenixd's measured answer therefore fails
+            // closed as an error, which merely stalls the drive.
             if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                return Ok(None);
+                let body = resp.text().await.unwrap_or_default();
+                if body.trim().eq_ignore_ascii_case("not found") {
+                    return Ok(None);
+                }
+                anyhow::bail!(
+                    "phoenixd payments/outgoingbyhash returned 404 with an unrecognised body, so it \
+                     is not phoenixd's measured `Not found` and cannot be read as proof the hash \
+                     never paid; refusing to treat it as a clean miss (body length {})",
+                    body.len()
+                );
             }
             let status = resp.status();
             if !status.is_success() {
