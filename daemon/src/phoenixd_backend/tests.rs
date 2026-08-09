@@ -3082,10 +3082,13 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
     // stopped OUTRIGHT rather than deferred to a checklist: the runbook no longer has one. A DM
     // that merely said "don't restore from this message alone" would still read as "there is a
     // procedure, go find it".
+    // Both hazards, and both must be forbidden OUTRIGHT rather than deferred to a checklist: the
+    // runbook no longer has one. Restarting is the one an operator will reach for first — the
+    // service is down and unaffected subscribers are waiting — and it double-pays for the same
+    // reason a restore does, because the dedup record was in the index that was lost.
     assert!(
-        detail.contains("do NOT \
-             restore from a backup"),
-        "the alert must forbid restoring outright, not defer it to a checklist: {detail}"
+        detail.contains("do NOT restart it") && detail.contains("do NOT restore a backup"),
+        "the alert must forbid BOTH restarting and restoring, outright: {detail}"
     );
     // The no-safe-backup branch must give an instruction the operator can actually CARRY OUT.
     // "reconcile by hand" was not one: `lnrent reconcile` is report-only, nothing reconstructs the
@@ -3098,7 +3101,7 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
     // Asserting only that the command APPEARS would have passed on the broken version.
     {
         let withdraw = detail.find("listing withdraw").expect("names the withdraw verb");
-        let stop_daemon = detail.find("stop the daemon").expect("names stopping the daemon");
+        let stop_daemon = detail.find("THEN stop it").expect("names stopping the daemon");
         assert!(
             withdraw < stop_daemon,
             "withdraw must come BEFORE stopping the daemon — it needs the socket: {detail}"
@@ -3112,9 +3115,7 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
     // money unbooked, so the DM must also name what they CAN do — and every verb here is real:
     // `lnrent listing withdraw` exists, and phoenixd's own records are what settlement reads.
     assert!(
-        detail.contains("NO safe repair and NO repair command")
-            && detail.contains("lnrent \
-             listing withdraw")
+        detail.contains("lnrent listing withdraw")
             && detail.contains("settle the affected buyers out of band"),
         "and must give an ACTIONABLE next step, not just a refusal: {detail}"
     );
@@ -3122,18 +3123,22 @@ async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
     // however many there are. An operator who verifies a candidate backup against the named id
     // alone can pick one that omits the others, and the whole-dir restore then drops those orders.
     // The text must say so and give the rule for finding the rest.
+    // It must still say the named invoice is not the whole set — but NOT tell the operator to
+    // enumerate, which was an instruction with no procedure behind it once the shell was cut.
     assert!(
-        detail.contains("ONE EXAMPLE, not the set")
-            && detail.contains("every OPEN invoice your state DB has"),
-        "the alert must say the named invoice is one example and how to enumerate the rest: {detail}"
+        detail.contains("ONE ALERT COVERS THEM ALL")
+            && detail.contains("not only this one")
+            && !detail.contains("enumerate"),
+        "the alert must say the named invoice is not the whole set, without instructing an \
+         enumeration the runbook no longer provides: {detail}"
     );
     // WHY a restore is unsafe, not just that it is. Without the mechanism an operator reads the
     // refusal as excessive caution and restores anyway: the rollback drops lnrent's record of which
     // refunds already paid while phoenixd keeps that history, so the second pay is not a risk but
     // the expected outcome of re-driving a restored PENDING refund.
     assert!(
-        detail.contains("rolls back lnrent's only record of which refunds already \
-             paid")
+        detail.contains("the record of which refunds already \
+             paid lived in the lost index")
             && detail.contains("while phoenixd keeps that history"),
         "and must give the MECHANISM, so the refusal does not read as mere caution: {detail}"
     );

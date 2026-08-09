@@ -586,16 +586,16 @@ async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_i
         // on lnrent-ole, every one a double pay; repair TOOLING is lnrent-8scw.
         format!(
             "INDEX DIVERGENCE: invoice {invoice_id} absent from {INDEX_DB_FILE} — payment state \
-             UNKNOWN: lnrent can neither book nor expire it. THAT IS ONE EXAMPLE, not the set: one \
-             alert covers them all, so enumerate every OPEN invoice your state DB has that \
-             {INDEX_DB_FILE} lacks. REMEDY, IN THIS ORDER: run `lnrent listing withdraw` FIRST, \
-             while the daemon is still up — it needs the daemon's socket — then stop the daemon, \
-             then follow the index-divergence section in docs/go-live.md. There is NO safe repair \
-             and NO repair command: do NOT restore from a backup — it rolls back lnrent's only \
-             record of which refunds already paid, while phoenixd keeps that history, so the \
-             daemon can pay a refund a SECOND time. Keep the data dir and phoenixd's history \
-             intact and settle the affected buyers out of band from phoenixd's own records. Leave \
-             phoenixd on its original wallet, and never recreate or expire an affected invoice."
+             UNKNOWN: lnrent can neither book nor expire it. ONE ALERT COVERS THEM ALL: every \
+             invoice whose index row is gone is affected, not only this one. REMEDY, IN THIS \
+             ORDER: run `lnrent listing withdraw` FIRST, while the daemon is still up (it needs \
+             the daemon's socket), THEN stop it — and do NOT restart it, and do NOT restore a \
+             backup. Either can pay a refund a SECOND time: the record of which refunds already \
+             paid lived in the lost index, while phoenixd keeps that history. Keep the data dir \
+             and phoenixd's history intact and settle the affected buyers out of band from \
+             phoenixd's own records. Full detail in the index-divergence section of \
+             docs/go-live.md. Leave phoenixd on its original wallet, and never recreate or expire \
+             an affected invoice."
         ),
     )
     .await;

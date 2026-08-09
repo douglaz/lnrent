@@ -276,196 +276,53 @@ refuses orders it cannot service.
     after your local invoice had already expired: that is watched only for a grace window past the
     expiry, and past it lnrent cannot book it at all — settle that buyer from phoenixd's records.
 
-  - *Index divergence — a missing `phoenixd_index.db` row.* Payment state becomes UNKNOWN: lnrent can neither observe,
-    book, nor expire it. **There is no safe repair for this one** — the section is short, and the second step
-    explains why rather than asking you to take it on trust.
+  - *Index divergence — a missing `phoenixd_index.db` row.* Payment state becomes UNKNOWN: lnrent
+    can neither observe, book, nor expire it. **There is no safe repair.** Read this whole entry
+    before touching anything; the only command in it is the first one.
 
-    1. **Stop new orders FIRST, while the daemon is still up.** `listing withdraw` talks to the
-       daemon over `<data-dir>/lnrent.sock`, so it cannot run once you have stopped it — and every
-       order accepted from here is another buyer to settle by hand:
+    1. **Stop new orders, while the daemon is still up.** `listing withdraw` reaches the daemon over
+       `<data-dir>/lnrent.sock`, so it cannot run once you have stopped it — and every order taken
+       from here is another buyer you will have to settle by hand:
 
        ```sh
        lnrent --data-dir /path/to/your/data-dir listing withdraw
        ```
 
-       THEN stop the daemon.
-    2. **Enumerate the set.** The alert names one invoice however many are affected. With the
-       daemon now STOPPED, read both databases (read-only — never write them; the daemon is the
-       sole writer, ADR-0001):
+    2. **Do not restore from a backup.** Deciding a backup is safe means knowing which refunds
+       already went out, and lnrent's only record of that is `phoenixd_pay` — inside the very index
+       whose loss IS this incident. The phoenixd WALLET is also deliberately excluded from lnrent's
+       backups (`backup.rs:27-34`), so restoring reinstates lnrent's commitments without the wallet
+       that fulfilled them: a clean dedup map over payments phoenixd still holds. The daemon can
+       then re-drive a restored PENDING refund and **pay it a second time**. A restore can also
+       resurrect a subscription that was since terminated, and drops every order, capture and ledger
+       row committed after the backup. Three schemes for proving a restore safe were refuted across
+       eight review passes on lnrent-ole, every one a double pay; do not reconstruct them.
 
-       **Run this as a script with `bash`, not pasted line by line.** It needs the `sqlite3` CLI —
-       lnrent does not ship it and nothing else in this runbook requires it, so install it first
-       — the script probes for what it needs rather than trusting a version string, because `-json`
-       arrived in SQLite 3.33 and a 3.26 host would pass a bare "is it 3.x?" check and then fail
-       mid-incident. Its header matters as much as its queries:
+    3. **Do not restart the daemon either, and understand why.** The dedup map lives in the index
+       you just lost, so `pay_get` finds no row — indistinguishable from "never paid". The boot
+       drive then re-sends any `refund_attempt` still PENDING whose payment already went out, and
+       the same applies to `sweep_attempt` (that one pays the operator, so it costs routing fees
+       rather than a buyer's money — still a second payment). A payment that is merely IN FLIGHT is
+       not a negative answer either: it can still settle while a new one is posted alongside it.
+       The restore is not the hazard; the missing dedup map is, and the incident already handed you
+       that.
 
-       ```sh
-       #!/usr/bin/env bash
-       set -euo pipefail                  # see "fail closed" below — this is load-bearing
-       export LC_ALL=C                    # sort AND comm must agree on collation; see below
-       sqlite3 -json ":memory:" "SELECT 1;" >/dev/null 2>&1 \
-         || { echo "this sqlite3 has no -json (needs 3.33+); install a newer one"; exit 1; }
-       DD=/path/to/your/data-dir          # the daemon's LNRENT_DATA_DIR
-       WORK=$(mktemp -d)                  # query COPIES, never the live files
-       for db in lnrent.sqlite phoenixd_index.db; do
-         cp "$DD/$db" "$WORK/" || { echo "FAILED to copy $db"; exit 1; }
-         # BOTH journal shapes: lnrent.sqlite runs WAL (-wal/-shm), phoenixd_index.db runs
-         # SQLite's default rollback journal (-journal). Copying only one shape leaves the other
-         # database's hot sidecar behind, and that failure is SILENT -- see below.
-         for side in "$db-wal" "$db-shm" "$db-journal"; do
-           # Absent is normal (a clean exit removes them). A copy that FAILS is not:
-           # it would silently drop committed transactions, so the affected set below would be
-           # WRONG -- and its job is telling you which buyers to settle by hand.
-           [ -e "$DD/$side" ] || continue
-           cp "$DD/$side" "$WORK/" || { echo "FAILED to copy $side"; exit 1; }
-         done
-       done
-       sqlite3 "$WORK/lnrent.sqlite" \
-         "SELECT id FROM invoice WHERE status='OPEN';" | LC_ALL=C sort > "$WORK/open.txt"
-       sqlite3 "$WORK/phoenixd_index.db" \
-         "SELECT invoice_id FROM phoenixd_invoice;" | LC_ALL=C sort > "$WORK/indexed.txt"
-       comm -23 "$WORK/open.txt" "$WORK/indexed.txt" > "$WORK/affected.txt"
+    4. **Settle the affected buyers out of band, from phoenixd's own records.** phoenixd knows what
+       it received; lnrent no longer does. Note that lnrent's own view is incomplete in two ways
+       that matter here: a settlement that landed after lnrent expired its invoice is owed but has
+       no OPEN row (lnrent-hh4q), and `received_msat` is only written at capture, which never
+       happened — so the net-of-fee figure exists only at phoenixd.
 
-       # An invoice id is not a buyer. Resolve who to pay, where, and how much -- this is the
-       # ONLY output of the whole procedure, and settling out of band needs all three.
-       # -json, NOT -column: on sqlite3 before 3.33 column mode truncates to fixed widths, which
-       # would silently cut 73-char invoice ids and 64-hex pubkeys -- at exit 0, past every guard
-       # above -- in the one output this whole procedure produces.
-       # Build the id list as its OWN checked step. A failure inside $(...) is DISCARDED -- the
-       # enclosing command's status comes from sqlite3, so `set -euo pipefail` would not abort, the
-       # IN list would be empty or partial, and the buyer file would come back short. Silently.
-       IDS=$(paste -sd, - < "$WORK/affected.txt" | sed "s/[^,]*/'&'/g") \
-         || { echo "FAILED to build the affected-id list"; exit 1; }
-       [ -s "$WORK/affected.txt" ] && [ -n "$IDS" ] \
-         || { echo "affected.txt empty or id list blank -- STOP and find out why"; exit 1; }
-       [ "$(printf '%s' "$IDS" | tr -cd , | wc -c)" -eq "$(( $(wc -l < "$WORK/affected.txt") - 1 ))" ] \
-         || { echo "id list does not match affected.txt line count"; exit 1; }
-
-       sqlite3 -json "$WORK/lnrent.sqlite" "
-         SELECT i.id, i.amount_sat, i.received_msat, s.buyer_pubkey, s.refund_dest
-           FROM invoice i LEFT JOIN subscription s ON s.id = i.subscription_id
-          WHERE i.id IN ($IDS)
-          ORDER BY i.id;" | tee "$WORK/affected-buyers.txt"
-       ```
-
-       **Fail closed.** Without `pipefail`, `sqlite3 ... | LC_ALL=C sort > file` reports *sort's*
-       exit status — so a query that dies on the corrupt database this incident is about exits 0 and
-       leaves an EMPTY file. The `comm` then prints nothing, and an empty affected set reads exactly
-       like "nothing is wrong" — while the buyers you needed to settle are the ones missing from it.
-       `set -e` stops the script at the first failure instead; if it stops, fix the failing read
-       before going further, and do not read the absence of output as good news.
-
-       (The state file is `lnrent.sqlite`, not `state.db`.) Every scratch file goes under `$WORK`,
-       the `mktemp -d` directory, and never a fixed `/tmp/<name>` path: on a multi-user host another
-       user can pre-create such a name as a symlink, and a shell redirection run by the daemon's
-       owner would then truncate whatever it points at — including the stopped daemon's state DB.
-
-       **Why copies, and why every sidecar.** An unclean exit leaves a hot journal, and the two
-       databases use DIFFERENT journal shapes: `lnrent.sqlite` is WAL (`store.rs`, `journal_mode=WAL`)
-       so its sidecars are `-wal`/`-shm`, while `phoenixd_index.db` is opened plain
-       (`phoenixd_backend.rs`, no journal-mode pragma) and so uses SQLite's default rollback journal,
-       `-journal`. Leaving a sidecar behind does NOT raise an error: SQLite opens the lone main file,
-       finds nothing to roll back or replay, and hands you mid-transaction pages as though they were
-       committed. `set -euo pipefail` cannot catch that — nothing fails. An uncommitted
-       `phoenixd_invoice` row read as real would drop its invoice from the affected set, quietly
-       omitting a buyer from the list this whole procedure exists to produce.
-
-       Query the copy WITHOUT `mode=ro`: replaying a journal needs to write, which works when you own
-       the data dir and **fails to open the database at all when you do not** (the daemon's service
-       account owns it, or it is a read-only snapshot). That write must never touch the live files
-       anyway — the daemon is the sole writer, ADR-0001 — so it happens on the copy.
-
-       **This list is OPEN invoices only, and that is not the whole set.** A payment that landed
-       after lnrent had already EXPIRED its invoice is still owed back to the buyer — normal
-       operation refunds it (`capture.rs`) — but it has no OPEN row, so it appears nowhere above,
-       and past local expiry the settlement poll was its only observer: exactly what a missing
-       index row blinds. Cross-check phoenixd's own record of incoming payments against the
-       invoices lnrent shows as PAID; anything phoenixd received that lnrent never captured is
-       owed too, and is invisible to the query above. Tracked as lnrent-hh4q.
-
-       `"$WORK/affected-buyers.txt"` is the output that matters: for each invoice lnrent can no
-       longer establish, the buyer's pubkey, their refund destination, and what they paid. A row
-       with an empty `buyer_pubkey` means the invoice never reached a subscription — nothing was
-       provisioned, so there is no service to settle, but the receipt may still be at phoenixd.
-       `received_msat` will be NULL on every row here and that is expected: it is written only when
-       a settlement is CAPTURED (`capture.rs`), which is precisely what never happened. Settle from
-       `amount_sat` — what the buyer's invoice asked for — cross-checked against what phoenixd
-       records as actually received, which is the only place the net-of-fee figure now exists.
-    3. **There is no safe repair — do NOT restore from a backup.** This is the whole remedy, and it
-       is deliberately short.
-
-       A whole-directory `lnrentd restore` looks like the fix and is not. Deciding whether a
-       candidate backup is safe means knowing which refunds already went out, and lnrent's only
-       record of that is `phoenixd_pay` in the very index whose loss IS this incident — so the
-       check would be reasoning from the corrupted evidence. Worse, the phoenixd WALLET is
-       deliberately not in lnrent's backup (`backup.rs:27-34`): restoring reinstates lnrent's
-       commitments without the wallet that fulfilled them, leaving a clean dedup map over payments
-       phoenixd still holds. The daemon can then re-drive a restored PENDING refund, resolve a fresh
-       bolt11, and **pay it a second time**. A restore can also resurrect a subscription that was
-       since terminated, and silently drop every order, capture and ledger row committed after the
-       backup.
-
-       This is settled, not cautious: three schemes for proving a restore safe were refuted across
-       eight review passes on lnrent-ole, every one a double pay. Do not reconstruct them.
-
-       Instead:
-
-       1. Keep the data directory and phoenixd's payment history exactly as they are.
-       2. New orders are already stopped — you withdrew the listing in step 1, before the daemon
-          went down. Leave it withdrawn until this is resolved.
-       3. Settle the buyers in `"$WORK/affected-buyers.txt"` out of band, checking each against
-          phoenixd's own record of what it actually received.
-       4. `lnrent reconcile` is report-only and no command reconstructs the missing rows; writing
-          the DB by hand is forbidden (the daemon is the sole sqlite writer, ADR-0001).
-
-       Repair TOOLING — which can be sound, because it can enumerate phoenixd's outgoing payments
-       as the authority instead of trusting the local index — is tracked as lnrent-8scw.
-
-       **Do NOT restart the daemon yet, and understand why.** The same map this section warns a
-       restore would roll back, `phoenixd_pay`, lives in the index you just lost — and a missing row
-       reads exactly like "never paid" (`pay_get` returns no row, so the next drive PREPARES and
-       sends a new payment). Any `refund_attempt` still in `PENDING` whose payment actually went out
-       before the loss will therefore be paid a SECOND time on the first drive after restart. The
-       restore is not the hazard; the missing dedup map is, and you already have that.
-
-       So before the daemon comes back, list what is at risk and check each one against phoenixd:
-
-       ```sh
-       sqlite3 -json "$WORK/lnrent.sqlite" \
-         "SELECT 'refund' AS kind, id, dest, resolved_bolt11, resolution_gen, amount_sat,
-                 idempotency_key
-            FROM refund_attempt WHERE status='PENDING'
-          UNION ALL
-          SELECT 'sweep' AS kind, id, dest, NULL, NULL, amount_sat, idempotency_key
-            FROM sweep_attempt  WHERE status='PENDING';"
-       ```
-
-       BOTH tables, because the boot drive finishes every PENDING sweep too (`sweep.rs`) and its
-       started-evidence check reads the same lost `phoenixd_pay`. A re-sent sweep pays the OPERATOR,
-       not a buyer, so it costs routing fees rather than a customer's money — but it is still a
-       second payment, and a stuck sweep can sit PENDING indefinitely.
-
-       Use `resolved_bolt11`, not `dest`. For the ordinary LN-address or LNURL refund `dest` is the
-       ADDRESS; the concrete invoice actually paid is the resolved bolt11, generation-bound by
-       `resolution_gen` (`refund.rs`), and its payment hash is what correlates a row to phoenixd's
-       outgoing history. A PENDING row whose `resolved_bolt11` is NULL was never resolved, so
-       nothing went out for it.
-
-       If the list is empty, nothing here can double-pay and you may restart. Otherwise look each
-       row's payment hash up in phoenixd's outgoing history. THREE outcomes, and only one of them
-       permits a restart:
-
-       - **No record** — nothing was sent; the daemon may drive it.
-       - **A record that already PAID** — restarting re-sends it.
-       - **A record still IN FLIGHT** (present, unpaid, no `completedAt`) — equally unsafe. It can
-         still settle, and after the index loss the daemon takes the no-row path and may POST again
-         while the first attempt is live. An in-flight payment is an unanswered question, not a
-         negative answer: wait for it to reach a terminal state before deciding.
-
-       For anything but "no record", leave the daemon down and settle those buyers out of band too.
-       There is no supported way to tell lnrent "this one is already done" — that is precisely what
-       lnrent-8scw's tool must provide. Restarting to keep unaffected subscribers served is a real
-       pressure; it is also how the second payment happens.
+    **Why this entry names no queries.** Enumerating the exposure and deciding whether a restart is
+    safe depend on daemon-internal semantics — which column holds the paid invoice, which states
+    count as unsafe, which tables hold pending money, which journal each database uses. A shell
+    procedure is a second implementation of that, in a medium with no test harness, maintained
+    beside the code rather than with it; every revision is an unverified claim, and its failure mode
+    is an empty result that reads like good news. ADR-0001 keeps those semantics in one audited
+    codebase, which is also why `lnrent reconcile` is deliberately report-only. The enumeration and
+    the pre-restart safety gate belong in the repair tool tracked as **lnrent-8scw**, where each
+    check is code a test can deliberately break. Until it exists, this incident is handled by
+    stopping, not by improvising.
 
     Never recreate or expire an affected invoice.
 
