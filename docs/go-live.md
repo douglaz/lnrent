@@ -366,6 +366,14 @@ refuses orders it cannot service.
        account owns it, or it is a read-only snapshot). That write must never touch the live files
        anyway — the daemon is the sole writer, ADR-0001 — so it happens on the copy.
 
+       **This list is OPEN invoices only, and that is not the whole set.** A payment that landed
+       after lnrent had already EXPIRED its invoice is still owed back to the buyer — normal
+       operation refunds it (`capture.rs`) — but it has no OPEN row, so it appears nowhere above,
+       and past local expiry the settlement poll was its only observer: exactly what a missing
+       index row blinds. Cross-check phoenixd's own record of incoming payments against the
+       invoices lnrent shows as PAID; anything phoenixd received that lnrent never captured is
+       owed too, and is invisible to the query above. Tracked as lnrent-hh4q.
+
        `"$WORK/affected-buyers.txt"` is the output that matters: for each invoice lnrent can no
        longer establish, the buyer's pubkey, their refund destination, and what they paid. A row
        with an empty `buyer_pubkey` means the invoice never reached a subscription — nothing was
@@ -415,11 +423,19 @@ refuses orders it cannot service.
 
        ```sh
        sqlite3 -json "$WORK/lnrent.sqlite" \
-         "SELECT id, subscription_id, dest, amount_sat, idempotency_key
-            FROM refund_attempt WHERE status='PENDING';"
+         "SELECT 'refund' AS kind, id, dest, amount_sat, idempotency_key
+            FROM refund_attempt WHERE status='PENDING'
+          UNION ALL
+          SELECT 'sweep'  AS kind, id, dest, amount_sat, idempotency_key
+            FROM sweep_attempt  WHERE status='PENDING';"
        ```
 
-       If that list is empty, nothing can double-pay and you may restart. If it is not, each row is
+       BOTH tables, because the boot drive finishes every PENDING sweep too (`sweep.rs`) and its
+       started-evidence check reads the same lost `phoenixd_pay`. A re-sent sweep pays the OPERATOR,
+       not a buyer, so it costs routing fees rather than a customer's money — but it is still a
+       second payment, and a stuck sweep can sit PENDING indefinitely.
+
+       If that list is empty, nothing here can double-pay and you may restart. If it is not, each row is
        a refund the daemon will re-send: confirm against phoenixd's own outgoing history whether it
        already paid. There is no supported way to tell lnrent "this one is already done" — that is
        exactly what lnrent-8scw's tool must provide — so if any already paid, leave the daemon down

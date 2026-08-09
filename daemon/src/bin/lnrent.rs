@@ -950,7 +950,7 @@ mod tests {
                 },
                 {
                     "subject": "index_diverged",
-                    "detail": "INDEX DIVERGENCE; REMEDY: restore from your NEWEST backup",
+                    "detail": "INDEX DIVERGENCE; REMEDY: do NOT restore from a backup",
                     "at": 800
                 },
             ],
@@ -967,7 +967,7 @@ mod tests {
         );
         assert!(
             rendered.contains("alerted_at=800 \u{b7} index_diverged \u{b7} INDEX DIVERGENCE; \
-                               REMEDY: restore from your NEWEST backup"),
+                               REMEDY: do NOT restore from a backup"),
             "the second condition's OWN remedy, not a summary of the first: {rendered}"
         );
     }
