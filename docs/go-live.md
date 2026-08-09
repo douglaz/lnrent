@@ -280,9 +280,18 @@ refuses orders it cannot service.
     book, nor expire it. **There is no safe repair for this one** — the section is short, and the second step
     explains why rather than asking you to take it on trust.
 
-    1. **Enumerate the set.** The alert names one invoice however many are affected. With the
-       daemon STOPPED, read both databases (read-only — never write them; the daemon is the sole
-       writer, ADR-0001):
+    1. **Stop new orders FIRST, while the daemon is still up.** `listing withdraw` talks to the
+       daemon over `<data-dir>/lnrent.sock`, so it cannot run once you have stopped it — and every
+       order accepted from here is another buyer to settle by hand:
+
+       ```sh
+       lnrent --data-dir /path/to/your/data-dir listing withdraw
+       ```
+
+       THEN stop the daemon.
+    2. **Enumerate the set.** The alert names one invoice however many are affected. With the
+       daemon now STOPPED, read both databases (read-only — never write them; the daemon is the
+       sole writer, ADR-0001):
 
        **Run this as a script with `bash`, not pasted line by line.** Its header matters as much as
        its queries:
@@ -311,7 +320,15 @@ refuses orders it cannot service.
        sqlite3 "$WORK/phoenixd_index.db" \
          "SELECT invoice_id FROM phoenixd_invoice;" | LC_ALL=C sort > "$WORK/indexed.txt"
        comm -23 "$WORK/open.txt" "$WORK/indexed.txt" > "$WORK/affected.txt"
-       cat "$WORK/affected.txt"                       # the affected set
+
+       # An invoice id is not a buyer. Resolve who to pay, where, and how much -- this is the
+       # ONLY output of the whole procedure, and settling out of band needs all three.
+       sqlite3 -header -column "$WORK/lnrent.sqlite" "
+         SELECT i.id, i.amount_sat, i.received_msat, s.buyer_pubkey, s.refund_dest
+           FROM invoice i LEFT JOIN subscription s ON s.id = i.subscription_id
+          WHERE i.id IN ($(paste -sd, -           < "$WORK/affected.txt" \
+                          | sed "s/[^,]*/'&'/g"))
+          ORDER BY i.id;" | tee "$WORK/affected-buyers.txt"
        ```
 
        **Fail closed.** Without `pipefail`, `sqlite3 ... | LC_ALL=C sort > file` reports *sort's*
@@ -341,9 +358,13 @@ refuses orders it cannot service.
        account owns it, or it is a read-only snapshot). That write must never touch the live files
        anyway — the daemon is the sole writer, ADR-0001 — so it happens on the copy.
 
-       `"$WORK/affected.txt"` is the scope of the incident: the invoices whose payment state
-       lnrent can no longer establish. You need it to settle those buyers by hand below.
-    2. **There is no safe repair — do NOT restore from a backup.** This is the whole remedy, and it
+       `"$WORK/affected-buyers.txt"` is the output that matters: for each invoice lnrent can no
+       longer establish, the buyer's pubkey, their refund destination, and what they paid. A row
+       with an empty `buyer_pubkey` means the invoice never reached a subscription — nothing was
+       provisioned, so there is no service to settle, but the receipt may still be at phoenixd.
+       `received_msat` is the NET wallet credit (receive fees already taken) and is what you can
+       actually return; `amount_sat` is what the buyer sent.
+    3. **There is no safe repair — do NOT restore from a backup.** This is the whole remedy, and it
        is deliberately short.
 
        A whole-directory `lnrentd restore` looks like the fix and is not. Deciding whether a
@@ -363,9 +384,10 @@ refuses orders it cannot service.
        Instead:
 
        1. Keep the data directory and phoenixd's payment history exactly as they are.
-       2. Stop taking new orders: `lnrent listing withdraw`.
-       3. Settle the buyers in `"$WORK/affected.txt"` out of band, from phoenixd's own records of
-          what it received.
+       2. New orders are already stopped — you withdrew the listing in step 1, before the daemon
+          went down. Leave it withdrawn until this is resolved.
+       3. Settle the buyers in `"$WORK/affected-buyers.txt"` out of band, checking each against
+          phoenixd's own record of what it actually received.
        4. `lnrent reconcile` is report-only and no command reconstructs the missing rows; writing
           the DB by hand is forbidden (the daemon is the sole sqlite writer, ADR-0001).
 

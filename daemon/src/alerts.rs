@@ -187,9 +187,14 @@ pub async fn recent_alerts(
     let glob = format!("outbox:alert:{wire}:*");
     store
         .read(move |conn| {
+            // Select by the alert ID and the window ONLY, then validate `msg_type` in the loop
+            // below beside the payload. Filtering on it here would make a row whose `msg_type` is
+            // corrupt simply vanish from the result set — and a vanished row cannot be refused, so
+            // an unreadable history could return total=0, the false all-clear this whole function
+            // is written to prevent.
             let mut stmt = conn.prepare(
-                "SELECT payload_json, created_at FROM outbox
-                  WHERE msg_type='operator.alert' AND created_at >= ?1 AND id GLOB ?2
+                "SELECT payload_json, created_at, msg_type FROM outbox
+                  WHERE created_at >= ?1 AND id GLOB ?2
                   ORDER BY created_at DESC, id DESC",
             )?;
             let mut rows = stmt.query(params![since, glob])?;
@@ -198,6 +203,12 @@ pub async fn recent_alerts(
             while let Some(row) = rows.next()? {
                 let payload: String = row.get(0)?;
                 let at: i64 = row.get(1)?;
+                let msg_type: String = row.get(2)?;
+                if msg_type != "operator.alert" {
+                    return Err(anyhow::anyhow!(
+                        "outbox row under an alert id carries msg_type {msg_type}, not operator.alert"
+                    ));
+                }
                 // Do NOT swallow a row that will not decode. Dropping it silently would report
                 // FEWER incidents than exist — or zero — and the operator surface reads a zero as
                 // "nothing is wrong", which is the one thing this history must never say by
@@ -719,6 +730,45 @@ mod tests {
     // history saying that is the single failure this whole alert path exists to prevent. Neither arm
     // is reachable through the dispatcher, so without these two tests deleting either `return Err`
     // in favour of a `continue` leaves the suite green and silently under-counts live incidents.
+
+    // The THIRD corruption shape, and the one a WHERE clause used to hide. `msg_type` was filtered
+    // in SQL, so a row whose type is corrupt never reached the loop at all — it vanished from the
+    // result set, and a vanished row cannot be refused. The history then read as total=0: a false
+    // all-clear produced by the very query written to make one impossible.
+    #[tokio::test]
+    async fn a_corrupt_msg_type_under_an_alert_id_refuses_rather_than_vanishing() {
+        let store = mem_store();
+        // A perfectly good alert payload, filed under a row whose msg_type has been mangled.
+        let payload = serde_json::to_string(&Msg::OperatorAlert(lnrent_wire::OperatorAlert {
+            kind: AlertKind::SettlementUnbookable.wire_str().to_string(),
+            subject: "fee_credit".into(),
+            detail: "REMEDY: fund it".into(),
+        }))
+        .unwrap();
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO outbox
+                        (id, recipient, subscription_id, msg_type, payload_json, state, attempts,
+                         created_at)
+                     VALUES ('outbox:alert:settlement_unbookable:s:1000', 'npub', NULL,
+                             'operator.alertX', ?1, 'PENDING', 0, 1000)",
+                    rusqlite::params![payload],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let err = match recent_alerts(&store, AlertKind::SettlementUnbookable, 0).await {
+            Ok(_) => panic!("a corrupt msg_type must not read as a readable, empty history"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("operator.alertX"),
+            "and must name the type it found: {err:#}"
+        );
+    }
 
     #[tokio::test]
     async fn a_non_alert_payload_under_an_alert_id_refuses_rather_than_under_counts() {
