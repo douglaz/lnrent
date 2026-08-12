@@ -22,6 +22,15 @@ the loop.
   holds roughly three runs' worth, so a runaway drains a deliberately small wallet and
   stops; and a reaper sweeps EVERY droplet carrying the test tag at job START, so a
   SIGKILLed run is cleaned by the next one rather than by a `Drop` impl that never fires.
+  > **AMENDED 2026-08-12 — "three runs' worth" is not implementable on phoenixd.** Live
+  > measurements (2026-07-25/26) that pre-date this ADR but were not confronted by it: a new
+  > phoenixd node's FIRST receive triggers ACINQ auto-liquidity (2M-sat channel minimum) at
+  > ~22,277 sat in fees — the staging node's 25k funding netted 2,723 sat spendable — and any
+  > amount below the channel threshold strands as fee credit, which cannot pay an invoice
+  > (lnrent-itw). A literal three-runs wallet cannot buy anything. Decided policy: fund once
+  > with 50,000 sat from fenix-ostracoda (~27k spendable ≈ 27 runs at 1,000 sat/run), refill
+  > manually below 3,000 sat. The by-construction bound survives with the corrected number:
+  > a runaway drains ≤ ~27k sat and stops. Details in lnrent-nfj.
 - **Time is compressed and nothing runs at real cadence.** `period=10m / renew_lead=5m /
   retention=5m`. A run is ~90 minutes, floored by the fixed one-hour order-invoice expiry.
 - **Failure reaches the operator by Nostr DM through the real `OperatorAlert` path**,
