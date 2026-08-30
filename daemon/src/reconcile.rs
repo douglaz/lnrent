@@ -1202,13 +1202,15 @@ impl Reconciler {
         // This is ALSO what holds a settlement lnrent cannot BOOK, and lnrent-gc7's open question
         // (comment 82: alert-only, or hold the suspend?) is answered here rather than left to a new
         // coupling: the HOLD already exists. A phoenixd fee-credit refusal (ADR-0019) lives in
-        // `received_amount_msat`/`spendable_credit_msat`, NOT in `lookup` — which still reports the
-        // invoice `Paid` — so `renewal_settlement_pending` sees Paid and defers, indefinitely, for
-        // as long as the wallet stays unfunded. The cascade gc7's comment 79 feared (refused renewal
-        // -> paid_through frozen -> fire_suspend -> destroy) therefore cannot run: a buyer who paid
-        // is not suspended, and the alert's threshold does not race `effective_suspend_at` because
-        // that deadline never fires while the settlement is outstanding. The alert is what gets the
-        // wallet funded; this is what protects the buyer meanwhile. Verified by
+        // `received_amount_msat`/`spendable_credit_msat`, NOT in the status seam — phoenixd keeps the
+        // `lookup_settlement_by_ref` default, which delegates to its `lookup_settlement`, and that
+        // still reports the invoice `Paid` — so `renewal_settlement_pending` sees Paid and defers,
+        // indefinitely, for as long as the wallet stays unfunded. The cascade gc7's comment 79
+        // feared (refused renewal -> paid_through frozen -> fire_suspend -> destroy) therefore
+        // cannot run: a buyer who paid is not suspended, and the alert's threshold does not race
+        // `effective_suspend_at` because that deadline never fires while the settlement is
+        // outstanding. The alert is what gets the wallet funded; this is what protects the buyer
+        // meanwhile. Verified by
         // `a_fee_credit_refused_renewal_never_suspends_the_buyer_who_paid`.
         if self.renewal_settlement_pending(sub_id).await? {
             return Ok(false);
@@ -2350,6 +2352,9 @@ mod tests {
             rep.suspended, 0,
             "renewal_settlement_pending: an unanswerable backend defers suspend, never lapses the sub"
         );
+        // The suspend arm was SELECTED and declined (`fire_suspend` -> false -> noops). Without this,
+        // every assert below passes vacuously the day a seed change stops making this sub due.
+        assert_eq!(rep.noops, 1, "the suspend arm ran and declined");
         assert_eq!(sub_state(&store, "s1").await, "ACTIVE");
         assert!(
             !suspend_marker.exists(),

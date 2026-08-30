@@ -30,6 +30,12 @@ pub trait PaymentBackend: Send + Sync {
         expiry_s: u32,
         external_id: &str, // binds settlement -> order (ADR-0009); deterministic per invoice class (§6.6)
     ) -> Result<Invoice>;
+    /// Invoice status alone. Both real backends answer it by delegating to
+    /// [`lookup_settlement`](Self::lookup_settlement) (`lnv2_backend.rs`, `phoenixd_backend.rs`), so
+    /// it inherits that bare-id seam's blind spot verbatim — lnv2 answers a MISSING index row
+    /// `Expired`, which over a PAID invoice is the lnrent-l07s bug. **Never decide EXPIRY or
+    /// SETTLEMENT through this seam**; that is
+    /// [`lookup_settlement_by_ref`](Self::lookup_settlement_by_ref).
     async fn lookup(&self, id: &str) -> Result<PaymentStatus>;
     /// Invoice status PLUS the backend's observed-LIVE settled_at. `Some(ts)` is returned ONLY for a
     /// settlement the backend observed live (its true time is known); `None` for a not-paid invoice
