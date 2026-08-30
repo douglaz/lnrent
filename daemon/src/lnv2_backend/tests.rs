@@ -3,6 +3,7 @@
 //! run under `cargo test --workspace` without a federation, and each asserts the intended arm actually
 //! FIRED ([9A] non-vacuity). The pure fee/selection helpers are tested directly where appropriate.
 
+#![allow(clippy::disallowed_methods)] // tests exercise the bare seams; clippy.toml guards production
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
 use std::sync::{Arc, Mutex};

@@ -19,6 +19,7 @@
 //!      devimint dev-fed --exec $TESTBIN --ignored --nocapture"
 #![cfg(feature = "fedimint")]
 
+#![allow(clippy::disallowed_methods)] // tests exercise the bare seams; clippy.toml guards production
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;

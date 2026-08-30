@@ -1993,6 +1993,7 @@ impl PaymentBackend for PhoenixdPayment {
         Ok(inv)
     }
 
+    #[allow(clippy::disallowed_methods)] // the backend's own internal delegate, not a decider
     async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
         Ok(self.lookup_settlement(id).await?.0)
     }

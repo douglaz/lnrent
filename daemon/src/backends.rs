@@ -53,7 +53,8 @@ pub trait PaymentBackend: Send + Sync {
     /// A backend that keeps its own correlation index can lose a row. Given only the id, "the index
     /// has no such id" is indistinguishable from "the index deliberately RETIRED that id" — lnv2
     /// rewrites `invoice_id` in place when it replaces a CANCELED row for the same `external_id`
-    /// (`lnv2_backend.rs` `idx_insert`), so the main store can still hold a retired id for which
+    /// (`idx_insert`, `lnv2_backend.rs:1543` — the `ON CONFLICT(external_id) DO UPDATE` at `:1554`
+    /// is the rewrite), so the main store can still hold a retired id for which
     /// `Expired` is the honest answer. Answering `Expired` for the LOST case as well expires an
     /// invoice the buyer already paid: reconcile treats `Expired` as licence to expire and `Err` as
     /// "defer, retry next tick" (lnrent-l07s). With the `external_id` the two separate cleanly — a
@@ -63,10 +64,13 @@ pub trait PaymentBackend: Send + Sync {
     /// Default: delegate to [`lookup_settlement`](Self::lookup_settlement). Correct for any backend
     /// with no separate correlation index to lose (`MockPayment`), where the id alone is already the
     /// whole truth — and equally for one that HAS an index but already fails closed on a missing row
-    /// from the bare id alone, which is why phoenixd keeps the default (`phoenixd_backend.rs`
-    /// `lookup_settlement` bails on `incoming_for_invoice` returning `None`, and nothing ever deletes
-    /// a `phoenixd_invoice` row). A backend must override this ONLY when it can answer a missing row
+    /// from the bare id alone, which is why phoenixd keeps the default: its `lookup_settlement`
+    /// bails on a missing index row (`phoenixd_backend.rs:2022`), and no code path deletes a
+    /// `phoenixd_invoice` row — index GC is deferred to lnrent-rpa, recorded in that module's
+    /// header (`phoenixd_backend.rs:159`), which any future reaper must reconcile with this
+    /// contract. A backend must override this ONLY when it can answer a missing row
     /// `Expired`; then it owes the caller the retired-vs-lost distinction above.
+    #[allow(clippy::disallowed_methods)] // the default body IS the sanctioned delegate
     async fn lookup_settlement_by_ref(
         &self,
         id: &str,
@@ -703,6 +707,8 @@ impl PaymentBackend for MockPayment {
 
 #[cfg(test)]
 mod mock_payment_tests {
+    // Tests exercise the bare seams directly; clippy.toml's denylist protects production deciders.
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     #[tokio::test]
@@ -824,83 +830,5 @@ mod mock_payment_tests {
         assert_eq!(got.amount_sat, 1000);
         assert_eq!(got.settled_at, 42);
         assert_eq!(pushed.external_id, got.external_id);
-    }
-
-    /// lnrent-l07s: the fail-closed guarantee holds only if every caller that DECIDES expiry or
-    /// settlement goes through `lookup_settlement_by_ref` — a future bare-seam call (dot-lookup
-    /// or dot-lookup_settlement) in reconcile/supervisor would silently reopen the
-    /// paid-reported-as-EXPIRED hole while every behavioural test here stays green. So pin the
-    /// bare seams' call sites exactly. The needles are built at runtime so this test's own
-    /// source never matches them.
-    ///
-    /// Deliberately NOT the `available_balance_msat` scan's split-at-first-`#[cfg(test)]`
-    /// heuristic (ipc.rs): several files (phoenixd_backend.rs, ipc.rs, order_intake.rs, …) carry
-    /// cfg(test) items MID-file, so that split silently excludes production code that follows one
-    /// — an invariant test that can under-count is a check that passes without proving. Instead:
-    /// WHOLE-file raw counts (skipping `tests.rs` siblings, which are test-only by convention)
-    /// pinned against a per-file allowlist naming what each occurrence is. Adding ANY call to a
-    /// bare seam — production or test double — fails this test and forces the answer to one
-    /// question: should this be `lookup_settlement_by_ref` instead?
-    #[test]
-    fn bare_lookup_seams_have_exactly_the_allowlisted_call_sites() {
-        fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    collect_rs(&path, out);
-                } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
-                    && path.file_name().and_then(|n| n.to_str()) != Some("tests.rs")
-                {
-                    out.push(path);
-                }
-            }
-        }
-        // (file, allowed dot-lookup, allowed dot-lookup_settlement), with what each one is:
-        //   backends.rs        3 lookup: MockPayment assertions in this test module;
-        //                      1 lookup_settlement: the `lookup_settlement_by_ref` default body.
-        //   lnv2_backend.rs    1 lookup_settlement: `lookup()`'s own one-line delegate.
-        //   phoenixd_backend.rs 1 lookup_settlement: same delegate shape.
-        //   order_intake.rs    2/2: the two delegating test wrappers.
-        //   reconcile.rs       1/1: the `RefLookupFailsClosed` test double's delegates.
-        //   supervisor.rs      2/2: the two delegating test doubles.
-        let lookup_needle = format!(".{}(", "lookup");
-        let settlement_needle = format!(".{}(", "lookup_settlement");
-        let allow: &[(&str, usize, usize)] = &[
-            ("backends.rs", 3, 1),
-            ("lnv2_backend.rs", 0, 1),
-            ("phoenixd_backend.rs", 0, 1),
-            ("order_intake.rs", 2, 2),
-            ("reconcile.rs", 1, 1),
-            ("supervisor.rs", 2, 2),
-        ];
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        collect_rs(&src, &mut files);
-        for f in &files {
-            let name = f.file_name().and_then(|n| n.to_str()).unwrap().to_string();
-            let text = std::fs::read_to_string(f).unwrap();
-            let (want_lookup, want_settlement) = allow
-                .iter()
-                .find(|(n, _, _)| *n == name)
-                .map(|(_, a, b)| (*a, *b))
-                .unwrap_or((0, 0));
-            // The two counts are independent: a dot-lookup_settlement occurrence never matches
-            // the lookup needle, because the char after "lookup" is '_' there, not '('.
-            assert_eq!(
-                text.matches(&lookup_needle).count(),
-                want_lookup,
-                "{name}: `{lookup_needle}` call-site count changed. Production callers deciding \
-                 expiry or settlement must use lookup_settlement_by_ref (lnrent-l07s); if this is \
-                 a new test double, update the allowlist in this test WITH a comment naming it"
-            );
-            assert_eq!(
-                text.matches(&settlement_needle).count(),
-                want_settlement,
-                "{name}: `{settlement_needle}` call-site count changed. Production callers \
-                 deciding expiry or settlement must use lookup_settlement_by_ref (lnrent-l07s); \
-                 if this is a new test double, update the allowlist in this test WITH a comment \
-                 naming it"
-            );
-        }
     }
 }

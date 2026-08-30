@@ -1070,6 +1070,7 @@ impl PaymentBackend for Lnv2Payment {
         Ok(inv)
     }
 
+    #[allow(clippy::disallowed_methods)] // the backend's own internal delegate, not a decider
     async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
         Ok(self.lookup_settlement(id).await?.0)
     }
@@ -1099,7 +1100,7 @@ impl PaymentBackend for Lnv2Payment {
     ///     have PAID must never be reported as an unpaid expiry;
     /// (d) NO row and a FOREIGN backend's id (a `phoenixd-<hash>` id surviving a backend switch) —
     ///     `Expired` plus a warn, never `Err`. `order_invoice_may_expire` returns `Ok(false)` on
-    ///     `Err` (`reconcile.rs`), so an id that errors forever would hold the ORDER open and its
+    ///     `Err` (`order_invoice_may_expire`, `reconcile.rs:621`), so an id that errors forever would hold the ORDER open and its
     ///     capacity reservation HELD forever.
     ///
     /// KNOWN, BOUNDED interaction with this module's own reaper, recorded the way phoenixd records

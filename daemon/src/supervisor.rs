@@ -2143,6 +2143,8 @@ pub(crate) fn duration_secs(s: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    // Test doubles delegate through the bare seams; clippy.toml's denylist guards production.
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use crate::backends::{Invoice, REDACTED_PHOENIXD_VERSION};
     use crate::store::migrate;
