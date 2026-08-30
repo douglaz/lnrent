@@ -1955,7 +1955,14 @@ async fn settlement_catch_up(
         suspend_not_before,
     ) in open
     {
-        match payment.lookup_settlement(&inv_id).await {
+        // By REF (lnrent-l07s): the row already carries its `external_id`, so a backend whose
+        // correlation index lost this invoice answers `Err` — taken by the arm at the bottom of this
+        // match, which leaves the invoice OPEN for the next catch-up pass — instead of a false
+        // `Expired` that silently drops a settled invoice out of catch-up forever.
+        match payment
+            .lookup_settlement_by_ref(&inv_id, &external_id)
+            .await
+        {
             Ok((PaymentStatus::Paid, observed)) => {
                 let now = clock.now();
                 let received_msat = match payment.received_amount_msat(&inv_id).await {
