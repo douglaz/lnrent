@@ -66,6 +66,10 @@ secret (HKDF domain `lnrent:fedimint:v1`, §4.6) or the phoenixd seed (HKDF doma
 `lnrent:phoenixd:v1`). One backup covers identity AND the wallet — but restoring the wallet
 also needs the backend's config alongside the seed (the federation invite for Fedimint;
 phoenixd's channel recovery runs through its ACINQ peer), so backup must include it.
+**phoenixd caveat (true as of 2026-08-30):** the phoenixd derivation is DESIGNED (ADR-0018),
+not yet built. Until it lands, a phoenixd wallet keeps its own independently generated seed
+and its own config, and BOTH must be backed up separately — the Operator seed does not
+cover them, and restoring the seed alone regenerates the config (access is lost).
 _Avoid_: wallet, private key.
 
 **Master identity**:
