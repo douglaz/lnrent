@@ -4236,4 +4236,127 @@ mod tests {
         );
         assert_eq!(rec_refunds, 0, "no refund for an in-window recovered order");
     }
+
+    /// A `MockPayment`-backed double whose REF seam fails closed the way lnv2 does when the index row
+    /// for the `external_id` is gone (lnrent-l07s). The BARE seam still delegates and still reports the
+    /// settled invoice PAID, so the two seams disagree — which is exactly what lets the test below tell
+    /// which one settlement catch-up asks.
+    struct RefSeamFailsClosed(Arc<crate::backends::MockPayment>);
+
+    #[async_trait]
+    impl PaymentBackend for RefSeamFailsClosed {
+        async fn create_invoice(
+            &self,
+            amount_sat: u64,
+            memo: &str,
+            expiry_secs: u32,
+            external_id: &str,
+        ) -> Result<Invoice> {
+            self.0
+                .create_invoice(amount_sat, memo, expiry_secs, external_id)
+                .await
+        }
+        async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
+            self.0.lookup(id).await
+        }
+        async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            self.0.lookup_settlement(id).await
+        }
+        async fn lookup_settlement_by_ref(
+            &self,
+            id: &str,
+            ext: &str,
+        ) -> Result<(PaymentStatus, Option<i64>)> {
+            anyhow::bail!("invoice {id} (external_id {ext}): index row missing")
+        }
+        async fn pay(&self, dest: &str, amount_sat: u64, key: &str) -> Result<String> {
+            self.0.pay(dest, amount_sat, key).await
+        }
+        async fn payment_status(&self, id: &str) -> Result<PayStatus> {
+            self.0.payment_status(id).await
+        }
+        async fn payment_status_by_key(&self, key: &str) -> Result<PayStatus> {
+            self.0.payment_status_by_key(key).await
+        }
+        async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+            self.0.watch().await
+        }
+    }
+
+    // lnrent-l07s: settlement catch-up is the ONLY recovery path for a settlement the live watch
+    // missed, so it must ask the REF seam. Asking the bare one would book a settlement the backend can
+    // no longer correlate — and, on a real lost row, would let a `false` Expired drop the invoice out
+    // of catch-up for good. On `Err` the invoice stays OPEN and the next pass retries; reverting the
+    // call site to `lookup_settlement` captures instead, which is what these asserts pin.
+    #[tokio::test]
+    async fn settlement_catch_up_defers_when_the_backend_cannot_correlate_the_invoice() {
+        use crate::backends::MockPayment;
+        use crate::clock::TestClock;
+        use crate::store::migrate;
+        use rusqlite::{params, Connection};
+
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let store = Store::spawn(conn);
+
+        let mock = Arc::new(MockPayment::new());
+        mock.set_now(0); // the order invoice expires at 0 + 1000 = 1000
+        let inv = mock
+            .create_invoice(1000, "lnrent order o1", 1000, "order:o1")
+            .await
+            .unwrap();
+        let (inv_id, expires_at) = (inv.id.clone(), inv.expires_at);
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO subscription
+                        (id, state, period_s, renew_lead_s, retention_s, next_deadline, created_at, updated_at)
+                     VALUES ('o1','PENDING',100,10,500,1000,0,0)",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO invoice
+                        (id, subscription_id, external_id, kind, amount_sat, status, expires_at, issued_at)
+                     VALUES (?1,'o1','order:o1','order',1000,'OPEN',?2,0)",
+                    params![inv_id, expires_at],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // Paid IN WINDOW at the backend: through the bare seam this order captures and provisions.
+        mock.settle("order:o1", 500).unwrap();
+
+        let payment: Arc<dyn PaymentBackend> = Arc::new(RefSeamFailsClosed(mock));
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1500));
+        let caught = settlement_catch_up(&store, &payment, &clock).await.unwrap();
+
+        assert_eq!(caught, 0, "an unanswerable backend captures nothing");
+        let (state, status, refunds): (String, String, i64) = store
+            .read(|c| {
+                let state =
+                    c.query_row("SELECT state FROM subscription WHERE id='o1'", [], |r| {
+                        r.get(0)
+                    })?;
+                let status = c.query_row(
+                    "SELECT status FROM invoice WHERE external_id='order:o1'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let refunds: i64 =
+                    c.query_row("SELECT count(*) FROM refund_attempt", [], |r| r.get(0))?;
+                Ok((state, status, refunds))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "OPEN",
+            "the invoice stays OPEN, so the next catch-up pass re-asks"
+        );
+        assert_eq!(
+            state, "PENDING",
+            "nothing is provisioned off a settlement the backend cannot correlate"
+        );
+        assert_eq!(refunds, 0, "and nothing is refunded off it either");
+    }
 }

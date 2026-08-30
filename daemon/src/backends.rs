@@ -36,8 +36,9 @@ pub trait PaymentBackend: Send + Sync {
     /// OR a RECOVERY settlement (settled while the daemon was down, so the true time is unknown). The
     /// supervisor's settlement catch-up uses `Some(ts)` EXACTLY and caps only on `None` — so a late
     /// LIVE payment refunds (capture's g5p gate) instead of being stamped just-in-window and wrongly
-    /// provisioned (lnrent-zwk). This bare-id seam remains for callers without an `external_id`;
-    /// expiry and settlement decisions use `lookup_settlement_by_ref` below.
+    /// provisioned (lnrent-zwk). No production caller decides expiry or settlement through this
+    /// bare-id seam any more (lnrent-l07s): it survives as the delegate the
+    /// `lookup_settlement_by_ref` default calls and as each backend's own internal helper.
     async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)>;
     /// Exactly [`lookup_settlement`](Self::lookup_settlement), but told the invoice's `external_id`
     /// (the ADR-0009 correlation token) alongside its id. **Every caller that decides EXPIRY or
@@ -55,7 +56,11 @@ pub trait PaymentBackend: Send + Sync {
     ///
     /// Default: delegate to [`lookup_settlement`](Self::lookup_settlement). Correct for any backend
     /// with no separate correlation index to lose (`MockPayment`), where the id alone is already the
-    /// whole truth.
+    /// whole truth — and equally for one that HAS an index but already fails closed on a missing row
+    /// from the bare id alone, which is why phoenixd keeps the default (`phoenixd_backend.rs`
+    /// `lookup_settlement` bails on `incoming_for_invoice` returning `None`, and nothing ever deletes
+    /// a `phoenixd_invoice` row). A backend must override this ONLY when it can answer a missing row
+    /// `Expired`; then it owes the caller the retired-vs-lost distinction above.
     async fn lookup_settlement_by_ref(
         &self,
         id: &str,

@@ -1101,6 +1101,19 @@ impl PaymentBackend for Lnv2Payment {
     ///     `Expired` plus a warn, never `Err`. `order_invoice_may_expire` returns `Ok(false)` on
     ///     `Err` (`reconcile.rs`), so an id that errors forever would hold the ORDER open and its
     ///     capacity reservation HELD forever.
+    ///
+    /// KNOWN, BOUNDED interaction with this module's own reaper, recorded the way phoenixd records
+    /// its own (`phoenixd_backend.rs`, "NOTE for lnrent-rpa"): `gc_lnv2_invoice_index` below deletes
+    /// rows `INVOICE_INDEX_RETENTION_SECS` past their `expires_at`, so a main-store invoice STILL
+    /// `OPEN` that long after expiry — reconcile dead for the whole retention window — would take (c)
+    /// and stay deferred until an operator acts. No money is at risk: the reaper touches only
+    /// `status='CANCELED'`, and CANCELED is only ever reached by a CAS on `status='OPEN'`
+    /// (`idx_mark_canceled` below), so a reaped row was definitively unpaid. Separating "reaped" from
+    /// "lost" needs the
+    /// main store's own `expires_at`, which this seam is deliberately not told.
+    ///
+    /// (c) surfaces to operator LOGS only. The durable condition-ledger notification for it is
+    /// lnrent-unbooked-settlement-condition-ledger-hwni / lnrent-3p71, NOT this bead.
     async fn lookup_settlement_by_ref(
         &self,
         id: &str,

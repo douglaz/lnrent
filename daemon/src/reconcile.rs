@@ -2302,6 +2302,63 @@ mod tests {
         );
     }
 
+    // lnrent-l07s, the RENEWAL half: the other two arms that decide expiry must ask the REF seam too,
+    // or a lost correlation reads as a definitive `Expired`. One tick exercises both, because an OPEN
+    // renewal invoice past its expiry is selected by `expire_open_renewals` while the same sub is due
+    // for suspend through `renewal_settlement_pending`. The double answers the BARE seam exactly as
+    // `MockPayment` does (an unsettled invoice past expiry -> `Expired`), so reverting either arm to
+    // `lookup_settlement` suspends the buyer and expires the invoice — which is what these asserts pin.
+    #[tokio::test]
+    async fn renewal_arms_defer_on_a_fail_closed_backend_and_leave_the_invoice_open() {
+        let store = mem_store();
+        let (recipe, suspend_marker, _destroy_marker) = marker_recipe();
+        let inner = Arc::new(crate::backends::MockPayment::new());
+        let inv = inner
+            .create_invoice(100, "lnrent renewal s1", 100, "renewal:s1")
+            .await
+            .unwrap();
+        // paid_through=1000 with the cursor at it: the tick below is due to suspend.
+        seed_sub(&store, "s1", "ACTIVE", "buyerhex", Some(1000), 500, Some(1000)).await;
+        seed_invoice(
+            &store,
+            &inv.id,
+            "s1",
+            "renewal:s1",
+            "renewal",
+            "OPEN",
+            Some(inv.expires_at),
+        )
+        .await;
+        assert!(
+            inv.expires_at <= 1000,
+            "precondition: the invoice is past expiry at the tick, so `expire_open_renewals` selects it"
+        );
+        let r = Reconciler::new(store.clone(), Arc::new(RefLookupFailsClosed(inner)), recipe);
+
+        let rep = r.reconcile_tick(1000).await.unwrap();
+
+        assert_eq!(
+            rep.suspended, 0,
+            "renewal_settlement_pending: an unanswerable backend defers suspend, never lapses the sub"
+        );
+        assert_eq!(sub_state(&store, "s1").await, "ACTIVE");
+        assert!(
+            !suspend_marker.exists(),
+            "and the suspend hook must not have run"
+        );
+        assert_eq!(
+            inv_status(&store, "renewal:s1").await,
+            "OPEN",
+            "expire_open_renewals: the invoice stays OPEN for the next tick rather than expiring an \
+             invoice the buyer may have paid"
+        );
+        assert_eq!(
+            sub_next_deadline(&store, "s1").await,
+            Some(1000),
+            "the cursor stays due, so the next tick retries both arms"
+        );
+    }
+
     // Test 1b: an ACTIVE sub at its soft_date -> a renewal invoice (renew:auto external_id) +
     // billing.invoice + billing.notice outbox rows; the cursor advances to paid_through, state ACTIVE.
     #[tokio::test]
