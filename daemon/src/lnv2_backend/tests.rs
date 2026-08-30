@@ -1304,7 +1304,10 @@ async fn a_retired_invoice_id_still_reports_expired_through_the_ref_lookup() {
         )
         .unwrap();
     let fresh = backend.create_invoice(1000, "m", 3600, ext).await.unwrap();
-    assert_ne!(fresh.id, dead.id, "[9A]: the replacement retired the old id");
+    assert_ne!(
+        fresh.id, dead.id,
+        "[9A]: the replacement retired the old id"
+    );
 
     assert_eq!(
         backend

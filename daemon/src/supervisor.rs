@@ -2935,6 +2935,13 @@ mod tests {
         async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
             self.0.lookup_settlement(id).await
         }
+        async fn lookup_settlement_by_ref(
+            &self,
+            id: &str,
+            ext: &str,
+        ) -> Result<(PaymentStatus, Option<i64>)> {
+            self.0.lookup_settlement_by_ref(id, ext).await
+        }
         async fn pay(&self, dest: &str, amount_sat: u64, key: &str) -> Result<String> {
             self.0.pay(dest, amount_sat, key).await
         }
