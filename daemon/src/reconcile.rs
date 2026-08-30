@@ -2318,7 +2318,16 @@ mod tests {
             .await
             .unwrap();
         // paid_through=1000 with the cursor at it: the tick below is due to suspend.
-        seed_sub(&store, "s1", "ACTIVE", "buyerhex", Some(1000), 500, Some(1000)).await;
+        seed_sub(
+            &store,
+            "s1",
+            "ACTIVE",
+            "buyerhex",
+            Some(1000),
+            500,
+            Some(1000),
+        )
+        .await;
         seed_invoice(
             &store,
             &inv.id,
