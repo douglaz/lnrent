@@ -16,6 +16,9 @@ use serde_json::{json, Value};
 use super::*;
 use crate::backends::{Lnv2Probe, PayStatus, PaymentBackend, PaymentStatus};
 use crate::clock::{Clock, TestClock};
+use crate::recipe::Recipe;
+use crate::reconcile::Reconciler;
+use crate::store::{migrate, Store};
 
 // --------------------------------------------------------------------------------------------------
 // Scripted fake fedimint seam
@@ -1332,7 +1335,7 @@ async fn a_retired_invoice_id_still_reports_expired_through_the_ref_lookup() {
 /// forever would hold the ORDER open and its capacity reservation HELD forever. lnv2 can only fail
 /// closed for ids it could have minted itself.
 #[tokio::test]
-async fn a_foreign_backend_invoice_id_reports_expired_not_err() {
+async fn a_foreign_backend_invoice_id_expires_order_and_releases_reservation() {
     let fake = FakeLnv2Ops::new();
     let backend = backend_with(fake, clock(5_000));
     assert_eq!(
@@ -1342,6 +1345,61 @@ async fn a_foreign_backend_invoice_id_reports_expired_not_err() {
             .unwrap(),
         (PaymentStatus::Expired, None),
         "a foreign-prefix id must never stall reconcile behind a permanent Err"
+    );
+
+    let conn = Connection::open_in_memory().unwrap();
+    migrate(&conn).unwrap();
+    let store = Store::spawn(conn);
+    store
+        .transaction(|tx| {
+            tx.execute_batch(
+                "INSERT INTO subscription
+                    (id, recipe_id, state, buyer_pubkey, period_s, renew_lead_s, retention_s,
+                     next_deadline, created_at, updated_at)
+                 VALUES ('o1', 'dummy', 'PENDING', 'buyer', 100, 10, 0, 5, 0, 0);
+                 INSERT INTO invoice
+                    (id, subscription_id, external_id, kind, amount_sat, status, expires_at,
+                     issued_at)
+                 VALUES ('phoenixd-deadbeef', 'o1', 'order:o1', 'order', 100, 'OPEN', 5, 0);
+                 INSERT INTO reservation
+                    (id, order_id, resources_json, ports_json, state, expires_at, created_at)
+                 VALUES ('res-o1', 'o1', '{\"cpu\":1}', '{\"count\":0}', 'HELD', 5, 0);",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let recipe = Recipe::load(format!(
+        "{}/../recipes/dummy",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let reconciler = Reconciler::new(store.clone(), Arc::new(backend), recipe);
+
+    let report = reconciler.reconcile_tick(5_000).await.unwrap();
+    assert_eq!(report.expired, 1, "the foreign-id order expiry fired");
+    let states: (String, String, String) = store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT s.state, i.status, r.state
+                   FROM subscription s
+                   JOIN invoice i ON i.subscription_id=s.id
+                   JOIN reservation r ON r.order_id=s.id
+                  WHERE s.id='o1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        states,
+        (
+            "EXPIRED".to_string(),
+            "EXPIRED".to_string(),
+            "RELEASED".to_string()
+        ),
+        "foreign ids expire the order and invoice and release the capacity reservation"
     );
 }
 
