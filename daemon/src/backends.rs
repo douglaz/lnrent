@@ -36,7 +36,8 @@ pub trait PaymentBackend: Send + Sync {
     /// OR a RECOVERY settlement (settled while the daemon was down, so the true time is unknown). The
     /// supervisor's settlement catch-up uses `Some(ts)` EXACTLY and caps only on `None` — so a late
     /// LIVE payment refunds (capture's g5p gate) instead of being stamped just-in-window and wrongly
-    /// provisioned (lnrent-zwk). `lookup()` stays the status-only seam reconcile uses (unchanged).
+    /// provisioned (lnrent-zwk). This bare-id seam remains for callers without an `external_id`;
+    /// expiry and settlement decisions use `lookup_settlement_by_ref` below.
     async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)>;
     /// Exactly [`lookup_settlement`](Self::lookup_settlement), but told the invoice's `external_id`
     /// (the ADR-0009 correlation token) alongside its id. **Every caller that decides EXPIRY or
@@ -746,8 +747,8 @@ mod mock_payment_tests {
 
     /// A backend that answers `lookup_settlement` with a distinctive sentinel and overrides NOTHING
     /// else — so what `lookup_settlement_by_ref` returns can only have come from the trait's DEFAULT
-    /// body. That default is what lets the ten test-only `impl PaymentBackend` blocks across the
-    /// daemon (and every non-lnv2 backend) keep compiling and behaving unchanged (lnrent-l07s).
+    /// body. That default is what lets existing test-only `PaymentBackend` implementations and
+    /// every non-lnv2 backend keep compiling and behaving unchanged (lnrent-l07s).
     struct SentinelLookup;
 
     #[async_trait]
