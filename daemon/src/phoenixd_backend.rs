@@ -2008,7 +2008,8 @@ impl PaymentBackend for PhoenixdPayment {
             // makes every caller defer and retry (reconcile.rs:617/660/1240 and the supervisor's
             // settlement catch-up all treat it as "retry next tick"), so the divergence surfaces in
             // operator logs instead of silently expiring paid money. Same discipline, and the same
-            // reason, as lnv2's `PAID_UNRECOVERED` bail (`lnv2_backend.rs:1074`) and
+            // reason, as lnv2's `PAID_UNRECOVERED` bail (`classify_indexed_settlement` in
+            // `lnv2_backend.rs`, shared by both of its settlement seams) and
             // `received_amount_msat` below. NOTE for lnrent-rpa, the deferred index-GC bead: a
             // reaper that deletes rows must keep any invoice reconcile can still `lookup`
             // (y4m.15's rule), or it turns this fail-closed arm into a permanent retry.
