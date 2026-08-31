@@ -20,6 +20,21 @@ each names something that the act of writing it changes or dates, and both drift
 file carried them.
 
 ## Done (this drive)
+- lnrent-l07s lnv2 fails CLOSED on a lost index row — merged #84 (squash `bdeeb04`), CLOSED.
+  rb-lite 5 panel rounds; codex bot round 2 raised two P1s (both accepted: the hand-counted
+  call-site scan replaced by a DERIVED `clippy.toml` denylist per AGENTS.md's no-frozen-counts
+  rule — landing lnrent-njv's measured mechanism for these two seams — plus `file:line` cites),
+  round 3 clean. Full 8-leg matrix EXIT=0 twice, CI 3x pass, `nix build` 0 post-merge, two
+  operator mutations each reddening exactly its pinning assertion.
+  **Merged under the degraded path with explicit operator authorization**: `bot-gate` returned
+  BLOCKED_UNATTRIBUTED (exit 4) on both the initial and the live recheck, because this bot
+  version emits NO wrapper on a clean round. GitHub status was "All Systems Operational" — so
+  this was NOT a forge incident, and the substitution rests on round 3 completing clean after
+  the push plus CI green on the exact SHA. Gate JSON kept at `.git/merge-gate-84.json` and
+  `/tmp/merge-evidence-84.json`. The gap itself is now lnrent-botgate-summary-table-unattributable-r4gf
+  (P2 dogfood) — EXPECT exit 4 on every clean PR until it is resolved.
+  Follow-ups filed rather than folded in: `lookup-seam-collapse-hbye` (P3, the skeptic's
+  SIMPLIFY), and a producer note added to `lnrent-3p71` for arm (c)'s missing operator alert.
 - lnrent-qvjz probe outgoingbyhash before a no-row phoenixd payment — merged #83, CLOSED.
   Six panel rounds (round 4 INVERTED, cut 93 net lines). Six beads filed rather than folded in.
 - lnrent-gc7 SettlementUnbookable operator alert — merged #82, CLOSED. 47 commits. Two operator
@@ -32,14 +47,8 @@ file carried them.
   merged); CONTEXT.md "Operator seed" repaired (phoenixd derivation is designed, not built).
 
 ## Now — order decided 2026-08-30 (panel fable + codex, independent, reconciled; both agreed)
-1. **`lnrent-l07s`** (P1). Recut: NOT blocked — the receive-lookup seam widening is folded in;
-   Q1 (retired-id path) answered "defensive, no production route found"; Q2 decided (foreign-backend
-   prefix keeps `Expired`, never `Err` — an `Err` holds the order's reservation forever). Break-test
-   inverted to expect `Err`, RED on master first. Its alert half stays behind hwni. NOTE the wording:
-   "reproduced" means reproduced IN A TEST by `DELETE FROM lnv2_invoice`; no production route to a
-   lost PAID row is named (the backup captures the index; GC deletes only CANCELED). The arm is
-   fail-open and closing it is right — its rank rests on parity with phoenixd and on cost.
-2. **`lnrent-7wbo`** (P1) — BEFORE the hwni ADR, by this file's own rule: money holes close before
+1. ~~`lnrent-l07s`~~ **DONE — merged #84 (squash `bdeeb04`), CLOSED 2026-08-31.** See Done above.
+2. **`lnrent-7wbo`** (P1) — NEXT. BEFORE the hwni ADR, by this file's own rule: money holes close before
    reporting ships. Recut: probe seam decided (a trait method keyed by payment hash, default
    "cannot answer" -> park + SweepStuck, never FAILED without backend evidence); "nothing alerts"
    corrected (SweepFailed DOES fire — with the wrong story); acceptance asserts exactly ONE outbound
