@@ -116,8 +116,11 @@
 //!    carry evidence, which is a change above this layer. Anyone adding a route into `start_pay`
 //!    must probe the hash first.
 //!
-//!    None of this makes restarting on a diverged index safe — the sweeper reaches its own terminal
-//!    decision without any of it (`daemon/src/sweep.rs:489-502`). `docs/go-live.md` is authoritative
+//!    None of this makes restarting on a diverged index safe. The sweeper's expired-intent recovery
+//!    arm no longer reaches a terminal decision without evidence — it probes this backend by hash
+//!    ([`PaymentBackend::outbound_status_by_payment_hash`], lnrent-7wbo) — but its RESTORED-stale-
+//!    `FAILED` arm still terminalizes unprobed, the same uxbd shape one layer up (`daemon/src/
+//!    sweep.rs`, the `PayStatus::Failed` arm of `Sweeper::drive`). `docs/go-live.md` is authoritative
 //!    for what an operator should do.
 //!
 //! ## Cross-order same-invoice guard (ported [8A], lnrent-85t)
@@ -381,9 +384,12 @@ pub(crate) struct PhoenixdOutgoing {
     pub(crate) is_paid: bool,
     pub(crate) fees_msat: u64,
     /// phoenixd's `completedAt`, epoch MILLIS, ABSENT while the payment is in flight. See the
-    /// measured truth table on the recovery arm in `pay_inner`. Decoded and carried so the shape is
-    /// recorded in the type and pinned by a test; lnrent does NOT resolve a payment off it — the
-    /// reasons are on that truth table.
+    /// measured truth table on the recovery arm in `pay_inner`. `pay_inner` does NOT resolve a
+    /// payment off it — the reasons are on that truth table (attribution, lnrent-ole), and they are
+    /// about what RESOLVING there would unlock: a re-POST of the same payment hash. The read-only
+    /// [`PaymentBackend::outbound_status_by_payment_hash`] probe DOES classify with it (lnrent-7wbo);
+    /// it starts no payment, and its caller uses the answer only to decide whether it may terminalize
+    /// a ledger row it would otherwise terminalize on NO evidence at all.
     pub(crate) completed_at_ms: Option<i64>,
 }
 
@@ -2169,6 +2175,31 @@ impl PaymentBackend for PhoenixdPayment {
 
     async fn payment_started_by_key(&self, idempotency_key: &str) -> Result<bool> {
         Ok(pay_status_by_key(&self.index, idempotency_key)?.is_some())
+    }
+
+    /// phoenixd CAN answer this (lnrent-7wbo): the node's own `outgoingbyhash` record is hash-keyed
+    /// history, so unlike the two `_by_key` reads above — which are pure `phoenixd_pay` index reads and
+    /// therefore answer `Unknown`/`false` for a payment a lost or restored index forgot — it does not
+    /// go blind when the local index does.
+    async fn outbound_status_by_payment_hash(
+        &self,
+        payment_hash: &str,
+    ) -> Result<Option<PayStatus>> {
+        // Classified by the MEASURED discriminator carried on the record: `completedAt` is the
+        // TERMINAL marker, ABSENT while the payment is in flight (`PhoenixdOutgoing::completed_at_ms`,
+        // `phoenixd_backend.rs:386-393`, and the live truth table in `pay_inner`). An `Err` propagates
+        // unchanged — a transport failure refutes nothing, and the trait requires callers to treat it
+        // exactly like `Ok(None)`.
+        match self.ops.outgoing_by_hash(payment_hash).await? {
+            Some(record) if record.is_paid => Ok(Some(PayStatus::Succeeded)),
+            Some(record) if record.completed_at_ms.is_none() => Ok(Some(PayStatus::Pending)),
+            // Completed and NOT paid: phoenixd positively reports a terminal outbound failure.
+            Some(_) => Ok(Some(PayStatus::Failed)),
+            // phoenixd's clean 404. Absence IS authoritative here, and only here: "an unknown hash is
+            // a clean 404. So a `PREPARED` key whose hash 404s provably never paid"
+            // (`phoenixd_backend.rs:66-68`, fact 3, live-measured).
+            None => Ok(Some(PayStatus::Failed)),
+        }
     }
 
     async fn available_balance_msat(&self) -> Result<Option<u64>> {

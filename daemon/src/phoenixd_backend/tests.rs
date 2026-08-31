@@ -1975,6 +1975,64 @@ async fn a_terminal_outgoing_record_stays_pending_but_reads_differently() {
     );
 }
 
+/// lnrent-7wbo: the read-only hash-keyed probe, over all four shapes `outgoingbyhash` can produce
+/// plus the transport failure. This is what lets a caller that would otherwise terminalize a ledger
+/// row on NO evidence (the sweep's expired-intent recovery arm) demand a positive answer first.
+///
+/// Note the deliberate contrast with `a_terminal_outgoing_record_stays_pending_but_reads_differently`
+/// above: on a completed-and-unpaid record the PAY arm stays `Pending`, because resolving it there
+/// would unlock a re-POST of the same hash that cannot be attributed to this attempt (lnrent-ole).
+/// This probe starts no payment, so it reports what phoenixd says.
+#[tokio::test]
+async fn outbound_status_by_payment_hash_classifies_every_measured_outgoing_shape() {
+    let ops = FakePhoenixdOps::new();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+
+    let record = |hash: &str, is_paid: bool, completed_at_ms: Option<i64>| PhoenixdOutgoing {
+        payment_id: format!("pay-{hash}"),
+        payment_hash: hash.to_string(),
+        is_paid,
+        fees_msat: 4_480,
+        completed_at_ms,
+    };
+
+    // isPaid=true (completedAt SET, as the live node always emits it) -> the money left.
+    ops.set_outgoing(record("aa", true, Some(MEASURED_COMPLETED_AT_MS)));
+    assert_eq!(
+        be.outbound_status_by_payment_hash("aa").await.unwrap(),
+        Some(PayStatus::Succeeded)
+    );
+
+    // completedAt ABSENT is the measured IN-FLIGHT shape — never a licence to terminalize.
+    ops.set_outgoing(record("bb", false, None));
+    assert_eq!(
+        be.outbound_status_by_payment_hash("bb").await.unwrap(),
+        Some(PayStatus::Pending)
+    );
+
+    // Completed and NOT paid: the measured terminal-failure shape.
+    ops.set_outgoing(record("cc", false, Some(MEASURED_COMPLETED_AT_MS)));
+    assert_eq!(
+        be.outbound_status_by_payment_hash("cc").await.unwrap(),
+        Some(PayStatus::Failed)
+    );
+
+    // An unseeded hash is phoenixd's clean 404, where absence IS authoritative (fact 3): this hash
+    // provably never paid. It is `Some(Failed)`, NOT `None` — `None` means "cannot answer".
+    assert_eq!(
+        be.outbound_status_by_payment_hash("dd").await.unwrap(),
+        Some(PayStatus::Failed)
+    );
+
+    // A transport failure is an `Err` the caller must treat like "cannot answer" — never the clean
+    // 404 above, which would terminalize a payment phoenixd was simply not asked about.
+    ops.fail_outgoing_by_hash();
+    assert!(
+        be.outbound_status_by_payment_hash("aa").await.is_err(),
+        "an unanswered probe must never be read as evidence"
+    );
+}
+
 #[tokio::test]
 async fn recovery_never_retries_an_unpaid_outgoing_record() {
     let ops = FakePhoenixdOps::new();
