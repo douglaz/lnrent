@@ -1358,9 +1358,14 @@ mod tests {
         async fn create_invoice(&self, a: u64, m: &str, e: u32, x: &str) -> Result<Invoice> {
             self.inner.create_invoice(a, m, e, x).await
         }
+        // The two bare seams delegate like everything else here. A test double's delegate is not a
+        // decider, which is what clippy.toml's denylist guards (lnrent-l07s); the inner fake's own
+        // `unimplemented!` is what any sweep test reaching them would hit.
+        #[allow(clippy::disallowed_methods)]
         async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
             self.inner.lookup(id).await
         }
+        #[allow(clippy::disallowed_methods)]
         async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
             self.inner.lookup_settlement(id).await
         }
