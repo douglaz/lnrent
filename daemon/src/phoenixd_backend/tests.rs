@@ -1982,8 +1982,9 @@ async fn a_terminal_outgoing_record_stays_pending_but_reads_differently() {
 }
 
 /// lnrent-7wbo: the read-only hash-keyed probe, over every `outgoingbyhash` response shape plus a
-/// transport failure. The measured discriminator classifies paid, in-flight, and completed-unpaid
-/// records; phoenixd's clean 404 is authoritative absence.
+/// transport failure. The measured discriminator classifies paid and in-flight records; a
+/// completed-unpaid record is NOT hash-wide evidence (one unattributed record per hash), while a
+/// clean 404 is — absence of any record for the hash, bounded to the answering wallet (lnrent-k0yl).
 #[tokio::test]
 async fn outbound_status_by_payment_hash_classifies_every_measured_shape() {
     let ops = FakePhoenixdOps::new();
@@ -2011,14 +2012,15 @@ async fn outbound_status_by_payment_hash_classifies_every_measured_shape() {
         Some(PayStatus::Pending)
     );
 
-    // completedAt SET and NOT paid is the measured terminal-failure shape.
+    // completedAt SET and NOT paid proves only that THIS record failed. `outgoingbyhash` returns one
+    // unattributed record when a hash has several attempts, so another may have paid or may still be
+    // in flight: `None` ("cannot answer"), never a licence to terminalize.
     ops.set_outgoing(record("cc", false, Some(MEASURED_COMPLETED_AT_MS)));
-    assert_eq!(
-        be.outbound_status_by_payment_hash("cc").await.unwrap(),
-        Some(PayStatus::Failed)
-    );
+    assert_eq!(be.outbound_status_by_payment_hash("cc").await.unwrap(), None);
 
-    // An unseeded hash is phoenixd's clean 404: authoritative absence for this hash.
+    // An unseeded hash is phoenixd's clean 404: no record for this hash at all, so nothing is in
+    // flight and nothing succeeded. This is what lets a sweep whose pay never left resolve rather
+    // than park forever; its authority is wallet-scoped (lnrent-k0yl), not unbounded.
     assert_eq!(
         be.outbound_status_by_payment_hash("dd").await.unwrap(),
         Some(PayStatus::Failed)
