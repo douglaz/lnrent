@@ -319,9 +319,8 @@ impl Sweeper {
         }
     }
 
-    /// Alert when a sweep row remains PENDING past the stuck threshold — `reason` names the cause
-    /// so the operator DM is accurate on both livelock arms (an ambiguous in-flight pay, or a
-    /// bolt11-less row needing manual handling).
+    /// Alert when a sweep row remains PENDING past the stuck threshold. `reason` names the cause so
+    /// the operator DM stays accurate for every caller.
     async fn maybe_alert_stuck(&self, row: &PendingSweep, now: i64, reason: &str) {
         let age = now - row.created_at;
         if age < SWEEP_STUCK_ALERT_S {
@@ -505,6 +504,7 @@ impl Sweeper {
                         // fresh bolt11, which is a different `sweep:<payment_hash>` row that phoenixd's
                         // hash-keyed dedup cannot catch — a genuine SECOND outbound payment. So ask the
                         // backend by PAYMENT HASH, and terminalize only on a positive answer.
+                        let invalid_reason = e.message();
                         let park_reason = match self
                             .payment
                             .outbound_status_by_payment_hash(&payment_hash)
@@ -522,35 +522,27 @@ impl Sweeper {
                             // "no such record" from a backend whose absence is authoritative). This is
                             // the one answer that licenses terminalizing, and the one where the
                             // existing SweepFailed DM tells the operator something true.
-                            //
-                            // NO SHIPPED BACKEND ANSWERS THIS TODAY. The probe has exactly three
-                            // impls — the trait default (`backends.rs:255`), phoenixd, and this
-                            // module's test double — and phoenixd's two non-evidence shapes both
-                            // return `Ok(None)` (`phoenixd_backend.rs:2220-2228`). So this arm
-                            // carries the trait's terminal answer and is exercised only by the test
-                            // double until lnrent-9dzu (phoenixd) or lnrent-8l8c (lnv2) gives it a
-                            // producer. It stays because a backend that gains hash-authoritative
-                            // absence must be able to terminalize; deleting it would make the
-                            // contract unrepresentable in the caller.
                             Ok(Some(PayStatus::Failed)) => {
-                                let reason =
-                                    format!("intent no longer payable during recovery: {}", e.message());
+                                let reason = format!(
+                                    "intent no longer payable during recovery: {invalid_reason}"
+                                );
                                 self.commit_failed(&row.id, &payment_hash, self.clock.now(), &reason)
                                     .await?;
                                 report.failed += 1;
                                 continue;
                             }
-                            Ok(Some(PayStatus::Pending)) => {
-                                "stored intent expired and the backend reports its payment still in \
-                                 flight"
-                            }
+                            Ok(Some(PayStatus::Pending)) => format!(
+                                "stored intent is no longer payable during recovery \
+                                 ({invalid_reason}); the backend reports its payment still in flight"
+                            ),
                             // `Ok(None)` is "this backend cannot answer from the hash" — the trait
                             // default, which lnv2 takes deliberately — and is NOT evidence of absence.
                             // `Ok(Some(Unknown))` violates the trait contract ("I don't know" is
                             // `Ok(None)`); treat it the same fail-safe way rather than trusting it.
-                            Ok(None) | Ok(Some(PayStatus::Unknown)) => {
-                                "stored intent expired and the backend cannot confirm whether it paid"
-                            }
+                            Ok(None) | Ok(Some(PayStatus::Unknown)) => format!(
+                                "stored intent is no longer payable during recovery \
+                                 ({invalid_reason}); the backend cannot confirm whether it paid"
+                            ),
                             Err(err) => {
                                 // Log it: a swallowed error here is indistinguishable from a backend
                                 // that answered "cannot answer".
@@ -560,8 +552,11 @@ impl Sweeper {
                                     "sweep outbound-payment probe by hash failed; parking PENDING \
                                      rather than terminalizing"
                                 );
-                                "stored intent expired and the backend probe failed, so whether it \
-                                 paid is unknown"
+                                format!(
+                                    "stored intent is no longer payable during recovery \
+                                     ({invalid_reason}); the backend probe failed, so whether it paid \
+                                     is unknown"
+                                )
                             }
                         };
                         // Park, do NOT terminalize. Staying PENDING is what keeps this cap counted in
@@ -570,19 +565,12 @@ impl Sweeper {
                         // `lnrent sweep` with `Busy` — that refusal is the mechanism that prevents the
                         // second outbound payment. SweepStuck is how the operator hears about it.
                         //
-                        // The row re-drives every tick, so a backend that later answers POSITIVELY
-                        // resolves it — but no shipped backend can answer `Failed` (see that arm
-                        // above), so today the only resolution is a payment that turns up PAID and is
-                        // adopted SENT. Every other parked row stays parked, cap held and sweeps
-                        // refused, until a human settles it against the wallet's own payment list:
-                        // on lnv2 because it takes the trait default (lnrent-8l8c), and on phoenixd
-                        // because BOTH of its non-evidence shapes — an unattributable
-                        // completed-and-unpaid record, and a 404 it cannot tie to the wallet that
-                        // started this sweep — return `Ok(None)` (`phoenixd_backend.rs:2220-2228`,
-                        // lnrent-9dzu). That is the deliberate trade — a held cap and a refused sweep
-                        // are recoverable, a second outbound payment is not.
+                        // The row re-drives every tick, so a backend that later answers positively
+                        // resolves it. A backend taking the trait default cannot answer by hash and
+                        // therefore keeps the row parked, cap held and fresh sweeps refused; teaching
+                        // lnv2 to answer is tracked separately as lnrent-8l8c.
                         report.pending += 1;
-                        self.maybe_alert_stuck(&row, self.clock.now(), park_reason)
+                        self.maybe_alert_stuck(&row, self.clock.now(), &park_reason)
                             .await;
                         continue;
                     }
@@ -2008,9 +1996,8 @@ mod tests {
         // is available, so the only reason not to pay is the expiry, and this is the arm where the
         // existing SweepFailed DM tells the operator something true.
         //
-        // The scripted answer is what makes this reachable: no SHIPPED backend answers `Failed`
-        // today (see that arm), so this pins the contract's terminal arm rather than a live backend
-        // path, and it is what a backend gaining hash-authoritative absence must keep working.
+        // The scripted answer isolates the caller contract: any backend with hash-authoritative
+        // failure evidence must be able to terminalize without starting a new payment.
         let store = mem_store();
         let clock = expiry_recovery_clock();
         seed_final_receipt(&store, "order:A", "A", 100_000).await; // earned 100_000_000

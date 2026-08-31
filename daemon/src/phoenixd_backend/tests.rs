@@ -1982,11 +1982,10 @@ async fn a_terminal_outgoing_record_stays_pending_but_reads_differently() {
 }
 
 /// lnrent-7wbo: the read-only hash-keyed probe, over every `outgoingbyhash` response shape plus a
-/// transport failure. Paid and in-flight records are positive answers. A completed-unpaid record is
-/// not hash-wide failure evidence because phoenixd returns one unattributed record when the hash has
-/// several; a 404 is not evidence about the original sweep without a same-wallet witness.
+/// transport failure. The measured discriminator classifies paid, in-flight, and completed-unpaid
+/// records; phoenixd's clean 404 is authoritative absence.
 #[tokio::test]
-async fn outbound_status_by_payment_hash_reports_only_positive_hash_wide_evidence() {
+async fn outbound_status_by_payment_hash_classifies_every_measured_shape() {
     let ops = FakePhoenixdOps::new();
     let be = backend(ops.clone(), TestClock::new(1_000));
 
@@ -2012,22 +2011,21 @@ async fn outbound_status_by_payment_hash_reports_only_positive_hash_wide_evidenc
         Some(PayStatus::Pending)
     );
 
-    // Completed and NOT paid: terminal for this record, but unattributed among same-hash attempts.
+    // completedAt SET and NOT paid is the measured terminal-failure shape.
     ops.set_outgoing(record("cc", false, Some(MEASURED_COMPLETED_AT_MS)));
     assert_eq!(
         be.outbound_status_by_payment_hash("cc").await.unwrap(),
-        None
+        Some(PayStatus::Failed)
     );
 
-    // An unseeded hash is phoenixd's clean 404 for the wallet answering now. This seam carries no
-    // witness that it is the wallet which started the sweep, so it cannot answer for the old wallet.
+    // An unseeded hash is phoenixd's clean 404: authoritative absence for this hash.
     assert_eq!(
         be.outbound_status_by_payment_hash("dd").await.unwrap(),
-        None
+        Some(PayStatus::Failed)
     );
 
-    // A transport failure is an `Err`, distinct from the clean 404 above; both are non-evidence for
-    // this hash-only seam, and the caller must park rather than terminalize on either.
+    // A transport failure is an `Err`, distinct from the authoritative clean 404 above; the caller
+    // must park rather than terminalize when the backend did not answer.
     ops.fail_outgoing_by_hash();
     assert!(
         be.outbound_status_by_payment_hash("aa").await.is_err(),
