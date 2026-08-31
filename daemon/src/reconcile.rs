@@ -620,26 +620,34 @@ impl Reconciler {
     /// than guessing terminal.
     async fn order_invoice_may_expire(&self, sub_id: &str) -> Result<bool> {
         let id = sub_id.to_string();
-        let invoice_id: Option<String> = self
+        let invoice: Option<(String, String)> = self
             .store
             .read(move |c| {
                 Ok(c.query_row(
-                    "SELECT id
+                    "SELECT id, external_id
                        FROM invoice
                       WHERE subscription_id=?1 AND kind='order' AND status='OPEN'
                       ORDER BY issued_at DESC
                       LIMIT 1",
                     params![id],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?)
             })
             .await?;
 
-        let Some(invoice_id) = invoice_id else {
+        let Some((invoice_id, external_id)) = invoice else {
             return Ok(true);
         };
-        match self.payment.lookup(&invoice_id).await {
+        // By REF (lnrent-l07s): told the external_id too, a backend whose correlation index lost the
+        // row answers `Err` instead of a false `Expired`, and the `Err` arm below leaves the invoice
+        // OPEN and the reservation HELD for the next tick.
+        match self
+            .payment
+            .lookup_settlement_by_ref(&invoice_id, &external_id)
+            .await
+            .map(|(status, _)| status)
+        {
             Ok(PaymentStatus::Paid) => {
                 tracing::warn!(
                     sub = %sub_id,
@@ -668,21 +676,28 @@ impl Reconciler {
     /// tick) rather than guessing the renewal lapsed; only a definitive Open/Expired lets it proceed.
     async fn renewal_settlement_pending(&self, sub_id: &str) -> Result<bool> {
         let id = sub_id.to_string();
-        let invoice_ids: Vec<String> = self
+        let invoices: Vec<(String, String)> = self
             .store
             .read(move |c| {
                 let mut stmt = c.prepare(
-                    "SELECT id FROM invoice
+                    "SELECT id, external_id FROM invoice
                       WHERE subscription_id=?1 AND kind='renewal' AND status='OPEN'",
                 )?;
                 let rows = stmt
-                    .query_map(params![id], |r| r.get::<_, String>(0))?
+                    .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
             })
             .await?;
-        for invoice_id in invoice_ids {
-            match self.payment.lookup(&invoice_id).await {
+        for (invoice_id, external_id) in invoices {
+            // By REF (lnrent-l07s): a lost backend correlation is an `Err` here, not a false
+            // `Expired`, and the `Err` arm below defers suspend/terminate to the next tick.
+            match self
+                .payment
+                .lookup_settlement_by_ref(&invoice_id, &external_id)
+                .await
+                .map(|(status, _)| status)
+            {
                 Ok(PaymentStatus::Paid) => {
                     tracing::warn!(sub = %sub_id, invoice = %invoice_id,
                         "reconcile: renewal invoice paid at backend; deferring suspend/terminate for capture");
@@ -1187,13 +1202,15 @@ impl Reconciler {
         // This is ALSO what holds a settlement lnrent cannot BOOK, and lnrent-gc7's open question
         // (comment 82: alert-only, or hold the suspend?) is answered here rather than left to a new
         // coupling: the HOLD already exists. A phoenixd fee-credit refusal (ADR-0019) lives in
-        // `received_amount_msat`/`spendable_credit_msat`, NOT in `lookup` — which still reports the
-        // invoice `Paid` — so `renewal_settlement_pending` sees Paid and defers, indefinitely, for
-        // as long as the wallet stays unfunded. The cascade gc7's comment 79 feared (refused renewal
-        // -> paid_through frozen -> fire_suspend -> destroy) therefore cannot run: a buyer who paid
-        // is not suspended, and the alert's threshold does not race `effective_suspend_at` because
-        // that deadline never fires while the settlement is outstanding. The alert is what gets the
-        // wallet funded; this is what protects the buyer meanwhile. Verified by
+        // `received_amount_msat`/`spendable_credit_msat`, NOT in the status seam — phoenixd keeps the
+        // `lookup_settlement_by_ref` default, which delegates to its `lookup_settlement`, and that
+        // still reports the invoice `Paid` — so `renewal_settlement_pending` sees Paid and defers,
+        // indefinitely, for as long as the wallet stays unfunded. The cascade gc7's comment 79
+        // feared (refused renewal -> paid_through frozen -> fire_suspend -> destroy) therefore
+        // cannot run: a buyer who paid is not suspended, and the alert's threshold does not race
+        // `effective_suspend_at` because that deadline never fires while the settlement is
+        // outstanding. The alert is what gets the wallet funded; this is what protects the buyer
+        // meanwhile. Verified by
         // `a_fee_credit_refused_renewal_never_suspends_the_buyer_who_paid`.
         if self.renewal_settlement_pending(sub_id).await? {
             return Ok(false);
@@ -1391,11 +1408,11 @@ impl Reconciler {
     /// no `recipe_id` column to gate on at all (store.rs schema). Gating would leave a foreign
     /// recipe's OPEN invoices OPEN forever and re-looked-up at the backend on every tick.
     async fn expire_open_renewals(&self, now: i64) -> Result<usize> {
-        let rows: Vec<(String, String)> = self
+        let rows: Vec<(String, String, String)> = self
             .store
             .read(move |c| {
                 let mut stmt = c.prepare(
-                    "SELECT id, subscription_id FROM invoice
+                    "SELECT id, subscription_id, external_id FROM invoice
                      WHERE kind='renewal' AND status='OPEN'
                        AND expires_at IS NOT NULL AND expires_at <= ?1",
                 )?;
@@ -1404,6 +1421,7 @@ impl Reconciler {
                         Ok((
                             r.get::<_, String>(0)?,
                             r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                            r.get::<_, String>(2)?,
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1411,10 +1429,17 @@ impl Reconciler {
             })
             .await?;
         let mut expired = 0;
-        for (inv_id, sub_id) in rows {
+        for (inv_id, sub_id, external_id) in rows {
             // Don't expire a renewal invoice the backend reports PAID — leave it OPEN for capture
             // (.8) to apply (codex P1). A lookup error skips it this tick and retries next tick.
-            match self.payment.lookup(&inv_id).await {
+            // By REF (lnrent-l07s) so a lost backend correlation takes that error arm rather than
+            // answering `Expired` and expiring an invoice the buyer paid.
+            match self
+                .payment
+                .lookup_settlement_by_ref(&inv_id, &external_id)
+                .await
+                .map(|(status, _)| status)
+            {
                 Ok(PaymentStatus::Paid) => {
                     tracing::warn!(invoice = %inv_id, "reconcile: renewal invoice paid at backend; leaving OPEN for capture");
                     continue;
@@ -1588,6 +1613,8 @@ fn enqueue(
 
 #[cfg(test)]
 mod tests {
+    // Test doubles delegate through the bare seams; clippy.toml's denylist guards production.
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use crate::clock::{Clock, TestClock};
     use crate::store::{migrate, Store};
@@ -2170,6 +2197,181 @@ mod tests {
             .await,
             1,
             "capacity remains held while capture applies the paid invoice"
+        );
+    }
+
+    /// A `MockPayment` whose REF lookup always fails closed, the way lnv2 does when the index row
+    /// for the `external_id` is gone (lnrent-l07s). Everything else delegates, so the real tick
+    /// runs; only the seam under test changes. Note `lookup_settlement` (the bare-id seam) still
+    /// delegates: the point is that the arm now asks the REF seam, so it sees the error at all.
+    struct RefLookupFailsClosed(Arc<crate::backends::MockPayment>);
+
+    #[async_trait::async_trait]
+    impl PaymentBackend for RefLookupFailsClosed {
+        async fn create_invoice(
+            &self,
+            amount_sat: u64,
+            memo: &str,
+            expiry_s: u32,
+            external_id: &str,
+        ) -> Result<crate::backends::Invoice> {
+            self.0
+                .create_invoice(amount_sat, memo, expiry_s, external_id)
+                .await
+        }
+        async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
+            self.0.lookup(id).await
+        }
+        async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            self.0.lookup_settlement(id).await
+        }
+        async fn lookup_settlement_by_ref(
+            &self,
+            id: &str,
+            external_id: &str,
+        ) -> Result<(PaymentStatus, Option<i64>)> {
+            anyhow::bail!("invoice {id} (external_id {external_id}): index row missing")
+        }
+        async fn pay(&self, dest: &str, amount_sat: u64, key: &str) -> Result<String> {
+            self.0.pay(dest, amount_sat, key).await
+        }
+        async fn payment_status(&self, id: &str) -> Result<crate::backends::PayStatus> {
+            self.0.payment_status(id).await
+        }
+        async fn payment_status_by_key(&self, key: &str) -> Result<crate::backends::PayStatus> {
+            self.0.payment_status_by_key(key).await
+        }
+        async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<crate::backends::Settlement>> {
+            self.0.watch().await
+        }
+    }
+
+    // lnrent-l07s: when the backend cannot answer for an OPEN order invoice, the order-expiry arm
+    // must leave the invoice OPEN **and keep the capacity reservation HELD** — its consequence
+    // differs from the renewal arm's, because releasing the reservation is irreversible capacity the
+    // buyer paid for. `fire_pending_expiry` returns before its txn, so nothing is released.
+    #[tokio::test]
+    async fn order_expiry_defers_and_holds_the_reservation_when_the_backend_fails_closed() {
+        let store = mem_store();
+        let inner = Arc::new(crate::backends::MockPayment::new());
+        let inv = inner
+            .create_invoice(100, "lnrent order o1", 100, "order:o1")
+            .await
+            .unwrap();
+        seed_sub(
+            &store,
+            "o1",
+            "PENDING",
+            "buyer",
+            None,
+            0,
+            Some(inv.expires_at),
+        )
+        .await;
+        seed_invoice(
+            &store,
+            &inv.id,
+            "o1",
+            "order:o1",
+            "order",
+            "OPEN",
+            Some(inv.expires_at),
+        )
+        .await;
+        seed_reservation(&store, "o1").await;
+        let r = Reconciler::new(
+            store.clone(),
+            Arc::new(RefLookupFailsClosed(inner)),
+            dummy_recipe(),
+        );
+
+        let rep = r.reconcile_tick(inv.expires_at).await.unwrap();
+        assert_eq!(rep.expired, 0, "the order was not expired on an Err");
+        assert_eq!(rep.noops, 1, "[9A]: the arm was selected and declined");
+        assert_eq!(sub_state(&store, "o1").await, "PENDING");
+        assert_eq!(inv_status(&store, "order:o1").await, "OPEN");
+        assert_eq!(
+            sub_next_deadline(&store, "o1").await,
+            Some(inv.expires_at),
+            "the cursor stays due, so the next tick retries"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM reservation WHERE order_id='o1' AND state='HELD'"
+            )
+            .await,
+            1,
+            "an unanswerable backend must never release the buyer's capacity reservation"
+        );
+    }
+
+    // lnrent-l07s, the RENEWAL half: the other two arms that decide expiry must ask the REF seam too,
+    // or a lost correlation reads as a definitive `Expired`. One tick exercises both, because an OPEN
+    // renewal invoice past its expiry is selected by `expire_open_renewals` while the same sub is due
+    // for suspend through `renewal_settlement_pending`. The double answers the BARE seam exactly as
+    // `MockPayment` does (an unsettled invoice past expiry -> `Expired`), so reverting either arm to
+    // `lookup_settlement` suspends the buyer and expires the invoice — which is what these asserts pin.
+    #[tokio::test]
+    async fn renewal_arms_defer_on_a_fail_closed_backend_and_leave_the_invoice_open() {
+        let store = mem_store();
+        let (recipe, suspend_marker, _destroy_marker) = marker_recipe();
+        let inner = Arc::new(crate::backends::MockPayment::new());
+        let inv = inner
+            .create_invoice(100, "lnrent renewal s1", 100, "renewal:s1")
+            .await
+            .unwrap();
+        // paid_through=1000 with the cursor at it: the tick below is due to suspend.
+        seed_sub(
+            &store,
+            "s1",
+            "ACTIVE",
+            "buyerhex",
+            Some(1000),
+            500,
+            Some(1000),
+        )
+        .await;
+        seed_invoice(
+            &store,
+            &inv.id,
+            "s1",
+            "renewal:s1",
+            "renewal",
+            "OPEN",
+            Some(inv.expires_at),
+        )
+        .await;
+        assert!(
+            inv.expires_at <= 1000,
+            "precondition: the invoice is past expiry at the tick, so `expire_open_renewals` selects it"
+        );
+        let r = Reconciler::new(store.clone(), Arc::new(RefLookupFailsClosed(inner)), recipe);
+
+        let rep = r.reconcile_tick(1000).await.unwrap();
+
+        assert_eq!(
+            rep.suspended, 0,
+            "renewal_settlement_pending: an unanswerable backend defers suspend, never lapses the sub"
+        );
+        // The suspend arm was SELECTED and declined (`fire_suspend` -> false -> noops). Without this,
+        // every assert below passes vacuously the day a seed change stops making this sub due.
+        assert_eq!(rep.noops, 1, "the suspend arm ran and declined");
+        assert_eq!(sub_state(&store, "s1").await, "ACTIVE");
+        assert!(
+            !suspend_marker.exists(),
+            "and the suspend hook must not have run"
+        );
+        assert_eq!(
+            inv_status(&store, "renewal:s1").await,
+            "OPEN",
+            "expire_open_renewals: the invoice stays OPEN for the next tick rather than expiring an \
+             invoice the buyer may have paid"
+        );
+        assert_eq!(
+            sub_next_deadline(&store, "s1").await,
+            Some(1000),
+            "the cursor stays due, so the next tick retries both arms"
         );
     }
 

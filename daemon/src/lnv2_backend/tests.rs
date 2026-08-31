@@ -3,6 +3,7 @@
 //! run under `cargo test --workspace` without a federation, and each asserts the intended arm actually
 //! FIRED ([9A] non-vacuity). The pure fee/selection helpers are tested directly where appropriate.
 
+#![allow(clippy::disallowed_methods)] // tests exercise the bare seams; clippy.toml guards production
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,9 @@ use serde_json::{json, Value};
 use super::*;
 use crate::backends::{Lnv2Probe, PayStatus, PaymentBackend, PaymentStatus};
 use crate::clock::{Clock, TestClock};
+use crate::recipe::Recipe;
+use crate::reconcile::Reconciler;
+use crate::store::{migrate, Store};
 
 // --------------------------------------------------------------------------------------------------
 // Scripted fake fedimint seam
@@ -1225,6 +1229,178 @@ async fn canceled_invoice_is_replaced_by_a_fresh_payable_one() {
         backend.lookup_settlement(&dead.id).await.unwrap(),
         (PaymentStatus::Expired, None),
         "the replaced-away invoice id never reports Open/Paid"
+    );
+}
+
+/// lnrent-l07s: a LOST lnv2 index row over a PAID invoice must FAIL CLOSED.
+///
+/// This is the bead's break-test INVERTED. Before the fix the second lookup answered
+/// `Ok((Expired, None))` — and reconcile treats `Expired` as licence to expire the local invoice,
+/// so a buyer who actually paid was expired with no capture, no refund and no operator DM. phoenixd
+/// already fails closed on the identical shape (`phoenixd_backend/tests.rs`,
+/// `lookup_settlement("phoenixd-orphan")` is `Err`).
+#[tokio::test]
+async fn a_lost_index_row_over_a_paid_invoice_fails_closed() {
+    let fake = FakeLnv2Ops::new();
+    fake.set_receive_credit_msat(995_500);
+    let backend = backend_with(fake.clone(), clock(5_000));
+    let mut rx = backend.watch().await.unwrap();
+    let inv = backend
+        .create_invoice(1000, "m", 3600, "extLOST")
+        .await
+        .unwrap();
+    fake.set_receive_final(&inv.backend_invoice_id, ReceiveFinal::Claimed);
+    let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("a settlement arrives")
+        .expect("channel open");
+
+    assert_eq!(
+        backend
+            .lookup_settlement_by_ref(&inv.id, &inv.external_id)
+            .await
+            .unwrap(),
+        (PaymentStatus::Paid, Some(5_000)),
+        "precondition: with the index intact, this invoice is PAID"
+    );
+
+    // The incident: the lnv2 index row is gone. The MAIN store still holds the invoice and still
+    // asks about it by the same id AND external_id.
+    {
+        let conn = backend.index.lock().unwrap();
+        let n = conn.execute("DELETE FROM lnv2_invoice", []).unwrap();
+        assert_eq!(n, 1, "exactly the one row under test was removed");
+    }
+
+    let err = backend
+        .lookup_settlement_by_ref(&inv.id, &inv.external_id)
+        .await
+        .expect_err("a paid invoice whose index row is gone must never report an unpaid expiry");
+    let err = format!("{err:#}");
+    assert!(
+        err.contains("index row missing"),
+        "the diagnostic names the condition an operator greps for: {err}"
+    );
+    assert!(
+        err.contains(&inv.id) && err.contains(&inv.external_id),
+        "the diagnostic names the invoice id and the external_id: {err}"
+    );
+}
+
+/// The retired-id contract (lnrent-9yz) survives the fail-closed fix: `idx_insert` rewrote
+/// `invoice_id` in place when it replaced the CANCELED row for this `external_id`, so a row for the
+/// external_id EXISTS carrying a different id. That is a RETIRED id, not a lost index — `Expired` is
+/// honest, and the daemon store may still hold it. Deliberately a separate test:
+/// `canceled_invoice_is_replaced_by_a_fresh_payable_one` stays green UNCHANGED.
+#[tokio::test]
+async fn a_retired_invoice_id_still_reports_expired_through_the_ref_lookup() {
+    let ext = "renew:auto:sub1:42";
+    let fake = FakeLnv2Ops::new();
+    let backend = backend_with(fake.clone(), clock(1_000));
+    let dead = backend.create_invoice(1000, "m", 3600, ext).await.unwrap();
+    backend
+        .index
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE lnv2_invoice SET status = 'CANCELED' WHERE external_id = ?1",
+            params![ext],
+        )
+        .unwrap();
+    let fresh = backend.create_invoice(1000, "m", 3600, ext).await.unwrap();
+    assert_ne!(
+        fresh.id, dead.id,
+        "[9A]: the replacement retired the old id"
+    );
+
+    assert_eq!(
+        backend
+            .lookup_settlement_by_ref(&dead.id, ext)
+            .await
+            .unwrap(),
+        (PaymentStatus::Expired, None),
+        "a row for the external_id carrying a DIFFERENT id is a retired id, not a lost index"
+    );
+    assert_eq!(
+        backend
+            .lookup_settlement_by_ref(&fresh.id, ext)
+            .await
+            .unwrap(),
+        (PaymentStatus::Open, None),
+        "the replacement is still payable"
+    );
+}
+
+/// A FOREIGN backend's invoice id (an operator switched backends) reports `Expired`, never `Err`.
+/// `order_invoice_may_expire` returns `Ok(false)` on `Err` (reconcile.rs), so an id that errors
+/// forever would hold the ORDER open and its capacity reservation HELD forever. lnv2 can only fail
+/// closed for ids it could have minted itself.
+#[tokio::test]
+async fn a_foreign_backend_invoice_id_expires_order_and_releases_reservation() {
+    let fake = FakeLnv2Ops::new();
+    let backend = backend_with(fake, clock(5_000));
+    assert_eq!(
+        backend
+            .lookup_settlement_by_ref("phoenixd-deadbeef", "order:o1")
+            .await
+            .unwrap(),
+        (PaymentStatus::Expired, None),
+        "a foreign-prefix id must never stall reconcile behind a permanent Err"
+    );
+
+    let conn = Connection::open_in_memory().unwrap();
+    migrate(&conn).unwrap();
+    let store = Store::spawn(conn);
+    store
+        .transaction(|tx| {
+            tx.execute_batch(
+                "INSERT INTO subscription
+                    (id, recipe_id, state, buyer_pubkey, period_s, renew_lead_s, retention_s,
+                     next_deadline, created_at, updated_at)
+                 VALUES ('o1', 'dummy', 'PENDING', 'buyer', 100, 10, 0, 5, 0, 0);
+                 INSERT INTO invoice
+                    (id, subscription_id, external_id, kind, amount_sat, status, expires_at,
+                     issued_at)
+                 VALUES ('phoenixd-deadbeef', 'o1', 'order:o1', 'order', 100, 'OPEN', 5, 0);
+                 INSERT INTO reservation
+                    (id, order_id, resources_json, ports_json, state, expires_at, created_at)
+                 VALUES ('res-o1', 'o1', '{\"cpu\":1}', '{\"count\":0}', 'HELD', 5, 0);",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let recipe = Recipe::load(format!(
+        "{}/../recipes/dummy",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let reconciler = Reconciler::new(store.clone(), Arc::new(backend), recipe);
+
+    let report = reconciler.reconcile_tick(5_000).await.unwrap();
+    assert_eq!(report.expired, 1, "the foreign-id order expiry fired");
+    let states: (String, String, String) = store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT s.state, i.status, r.state
+                   FROM subscription s
+                   JOIN invoice i ON i.subscription_id=s.id
+                   JOIN reservation r ON r.order_id=s.id
+                  WHERE s.id='o1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        states,
+        (
+            "EXPIRED".to_string(),
+            "EXPIRED".to_string(),
+            "RELEASED".to_string()
+        ),
+        "foreign ids expire the order and invoice and release the capacity reservation"
     );
 }
 

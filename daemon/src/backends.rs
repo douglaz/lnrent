@@ -30,14 +30,55 @@ pub trait PaymentBackend: Send + Sync {
         expiry_s: u32,
         external_id: &str, // binds settlement -> order (ADR-0009); deterministic per invoice class (§6.6)
     ) -> Result<Invoice>;
+    /// Invoice status alone. Both real backends answer it by delegating to
+    /// [`lookup_settlement`](Self::lookup_settlement) (`lnv2_backend.rs`, `phoenixd_backend.rs`), so
+    /// it inherits that bare-id seam's blind spot verbatim — lnv2 answers a MISSING index row
+    /// `Expired`, which over a PAID invoice is the lnrent-l07s bug. **Never decide EXPIRY or
+    /// SETTLEMENT through this seam**; that is
+    /// [`lookup_settlement_by_ref`](Self::lookup_settlement_by_ref).
     async fn lookup(&self, id: &str) -> Result<PaymentStatus>;
     /// Invoice status PLUS the backend's observed-LIVE settled_at. `Some(ts)` is returned ONLY for a
     /// settlement the backend observed live (its true time is known); `None` for a not-paid invoice
     /// OR a RECOVERY settlement (settled while the daemon was down, so the true time is unknown). The
     /// supervisor's settlement catch-up uses `Some(ts)` EXACTLY and caps only on `None` — so a late
     /// LIVE payment refunds (capture's g5p gate) instead of being stamped just-in-window and wrongly
-    /// provisioned (lnrent-zwk). `lookup()` stays the status-only seam reconcile uses (unchanged).
+    /// provisioned (lnrent-zwk). No production caller decides expiry or settlement through this
+    /// bare-id seam any more (lnrent-l07s): it survives as the delegate the
+    /// `lookup_settlement_by_ref` default calls and as each backend's own internal helper.
     async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)>;
+    /// Exactly [`lookup_settlement`](Self::lookup_settlement), but told the invoice's `external_id`
+    /// (the ADR-0009 correlation token) alongside its id. **Every caller that decides EXPIRY or
+    /// SETTLEMENT must use this seam**, because the bare id is not enough to answer safely.
+    ///
+    /// A backend that keeps its own correlation index can lose a row. Given only the id, "the index
+    /// has no such id" is indistinguishable from "the index deliberately RETIRED that id" — lnv2
+    /// rewrites `invoice_id` in place when it replaces a CANCELED row for the same `external_id`
+    /// (`idx_insert`, `lnv2_backend.rs:1543` — the `ON CONFLICT(external_id) DO UPDATE` at `:1554`
+    /// is the rewrite), so the main store can still hold a retired id for which
+    /// `Expired` is the honest answer. Answering `Expired` for the LOST case as well expires an
+    /// invoice the buyer already paid: reconcile treats `Expired` as licence to expire and `Err` as
+    /// "defer, retry next tick" (lnrent-l07s). With the `external_id` the two separate cleanly — a
+    /// row for that `external_id` carrying a DIFFERENT id was retired; NO row at all means the
+    /// correlation is gone and the backend MUST fail closed with `Err`.
+    ///
+    /// Default: delegate to [`lookup_settlement`](Self::lookup_settlement). Correct for any backend
+    /// with no separate correlation index to lose (`MockPayment`), where the id alone is already the
+    /// whole truth — and equally for one that HAS an index but already fails closed on a missing row
+    /// from the bare id alone, which is why phoenixd keeps the default: its `lookup_settlement`
+    /// bails on a missing index row (`phoenixd_backend.rs:2022`), and no code path deletes a
+    /// `phoenixd_invoice` row — index GC is deferred to lnrent-rpa, recorded in that module's
+    /// header (`phoenixd_backend.rs:159`), which any future reaper must reconcile with this
+    /// contract. A backend must override this ONLY when it can answer a missing row
+    /// `Expired`; then it owes the caller the retired-vs-lost distinction above.
+    #[allow(clippy::disallowed_methods)] // the default body IS the sanctioned delegate
+    async fn lookup_settlement_by_ref(
+        &self,
+        id: &str,
+        external_id: &str,
+    ) -> Result<(PaymentStatus, Option<i64>)> {
+        let _ = external_id; // no separate correlation index: the id alone is the whole truth
+        self.lookup_settlement(id).await
+    }
     /// Outbound payment, used for refunds. **Idempotent on `idempotency_key`**: calling twice
     /// with the same key never pays twice (ADR-0009, SPEC §6.6). Returns a backend payment id.
     async fn pay(&self, dest: &str, amount_sat: u64, idempotency_key: &str) -> Result<String>;
@@ -666,6 +707,8 @@ impl PaymentBackend for MockPayment {
 
 #[cfg(test)]
 mod mock_payment_tests {
+    // Tests exercise the bare seams directly; clippy.toml's denylist protects production deciders.
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     #[tokio::test]
@@ -716,6 +759,63 @@ mod mock_payment_tests {
         assert_eq!(
             m.payment_status_by_key("refund:never").await.unwrap(),
             PayStatus::Unknown
+        );
+    }
+
+    /// A backend that answers `lookup_settlement` with a distinctive sentinel and overrides NOTHING
+    /// else — so what `lookup_settlement_by_ref` returns can only have come from the trait's DEFAULT
+    /// body. That default is what lets existing test-only `PaymentBackend` implementations and
+    /// every non-lnv2 backend keep compiling and behaving unchanged (lnrent-l07s).
+    struct SentinelLookup;
+
+    #[async_trait]
+    impl PaymentBackend for SentinelLookup {
+        async fn create_invoice(&self, _: u64, _: &str, _: u32, _: &str) -> Result<Invoice> {
+            unimplemented!("the default-body test only calls the lookup seams")
+        }
+        async fn lookup(&self, _: &str) -> Result<PaymentStatus> {
+            Ok(PaymentStatus::Paid)
+        }
+        async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            match id {
+                "sentinel-ok" => Ok((PaymentStatus::Paid, Some(4_242))),
+                _ => bail!("sentinel: no such invoice {id}"),
+            }
+        }
+        async fn pay(&self, _: &str, _: u64, _: &str) -> Result<String> {
+            unimplemented!("the default-body test only calls the lookup seams")
+        }
+        async fn payment_status(&self, _: &str) -> Result<PayStatus> {
+            Ok(PayStatus::Unknown)
+        }
+        async fn payment_status_by_key(&self, _: &str) -> Result<PayStatus> {
+            Ok(PayStatus::Unknown)
+        }
+        async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+            Ok(mpsc::channel(1).1)
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_settlement_by_ref_defaults_to_lookup_settlement() {
+        let be = SentinelLookup;
+        assert_eq!(
+            be.lookup_settlement_by_ref("sentinel-ok", "ext-ignored")
+                .await
+                .unwrap(),
+            (PaymentStatus::Paid, Some(4_242)),
+            "the default body delegates verbatim to lookup_settlement, external_id and all"
+        );
+        // ...including its errors: the default adds no fail-closed behaviour of its own.
+        let err = format!(
+            "{:#}",
+            be.lookup_settlement_by_ref("sentinel-missing", "ext-ignored")
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            err.contains("sentinel: no such invoice sentinel-missing"),
+            "the delegated error is returned unchanged: {err}"
         );
     }
 

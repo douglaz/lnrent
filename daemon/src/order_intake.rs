@@ -1408,6 +1408,8 @@ fn unavailable(message: &str) -> WireError {
 
 #[cfg(test)]
 mod tests {
+    // Test doubles delegate through the bare seams; clippy.toml's denylist guards production.
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use crate::clock::TestClock;
     use crate::store::{migrate, Store};
@@ -1604,6 +1606,13 @@ mod tests {
         async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
             self.inner.lookup_settlement(id).await
         }
+        async fn lookup_settlement_by_ref(
+            &self,
+            id: &str,
+            ext: &str,
+        ) -> Result<(PaymentStatus, Option<i64>)> {
+            self.inner.lookup_settlement_by_ref(id, ext).await
+        }
         async fn pay(&self, d: &str, a: u64, k: &str) -> Result<String> {
             self.inner.pay(d, a, k).await
         }
@@ -1716,6 +1725,13 @@ mod tests {
         }
         async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
             self.inner.lookup_settlement(id).await
+        }
+        async fn lookup_settlement_by_ref(
+            &self,
+            id: &str,
+            ext: &str,
+        ) -> Result<(PaymentStatus, Option<i64>)> {
+            self.inner.lookup_settlement_by_ref(id, ext).await
         }
         async fn pay(&self, d: &str, a: u64, k: &str) -> Result<String> {
             self.inner.pay(d, a, k).await

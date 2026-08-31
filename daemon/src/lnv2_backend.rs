@@ -157,6 +157,14 @@ const PAY_INDEX_RETENTION_SECS: i64 = 180 * 24 * 60 * 60;
 /// A create burst schedules at most one best-effort terminal-row reap per hour.
 const INDEX_GC_INTERVAL_SECS: i64 = 60 * 60;
 
+/// The prefix `create_invoice` stamps on every invoice id it mints (`lnv2-<operation_id>`), and so
+/// the discriminator for "could THIS backend have minted this id at all". An id that does not carry
+/// it belongs to another backend (a `phoenixd-<hash>` id surviving a backend switch), and lnv2 must
+/// answer such an id `Expired` rather than fail closed forever — see `lookup_settlement_by_ref`.
+/// The coupling to `create_invoice`'s literal is pinned by
+/// `a_lost_index_row_over_a_paid_invoice_fails_closed`, which feeds a minted id straight back in.
+const INVOICE_ID_PREFIX: &str = "lnv2-";
+
 /// Backoff between receive-subscription re-attempts after a transient stream error. `watch()` is called
 /// only ONCE (at boot) and `lookup()` reads the local index (a still-OPEN row can't be recovered by the
 /// supervisor catch-up), so a receive task that gave up on the first error would strand a later-paid
@@ -1062,33 +1070,75 @@ impl PaymentBackend for Lnv2Payment {
         Ok(inv)
     }
 
+    #[allow(clippy::disallowed_methods)] // the backend's own internal delegate, not a decider
     async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
         Ok(self.lookup_settlement(id).await?.0)
     }
 
     async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
         match idx_get_settlement(&self.index, id)? {
-            // `settled_at` is Some ONLY for a LIVE Claimed (spawn_receive_task live=true); a recovery
-            // Claimed left it NULL -> None, so the supervisor catch-up caps conservatively (lnrent-zwk).
             Some((status, expires_at, settled_at)) => {
-                if status == "PAID" {
-                    Ok((PaymentStatus::Paid, settled_at))
-                } else if status == "PAID_UNRECOVERED" {
-                    // Upstream reaches FinalReceiveOperationState::Failure only after Pending->Claiming:
-                    // Lightning payment was confirmed, but mint output issuance failed. Returning an
-                    // error keeps reconcile from expiring the local invoice as unpaid and repeatedly
-                    // surfaces the durable manual-recovery liability to operator logs.
-                    bail!(
-                        "lnv2 invoice {id} received its Lightning payment but ecash minting failed; \
-                         manual wallet/federation recovery is required"
-                    )
-                } else if self.clock.now() >= expires_at {
-                    Ok((PaymentStatus::Expired, None))
-                } else {
-                    Ok((PaymentStatus::Open, None))
-                }
+                classify_indexed_settlement(id, &status, expires_at, settled_at, self.clock.now())
             }
+            // UNCHANGED, deliberately: told only the id, this seam cannot tell a LOST index row from
+            // an id `idx_insert` legitimately retired, so it keeps today's answer for every existing
+            // caller. The callers that DECIDE expiry or settlement use `lookup_settlement_by_ref`
+            // below, which is told the external_id and can separate the two (lnrent-l07s).
             None => Ok((PaymentStatus::Expired, None)),
+        }
+    }
+
+    /// The fail-closed settlement seam (lnrent-l07s). See the trait's contract in `backends.rs`; the
+    /// classification, in order:
+    ///
+    /// (a) the index row for `external_id` carries THIS `invoice_id` — exactly `lookup_settlement`;
+    /// (b) it carries a DIFFERENT one — `idx_insert` replaced a CANCELED row for this `external_id`
+    ///     and rewrote `invoice_id` in place, so `id` is the RETIRED id. The daemon store can still
+    ///     hold it and it must never look payable again, so `Expired` is the honest answer;
+    /// (c) NO row for `external_id` and the id is one lnv2 could have minted — the correlation is
+    ///     GONE. Fail closed exactly like the `PAID_UNRECOVERED` arm above: an invoice the buyer may
+    ///     have PAID must never be reported as an unpaid expiry;
+    /// (d) NO row and a FOREIGN backend's id (a `phoenixd-<hash>` id surviving a backend switch) —
+    ///     `Expired` plus a warn, never `Err`. `order_invoice_may_expire` returns `Ok(false)` on
+    ///     `Err` (`order_invoice_may_expire`, `reconcile.rs:621`), so an id that errors forever would hold the ORDER open and its
+    ///     capacity reservation HELD forever.
+    ///
+    /// KNOWN, BOUNDED interaction with this module's own reaper, recorded the way phoenixd records
+    /// its own (`phoenixd_backend.rs`, "NOTE for lnrent-rpa"): `gc_lnv2_invoice_index` below deletes
+    /// rows `INVOICE_INDEX_RETENTION_SECS` past their `expires_at`, so a main-store invoice STILL
+    /// `OPEN` that long after expiry — reconcile dead for the whole retention window — would take (c)
+    /// and stay deferred until an operator acts. No money is at risk: the reaper touches only
+    /// `status='CANCELED'`, and CANCELED is only ever reached by a CAS on `status='OPEN'`
+    /// (`idx_mark_canceled` below), so a reaped row was definitively unpaid. Separating "reaped" from
+    /// "lost" needs the
+    /// main store's own `expires_at`, which this seam is deliberately not told.
+    ///
+    /// (c) surfaces to operator LOGS only. The durable condition-ledger notification for it is
+    /// lnrent-unbooked-settlement-condition-ledger-hwni / lnrent-3p71, NOT this bead.
+    async fn lookup_settlement_by_ref(
+        &self,
+        id: &str,
+        external_id: &str,
+    ) -> Result<(PaymentStatus, Option<i64>)> {
+        match idx_get_settlement_by_external(&self.index, external_id)? {
+            Some((row_id, status, expires_at, settled_at)) if row_id == id => {
+                classify_indexed_settlement(id, &status, expires_at, settled_at, self.clock.now())
+            }
+            Some(_) => Ok((PaymentStatus::Expired, None)), // (b) retired id
+            None if id.starts_with(INVOICE_ID_PREFIX) => bail!(
+                "lnv2 invoice {id} (external_id {external_id}): index row missing — the receive \
+                 correlation is gone, so a settled payment would be indistinguishable from an \
+                 unpaid expiry; failing closed. Manual index/wallet recovery is required"
+            ),
+            None => {
+                tracing::warn!(
+                    invoice = %id,
+                    external = %external_id,
+                    "lnv2: settlement asked for an invoice id this backend could not have minted \
+                     (foreign backend prefix); reporting Expired"
+                );
+                Ok((PaymentStatus::Expired, None))
+            }
         }
     }
 
@@ -1551,6 +1601,59 @@ fn idx_get_settlement(
     )
     .optional()
     .context("reading lnv2_invoice settlement")
+}
+
+/// One `lnv2_invoice` settlement row as `lookup_settlement_by_ref` reads it:
+/// `(invoice_id, status, expires_at, settled_at)`.
+type IndexedSettlement = (String, String, i64, Option<i64>);
+
+/// The same settlement row, found by its `external_id` (the correlation token) instead of by
+/// invoice id, and carrying the `invoice_id` the index currently holds for it. That id is what
+/// separates a RETIRED id from a LOST index row in `lookup_settlement_by_ref`.
+fn idx_get_settlement_by_external(
+    index: &Mutex<Connection>,
+    external_id: &str,
+) -> Result<Option<IndexedSettlement>> {
+    let conn = index.lock().unwrap();
+    conn.query_row(
+        "SELECT invoice_id, status, expires_at, settled_at FROM lnv2_invoice WHERE external_id = ?1",
+        params![external_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )
+    .optional()
+    .context("reading lnv2_invoice settlement by external_id")
+}
+
+/// Map an index row that DOES correlate to this invoice onto a payment status. Shared by
+/// `lookup_settlement` and `lookup_settlement_by_ref` so the two can never drift on what a PAID,
+/// PAID_UNRECOVERED, expired or open row means — they differ ONLY in how they handle a row that is
+/// not there (lnrent-l07s).
+///
+/// `settled_at` is `Some` ONLY for a LIVE Claimed (`spawn_receive_task` live=true); a recovery
+/// Claimed left it NULL -> `None`, so the supervisor catch-up caps conservatively (lnrent-zwk).
+fn classify_indexed_settlement(
+    id: &str,
+    status: &str,
+    expires_at: i64,
+    settled_at: Option<i64>,
+    now: i64,
+) -> Result<(PaymentStatus, Option<i64>)> {
+    if status == "PAID" {
+        Ok((PaymentStatus::Paid, settled_at))
+    } else if status == "PAID_UNRECOVERED" {
+        // Upstream reaches FinalReceiveOperationState::Failure only after Pending->Claiming:
+        // Lightning payment was confirmed, but mint output issuance failed. Returning an
+        // error keeps reconcile from expiring the local invoice as unpaid and repeatedly
+        // surfaces the durable manual-recovery liability to operator logs.
+        bail!(
+            "lnv2 invoice {id} received its Lightning payment but ecash minting failed; \
+             manual wallet/federation recovery is required"
+        )
+    } else if now >= expires_at {
+        Ok((PaymentStatus::Expired, None))
+    } else {
+        Ok((PaymentStatus::Open, None))
+    }
 }
 
 fn idx_received_msat(index: &Mutex<Connection>, invoice_id: &str) -> Result<Option<u64>> {

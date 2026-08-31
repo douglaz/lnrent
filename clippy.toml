@@ -1,0 +1,4 @@
+disallowed-methods = [
+  { path = "lnrentd::backends::PaymentBackend::lookup", reason = "expiry/settlement decisions must use lookup_settlement_by_ref (lnrent-l07s)" },
+  { path = "lnrentd::backends::PaymentBackend::lookup_settlement", reason = "expiry/settlement decisions must use lookup_settlement_by_ref (lnrent-l07s)" },
+]

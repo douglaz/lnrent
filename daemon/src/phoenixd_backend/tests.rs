@@ -5,6 +5,7 @@
 //! intended arm actually FIRED ([9A] non-vacuity) — a refusal test also asserts that NO payment was
 //! POSTed, not merely that an error came back.
 
+#![allow(clippy::disallowed_methods)] // tests exercise the bare seams; clippy.toml guards production
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
