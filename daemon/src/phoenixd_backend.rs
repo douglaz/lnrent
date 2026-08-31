@@ -2190,14 +2190,30 @@ impl PaymentBackend for PhoenixdPayment {
         // `phoenixd_backend.rs:386-393`, and the live truth table in `pay_inner`). An `Err` propagates
         // unchanged — a transport failure refutes nothing, and the trait requires callers to treat it
         // exactly like `Ok(None)`.
-        match self.ops.outgoing_by_hash(payment_hash).await? {
+        // Validate the echoed hash before classifying any discriminator. The neighbouring no-row
+        // recovery probe does the same (`phoenixd_backend.rs:1398-1412`): a response about another
+        // destination is evidence about neither this payment's success nor its failure. The
+        // comparison is case-insensitive because phoenixd's echo casing is not measured.
+        let record = match self.ops.outgoing_by_hash(payment_hash).await? {
+            Some(record) if !record.payment_hash.eq_ignore_ascii_case(payment_hash) => {
+                bail!(
+                    "phoenixd returned an outgoing record for hash {} when asked about {}; refusing \
+                     to classify a different payment",
+                    record.payment_hash,
+                    payment_hash
+                )
+            }
+            other => other,
+        };
+        match record {
             Some(record) if record.is_paid => Ok(Some(PayStatus::Succeeded)),
             Some(record) if record.completed_at_ms.is_none() => Ok(Some(PayStatus::Pending)),
             // Completed and NOT paid: phoenixd positively reports a terminal outbound failure.
             Some(_) => Ok(Some(PayStatus::Failed)),
-            // phoenixd's clean 404. Absence IS authoritative here, and only here: "an unknown hash is
-            // a clean 404. So a `PREPARED` key whose hash 404s provably never paid"
-            // (`phoenixd_backend.rs:66-68`, fact 3, live-measured).
+            // phoenixd's clean 404. Absence IS authoritative for the wallet answering, and only
+            // there: "an unknown hash is a clean 404" (`phoenixd_backend.rs:66-72`, fact 3,
+            // live-measured). That fact also records the same-wallet limitation; unlike a PREPARED
+            // pay row, this hash-only seam has no persisted node witness with which to close it.
             None => Ok(Some(PayStatus::Failed)),
         }
     }

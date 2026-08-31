@@ -239,8 +239,9 @@ pub trait PaymentBackend: Send + Sync {
     /// - `Ok(Some(PayStatus::Pending))` — the backend reports one IN FLIGHT.
     /// - `Ok(Some(PayStatus::Failed))` — the backend positively reports that no outbound payment for
     ///   this hash is in flight and none succeeded: a terminal failure, or a clean "no such record"
-    ///   from a backend whose ABSENCE is authoritative (phoenixd's 404 — its module header, fact 3).
-    ///   **This is the only answer that licenses a caller to terminalize.**
+    ///   from a backend whose ABSENCE is authoritative for the wallet answering (phoenixd's 404 —
+    ///   its module header, fact 3, including that fact's same-wallet limitation). **This is the only
+    ///   answer that licenses a caller to terminalize.**
     /// - `Err` — a transport/lookup failure. Callers MUST treat it exactly like `Ok(None)`: the
     ///   backend did not answer, so nothing was refuted.
     ///
