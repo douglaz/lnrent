@@ -386,12 +386,11 @@ pub(crate) struct PhoenixdOutgoing {
     pub(crate) is_paid: bool,
     pub(crate) fees_msat: u64,
     /// phoenixd's `completedAt`, epoch MILLIS, ABSENT while the payment is in flight. See the
-    /// measured truth table on the recovery arm in `pay_inner`. `pay_inner` does NOT resolve a
-    /// payment off it — the reasons are on that truth table (attribution, lnrent-ole), and they are
-    /// about what RESOLVING there would unlock: a re-POST of the same payment hash. The read-only
-    /// [`PaymentBackend::outbound_status_by_payment_hash`] probe DOES classify with it (lnrent-7wbo);
-    /// it starts no payment, and its caller uses the answer only to decide whether it may terminalize
-    /// a ledger row it would otherwise terminalize on NO evidence at all.
+    /// measured truth table on the recovery arm in `pay_inner`. A completed unpaid record proves
+    /// that record failed, but not that every attempt for its hash did: `outgoingbyhash` returns one
+    /// unattributed record when a hash has several (`pay_inner`, lnrent-ole). Consequently neither
+    /// `pay_inner` nor [`PaymentBackend::outbound_status_by_payment_hash`] treats that shape as proof
+    /// that no payment succeeded or remains in flight.
     pub(crate) completed_at_ms: Option<i64>,
 }
 
@@ -1436,7 +1435,9 @@ impl PhoenixdPayment {
                          catch. For a REFUND this surfaces as a RefundStuck operator alert. For a \
                          SWEEP the next drive treats the intent as never started and, once the \
                          stored invoice has expired, asks this same endpoint by hash before it \
-                         decides anything (lnrent-sweep-failed-ledger-lie-7wbo): {}. \
+                         decides anything (lnrent-sweep-failed-ledger-lie-7wbo). This unresolved \
+                         record leaves the sweep PENDING with its cap reserved and eventually \
+                         surfaces as SweepStuck. \
                          Either way settling it needs a human who can read the wallet's own \
                          payment list; do not pay this destination out of band while a payment for \
                          it may still be in flight.",
@@ -1448,18 +1449,6 @@ impl PhoenixdPayment {
                             "but does carry a completion time, which on the release lnrent measured \
                              means it failed — though phoenixd returns only one record per hash, so \
                              that failure cannot be proven to be this attempt"
-                        },
-                        // The sweep consequence is per-SHAPE for the same reason the wording above
-                        // is: the probe classifies this record, so the two shapes end the sweep row
-                        // in different states and name different alerts.
-                        if record.completed_at_ms.is_none() {
-                            "read as still in flight, that leaves the sweep row PENDING with its \
-                             cap still reserved, and once it has been stuck past the alert \
-                             threshold the operator hears SweepStuck"
-                        } else {
-                            "a completion time is the positive evidence the sweep requires, so it \
-                             parks the row FAILED and the SweepFailed alert it sends is then \
-                             telling the truth"
                         }
                     ),
                     // A clean 404 proves this wallet has no payment for this hash, so sending it now
@@ -2191,19 +2180,19 @@ impl PaymentBackend for PhoenixdPayment {
         Ok(pay_status_by_key(&self.index, idempotency_key)?.is_some())
     }
 
-    /// phoenixd CAN answer this (lnrent-7wbo): the node's own `outgoingbyhash` record is hash-keyed
-    /// history, so unlike the two `_by_key` reads above — which are pure `phoenixd_pay` index reads and
-    /// therefore answer `Unknown`/`false` for a payment a lost or restored index forgot — it does not
-    /// go blind when the local index does.
+    /// phoenixd can positively report a paid or in-flight hash even when the local `phoenixd_pay`
+    /// index is lost (lnrent-7wbo). It cannot prove hash-wide terminal failure from the endpoint's
+    /// single unattributed record, and a 404 is authoritative only for the wallet answering now;
+    /// this hash-only seam has no persisted witness that it is the wallet which started the sweep.
     async fn outbound_status_by_payment_hash(
         &self,
         payment_hash: &str,
     ) -> Result<Option<PayStatus>> {
-        // Classified by the MEASURED discriminator carried on the record: `completedAt` is the
-        // TERMINAL marker, ABSENT while the payment is in flight (`PhoenixdOutgoing::completed_at_ms`,
-        // `phoenixd_backend.rs:386-393`, and the live truth table in `pay_inner`). An `Err` propagates
-        // unchanged — a transport failure refutes nothing, and the trait requires callers to treat it
-        // exactly like `Ok(None)`.
+        // Read the MEASURED discriminator carried on the record: `completedAt` is absent while the
+        // payment is in flight (`PhoenixdOutgoing::completed_at_ms`, `phoenixd_backend.rs:386-393`,
+        // and the live truth table in `pay_inner`). A terminal marker classifies that record, not all
+        // attempts for its hash. An `Err` propagates unchanged — a transport failure refutes nothing,
+        // and the trait requires callers to treat it exactly like `Ok(None)`.
         // Validate the echoed hash before classifying any discriminator. The neighbouring no-row
         // recovery probe does the same (`phoenixd_backend.rs:1398-1412`): a response about another
         // destination is evidence about neither this payment's success nor its failure. The
@@ -2222,13 +2211,15 @@ impl PaymentBackend for PhoenixdPayment {
         match record {
             Some(record) if record.is_paid => Ok(Some(PayStatus::Succeeded)),
             Some(record) if record.completed_at_ms.is_none() => Ok(Some(PayStatus::Pending)),
-            // Completed and NOT paid: phoenixd positively reports a terminal outbound failure.
-            Some(_) => Ok(Some(PayStatus::Failed)),
-            // phoenixd's clean 404. Absence IS authoritative for the wallet answering, and only
-            // there: "an unknown hash is a clean 404" (`phoenixd_backend.rs:66-72`, fact 3,
-            // live-measured). That fact also records the same-wallet limitation; unlike a PREPARED
-            // pay row, this hash-only seam has no persisted node witness with which to close it.
-            None => Ok(Some(PayStatus::Failed)),
+            // `pay_inner` documents why this is not hash-wide terminal evidence
+            // (`phoenixd_backend.rs:1286-1310`): phoenixd returns one record without attributing it
+            // when the hash has several, so another attempt may have paid or may still be in flight.
+            Some(_) => Ok(None),
+            // A clean 404 proves absence only in the wallet answering now
+            // (`phoenixd_backend.rs:66-72`). Unlike a PREPARED pay row, a sweep row carries no
+            // persisted node witness for `require_prepared_node` to compare (`:1180-1208`), so this
+            // method cannot prove that the original wallet is the one whose history returned 404.
+            None => Ok(None),
         }
     }
 

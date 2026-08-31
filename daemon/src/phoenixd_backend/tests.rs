@@ -1577,9 +1577,7 @@ async fn index_loss_refuses_a_terminal_unpaid_record_without_writing_failed() {
         .await
         .expect_err("an unattributable terminal record is not a licence to pay again");
 
-    // Both directions, matching the PREPARED siblings: collapsing the shape conditional to emit one
-    // string on both branches would otherwise leave the suite green while the operator is told an
-    // in-flight payment failed, or a failed one is still running.
+    // The record's own measured shape remains truthful in the operator message.
     let rendered = format!("{err:#}");
     assert!(
         rendered.contains("does carry a completion time")
@@ -1587,9 +1585,8 @@ async fn index_loss_refuses_a_terminal_unpaid_record_without_writing_failed() {
         "the terminal shape must use its own wording and not borrow the in-flight one: {rendered}"
     );
     assert!(
-        rendered.contains("SweepFailed") && !rendered.contains("SweepStuck"),
-        "a no-row sweep parks FAILED; promising SweepStuck would name an alert that never \
-         arrives: {rendered}"
+        rendered.contains("SweepStuck") && !rendered.contains("SweepFailed"),
+        "one unattributed failed record cannot terminalize the sweep: {rendered}"
     );
     assert!(ops.pay_calls().is_empty());
     assert_eq!(
@@ -1982,16 +1979,12 @@ async fn a_terminal_outgoing_record_stays_pending_but_reads_differently() {
     );
 }
 
-/// lnrent-7wbo: the read-only hash-keyed probe, over all four shapes `outgoingbyhash` can produce
-/// plus the transport failure. This is what lets a caller that would otherwise terminalize a ledger
-/// row on NO evidence (the sweep's expired-intent recovery arm) demand a positive answer first.
-///
-/// Note the deliberate contrast with `a_terminal_outgoing_record_stays_pending_but_reads_differently`
-/// above: on a completed-and-unpaid record the PAY arm stays `Pending`, because resolving it there
-/// would unlock a re-POST of the same hash that cannot be attributed to this attempt (lnrent-ole).
-/// This probe starts no payment, so it reports what phoenixd says.
+/// lnrent-7wbo: the read-only hash-keyed probe, over every `outgoingbyhash` response shape plus a
+/// transport failure. Paid and in-flight records are positive answers. A completed-unpaid record is
+/// not hash-wide failure evidence because phoenixd returns one unattributed record when the hash has
+/// several; a 404 is not evidence about the original sweep without a same-wallet witness.
 #[tokio::test]
-async fn outbound_status_by_payment_hash_classifies_every_measured_outgoing_shape() {
+async fn outbound_status_by_payment_hash_reports_only_positive_hash_wide_evidence() {
     let ops = FakePhoenixdOps::new();
     let be = backend(ops.clone(), TestClock::new(1_000));
 
@@ -2017,22 +2010,22 @@ async fn outbound_status_by_payment_hash_classifies_every_measured_outgoing_shap
         Some(PayStatus::Pending)
     );
 
-    // Completed and NOT paid: the measured terminal-failure shape.
+    // Completed and NOT paid: terminal for this record, but unattributed among same-hash attempts.
     ops.set_outgoing(record("cc", false, Some(MEASURED_COMPLETED_AT_MS)));
     assert_eq!(
         be.outbound_status_by_payment_hash("cc").await.unwrap(),
-        Some(PayStatus::Failed)
+        None
     );
 
-    // An unseeded hash is phoenixd's clean 404, where absence IS authoritative (fact 3): this hash
-    // provably never paid. It is `Some(Failed)`, NOT `None` — `None` means "cannot answer".
+    // An unseeded hash is phoenixd's clean 404 for the wallet answering now. This seam carries no
+    // witness that it is the wallet which started the sweep, so it cannot answer for the old wallet.
     assert_eq!(
         be.outbound_status_by_payment_hash("dd").await.unwrap(),
-        Some(PayStatus::Failed)
+        None
     );
 
-    // A transport failure is an `Err` the caller must treat like "cannot answer" — never the clean
-    // 404 above, which would terminalize a payment phoenixd was simply not asked about.
+    // A transport failure is an `Err`, distinct from the clean 404 above; both are non-evidence for
+    // this hash-only seam, and the caller must park rather than terminalize on either.
     ops.fail_outgoing_by_hash();
     assert!(
         be.outbound_status_by_payment_hash("aa").await.is_err(),
@@ -2043,8 +2036,7 @@ async fn outbound_status_by_payment_hash_classifies_every_measured_outgoing_shap
 /// The probe's own echoed-hash guard. Nothing else can fire it: `set_outgoing` keys every record by
 /// the record's OWN hash, so only a deliberately mis-keyed one reaches the check — and a guard that
 /// cannot be shown to fire is not a guard. What it stands between: a record about someone else's
-/// payment and the one answer (`Some(Failed)`/`Some(Succeeded)`) that licenses the sweep's recovery
-/// arm to terminalize a ledger row.
+/// payment and `Some(Succeeded)`, which would make the sweep adopt SENT and terminalize its row.
 #[tokio::test]
 async fn outbound_status_by_payment_hash_refuses_a_record_naming_a_different_hash() {
     let ops = FakePhoenixdOps::new();

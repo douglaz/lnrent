@@ -1872,9 +1872,9 @@ mod tests {
         let clock = expiry_recovery_clock();
         seed_final_receipt(&store, "order:A", "A", 100_000).await; // earned 100_000_000
         let expired = mint_bolt11(40_000 * 1000, META, 100, 10); // expired at 110, aeons ago
-        // The row id carries the payment hash of the LOST pay. The fresh invoice below has a
-        // DIFFERENT hash, so it writes a different row — which is exactly why the one-at-a-time gate,
-        // not row identity, has to be what refuses it.
+        // This shared test minter reuses one synthetic payment hash, so the lost row uses a distinct
+        // literal id. The fresh execute below would therefore write a different row; the assertion
+        // still isolates the one-at-a-time gate rather than relying on row-key reuse.
         seed_pending_sweep_bolt11(&store, "sweep:lostpay", &expired, 40_000, 41_000_000).await;
 
         let payment = Arc::new(SweepPayment::new());
