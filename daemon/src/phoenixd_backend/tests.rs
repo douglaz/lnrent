@@ -1531,9 +1531,11 @@ async fn index_loss_refuses_an_in_flight_record_and_records_no_failure() {
         "the operator must be told the shape, and must not be handed the other shape's \
          wording: {msg}"
     );
-    // The other direction of the sweep consequence, pinned like its terminal sibling below: the
-    // hash probe classifies THIS record, so an in-flight one leaves the sweep PENDING. Naming
-    // SweepFailed here would promise the operator the opposite outcome (lnrent-7wbo).
+    // The sweep consequence is shape-INDEPENDENT: it sits outside the message's shape conditional
+    // (`phoenixd_backend.rs:1435-1440`), so this pins the SAME sentence the terminal sibling below
+    // pins, on the other shape's rendered message — not a per-shape direction. What it guards is
+    // that neither shape re-acquires a SweepFailed promise: no-row recovery parks the sweep, and the
+    // hash probe cannot terminalize it (lnrent-7wbo).
     assert!(
         msg.contains("SweepStuck") && !msg.contains("SweepFailed"),
         "an in-flight record parks a sweep PENDING, not FAILED: {msg}"

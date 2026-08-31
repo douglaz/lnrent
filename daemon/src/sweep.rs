@@ -522,6 +522,16 @@ impl Sweeper {
                             // "no such record" from a backend whose absence is authoritative). This is
                             // the one answer that licenses terminalizing, and the one where the
                             // existing SweepFailed DM tells the operator something true.
+                            //
+                            // NO SHIPPED BACKEND ANSWERS THIS TODAY. The probe has exactly three
+                            // impls — the trait default (`backends.rs:255`), phoenixd, and this
+                            // module's test double — and phoenixd's two non-evidence shapes both
+                            // return `Ok(None)` (`phoenixd_backend.rs:2220-2228`). So this arm
+                            // carries the trait's terminal answer and is exercised only by the test
+                            // double until lnrent-9dzu (phoenixd) or lnrent-8l8c (lnv2) gives it a
+                            // producer. It stays because a backend that gains hash-authoritative
+                            // absence must be able to terminalize; deleting it would make the
+                            // contract unrepresentable in the caller.
                             Ok(Some(PayStatus::Failed)) => {
                                 let reason =
                                     format!("intent no longer payable during recovery: {}", e.message());
@@ -560,11 +570,16 @@ impl Sweeper {
                         // `lnrent sweep` with `Busy` — that refusal is the mechanism that prevents the
                         // second outbound payment. SweepStuck is how the operator hears about it.
                         //
-                        // The row re-drives every tick, so a backend that CAN answer resolves it on
-                        // the next one. A backend taking the trait default never can: on lnv2 this row
-                        // stays parked, cap held and sweeps refused, until lnv2 learns to answer the
-                        // hash probe (lnrent-8l8c) or a human settles it against the wallet's own
-                        // payment list. That is the deliberate trade — a held cap and a refused sweep
+                        // The row re-drives every tick, so a backend that later answers POSITIVELY
+                        // resolves it — but no shipped backend can answer `Failed` (see that arm
+                        // above), so today the only resolution is a payment that turns up PAID and is
+                        // adopted SENT. Every other parked row stays parked, cap held and sweeps
+                        // refused, until a human settles it against the wallet's own payment list:
+                        // on lnv2 because it takes the trait default (lnrent-8l8c), and on phoenixd
+                        // because BOTH of its non-evidence shapes — an unattributable
+                        // completed-and-unpaid record, and a 404 it cannot tie to the wallet that
+                        // started this sweep — return `Ok(None)` (`phoenixd_backend.rs:2220-2228`,
+                        // lnrent-9dzu). That is the deliberate trade — a held cap and a refused sweep
                         // are recoverable, a second outbound payment is not.
                         report.pending += 1;
                         self.maybe_alert_stuck(&row, self.clock.now(), park_reason)
@@ -1992,6 +2007,10 @@ mod tests {
         // positively reported that no payment for this hash is in flight and none succeeded. Surplus
         // is available, so the only reason not to pay is the expiry, and this is the arm where the
         // existing SweepFailed DM tells the operator something true.
+        //
+        // The scripted answer is what makes this reachable: no SHIPPED backend answers `Failed`
+        // today (see that arm), so this pins the contract's terminal arm rather than a live backend
+        // path, and it is what a backend gaining hash-authoritative absence must keep working.
         let store = mem_store();
         let clock = expiry_recovery_clock();
         seed_final_receipt(&store, "order:A", "A", 100_000).await; // earned 100_000_000

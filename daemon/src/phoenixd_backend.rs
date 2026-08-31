@@ -2184,17 +2184,23 @@ impl PaymentBackend for PhoenixdPayment {
     /// index is lost (lnrent-7wbo). It cannot prove hash-wide terminal failure from the endpoint's
     /// single unattributed record, and a 404 is authoritative only for the wallet answering now;
     /// this hash-only seam has no persisted witness that it is the wallet which started the sweep.
+    ///
+    /// So this override NEVER returns `Ok(Some(PayStatus::Failed))`. That is the money-safe
+    /// direction — a caller that cannot prove absence must not terminalize — and its price is
+    /// liveness: a sweep whose payment really failed or never started parks until a human settles it
+    /// against the wallet's own payment list. Closing that needs evidence this seam does not have
+    /// (a same-wallet witness on the sweep row); tracked as lnrent-9dzu.
     async fn outbound_status_by_payment_hash(
         &self,
         payment_hash: &str,
     ) -> Result<Option<PayStatus>> {
         // Read the MEASURED discriminator carried on the record: `completedAt` is absent while the
-        // payment is in flight (`PhoenixdOutgoing::completed_at_ms`, `phoenixd_backend.rs:386-393`,
+        // payment is in flight (`PhoenixdOutgoing::completed_at_ms`, `phoenixd_backend.rs:389-394`,
         // and the live truth table in `pay_inner`). A terminal marker classifies that record, not all
         // attempts for its hash. An `Err` propagates unchanged — a transport failure refutes nothing,
         // and the trait requires callers to treat it exactly like `Ok(None)`.
         // Validate the echoed hash before classifying any discriminator. The neighbouring no-row
-        // recovery probe does the same (`phoenixd_backend.rs:1398-1412`): a response about another
+        // recovery probe does the same (`phoenixd_backend.rs:1399-1414`): a response about another
         // destination is evidence about neither this payment's success nor its failure. The
         // comparison is case-insensitive because phoenixd's echo casing is not measured.
         let record = match self.ops.outgoing_by_hash(payment_hash).await? {
@@ -2212,12 +2218,12 @@ impl PaymentBackend for PhoenixdPayment {
             Some(record) if record.is_paid => Ok(Some(PayStatus::Succeeded)),
             Some(record) if record.completed_at_ms.is_none() => Ok(Some(PayStatus::Pending)),
             // `pay_inner` documents why this is not hash-wide terminal evidence
-            // (`phoenixd_backend.rs:1286-1310`): phoenixd returns one record without attributing it
+            // (`phoenixd_backend.rs:1285-1310`): phoenixd returns one record without attributing it
             // when the hash has several, so another attempt may have paid or may still be in flight.
             Some(_) => Ok(None),
             // A clean 404 proves absence only in the wallet answering now
             // (`phoenixd_backend.rs:66-72`). Unlike a PREPARED pay row, a sweep row carries no
-            // persisted node witness for `require_prepared_node` to compare (`:1180-1208`), so this
+            // persisted node witness for `require_prepared_node` to compare (`:1179-1208`), so this
             // method cannot prove that the original wallet is the one whose history returned 404.
             None => Ok(None),
         }
