@@ -558,9 +558,14 @@ impl Sweeper {
                         // `paid_out_msat` (so surplus never re-offers money that may already be gone)
                         // AND what makes `gate_and_write`'s one-at-a-time gate refuse a fresh
                         // `lnrent sweep` with `Busy` — that refusal is the mechanism that prevents the
-                        // second outbound payment. The row re-drives every tick, so it resolves itself
-                        // as soon as the backend can answer; SweepStuck is how the operator hears about
-                        // it in the meantime.
+                        // second outbound payment. SweepStuck is how the operator hears about it.
+                        //
+                        // The row re-drives every tick, so a backend that CAN answer resolves it on
+                        // the next one. A backend taking the trait default never can: on lnv2 this row
+                        // stays parked, cap held and sweeps refused, until lnv2 learns to answer the
+                        // hash probe (lnrent-8l8c) or a human settles it against the wallet's own
+                        // payment list. That is the deliberate trade — a held cap and a refused sweep
+                        // are recoverable, a second outbound payment is not.
                         report.pending += 1;
                         self.maybe_alert_stuck(&row, self.clock.now(), park_reason)
                             .await;
@@ -1322,17 +1327,18 @@ mod tests {
     /// positive evidence (lnrent-7wbo). It wraps rather than extends so that `SweepPayment` itself
     /// keeps overriding NOTHING — which is what lets the break test below drive the trait's DEFAULT
     /// `outbound_status_by_payment_hash`, the answer every backend that has not implemented it gives
-    /// (lnv2 included, deliberately). Everything else delegates, so the same pay/idempotency/send
-    /// counting runs underneath — including `available_balance_msat`'s panic.
+    /// (lnv2 included, deliberately). Every method the sweep path actually calls delegates, so the
+    /// same pay/idempotency/send counting runs underneath — including `available_balance_msat`'s
+    /// panic; the rest refuse exactly as the inner fake does.
     struct ProbeablePayment {
-        inner: Arc<SweepPayment>,
+        inner: SweepPayment,
         answers: Mutex<HashMap<String, PayStatus>>,
     }
 
     impl ProbeablePayment {
         fn new() -> Self {
             Self {
-                inner: Arc::new(SweepPayment::new()),
+                inner: SweepPayment::new(),
                 answers: Mutex::new(HashMap::new()),
             }
         }
@@ -1355,31 +1361,29 @@ mod tests {
             // trait default, so a test only gets a positive answer it asked for.
             Ok(self.answers.lock().unwrap().get(payment_hash).copied())
         }
-        async fn create_invoice(&self, a: u64, m: &str, e: u32, x: &str) -> Result<Invoice> {
-            self.inner.create_invoice(a, m, e, x).await
+        // The methods the sweep path never reaches refuse here exactly as `SweepPayment` does, rather
+        // than delegating: a delegate would buy nothing and would re-cross the bare-lookup denylist
+        // clippy.toml guards (lnrent-l07s) inside a test double.
+        async fn create_invoice(&self, _: u64, _: &str, _: u32, _: &str) -> Result<Invoice> {
+            unimplemented!("sweep never receives")
         }
-        // The two bare seams delegate like everything else here. A test double's delegate is not a
-        // decider, which is what clippy.toml's denylist guards (lnrent-l07s); the inner fake's own
-        // `unimplemented!` is what any sweep test reaching them would hit.
-        #[allow(clippy::disallowed_methods)]
-        async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
-            self.inner.lookup(id).await
+        async fn lookup(&self, _: &str) -> Result<PaymentStatus> {
+            unimplemented!("sweep never looks up invoices")
         }
-        #[allow(clippy::disallowed_methods)]
-        async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
-            self.inner.lookup_settlement(id).await
+        async fn lookup_settlement(&self, _: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            unimplemented!("sweep never looks up settlements")
         }
-        async fn pay(&self, d: &str, a: u64, k: &str) -> Result<String> {
-            self.inner.pay(d, a, k).await
+        async fn pay(&self, _: &str, _: u64, _: &str) -> Result<String> {
+            unimplemented!("sweep uses pay_capped")
+        }
+        async fn payment_status(&self, _: &str) -> Result<PayStatus> {
+            unimplemented!("sweep checks by key")
         }
         async fn refund_required_outlay_msat(&self, g: u64, p: Option<u64>) -> Result<u128> {
             self.inner.refund_required_outlay_msat(g, p).await
         }
         async fn pay_capped(&self, b: &str, a: u64, cap: u128, k: &str) -> Result<String> {
             self.inner.pay_capped(b, a, cap, k).await
-        }
-        async fn payment_status(&self, id: &str) -> Result<PayStatus> {
-            self.inner.payment_status(id).await
         }
         async fn payment_status_by_key(&self, k: &str) -> Result<PayStatus> {
             self.inner.payment_status_by_key(k).await
@@ -1391,7 +1395,7 @@ mod tests {
             self.inner.available_balance_msat().await
         }
         async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
-            self.inner.watch().await
+            unimplemented!("sweep never watches")
         }
     }
 

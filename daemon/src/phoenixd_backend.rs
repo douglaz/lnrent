@@ -118,10 +118,12 @@
 //!
 //!    None of this makes restarting on a diverged index safe. The sweeper's expired-intent recovery
 //!    arm no longer reaches a terminal decision without evidence — it probes this backend by hash
-//!    ([`PaymentBackend::outbound_status_by_payment_hash`], lnrent-7wbo) — but its RESTORED-stale-
-//!    `FAILED` arm still terminalizes unprobed, the same uxbd shape one layer up (`daemon/src/
-//!    sweep.rs`, the `PayStatus::Failed` arm of `Sweeper::drive`). `docs/go-live.md` is authoritative
-//!    for what an operator should do.
+//!    ([`PaymentBackend::outbound_status_by_payment_hash`], lnrent-7wbo) — but TWO exits of
+//!    `Sweeper::drive` still terminalize unprobed (`daemon/src/sweep.rs`): its RESTORED-stale-
+//!    `FAILED` arm, the same uxbd shape one layer up, and the `superseded_by_liability` exit of the
+//!    very arm 7wbo fixed, which parks a still-VALID intent FAILED when new liabilities have shrunk
+//!    the surplus below its cap (lnrent-meqe). `docs/go-live.md` is authoritative for what an
+//!    operator should do.
 //!
 //! ## Cross-order same-invoice guard (ported [8A], lnrent-85t)
 //! phoenixd dedups by payment hash across the WHOLE node, so if some other idempotency key already
@@ -1432,9 +1434,9 @@ impl PhoenixdPayment {
                          it: a recorded failure would let the refund re-resolve to a NEW invoice \
                          and pay a second time, which phoenixd's same-invoice dedup could not \
                          catch. For a REFUND this surfaces as a RefundStuck operator alert. For a \
-                         SWEEP it does not: with no row the next drive treats the intent as never \
-                         started and, once it expires, parks it FAILED with a SweepFailed alert \
-                         that overstates what is known (lnrent-sweep-failed-ledger-lie-7wbo). \
+                         SWEEP the next drive treats the intent as never started and, once the \
+                         stored invoice has expired, asks this same endpoint by hash before it \
+                         decides anything (lnrent-sweep-failed-ledger-lie-7wbo): {}. \
                          Either way settling it needs a human who can read the wallet's own \
                          payment list; do not pay this destination out of band while a payment for \
                          it may still be in flight.",
@@ -1446,6 +1448,18 @@ impl PhoenixdPayment {
                             "but does carry a completion time, which on the release lnrent measured \
                              means it failed — though phoenixd returns only one record per hash, so \
                              that failure cannot be proven to be this attempt"
+                        },
+                        // The sweep consequence is per-SHAPE for the same reason the wording above
+                        // is: the probe classifies this record, so the two shapes end the sweep row
+                        // in different states and name different alerts.
+                        if record.completed_at_ms.is_none() {
+                            "read as still in flight, that leaves the sweep row PENDING with its \
+                             cap still reserved, and once it has been stuck past the alert \
+                             threshold the operator hears SweepStuck"
+                        } else {
+                            "a completion time is the positive evidence the sweep requires, so it \
+                             parks the row FAILED and the SweepFailed alert it sends is then \
+                             telling the truth"
                         }
                     ),
                     // A clean 404 proves this wallet has no payment for this hash, so sending it now
