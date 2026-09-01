@@ -2211,17 +2211,36 @@ impl PaymentBackend for PhoenixdPayment {
         match record {
             Some(record) if record.is_paid => Ok(Some(PayStatus::Succeeded)),
             Some(record) if record.completed_at_ms.is_none() => Ok(Some(PayStatus::Pending)),
-            // Completed and NOT paid proves THIS RECORD failed, not that the hash did: when a hash
-            // has several attempts `outgoingbyhash` returns one of them without attributing it
-            // (`pay_inner`'s measured truth table, lnrent-ole), so another attempt may have paid or
-            // may still be in flight. Not evidence, therefore not a licence to terminalize.
+            // Completed and NOT paid proves THIS RECORD failed. Whether it proves the HASH failed
+            // depends on which record `outgoingbyhash` returns when a hash has several attempts —
+            // and lnrent has NOT measured that. `pay_inner` states the gap exactly: the endpoint
+            // "returns exactly ONE record, with no measurement of which one it picks when a hash
+            // has several" (`phoenixd_backend.rs:1287-1290`), and it refuses to resolve this same
+            // shape for the same reason, having built and refuted three attribution schemes whose
+            // every failure mode was a double pay.
+            //
+            // So this is `Ok(None)` to stay consistent with that standing decision, not because the
+            // record is known to be uninformative. Reading phoenixd's source suggests it ranks
+            // attempts (Succeeded > Pending > Failed), which if MEASURED would make this arm
+            // terminal and would also unblock `pay_inner`'s much larger refund-side decision — that
+            // measurement is lnrent-tk34. Until it exists, treating this as terminal would be a
+            // guess about an API surface this module refuses to guess about; the cost of the
+            // conservative choice is a parked row a human can settle, the cost of guessing wrong is
+            // a second payment.
             Some(_) => Ok(None),
-            // A clean 404 IS terminal evidence: phoenixd has no record of this hash at all, so no
-            // attempt for it is in flight and none succeeded (`phoenixd_backend.rs:66-72`, fact 3,
-            // live-measured). This is the arm that lets a sweep whose pay never left — a crash
-            // between the durable PENDING write and `pay_capped` — resolve instead of parking
-            // forever; answering `Ok(None)` here would hold its cap and make `gate_and_write`'s
-            // one-at-a-time gate refuse every future sweep, with no operator escape.
+            // A clean 404 IS terminal evidence: phoenixd holds NO record for this hash, so within
+            // the history it is answering from, nothing is in flight and nothing succeeded
+            // (`phoenixd_backend.rs:66-72`, fact 3, live-measured). Stated precisely, because the
+            // stronger reading is tempting and wrong: this proves "no durable record in the payment
+            // DB answering now", not "no POST was ever made". The two differ only where that DB has
+            // lost history — the residual below.
+            //
+            // This is the arm that lets the ordinary case resolve: a crash between the durable
+            // PENDING write and `pay_capped` leaves lnrent's own index empty AND phoenixd with
+            // nothing, and answering `Ok(None)` here would hold that row's cap forever and make
+            // `gate_and_write`'s one-at-a-time gate refuse every future sweep, with no operator
+            // escape (`read_surplus` counts PENDING caps; `store.rs`'s reaper never removes
+            // `sweep_attempt` rows).
             //
             // Its authority is bounded to the wallet answering NOW (fact 3's own caveat), and this
             // seam has no witness to check that with: `require_prepared_node` compares a nodeId held

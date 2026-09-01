@@ -1983,8 +1983,9 @@ async fn a_terminal_outgoing_record_stays_pending_but_reads_differently() {
 
 /// lnrent-7wbo: the read-only hash-keyed probe, over every `outgoingbyhash` response shape plus a
 /// transport failure. The measured discriminator classifies paid and in-flight records; a
-/// completed-unpaid record is NOT hash-wide evidence (one unattributed record per hash), while a
-/// clean 404 is — absence of any record for the hash, bounded to the answering wallet (lnrent-k0yl).
+/// completed-unpaid record is not TREATED as hash-wide evidence while the endpoint's multi-attempt
+/// selection rule is unmeasured (lnrent-tk34), while a clean 404 is — no record for the hash in the
+/// history being answered from, which is bounded to the answering wallet (lnrent-k0yl).
 #[tokio::test]
 async fn outbound_status_by_payment_hash_classifies_every_measured_shape() {
     let ops = FakePhoenixdOps::new();
@@ -2012,9 +2013,10 @@ async fn outbound_status_by_payment_hash_classifies_every_measured_shape() {
         Some(PayStatus::Pending)
     );
 
-    // completedAt SET and NOT paid proves only that THIS record failed. `outgoingbyhash` returns one
-    // unattributed record when a hash has several attempts, so another may have paid or may still be
-    // in flight: `None` ("cannot answer"), never a licence to terminalize.
+    // completedAt SET and NOT paid proves THIS record failed. Whether it proves the HASH failed
+    // depends on which record the endpoint returns when a hash has several attempts, which lnrent
+    // has NOT measured (lnrent-tk34) — so `None`, matching `pay_inner`'s refusal to resolve the same
+    // shape. This pins a DECISION under uncertainty, not a known property of the record.
     ops.set_outgoing(record("cc", false, Some(MEASURED_COMPLETED_AT_MS)));
     assert_eq!(be.outbound_status_by_payment_hash("cc").await.unwrap(), None);
 
