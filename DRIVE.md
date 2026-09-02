@@ -11,7 +11,7 @@
 `lnv2-restore-fresh-hash-proof-l5kk` (a devimint proof task), `ea1` (release), `5h4` (product
 design), `xov` (user deferred). `br ready` counts the whole repo — filter it through this line.
 
-**Phase:** BUILD · **Bead:** lnrent-meqe (next — see Now) · **Branch:** —
+**Phase:** BUILD · **Bead:** lnrent-hwni (next — see Now) · **Branch:** —
 **Pending:** —
 **Gate:** the full CI matrix in AGENTS.md "Building and testing" — the workspace clippy+test pair
 is the inner loop only; it omits both `--no-default-features` legs, wasm, and the two web E2E runs
@@ -20,6 +20,28 @@ each names something that the act of writing it changes or dates, and both drift
 file carried them.
 
 ## Done (this drive)
+- lnrent-meqe the `superseded_by_liability` exit probes before it terminalizes — merged #86 (squash
+  `3748c11`), CLOSED. rb-lite 4 rounds / 10 iterations (19 accepted, 13 declined, 4 deferred;
+  `rejections_by_round: [2,5,5,5]`, no ratchet), trend 5->4->3->2. The decision table is EXTRACTED,
+  not copied: one `resolve_or_park` serving both exits, leaving exactly ONE production call site of
+  the probe — a panel reviewer verified that, and the park->terminalize mutation reddening BOTH
+  exits' tests is the independent proof it is shared.
+  STOPPED by the operator once every remaining finding was blocked on the TASK FILE rather than the
+  code (the implementer said so when deferring, and was right). Three settled by hand: a SECOND spec
+  bullet my lock wrongly excluded (reachable — `MockPayment` takes the trait default while the spec
+  claims the suite "works identically" on it), an unbounded "second way out" claim, and a redundant
+  adoption test the skeptic argued four rounds running. See the memory
+  `rb-lite-task-file-is-the-limiting-factor` — this is the second bead in a row where my own task
+  file, not the panel, was the limiting factor.
+  Merged through the NORMAL gate. It first blocked twice, correctly: once on unresolved CodeRabbit
+  threads, then on `rerun_requested` — the wrapper could not be PROVEN to answer my `@codex review`
+  because no completed round separated it from a 14h-old round-start. A second trigger disambiguated
+  it. Full 8-leg matrix EXIT=0.
+  CodeRabbit caught a real one: my r4gf close reason claimed the premise was "corrected upstream at
+  douglaz/skills#74", but only a correction COMMENT existed — the issue's title and body still
+  asserted the false claim. Fixed at the source; #74 now leads with the retraction.
+  A THIRD site of the unprobed-terminalize class (`capped_pay`'s `status_after_error` -> Failed arm)
+  was found by the panel and recorded on `uxbd`, which owns that stale-FAILED shape.
 - lnrent-7wbo never park a sweep FAILED without positive backend evidence — merged #85 (squash
   `b32a99b`), CLOSED. rb-lite 6 rounds / 12 iterations (13 accepted, 9 declined, 5 deferred), STOPPED
   by the operator at round 7: three findings were legitimately deferred to beads and the panel
@@ -70,10 +92,12 @@ file carried them.
 ## Now — order decided 2026-08-30 (panel fable + codex, independent, reconciled; both agreed)
 1. ~~`lnrent-l07s`~~ **DONE — merged #84 (squash `bdeeb04`), CLOSED 2026-08-31.** See Done above.
 2. ~~`lnrent-7wbo`~~ **DONE — merged #85 (squash `b32a99b`), CLOSED 2026-09-02.** See Done above.
-   **NEXT is `lnrent-meqe` (P1)**, which 7wbo's own panel found and filed: the
-   `superseded_by_liability` exit of the SAME `PayStatus::Unknown` arm still terminalizes on zero
-   backend evidence (still-valid intent, surplus shrunk since). The seam it needs already exists, so
-   it is a small bead — take it before the hwni ADR by the same rule that ordered 7wbo ahead of it.
+2b. ~~`lnrent-meqe`~~ **DONE — merged #86 (squash `3748c11`), CLOSED 2026-09-02.** See Done above.
+   **NEXT in this drive is item 3, `hwni`.** `lnrent-tk34` (P1) is the higher-value bead — one
+   staging measurement unblocks TWO conservative arms (the sweep probe's completed-unpaid answer, and
+   `pay_inner`'s refund-side decision, unresolved since lnrent-ole) — but it needs the phoenixd
+   staging node and real sats, so it is OUT of this drive's scope by the line at the top. It belongs
+   to the next live-infra session, alongside `nfj`.
 3. **`lnrent-unbooked-settlement-condition-ledger-hwni`** (P1, design/ADR — not an rb-lite loop).
    Now SEVEN questions: the original four + subject DOMAIN (receive-only vs outbound keys — 7fx,
    sll4, uxbd want in), subject CARDINALITY (phoenixd aggregates many invoices under one subject;
