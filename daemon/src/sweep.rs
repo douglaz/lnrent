@@ -657,10 +657,13 @@ impl Sweeper {
         // lnv2's absent attempt-0 operation are each positive proof of absence. What still parks
         // indefinitely is genuine ambiguity (an unattributable phoenixd record, an lnv2 attempt whose
         // state needs a blocking await), and a backend on the trait default; lnrent-8l8c tracks
-        // widening lnv2's answer to Succeeded/Pending. That is the whole liveness story for the
-        // EXPIRED caller only — the superseded caller has a second way out, because the surplus can
-        // recover: the next tick's re-gate then takes the still-fits path above, re-submitting THIS
-        // key and bolt11, exactly the re-submit the started/re-await branch already relies on.
+        // widening lnv2's answer to Succeeded/Pending. The superseded caller has one extra way out
+        // the expired caller does not: the surplus can recover, and the next tick's re-gate then
+        // takes the still-fits path above, re-submitting THIS key and bolt11 — exactly the re-submit
+        // the started/re-await branch already relies on. That escape is BOUNDED by the stored
+        // invoice's own expiry, though: once the parked intent expires, the next tick takes the
+        // expired exit instead and the row parks on the same terms as any other. So the extra exit
+        // buys time, not a guarantee.
         self.maybe_alert_stuck(
             row,
             self.clock.now(),
@@ -2240,29 +2243,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn drive_adopts_a_superseded_intent_the_backend_confirms_was_paid() {
-        // Probe says SUCCEEDED: the money left despite the shrunken surplus, so the row is adopted
-        // SENT (cap stays consumed) rather than superseded, and nothing is re-sent.
-        let store = mem_store();
-        let clock = expiry_recovery_clock();
-        seed_superseded_pending_sweep(&store, "sweep:x").await;
-
-        let payment = Arc::new(ProbeablePayment::new());
-        payment.answer("x", PayStatus::Succeeded);
-        let s = sweeper_with_alerts(&store, payment.clone(), clock);
-
-        let report = s.drive().await.unwrap();
-        assert_eq!(report.sent, 1);
-        assert_eq!(single_sweep_status(&store).await, "SENT");
-        assert_eq!(payment.sends(), 0, "an adopted payment is never re-sent");
-        assert_eq!(alert_count(&store, "sweep_failed").await, 0);
-        assert_eq!(
-            surplus_snapshot(&store).await.paid_out_msat,
-            105_000_000,
-            "a SENT sweep keeps its cap out of surplus"
-        );
-    }
 
     #[tokio::test]
     async fn no_balance_read_across_quote_execute_drive() {

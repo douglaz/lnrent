@@ -197,9 +197,13 @@ alerting spec §F).
 - Fee-rise safety: quote at fee F, raise the gateway fee before send → the capped send refuses;
   nothing paid; row FAILED with the cap error.
 - Idempotency/crash: kill between ledger-PENDING and pay-confirm → restart re-drives by key, funds
-  sent exactly once (mirror the refund crash tests); the not-started branch re-gates and refuses
-  (`superseded_by_liability`) when a new liability consumed the surplus; re-submitting the same
-  bolt11 after success returns the cached success, no second payment.
+  sent exactly once (mirror the refund crash tests); when a new liability consumed the surplus the
+  not-started branch re-gates and then asks the backend for outbound evidence, writing
+  `superseded_by_liability` **only** on a positive "not paid and not in flight" answer and otherwise
+  leaving the row PENDING (§Idempotency + ledger's decision table) — so on a backend that cannot
+  answer, including `MockPayment`'s trait default, the acceptance shape is a PARKED row, not a
+  refusal; re-submitting the same bolt11 after success returns the cached success, no second
+  payment.
 - Zero-amount bolt11, expired bolt11, quote failure (`sweep_unpriceable`), and a second concurrent
   sweep (`sweep_busy`) are structured refusals; nothing is written to `refund_attempt`; a sweep
   never enters the refund LIABILITY set (`required_msat` unchanged) — but it DOES reduce
