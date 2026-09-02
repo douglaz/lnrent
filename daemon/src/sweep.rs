@@ -2036,6 +2036,113 @@ mod tests {
         assert_eq!(alert_count(&store, "sweep_stuck").await, 0);
     }
 
+    /// Seed a captured receipt whose sub is still PROVISIONING: earned, and reserved at gross, so it
+    /// is a NEW liability that shrinks the surplus a committed sweep cap was gated against.
+    async fn seed_at_risk_receipt(store: &Store, external_id: &str, sub_id: &str, amount_sat: i64) {
+        let (external_id, sub_id) = (external_id.to_string(), sub_id.to_string());
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO subscription (id, state, created_at, updated_at) VALUES (?1, 'PROVISIONING', 0, 0)",
+                    params![sub_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO invoice (id, subscription_id, external_id, kind, amount_sat, status, issued_at)
+                     VALUES (?1, ?2, ?3, 'order', ?4, 'PAID', 0)",
+                    params![format!("inv-{external_id}"), sub_id, external_id, amount_sat],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_never_terminalizes_a_superseded_intent_the_backend_cannot_answer_for() {
+        // lnrent-meqe, the break test: 7wbo's shape on the OTHER exit of the SAME `PayStatus::Unknown`
+        // not-started arm. Here the stored intent is STILL VALID — what fails is the re-run surplus
+        // gate, because a new liability has shrunk the surplus below the committed cap since the
+        // intent was written. The branch's premise is still "the key index says not-started", which
+        // is exactly what an index loss over an IN-FLIGHT sweep pay looks like, so terminalizing on
+        // it returns the cap to surplus and DMs the operator that the sweep failed; the fresh
+        // `lnrent sweep` they then run mints a NEW payment hash the node's hash-keyed dedup cannot
+        // catch — a genuine SECOND outbound payment. `SweepPayment` overrides NOTHING for the probe,
+        // so this drives the trait DEFAULT ("cannot answer").
+        let store = mem_store();
+        let clock = expiry_recovery_clock();
+        // earned 160_000_000, of which the at-risk 60k receipt reserves 60_000_000 -> 100_000_000
+        // surplus excluding this row's own cap, BELOW the 105_000_000 the PENDING row committed.
+        seed_final_receipt(&store, "order:A", "A", 100_000).await;
+        seed_at_risk_receipt(&store, "order:B", "B", 60_000).await;
+        // Valid at the recovery clock (minted now, hour-long expiry): the ONLY reason this drive
+        // refuses to send is the superseding liability.
+        let valid = mint_bolt11(
+            100_000 * 1000,
+            META,
+            u64::try_from(SWEEP_STUCK_ALERT_S * 2).unwrap(),
+            3_600,
+        );
+        // The shared minter reuses ONE synthetic payment hash, so the lost row takes a distinct
+        // literal id; the fresh execute below therefore hits the one-at-a-time PENDING gate
+        // (`gate_and_write` checks it BEFORE the surplus gate) rather than this row's own cache.
+        seed_pending_sweep_bolt11(&store, "sweep:lostpay", &valid, 100_000, 105_000_000).await;
+
+        let payment = Arc::new(SweepPayment::new());
+        payment.seed_lost_outbound_payment(); // the pay that really left; its index row is gone
+        let s = sweeper_with_alerts(&store, payment.clone(), clock);
+
+        let before = surplus_snapshot(&store).await;
+        let report = s.drive().await.unwrap();
+
+        assert_eq!(
+            single_sweep_status(&store).await,
+            "PENDING",
+            "no backend evidence -> the superseded row must stay PENDING, never FAILED"
+        );
+        assert_eq!(
+            report,
+            SweepReport {
+                sent: 0,
+                failed: 0,
+                pending: 1
+            }
+        );
+        assert_eq!(
+            surplus_snapshot(&store).await,
+            before,
+            "the cap stays reserved: surplus must be unchanged across the incident"
+        );
+        assert_eq!(
+            alert_count(&store, "sweep_failed").await,
+            0,
+            "no terminal SweepFailed DM for a payment that may have settled"
+        );
+        assert_eq!(
+            alert_count(&store, "sweep_stuck").await,
+            1,
+            "the operator is told the truth instead: one SweepStuck"
+        );
+
+        // The operator now re-runs `lnrent sweep` with a FRESH invoice. The parked row still holds
+        // the one in-flight slot, which is what stops the second payment.
+        let fresh = mint_bolt11(
+            40_000 * 1000,
+            META,
+            u64::try_from(SWEEP_STUCK_ALERT_S * 2).unwrap(),
+            3_600,
+        );
+        assert_eq!(
+            s.execute(&fresh).await.unwrap_err().code(),
+            "sweep_busy",
+            "the parked row must refuse a fresh sweep"
+        );
+        assert_eq!(
+            payment.sends(),
+            1,
+            "EXACTLY ONE outbound payment across the whole incident"
+        );
+    }
+
     #[tokio::test]
     async fn no_balance_read_across_quote_execute_drive() {
         // The SweepPayment double PANICS on available_balance_msat; the whole path must never call it.
