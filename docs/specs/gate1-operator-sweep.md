@@ -132,13 +132,11 @@ docs/specs/gate1-alerting-operability.md §F — never by this authorization pat
       being recovered from its own `paid_out_msat`** (its cap is already subtracted the moment the
       PENDING row exists; gating it against itself would demand the funds twice and falsely
       supersede a sweep that fit exactly). Other PENDING/SENT sweeps still count. If the gate now
-      fails, **never send** — but do not terminalize on the key index's silence either. This exit
-      reads the same not-started evidence as the sub-case below, so a FAILED row here returns the cap
-      to surplus for a payment that may still settle, and the operator's next `lnrent sweep` mints a
-      new payment hash the node's dedup cannot catch (lnrent-meqe). Ask the backend for outbound
-      evidence and act on the SAME four-way table as below; only its "positively NOT paid" row marks
-      the row FAILED — with reason `superseded_by_liability` (carrying the surplus and cap figures)
-      and the alert. Every other answer parks the row PENDING with `SweepStuck` past the threshold.
+      fails, **never send** — but do not terminalize on the key index's silence either: this exit
+      rests on the same not-started evidence, and therefore on the same hazard, as the sub-case below
+      (lnrent-meqe). Ask the backend for outbound evidence and act on the SAME four-way table as
+      below — only its "positively NOT paid" row marks the row FAILED, and on this exit that FAILED
+      carries reason `superseded_by_liability` (with the surplus and cap figures) and the alert.
     - **no longer payable**: the row may NOT be terminalized on the key index's silence.
       `payment_started_by_key` is a row-existence read over a LOCAL index, so an index loss over an
       in-flight sweep pay is indistinguishable from a sweep that never started — and a FAILED row

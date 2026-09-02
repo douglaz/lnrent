@@ -657,7 +657,10 @@ impl Sweeper {
         // lnv2's absent attempt-0 operation are each positive proof of absence. What still parks
         // indefinitely is genuine ambiguity (an unattributable phoenixd record, an lnv2 attempt whose
         // state needs a blocking await), and a backend on the trait default; lnrent-8l8c tracks
-        // widening lnv2's answer to Succeeded/Pending.
+        // widening lnv2's answer to Succeeded/Pending. That is the whole liveness story for the
+        // EXPIRED caller only — the superseded caller has a second way out, because the surplus can
+        // recover: the next tick's re-gate then takes the still-fits path above, re-submitting THIS
+        // key and bolt11, exactly the re-submit the started/re-await branch already relies on.
         self.maybe_alert_stuck(
             row,
             self.clock.now(),
@@ -1455,13 +1458,27 @@ mod tests {
         }
     }
 
-    async fn seed_final_receipt(store: &Store, external_id: &str, sub_id: &str, amount_sat: i64) {
-        let (external_id, sub_id) = (external_id.to_string(), sub_id.to_string());
+    /// A captured (PAID) order receipt, seeded through the `Store`, whose subscription sits in
+    /// `sub_state`. That state is what the surplus gate reads: `ACTIVE` is earned and sweepable,
+    /// `PROVISIONING` is at-risk and reserved at gross. (The pure-ledger tests above seed the same
+    /// two rows straight onto a `Connection` with `seed_sub` + `seed_receipt`.)
+    async fn seed_receipt_in_state(
+        store: &Store,
+        external_id: &str,
+        sub_id: &str,
+        amount_sat: i64,
+        sub_state: &str,
+    ) {
+        let (external_id, sub_id, sub_state) = (
+            external_id.to_string(),
+            sub_id.to_string(),
+            sub_state.to_string(),
+        );
         store
             .transaction(move |tx| {
                 tx.execute(
-                    "INSERT INTO subscription (id, state, created_at, updated_at) VALUES (?1, 'ACTIVE', 0, 0)",
-                    params![sub_id],
+                    "INSERT INTO subscription (id, state, created_at, updated_at) VALUES (?1, ?2, 0, 0)",
+                    params![sub_id, sub_state],
                 )?;
                 tx.execute(
                     "INSERT INTO invoice (id, subscription_id, external_id, kind, amount_sat, status, issued_at)
@@ -1472,6 +1489,10 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    async fn seed_final_receipt(store: &Store, external_id: &str, sub_id: &str, amount_sat: i64) {
+        seed_receipt_in_state(store, external_id, sub_id, amount_sat, "ACTIVE").await;
     }
 
     async fn sweep_row(store: &Store, id: &str) -> Option<(String, Option<i64>, i64)> {
@@ -2113,27 +2134,6 @@ mod tests {
         assert_eq!(alert_count(&store, "sweep_stuck").await, 0);
     }
 
-    /// Seed a captured receipt whose sub is still PROVISIONING: earned, and reserved at gross, so it
-    /// is a NEW liability that shrinks the surplus a committed sweep cap was gated against.
-    async fn seed_at_risk_receipt(store: &Store, external_id: &str, sub_id: &str, amount_sat: i64) {
-        let (external_id, sub_id) = (external_id.to_string(), sub_id.to_string());
-        store
-            .transaction(move |tx| {
-                tx.execute(
-                    "INSERT INTO subscription (id, state, created_at, updated_at) VALUES (?1, 'PROVISIONING', 0, 0)",
-                    params![sub_id],
-                )?;
-                tx.execute(
-                    "INSERT INTO invoice (id, subscription_id, external_id, kind, amount_sat, status, issued_at)
-                     VALUES (?1, ?2, ?3, 'order', ?4, 'PAID', 0)",
-                    params![format!("inv-{external_id}"), sub_id, external_id, amount_sat],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-    }
-
     /// Seed the lnrent-meqe scenario: a PENDING sweep whose stored bolt11 is STILL VALID at the
     /// recovery clock, but whose committed 105_000_000 cap the CURRENT ledger no longer covers — the
     /// at-risk 60k receipt reserves against the final 100k one, leaving 100_000_000 surplus EXCLUDING
@@ -2144,7 +2144,9 @@ mod tests {
     /// the surplus gate) rather than this row's own re-submit cache.
     async fn seed_superseded_pending_sweep(store: &Store, id: &str) {
         seed_final_receipt(store, "order:A", "A", 100_000).await;
-        seed_at_risk_receipt(store, "order:B", "B", 60_000).await;
+        // Still PROVISIONING, so this receipt is earned AND reserved at gross: the NEW liability
+        // that shrinks the surplus the committed cap was gated against.
+        seed_receipt_in_state(store, "order:B", "B", 60_000, "PROVISIONING").await;
         let valid = mint_bolt11(
             100_000 * 1000,
             META,
