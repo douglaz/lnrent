@@ -116,14 +116,14 @@
 //!    carry evidence, which is a change above this layer. Anyone adding a route into `start_pay`
 //!    must probe the hash first.
 //!
-//!    None of this makes restarting on a diverged index safe. The sweeper's expired-intent recovery
-//!    arm no longer reaches a terminal decision without evidence — it probes this backend by hash
-//!    ([`PaymentBackend::outbound_status_by_ref`], lnrent-7wbo) — but TWO exits of
-//!    `Sweeper::drive` still terminalize unprobed (`daemon/src/sweep.rs`): its RESTORED-stale-
-//!    `FAILED` arm, the same uxbd shape one layer up, and the `superseded_by_liability` exit of the
-//!    very arm 7wbo fixed, which parks a still-VALID intent FAILED when new liabilities have shrunk
-//!    the surplus below its cap (lnrent-meqe). `docs/go-live.md` is authoritative for what an
-//!    operator should do.
+//!    None of this makes restarting on a diverged index safe. Both exits of `Sweeper::drive`'s
+//!    not-started arm that refuse to send now share one probe of this backend by hash before they
+//!    may terminalize ([`PaymentBackend::outbound_status_by_ref`] via `Sweeper::resolve_or_park`,
+//!    `daemon/src/sweep.rs`): the expired intent (lnrent-7wbo) and the intent whose committed cap the
+//!    surplus no longer covers (lnrent-meqe). What still terminalizes unprobed in pre-pay recovery is
+//!    `drive`'s top-level arm that adopts a `PayStatus::Failed` key verbatim — the stale-`FAILED`
+//!    shape described above, one layer up, and it closes with uxbd rather than separately.
+//!    `docs/go-live.md` is authoritative for what an operator should do.
 //!
 //! ## Cross-order same-invoice guard (ported [8A], lnrent-85t)
 //! phoenixd dedups by payment hash across the WHOLE node, so if some other idempotency key already

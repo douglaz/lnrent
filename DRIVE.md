@@ -11,7 +11,7 @@
 `lnv2-restore-fresh-hash-proof-l5kk` (a devimint proof task), `ea1` (release), `5h4` (product
 design), `xov` (user deferred). `br ready` counts the whole repo — filter it through this line.
 
-**Phase:** BUILD · **Bead:** (next — see Now) · **Branch:** —
+**Phase:** BUILD · **Bead:** lnrent-meqe (next — see Now) · **Branch:** —
 **Pending:** —
 **Gate:** the full CI matrix in AGENTS.md "Building and testing" — the workspace clippy+test pair
 is the inner loop only; it omits both `--no-default-features` legs, wasm, and the two web E2E runs
@@ -20,6 +20,24 @@ each names something that the act of writing it changes or dates, and both drift
 file carried them.
 
 ## Done (this drive)
+- lnrent-7wbo never park a sweep FAILED without positive backend evidence — merged #85 (squash
+  `b32a99b`), CLOSED. rb-lite 6 rounds / 12 iterations (13 accepted, 9 declined, 5 deferred), STOPPED
+  by the operator at round 7: three findings were legitimately deferred to beads and the panel
+  re-raised each every round, and the 404 arm OSCILLATED (r4 refused it, r6 restored it, r6's panel
+  demanded it refused again). Settled by hand — see the memory
+  `rb-lite-panel-cannot-settle-safety-vs-liveness`; the panel has no seat accountable for liveness,
+  so it converged on a tree where terminalization was unreachable by any shipped backend and called
+  it essentially clean (trend 11→7→7→1→9→3).
+  A separate codex pass on the settled tree caught two OVERCLAIMS in my own comments (fixed), and the
+  GitHub codex bot then caught a third thing neither had: I applied the liveness argument to phoenixd
+  and not to lnv2. lnv2 now answers from the federation's oplog. **Merged through the NORMAL gate**
+  (`wrapper_on_tip: 1`, `NO_PENDING_EVIDENCE`) — no § 8b. Full 8-leg matrix EXIT=0 four times; five
+  mutations, each reddening exactly its own assertion.
+  Follow-ups filed and linked to it: `meqe` (P1), `tk34` (P1), `8l8c` (P2), `k0yl` (P2); `9dzu` and
+  `7etm` closed.
+  **`r4gf` CLOSED as WRONG-PREMISED** — the bot does post a SHA-bearing clean-round comment; #84's
+  exit 4 was correct because that comment named the pre-push head. Corrected upstream at
+  douglaz/skills#74.
 - lnrent-l07s lnv2 fails CLOSED on a lost index row — merged #84 (squash `bdeeb04`), CLOSED.
   rb-lite 5 panel rounds; codex bot round 2 raised two P1s (both accepted: the hand-counted
   call-site scan replaced by a DERIVED `clippy.toml` denylist per AGENTS.md's no-frozen-counts
@@ -27,12 +45,15 @@ file carried them.
   round 3 clean. Full 8-leg matrix EXIT=0 twice, CI 3x pass, `nix build` 0 post-merge, two
   operator mutations each reddening exactly its pinning assertion.
   **Merged under the degraded path with explicit operator authorization**: `bot-gate` returned
-  BLOCKED_UNATTRIBUTED (exit 4) on both the initial and the live recheck, because this bot
-  version emits NO wrapper on a clean round. GitHub status was "All Systems Operational" — so
-  this was NOT a forge incident, and the substitution rests on round 3 completing clean after
-  the push plus CI green on the exact SHA. Gate JSON kept at `.git/merge-gate-84.json` and
-  `/tmp/merge-evidence-84.json`. The gap itself is now lnrent-botgate-summary-table-unattributable-r4gf
-  (P2 dogfood) — EXPECT exit 4 on every clean PR until it is resolved.
+  BLOCKED_UNATTRIBUTED (exit 4) on both the initial and the live recheck. **My stated reason for
+  that was WRONG, corrected 2026-09-02 while merging #85** — I wrote that this bot version emits no
+  wrapper on a clean round, having inferred it from the gate's exit code instead of reading the
+  comment listing. #84 DID carry the clean-round comment, with `Reviewed commit: b944cdadfa`; the
+  tip was `46c530d`, so it named the PRE-PUSH head and the gate was RIGHT to block. The § 8b
+  substitution was therefore unnecessary: re-triggering with `@codex review` and waiting would have
+  produced an attributable round, which is exactly what #85 did. Gate JSON kept at
+  `.git/merge-gate-84.json` and `/tmp/merge-evidence-84.json`. Do NOT expect exit 4 on clean PRs;
+  `r4gf` is closed as wrong-premised and the upstream issue is corrected.
   Follow-ups filed rather than folded in: `lookup-seam-collapse-hbye` (P3, the skeptic's
   SIMPLIFY), and a producer note added to `lnrent-3p71` for arm (c)'s missing operator alert.
 - lnrent-qvjz probe outgoingbyhash before a no-row phoenixd payment — merged #83, CLOSED.
@@ -48,11 +69,11 @@ file carried them.
 
 ## Now — order decided 2026-08-30 (panel fable + codex, independent, reconciled; both agreed)
 1. ~~`lnrent-l07s`~~ **DONE — merged #84 (squash `bdeeb04`), CLOSED 2026-08-31.** See Done above.
-2. **`lnrent-7wbo`** (P1) — NEXT. BEFORE the hwni ADR, by this file's own rule: money holes close before
-   reporting ships. Recut: probe seam decided (a trait method keyed by payment hash, default
-   "cannot answer" -> park + SweepStuck, never FAILED without backend evidence); "nothing alerts"
-   corrected (SweepFailed DOES fire — with the wrong story); acceptance asserts exactly ONE outbound
-   payment across the original intent and a later fresh sweep.
+2. ~~`lnrent-7wbo`~~ **DONE — merged #85 (squash `b32a99b`), CLOSED 2026-09-02.** See Done above.
+   **NEXT is `lnrent-meqe` (P1)**, which 7wbo's own panel found and filed: the
+   `superseded_by_liability` exit of the SAME `PayStatus::Unknown` arm still terminalizes on zero
+   backend evidence (still-valid intent, surplus shrunk since). The seam it needs already exists, so
+   it is a small bead — take it before the hwni ADR by the same rule that ordered 7wbo ahead of it.
 3. **`lnrent-unbooked-settlement-condition-ledger-hwni`** (P1, design/ADR — not an rb-lite loop).
    Now SEVEN questions: the original four + subject DOMAIN (receive-only vs outbound keys — 7fx,
    sll4, uxbd want in), subject CARDINALITY (phoenixd aggregates many invoices under one subject;

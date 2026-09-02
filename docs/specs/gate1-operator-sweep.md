@@ -132,7 +132,11 @@ docs/specs/gate1-alerting-operability.md §F — never by this authorization pat
       being recovered from its own `paid_out_msat`** (its cap is already subtracted the moment the
       PENDING row exists; gating it against itself would demand the funds twice and falsely
       supersede a sweep that fit exactly). Other PENDING/SENT sweeps still count. If the gate now
-      fails, mark the row FAILED with reason `superseded_by_liability` and alert — never send.
+      fails, **never send** — but do not terminalize on the key index's silence either: this exit
+      rests on the same not-started evidence, and therefore on the same hazard, as the sub-case below
+      (lnrent-meqe). Ask the backend for outbound evidence and act on the SAME four-way table as
+      below — only its "positively NOT paid" row marks the row FAILED, and on this exit that FAILED
+      carries reason `superseded_by_liability` (with the surplus and cap figures) and the alert.
     - **no longer payable**: the row may NOT be terminalized on the key index's silence.
       `payment_started_by_key` is a row-existence read over a LOCAL index, so an index loss over an
       in-flight sweep pay is indistinguishable from a sweep that never started — and a FAILED row
@@ -193,9 +197,13 @@ alerting spec §F).
 - Fee-rise safety: quote at fee F, raise the gateway fee before send → the capped send refuses;
   nothing paid; row FAILED with the cap error.
 - Idempotency/crash: kill between ledger-PENDING and pay-confirm → restart re-drives by key, funds
-  sent exactly once (mirror the refund crash tests); the not-started branch re-gates and refuses
-  (`superseded_by_liability`) when a new liability consumed the surplus; re-submitting the same
-  bolt11 after success returns the cached success, no second payment.
+  sent exactly once (mirror the refund crash tests); when a new liability consumed the surplus the
+  not-started branch re-gates and then asks the backend for outbound evidence, writing
+  `superseded_by_liability` **only** on a positive "not paid and not in flight" answer and otherwise
+  leaving the row PENDING (§Idempotency + ledger's decision table) — so on a backend that cannot
+  answer, including `MockPayment`'s trait default, the acceptance shape is a PARKED row, not a
+  refusal; re-submitting the same bolt11 after success returns the cached success, no second
+  payment.
 - Zero-amount bolt11, expired bolt11, quote failure (`sweep_unpriceable`), and a second concurrent
   sweep (`sweep_busy`) are structured refusals; nothing is written to `refund_attempt`; a sweep
   never enters the refund LIABILITY set (`required_msat` unchanged) — but it DOES reduce

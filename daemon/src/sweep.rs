@@ -430,10 +430,12 @@ impl Sweeper {
     /// Crash-recovery drive (boot + maintenance): finish every PENDING `sweep_attempt`. A terminal
     /// key status wins first (`Succeeded` => SENT, `Failed` => FAILED); an in-flight `Pending` key
     /// re-awaits by key. Only an `Unknown` key falls back to started evidence or, if not started,
-    /// re-validates the stored invoice and then either probes the backend by payment hash (expired
-    /// intent — see that arm; it terminalizes ONLY on a positive answer, lnrent-7wbo) or re-runs the
-    /// surplus gate against the CURRENT ledger EXCLUDING this row's own cap; still fits ⇒ capped-pay,
-    /// else park FAILED `superseded_by_liability`. Idempotent and safe to call repeatedly.
+    /// re-validates the stored invoice. An intent that expired meanwhile (lnrent-7wbo) goes through
+    /// [`Sweeper::resolve_or_park`]; a still-valid intent re-runs the surplus gate against the CURRENT
+    /// ledger EXCLUDING this row's own cap. Still fits ⇒ capped-pay; no longer covered
+    /// (`superseded_by_liability`, lnrent-meqe) ⇒ the same helper. `resolve_or_park` terminalizes
+    /// ONLY on positive backend evidence and otherwise leaves the row PENDING.
+    /// Idempotent and safe to call repeatedly.
     pub async fn drive(&self) -> Result<SweepReport> {
         let mut report = SweepReport::default();
         for row in self.pending_sweeps().await? {
@@ -493,122 +495,78 @@ impl Sweeper {
                     // paying it would either park PENDING forever (cap stuck, blocking new sweeps) or,
                     // on a no-validation backend, record an expired invoice SENT. (The
                     // started/re-await branches above do NOT re-validate — their funds are committed.)
-                    if let Err(e) = parse_sweep_invoice(&bolt11, self.clock.now()) {
-                        // The intent can no longer be paid, so this row is either terminal or parked —
-                        // and it must NEVER be terminalized on the key index's silence (lnrent-7wbo).
-                        // `payment_status_by_key`/`payment_started_by_key` are row-existence reads over
-                        // a LOCAL index, so an index loss over an in-flight sweep pay reads exactly
-                        // like a sweep that never started. `commit_failed` would then return this cap
-                        // to surplus (`read_surplus` counts a sweep's cap only while SENT/PENDING) and
-                        // DM the operator that the sweep failed; they re-run `lnrent sweep` with a
-                        // fresh bolt11, which is a different `sweep:<payment_hash>` row that phoenixd's
-                        // hash-keyed dedup cannot catch — a genuine SECOND outbound payment. So ask the
-                        // backend by PAYMENT HASH, and terminalize only on a positive answer.
+                    //
+                    // Both ways out of here that refuse to send route through `resolve_or_park`, which
+                    // holds the ONE probe table and terminalizes only on positive backend evidence.
+                    let resolved = if let Err(e) = parse_sweep_invoice(&bolt11, self.clock.now()) {
+                        // The intent can no longer be paid (lnrent-7wbo).
                         let invalid_reason = e.message();
-                        let park_reason = match self
-                            .payment
-                            .outbound_status_by_ref(&payment_hash, &bolt11)
-                            .await
-                        {
-                            // Positively PAID: adopt it. The money left, so the cap stays consumed and
-                            // no SweepFailed DM is ever sent for a payment that succeeded.
-                            Ok(Some(PayStatus::Succeeded)) => {
-                                self.commit_sent(&row.id, &payment_hash, None, self.clock.now())
-                                    .await?;
-                                report.sent += 1;
-                                continue;
-                            }
-                            // Positively NOT paid and not in flight (a terminal failure, or a clean
-                            // "no such record" from a backend whose absence is authoritative). This is
-                            // the one answer that licenses terminalizing, and the one where the
-                            // existing SweepFailed DM tells the operator something true.
-                            Ok(Some(PayStatus::Failed)) => {
-                                let reason = format!(
-                                    "intent no longer payable during recovery: {invalid_reason}"
-                                );
-                                self.commit_failed(&row.id, &payment_hash, self.clock.now(), &reason)
-                                    .await?;
-                                report.failed += 1;
-                                continue;
-                            }
-                            Ok(Some(PayStatus::Pending)) => format!(
-                                "stored intent is no longer payable during recovery \
-                                 ({invalid_reason}); the backend reports its payment still in flight"
-                            ),
-                            // `Ok(None)` is "this backend cannot answer for this intent" and is NOT
-                            // evidence of absence. Both shipped backends CAN answer for the common
-                            // shapes, so this arm is the residue: phoenixd's unattributable
-                            // completed-unpaid record, and an lnv2 attempt that exists but whose
-                            // state needs a blocking await. `Ok(Some(Unknown))` violates the trait
-                            // contract ("I don't know" is `Ok(None)`); treat it the same fail-safe
-                            // way rather than trusting it.
-                            Ok(None) | Ok(Some(PayStatus::Unknown)) => format!(
-                                "stored intent is no longer payable during recovery \
-                                 ({invalid_reason}); the backend cannot confirm whether it paid"
-                            ),
-                            Err(err) => {
-                                // Log it: a swallowed error here is indistinguishable from a backend
-                                // that answered "cannot answer".
-                                tracing::warn!(
-                                    sweep = %row.id,
-                                    error = %format!("{err:#}"),
-                                    "sweep outbound-payment probe by hash failed; parking PENDING \
-                                     rather than terminalizing"
-                                );
-                                format!(
-                                    "stored intent is no longer payable during recovery \
-                                     ({invalid_reason}); the backend probe failed, so whether it paid \
-                                     is unknown"
-                                )
-                            }
-                        };
-                        // Park, do NOT terminalize. Staying PENDING is what keeps this cap counted in
-                        // `paid_out_msat` (so surplus never re-offers money that may already be gone)
-                        // AND what makes `gate_and_write`'s one-at-a-time gate refuse a fresh
-                        // `lnrent sweep` with `Busy` — that refusal is the mechanism that prevents the
-                        // second outbound payment. SweepStuck is how the operator hears about it.
-                        //
-                        // The row re-drives every tick, so a backend that later answers positively
-                        // resolves it. The benign shape — a crash between the durable PENDING write
-                        // and `pay_capped`, so nothing was ever sent — resolves on BOTH shipped
-                        // backends without a human: phoenixd's clean 404 and lnv2's absent attempt-0
-                        // operation are each positive proof of absence. What still parks
-                        // indefinitely is genuine ambiguity (an unattributable phoenixd record, an
-                        // lnv2 attempt whose state needs a blocking await), and a backend on the
-                        // trait default; lnrent-8l8c tracks widening lnv2's answer to
-                        // Succeeded/Pending.
-                        report.pending += 1;
-                        self.maybe_alert_stuck(&row, self.clock.now(), &park_reason)
-                            .await;
-                        continue;
-                    }
-                    let surplus = {
-                        let id = row.id.clone();
-                        self.store
-                            .read(move |c| read_surplus(c, Some(id.as_str())))
-                            .await?
-                    };
-                    if surplus.surplus_msat() >= row.max_outlay_msat {
-                        self.capped_pay(
-                            &row.id,
+                        self.resolve_or_park(
+                            &row,
                             &bolt11,
                             &payment_hash,
-                            row.amount_sat,
-                            row.max_outlay_msat,
-                            self.clock.now(),
+                            &format!(
+                                "stored intent is no longer payable during recovery \
+                                 ({invalid_reason})"
+                            ),
+                            &format!("intent no longer payable during recovery: {invalid_reason}"),
                         )
                         .await?
                     } else {
-                        let reason = format!(
-                            "superseded_by_liability: surplus {} msat (excl. this sweep) fell below the \
-                             committed {} msat cap",
-                            surplus.surplus_msat(),
-                            row.max_outlay_msat
-                        );
-                        self.commit_failed(&row.id, &payment_hash, self.clock.now(), &reason)
-                            .await?;
-                        PayOutcome::Failed(reason)
-                    }
+                        let surplus = {
+                            let id = row.id.clone();
+                            self.store
+                                .read(move |c| read_surplus(c, Some(id.as_str())))
+                                .await?
+                        };
+                        if surplus.surplus_msat() >= row.max_outlay_msat {
+                            Some(
+                                self.capped_pay(
+                                    &row.id,
+                                    &bolt11,
+                                    &payment_hash,
+                                    row.amount_sat,
+                                    row.max_outlay_msat,
+                                    self.clock.now(),
+                                )
+                                .await?,
+                            )
+                        } else {
+                            // The intent is still VALID; what fails is the re-run surplus gate,
+                            // because new liabilities have shrunk the surplus below the committed cap
+                            // since the intent was written. Narrower trigger than the expiry exit
+                            // above, IDENTICAL hazard: the premise is still the key index's silence,
+                            // so this exit needs the same evidence before it may terminalize
+                            // (lnrent-meqe). The reason string keeps its `superseded_by_liability:`
+                            // token — `docs/specs/gate1-operator-sweep.md` names it, and
+                            // `commit_failed` carries it into the operator-visible SweepFailed DM.
+                            self.resolve_or_park(
+                                &row,
+                                &bolt11,
+                                &payment_hash,
+                                &format!(
+                                    "surplus {} msat (excl. this sweep) no longer covers the \
+                                     committed {} msat cap",
+                                    surplus.surplus_msat(),
+                                    row.max_outlay_msat
+                                ),
+                                &format!(
+                                    "superseded_by_liability: surplus {} msat (excl. this sweep) \
+                                     fell below the committed {} msat cap",
+                                    surplus.surplus_msat(),
+                                    row.max_outlay_msat
+                                ),
+                            )
+                            .await?
+                        }
+                    };
+                    let Some(outcome) = resolved else {
+                        // PARKED by the probe table: the row stays PENDING and `resolve_or_park`
+                        // already raised the truthful stuck alert.
+                        report.pending += 1;
+                        continue;
+                    };
+                    outcome
                 }
             };
             match outcome {
@@ -622,6 +580,97 @@ impl Sweeper {
             }
         }
         Ok(report)
+    }
+
+    /// Ask the backend what it POSITIVELY knows about an outbound payment for this intent, then
+    /// either RESOLVE the row (terminal) or PARK it PENDING. `Ok(Some(outcome))` ⇒ the row reached a
+    /// terminal state; `Ok(None)` ⇒ it was parked, and the caller must count it pending and move on.
+    ///
+    /// This is the ONE implementation of that decision table. Both exits of [`Sweeper::drive`]'s
+    /// not-started arm that refuse to send — the expired intent (lnrent-7wbo) and the one the surplus
+    /// no longer covers (lnrent-meqe) — call it, because they share a premise and therefore a hazard:
+    /// each fires when the key index says not-started, and `payment_status_by_key`/
+    /// `payment_started_by_key` are row-existence reads over a LOCAL index, so an index loss over an
+    /// in-flight sweep pay reads exactly like a sweep that never started. `commit_failed` would then
+    /// return this cap to surplus (`read_surplus` counts a sweep's cap only while SENT/PENDING) and
+    /// DM the operator that the sweep failed; they re-run `lnrent sweep` with a fresh bolt11, which
+    /// is a different `sweep:<payment_hash>` row that phoenixd's hash-keyed dedup cannot catch — a
+    /// genuine SECOND outbound payment. Two copies of this table could drift into that bug on one
+    /// exit while the other stayed safe, which is why it lives here.
+    ///
+    /// `park_context` states, in the CALLER's terms, why the row cannot simply be paid; it is joined
+    /// with what the probe said to form a truthful `SweepStuck` reason. `terminal_reason` is used
+    /// ONLY on the positively-failed arm.
+    async fn resolve_or_park(
+        &self,
+        row: &PendingSweep,
+        bolt11: &str,
+        payment_hash: &str,
+        park_context: &str,
+        terminal_reason: &str,
+    ) -> Result<Option<PayOutcome>> {
+        let probe_verdict = match self.payment.outbound_status_by_ref(payment_hash, bolt11).await {
+            // Positively PAID: adopt it. The money left, so the cap stays consumed and no SweepFailed
+            // DM is ever sent for a payment that succeeded.
+            Ok(Some(PayStatus::Succeeded)) => {
+                self.commit_sent(&row.id, payment_hash, None, self.clock.now())
+                    .await?;
+                return Ok(Some(PayOutcome::Sent(None)));
+            }
+            // Positively NOT paid and not in flight (a terminal failure, or a clean "no such record"
+            // from a backend whose absence is authoritative). This is the one answer that licenses
+            // terminalizing, and the one where the existing SweepFailed DM tells the operator
+            // something true.
+            Ok(Some(PayStatus::Failed)) => {
+                self.commit_failed(&row.id, payment_hash, self.clock.now(), terminal_reason)
+                    .await?;
+                return Ok(Some(PayOutcome::Failed(terminal_reason.to_string())));
+            }
+            Ok(Some(PayStatus::Pending)) => "the backend reports its payment still in flight",
+            // `Ok(None)` is "this backend cannot answer for this intent" and is NOT evidence of
+            // absence. Both shipped backends CAN answer for the common shapes, so this arm is the
+            // residue: phoenixd's unattributable completed-unpaid record, and an lnv2 attempt that
+            // exists but whose state needs a blocking await. `Ok(Some(Unknown))` violates the trait
+            // contract ("I don't know" is `Ok(None)`); treat it the same fail-safe way rather than
+            // trusting it.
+            Ok(None) | Ok(Some(PayStatus::Unknown)) => "the backend cannot confirm whether it paid",
+            Err(err) => {
+                // Log it: a swallowed error here is indistinguishable from a backend that answered
+                // "cannot answer".
+                tracing::warn!(
+                    sweep = %row.id,
+                    error = %format!("{err:#}"),
+                    "sweep outbound-payment probe failed; parking PENDING rather than terminalizing"
+                );
+                "the backend probe failed, so whether it paid is unknown"
+            }
+        };
+        // Park, do NOT terminalize. Staying PENDING is what keeps this cap counted in `paid_out_msat`
+        // (so surplus never re-offers money that may already be gone) AND what makes
+        // `gate_and_write`'s one-at-a-time gate refuse a fresh `lnrent sweep` with `Busy` — that
+        // refusal is the mechanism that prevents the second outbound payment. SweepStuck is how the
+        // operator hears about it.
+        //
+        // The row re-drives every tick, so a backend that later answers positively resolves it. The
+        // benign shape — a crash between the durable PENDING write and `pay_capped`, so nothing was
+        // ever sent — resolves on BOTH shipped backends without a human: phoenixd's clean 404 and
+        // lnv2's absent attempt-0 operation are each positive proof of absence. What still parks
+        // indefinitely is genuine ambiguity (an unattributable phoenixd record, an lnv2 attempt whose
+        // state needs a blocking await), and a backend on the trait default; lnrent-8l8c tracks
+        // widening lnv2's answer to Succeeded/Pending. The superseded caller has one extra way out
+        // the expired caller does not: the surplus can recover, and the next tick's re-gate then
+        // takes the still-fits path above, re-submitting THIS key and bolt11 — exactly the re-submit
+        // the started/re-await branch already relies on. That escape is BOUNDED by the stored
+        // invoice's own expiry, though: once the parked intent expires, the next tick takes the
+        // expired exit instead and the row parks on the same terms as any other. So the extra exit
+        // buys time, not a guarantee.
+        self.maybe_alert_stuck(
+            row,
+            self.clock.now(),
+            &format!("{park_context}; {probe_verdict}"),
+        )
+        .await;
+        Ok(None)
     }
 
     /// Quote the exact outlay msats for a NEW sweep pay (pricing, NOT a balance read). `Err` ⇒ refuse
@@ -1412,13 +1461,27 @@ mod tests {
         }
     }
 
-    async fn seed_final_receipt(store: &Store, external_id: &str, sub_id: &str, amount_sat: i64) {
-        let (external_id, sub_id) = (external_id.to_string(), sub_id.to_string());
+    /// A captured (PAID) order receipt, seeded through the `Store`, whose subscription sits in
+    /// `sub_state`. That state is what the surplus gate reads: `ACTIVE` is earned and sweepable,
+    /// `PROVISIONING` is at-risk and reserved at gross. (The pure-ledger tests above seed the same
+    /// two rows straight onto a `Connection` with `seed_sub` + `seed_receipt`.)
+    async fn seed_receipt_in_state(
+        store: &Store,
+        external_id: &str,
+        sub_id: &str,
+        amount_sat: i64,
+        sub_state: &str,
+    ) {
+        let (external_id, sub_id, sub_state) = (
+            external_id.to_string(),
+            sub_id.to_string(),
+            sub_state.to_string(),
+        );
         store
             .transaction(move |tx| {
                 tx.execute(
-                    "INSERT INTO subscription (id, state, created_at, updated_at) VALUES (?1, 'ACTIVE', 0, 0)",
-                    params![sub_id],
+                    "INSERT INTO subscription (id, state, created_at, updated_at) VALUES (?1, ?2, 0, 0)",
+                    params![sub_id, sub_state],
                 )?;
                 tx.execute(
                     "INSERT INTO invoice (id, subscription_id, external_id, kind, amount_sat, status, issued_at)
@@ -1429,6 +1492,10 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    async fn seed_final_receipt(store: &Store, external_id: &str, sub_id: &str, amount_sat: i64) {
+        seed_receipt_in_state(store, external_id, sub_id, amount_sat, "ACTIVE").await;
     }
 
     async fn sweep_row(store: &Store, id: &str) -> Option<(String, Option<i64>, i64)> {
@@ -1502,7 +1569,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn operator_alert_kinds(store: &Store) -> Vec<String> {
+    async fn operator_alerts(store: &Store) -> Vec<lnrent_wire::OperatorAlert> {
         let payloads: Vec<String> = store
             .read(|c| {
                 let mut stmt = c.prepare(
@@ -1518,9 +1585,17 @@ mod tests {
         payloads
             .into_iter()
             .map(|p| match serde_json::from_str::<lnrent_wire::Msg>(&p).unwrap() {
-                lnrent_wire::Msg::OperatorAlert(a) => a.kind,
+                lnrent_wire::Msg::OperatorAlert(a) => a,
                 other => panic!("expected OperatorAlert, got {other:?}"),
             })
+            .collect()
+    }
+
+    async fn operator_alert_kinds(store: &Store) -> Vec<String> {
+        operator_alerts(store)
+            .await
+            .into_iter()
+            .map(|a| a.kind)
             .collect()
     }
 
@@ -1530,6 +1605,19 @@ mod tests {
             .into_iter()
             .filter(|k| k == kind)
             .count()
+    }
+
+    /// The `detail` text of every operator alert of `kind`, in order. `resolve_or_park` composes that
+    /// text from a CALLER-supplied context, which is the one thing sharing the probe table does not
+    /// make impossible to get wrong — an exit that passed its sibling's context would keep every
+    /// other assertion green while telling the operator something false.
+    async fn alert_details(store: &Store, kind: &str) -> Vec<String> {
+        operator_alerts(store)
+            .await
+            .into_iter()
+            .filter(|a| a.kind == kind)
+            .map(|a| a.detail)
+            .collect()
     }
 
     fn sweeper(store: &Store, payment: Arc<dyn PaymentBackend>) -> Sweeper {
@@ -1809,8 +1897,15 @@ mod tests {
             })
             .await
             .unwrap();
-        let payment = Arc::new(SweepPayment::new()); // not-started (no seeded key)
-        let s = sweeper(&store, payment.clone());
+        // Not-started (no seeded key), and the backend positively reports that no outbound payment
+        // for this intent exists. That evidence is what lets the drive terminalize at all
+        // (lnrent-meqe); the property this test pins — a superseded sweep does not SEND — is
+        // unchanged, and the unprobed backend is now covered by
+        // `drive_never_terminalizes_a_superseded_intent_the_backend_cannot_answer_for`.
+        let payment = Arc::new(ProbeablePayment::new());
+        payment.answer("x", PayStatus::Failed);
+        let clock = Arc::new(TestClock::new(1_000));
+        let s = sweeper_with_alerts(&store, payment.clone(), clock);
 
         let report = s.drive().await.unwrap();
         assert_eq!(report.failed, 1);
@@ -1821,7 +1916,12 @@ mod tests {
             .read(|c| Ok(c.query_row("SELECT last_error FROM sweep_attempt WHERE id='sweep:x'", [], |r| r.get(0))?))
             .await
             .unwrap();
-        assert!(last_error.unwrap().contains("superseded_by_liability"));
+        assert!(last_error.unwrap().starts_with("superseded_by_liability:"));
+        assert_eq!(
+            alert_count(&store, "sweep_failed").await,
+            1,
+            "exactly one truthful SweepFailed DM"
+        );
     }
 
     #[tokio::test]
@@ -2035,6 +2135,114 @@ mod tests {
         );
         assert_eq!(alert_count(&store, "sweep_stuck").await, 0);
     }
+
+    /// Seed the lnrent-meqe scenario: a PENDING sweep whose stored bolt11 is STILL VALID at the
+    /// recovery clock, but whose committed 105_000_000 cap the CURRENT ledger no longer covers — the
+    /// at-risk 60k receipt reserves against the final 100k one, leaving 100_000_000 surplus EXCLUDING
+    /// this row's own cap. So the only reason the drive refuses to send is the superseding liability.
+    ///
+    /// The shared minter reuses ONE synthetic payment hash, so callers pass a distinct literal id; a
+    /// fresh `execute` then meets the one-at-a-time PENDING gate (`gate_and_write` checks it BEFORE
+    /// the surplus gate) rather than this row's own re-submit cache.
+    async fn seed_superseded_pending_sweep(store: &Store, id: &str) {
+        seed_final_receipt(store, "order:A", "A", 100_000).await;
+        // Still PROVISIONING, so this receipt is earned AND reserved at gross: the NEW liability
+        // that shrinks the surplus the committed cap was gated against.
+        seed_receipt_in_state(store, "order:B", "B", 60_000, "PROVISIONING").await;
+        let valid = mint_bolt11(
+            100_000 * 1000,
+            META,
+            u64::try_from(SWEEP_STUCK_ALERT_S * 2).unwrap(),
+            3_600,
+        );
+        seed_pending_sweep_bolt11(store, id, &valid, 100_000, 105_000_000).await;
+    }
+
+    #[tokio::test]
+    async fn drive_never_terminalizes_a_superseded_intent_the_backend_cannot_answer_for() {
+        // lnrent-meqe, the break test: 7wbo's shape on the OTHER exit of the SAME `PayStatus::Unknown`
+        // not-started arm. Here the stored intent is STILL VALID — what fails is the re-run surplus
+        // gate, because a new liability has shrunk the surplus below the committed cap since the
+        // intent was written. The branch's premise is still "the key index says not-started", which
+        // is exactly what an index loss over an IN-FLIGHT sweep pay looks like, so terminalizing on
+        // it returns the cap to surplus and DMs the operator that the sweep failed; the fresh
+        // `lnrent sweep` they then run mints a NEW payment hash the node's hash-keyed dedup cannot
+        // catch — a genuine SECOND outbound payment. `SweepPayment` overrides NOTHING for the probe,
+        // so this drives the trait DEFAULT ("cannot answer").
+        let store = mem_store();
+        let clock = expiry_recovery_clock();
+        seed_superseded_pending_sweep(&store, "sweep:lostpay").await;
+
+        let payment = Arc::new(SweepPayment::new());
+        payment.seed_lost_outbound_payment(); // the pay that really left; its index row is gone
+        let s = sweeper_with_alerts(&store, payment.clone(), clock);
+
+        let before = surplus_snapshot(&store).await;
+        let report = s.drive().await.unwrap();
+
+        assert_eq!(
+            single_sweep_status(&store).await,
+            "PENDING",
+            "no backend evidence -> the superseded row must stay PENDING, never FAILED"
+        );
+        assert_eq!(
+            report,
+            SweepReport {
+                sent: 0,
+                failed: 0,
+                pending: 1
+            }
+        );
+        assert_eq!(
+            surplus_snapshot(&store).await,
+            before,
+            "the cap stays reserved: surplus must be unchanged across the incident"
+        );
+        assert_eq!(
+            alert_count(&store, "sweep_failed").await,
+            0,
+            "no terminal SweepFailed DM for a payment that may have settled"
+        );
+        assert_eq!(
+            alert_count(&store, "sweep_stuck").await,
+            1,
+            "the operator is told the truth instead: one SweepStuck"
+        );
+        // And the truth is THIS exit's truth. The intent has NOT expired here — it is still valid —
+        // so the DM must name the shrunken surplus and the probe's silence, never the sibling exit's
+        // "no longer payable". The probe table is shared; these two strings are not, so this is the
+        // one drift the extraction cannot rule out.
+        let stuck = alert_details(&store, "sweep_stuck").await.remove(0);
+        assert!(
+            stuck.contains("no longer covers the committed")
+                && stuck.contains("cannot confirm whether it paid"),
+            "the stuck DM must name the shrunken surplus AND the unanswered probe: {stuck}"
+        );
+        assert!(
+            !stuck.contains("no longer payable"),
+            "a still-valid intent must never be reported as expired: {stuck}"
+        );
+
+        // The operator now re-runs `lnrent sweep` with a FRESH invoice. The parked row still holds
+        // the one in-flight slot, which is what stops the second payment.
+        let fresh = mint_bolt11(
+            40_000 * 1000,
+            META,
+            u64::try_from(SWEEP_STUCK_ALERT_S * 2).unwrap(),
+            3_600,
+        );
+        assert_eq!(
+            s.execute(&fresh).await.unwrap_err().code(),
+            "sweep_busy",
+            "the parked row must refuse a fresh sweep"
+        );
+        assert_eq!(
+            payment.sends(),
+            1,
+            "EXACTLY ONE outbound payment across the whole incident"
+        );
+    }
+
 
     #[tokio::test]
     async fn no_balance_read_across_quote_execute_drive() {
