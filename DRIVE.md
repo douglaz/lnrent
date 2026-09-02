@@ -45,12 +45,15 @@ file carried them.
   round 3 clean. Full 8-leg matrix EXIT=0 twice, CI 3x pass, `nix build` 0 post-merge, two
   operator mutations each reddening exactly its pinning assertion.
   **Merged under the degraded path with explicit operator authorization**: `bot-gate` returned
-  BLOCKED_UNATTRIBUTED (exit 4) on both the initial and the live recheck, because this bot
-  version emits NO wrapper on a clean round. GitHub status was "All Systems Operational" — so
-  this was NOT a forge incident, and the substitution rests on round 3 completing clean after
-  the push plus CI green on the exact SHA. Gate JSON kept at `.git/merge-gate-84.json` and
-  `/tmp/merge-evidence-84.json`. The gap itself is now lnrent-botgate-summary-table-unattributable-r4gf
-  (P2 dogfood) — EXPECT exit 4 on every clean PR until it is resolved.
+  BLOCKED_UNATTRIBUTED (exit 4) on both the initial and the live recheck. **My stated reason for
+  that was WRONG, corrected 2026-09-02 while merging #85** — I wrote that this bot version emits no
+  wrapper on a clean round, having inferred it from the gate's exit code instead of reading the
+  comment listing. #84 DID carry the clean-round comment, with `Reviewed commit: b944cdadfa`; the
+  tip was `46c530d`, so it named the PRE-PUSH head and the gate was RIGHT to block. The § 8b
+  substitution was therefore unnecessary: re-triggering with `@codex review` and waiting would have
+  produced an attributable round, which is exactly what #85 did. Gate JSON kept at
+  `.git/merge-gate-84.json` and `/tmp/merge-evidence-84.json`. Do NOT expect exit 4 on clean PRs;
+  `r4gf` is closed as wrong-premised and the upstream issue is corrected.
   Follow-ups filed rather than folded in: `lookup-seam-collapse-hbye` (P3, the skeptic's
   SIMPLIFY), and a producer note added to `lnrent-3p71` for arm (c)'s missing operator alert.
 - lnrent-qvjz probe outgoingbyhash before a no-row phoenixd payment — merged #83, CLOSED.
