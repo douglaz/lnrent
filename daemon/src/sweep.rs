@@ -1575,6 +1575,32 @@ mod tests {
             .count()
     }
 
+    /// The `detail` text of every operator alert of `kind`, in order. `resolve_or_park` composes that
+    /// text from a CALLER-supplied context, which is the one thing sharing the probe table does not
+    /// make impossible to get wrong — an exit that passed its sibling's context would keep every
+    /// other assertion green while telling the operator something false.
+    async fn alert_details(store: &Store, kind: &str) -> Vec<String> {
+        let payloads: Vec<String> = store
+            .read(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT payload_json FROM outbox WHERE msg_type='operator.alert' ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        payloads
+            .into_iter()
+            .filter_map(|p| match serde_json::from_str::<lnrent_wire::Msg>(&p).unwrap() {
+                lnrent_wire::Msg::OperatorAlert(a) if a.kind == kind => Some(a.detail),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn sweeper(store: &Store, payment: Arc<dyn PaymentBackend>) -> Sweeper {
         Sweeper::new(store.clone(), payment, Arc::new(TestClock::new(1_000)))
     }
@@ -2175,6 +2201,20 @@ mod tests {
             alert_count(&store, "sweep_stuck").await,
             1,
             "the operator is told the truth instead: one SweepStuck"
+        );
+        // And the truth is THIS exit's truth. The intent has NOT expired here — it is still valid —
+        // so the DM must name the shrunken surplus and the probe's silence, never the sibling exit's
+        // "no longer payable". The probe table is shared; these two strings are not, so this is the
+        // one drift the extraction cannot rule out.
+        let stuck = alert_details(&store, "sweep_stuck").await.remove(0);
+        assert!(
+            stuck.contains("no longer covers the committed")
+                && stuck.contains("cannot confirm whether it paid"),
+            "the stuck DM must name the shrunken surplus AND the unanswered probe: {stuck}"
+        );
+        assert!(
+            !stuck.contains("no longer payable"),
+            "a still-valid intent must never be reported as expired: {stuck}"
         );
 
         // The operator now re-runs `lnrent sweep` with a FRESH invoice. The parked row still holds
