@@ -1545,7 +1545,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn operator_alert_kinds(store: &Store) -> Vec<String> {
+    async fn operator_alerts(store: &Store) -> Vec<lnrent_wire::OperatorAlert> {
         let payloads: Vec<String> = store
             .read(|c| {
                 let mut stmt = c.prepare(
@@ -1561,9 +1561,17 @@ mod tests {
         payloads
             .into_iter()
             .map(|p| match serde_json::from_str::<lnrent_wire::Msg>(&p).unwrap() {
-                lnrent_wire::Msg::OperatorAlert(a) => a.kind,
+                lnrent_wire::Msg::OperatorAlert(a) => a,
                 other => panic!("expected OperatorAlert, got {other:?}"),
             })
+            .collect()
+    }
+
+    async fn operator_alert_kinds(store: &Store) -> Vec<String> {
+        operator_alerts(store)
+            .await
+            .into_iter()
+            .map(|a| a.kind)
             .collect()
     }
 
@@ -1580,24 +1588,11 @@ mod tests {
     /// make impossible to get wrong — an exit that passed its sibling's context would keep every
     /// other assertion green while telling the operator something false.
     async fn alert_details(store: &Store, kind: &str) -> Vec<String> {
-        let payloads: Vec<String> = store
-            .read(|c| {
-                let mut stmt = c.prepare(
-                    "SELECT payload_json FROM outbox WHERE msg_type='operator.alert' ORDER BY id",
-                )?;
-                let rows = stmt
-                    .query_map([], |r| r.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            })
+        operator_alerts(store)
             .await
-            .unwrap();
-        payloads
             .into_iter()
-            .filter_map(|p| match serde_json::from_str::<lnrent_wire::Msg>(&p).unwrap() {
-                lnrent_wire::Msg::OperatorAlert(a) if a.kind == kind => Some(a.detail),
-                _ => None,
-            })
+            .filter(|a| a.kind == kind)
+            .map(|a| a.detail)
             .collect()
     }
 
