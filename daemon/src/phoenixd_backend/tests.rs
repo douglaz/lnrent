@@ -1987,7 +1987,7 @@ async fn a_terminal_outgoing_record_stays_pending_but_reads_differently() {
 /// selection rule is unmeasured (lnrent-tk34), while a clean 404 is — no record for the hash in the
 /// history being answered from, which is bounded to the answering wallet (lnrent-k0yl).
 #[tokio::test]
-async fn outbound_status_by_payment_hash_classifies_every_measured_shape() {
+async fn outbound_status_by_ref_classifies_every_measured_shape() {
     let ops = FakePhoenixdOps::new();
     let be = backend(ops.clone(), TestClock::new(1_000));
 
@@ -2002,14 +2002,14 @@ async fn outbound_status_by_payment_hash_classifies_every_measured_shape() {
     // isPaid=true (completedAt SET, as the live node always emits it) -> the money left.
     ops.set_outgoing(record("aa", true, Some(MEASURED_COMPLETED_AT_MS)));
     assert_eq!(
-        be.outbound_status_by_payment_hash("aa").await.unwrap(),
+        be.outbound_status_by_ref("aa", "").await.unwrap(),
         Some(PayStatus::Succeeded)
     );
 
     // completedAt ABSENT is the measured IN-FLIGHT shape — never a licence to terminalize.
     ops.set_outgoing(record("bb", false, None));
     assert_eq!(
-        be.outbound_status_by_payment_hash("bb").await.unwrap(),
+        be.outbound_status_by_ref("bb", "").await.unwrap(),
         Some(PayStatus::Pending)
     );
 
@@ -2018,13 +2018,13 @@ async fn outbound_status_by_payment_hash_classifies_every_measured_shape() {
     // has NOT measured (lnrent-tk34) — so `None`, matching `pay_inner`'s refusal to resolve the same
     // shape. This pins a DECISION under uncertainty, not a known property of the record.
     ops.set_outgoing(record("cc", false, Some(MEASURED_COMPLETED_AT_MS)));
-    assert_eq!(be.outbound_status_by_payment_hash("cc").await.unwrap(), None);
+    assert_eq!(be.outbound_status_by_ref("cc", "").await.unwrap(), None);
 
     // An unseeded hash is phoenixd's clean 404: no record for this hash at all, so nothing is in
     // flight and nothing succeeded. This is what lets a sweep whose pay never left resolve rather
     // than park forever; its authority is wallet-scoped (lnrent-k0yl), not unbounded.
     assert_eq!(
-        be.outbound_status_by_payment_hash("dd").await.unwrap(),
+        be.outbound_status_by_ref("dd", "").await.unwrap(),
         Some(PayStatus::Failed)
     );
 
@@ -2032,7 +2032,7 @@ async fn outbound_status_by_payment_hash_classifies_every_measured_shape() {
     // must park rather than terminalize when the backend did not answer.
     ops.fail_outgoing_by_hash();
     assert!(
-        be.outbound_status_by_payment_hash("aa").await.is_err(),
+        be.outbound_status_by_ref("aa", "").await.is_err(),
         "an unanswered probe must never be read as evidence"
     );
 }
@@ -2042,7 +2042,7 @@ async fn outbound_status_by_payment_hash_classifies_every_measured_shape() {
 /// cannot be shown to fire is not a guard. What it stands between: a record about someone else's
 /// payment and `Some(Succeeded)`, which would make the sweep adopt SENT and terminalize its row.
 #[tokio::test]
-async fn outbound_status_by_payment_hash_refuses_a_record_naming_a_different_hash() {
+async fn outbound_status_by_ref_refuses_a_record_naming_a_different_hash() {
     let ops = FakePhoenixdOps::new();
     let be = backend(ops.clone(), TestClock::new(1_000));
     let asked = "aa".repeat(32);
@@ -2060,7 +2060,7 @@ async fn outbound_status_by_payment_hash_refuses_a_record_naming_a_different_has
         },
     );
     let err = be
-        .outbound_status_by_payment_hash(&asked)
+        .outbound_status_by_ref(&asked, "")
         .await
         .expect_err("a record about another hash answers nothing about this one");
     assert!(
@@ -2082,7 +2082,7 @@ async fn outbound_status_by_payment_hash_refuses_a_record_naming_a_different_has
         },
     );
     assert_eq!(
-        be.outbound_status_by_payment_hash(&asked).await.unwrap(),
+        be.outbound_status_by_ref(&asked, "").await.unwrap(),
         Some(PayStatus::Succeeded),
         "the same hash in another case is the same payment"
     );

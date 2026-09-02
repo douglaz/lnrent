@@ -220,20 +220,22 @@ pub trait PaymentBackend: Send + Sync {
     async fn payment_started_by_key(&self, _idempotency_key: &str) -> Result<bool> {
         Ok(false)
     }
-    /// What the backend POSITIVELY knows about an outbound payment for `payment_hash` — the evidence
-    /// a caller needs before it may declare such a payment dead (lnrent-7wbo).
+    /// What the backend POSITIVELY knows about an outbound payment for this destination — the
+    /// evidence a caller needs before it may declare such a payment dead (lnrent-7wbo).
     ///
-    /// Keyed by PAYMENT HASH, not by idempotency key, for two reasons. The caller that needs it (the
-    /// operator sweep's recovery arm, `sweep.rs`) holds the hash at its decision point; and the
-    /// key-shaped answers next door are row-existence reads over a LOCAL index
+    /// Takes the intent's OWN references, not an idempotency key, for two reasons. The key-shaped
+    /// answers next door are row-existence reads over a LOCAL index
     /// ([`payment_status_by_key`](Self::payment_status_by_key),
     /// [`payment_started_by_key`](Self::payment_started_by_key)), so a lost or restored index makes
-    /// them answer `Unknown`/`false` for a payment that really happened — which is exactly the
-    /// incident this seam exists to survive.
+    /// them answer `Unknown`/`false` for a payment that really happened — exactly the incident this
+    /// seam exists to survive. And the two shipped backends key their durable history differently:
+    /// phoenixd by PAYMENT HASH (`outgoingbyhash`), lnv2 by the deterministic attempt-0 OPERATION
+    /// derived from the BOLT11 (`send_operation_id`). Both references are therefore passed; an
+    /// implementation uses whichever its own history is keyed by and ignores the other.
     ///
     /// Every return is load-bearing:
-    /// - `Ok(None)` — **this backend CANNOT answer from the payment hash alone.** It is NOT evidence
-    ///   of absence, and a caller must NEVER terminalize a payment on it.
+    /// - `Ok(None)` — **this backend CANNOT answer for this destination.** It is NOT evidence of
+    ///   absence, and a caller must NEVER terminalize a payment on it.
     /// - `Ok(Some(PayStatus::Succeeded))` — the backend positively reports an outbound payment for
     ///   this hash that PAID.
     /// - `Ok(Some(PayStatus::Pending))` — the backend reports one IN FLIGHT.
@@ -247,14 +249,15 @@ pub trait PaymentBackend: Send + Sync {
     /// An implementation must NEVER return `Ok(Some(PayStatus::Unknown))`. "I don't know" is spelled
     /// `Ok(None)`; the four-way `PayStatus` is reused here only for its three POSITIVE answers.
     ///
-    /// Default: `Ok(None)` — "cannot answer". Correct for every backend with no hash-keyed history to
-    /// consult, and deliberately what lnv2 keeps for now (teaching it to answer is its own bead), so
-    /// the fail-safe direction is what an unimplemented backend gets. The default body is also what
-    /// keeps the trait's many implementations compiling unchanged, exactly as
-    /// [`lookup_settlement_by_ref`](Self::lookup_settlement_by_ref)'s does (lnrent-l07s).
-    async fn outbound_status_by_payment_hash(
+    /// Default: `Ok(None)` — "cannot answer". Correct for every backend with no durable outbound
+    /// history to consult (`MockPayment`), so the fail-safe direction is what an unimplemented
+    /// backend gets. The default body is also what keeps the trait's many implementations compiling
+    /// unchanged, exactly as [`lookup_settlement_by_ref`](Self::lookup_settlement_by_ref)'s does
+    /// (lnrent-l07s). Both shipped backends override it.
+    async fn outbound_status_by_ref(
         &self,
         _payment_hash: &str,
+        _bolt11: &str,
     ) -> Result<Option<PayStatus>> {
         Ok(None)
     }

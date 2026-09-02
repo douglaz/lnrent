@@ -507,7 +507,7 @@ impl Sweeper {
                         let invalid_reason = e.message();
                         let park_reason = match self
                             .payment
-                            .outbound_status_by_payment_hash(&payment_hash)
+                            .outbound_status_by_ref(&payment_hash, &bolt11)
                             .await
                         {
                             // Positively PAID: adopt it. The money left, so the cap stays consumed and
@@ -535,10 +535,13 @@ impl Sweeper {
                                 "stored intent is no longer payable during recovery \
                                  ({invalid_reason}); the backend reports its payment still in flight"
                             ),
-                            // `Ok(None)` is "this backend cannot answer from the hash" — the trait
-                            // default, which lnv2 takes deliberately — and is NOT evidence of absence.
-                            // `Ok(Some(Unknown))` violates the trait contract ("I don't know" is
-                            // `Ok(None)`); treat it the same fail-safe way rather than trusting it.
+                            // `Ok(None)` is "this backend cannot answer for this intent" and is NOT
+                            // evidence of absence. Both shipped backends CAN answer for the common
+                            // shapes, so this arm is the residue: phoenixd's unattributable
+                            // completed-unpaid record, and an lnv2 attempt that exists but whose
+                            // state needs a blocking await. `Ok(Some(Unknown))` violates the trait
+                            // contract ("I don't know" is `Ok(None)`); treat it the same fail-safe
+                            // way rather than trusting it.
                             Ok(None) | Ok(Some(PayStatus::Unknown)) => format!(
                                 "stored intent is no longer payable during recovery \
                                  ({invalid_reason}); the backend cannot confirm whether it paid"
@@ -566,9 +569,14 @@ impl Sweeper {
                         // second outbound payment. SweepStuck is how the operator hears about it.
                         //
                         // The row re-drives every tick, so a backend that later answers positively
-                        // resolves it. A backend taking the trait default cannot answer by hash and
-                        // therefore keeps the row parked, cap held and fresh sweeps refused; teaching
-                        // lnv2 to answer is tracked separately as lnrent-8l8c.
+                        // resolves it. The benign shape — a crash between the durable PENDING write
+                        // and `pay_capped`, so nothing was ever sent — resolves on BOTH shipped
+                        // backends without a human: phoenixd's clean 404 and lnv2's absent attempt-0
+                        // operation are each positive proof of absence. What still parks
+                        // indefinitely is genuine ambiguity (an unattributable phoenixd record, an
+                        // lnv2 attempt whose state needs a blocking await), and a backend on the
+                        // trait default; lnrent-8l8c tracks widening lnv2's answer to
+                        // Succeeded/Pending.
                         report.pending += 1;
                         self.maybe_alert_stuck(&row, self.clock.now(), &park_reason)
                             .await;
@@ -1329,8 +1337,9 @@ mod tests {
     /// A [`SweepPayment`] that can ALSO answer the hash probe, for the arms where the backend has
     /// positive evidence (lnrent-7wbo). It wraps rather than extends so that `SweepPayment` itself
     /// keeps overriding NOTHING — which is what lets the break test below drive the trait's DEFAULT
-    /// `outbound_status_by_payment_hash`, the answer every backend that has not implemented it gives
-    /// (lnv2 included, deliberately). Every method the sweep path actually calls delegates, so the
+    /// `outbound_status_by_ref`, i.e. a backend with no durable outbound history to consult. Both
+    /// SHIPPED backends override it, so that default is the contract's fail-safe rather than any
+    /// current backend's behaviour. Every method the sweep path actually calls delegates, so the
     /// same pay/idempotency/send counting runs underneath — including `available_balance_msat`'s
     /// panic; the rest refuse exactly as the inner fake does.
     struct ProbeablePayment {
@@ -1356,9 +1365,10 @@ mod tests {
 
     #[async_trait]
     impl PaymentBackend for ProbeablePayment {
-        async fn outbound_status_by_payment_hash(
+        async fn outbound_status_by_ref(
             &self,
             payment_hash: &str,
+            _bolt11: &str,
         ) -> Result<Option<PayStatus>> {
             // Unseeded hashes answer `Ok(None)` — "this backend cannot answer" — exactly like the
             // trait default, so a test only gets a positive answer it asked for.

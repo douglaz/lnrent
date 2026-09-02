@@ -118,7 +118,7 @@
 //!
 //!    None of this makes restarting on a diverged index safe. The sweeper's expired-intent recovery
 //!    arm no longer reaches a terminal decision without evidence — it probes this backend by hash
-//!    ([`PaymentBackend::outbound_status_by_payment_hash`], lnrent-7wbo) — but TWO exits of
+//!    ([`PaymentBackend::outbound_status_by_ref`], lnrent-7wbo) — but TWO exits of
 //!    `Sweeper::drive` still terminalize unprobed (`daemon/src/sweep.rs`): its RESTORED-stale-
 //!    `FAILED` arm, the same uxbd shape one layer up, and the `superseded_by_liability` exit of the
 //!    very arm 7wbo fixed, which parks a still-VALID intent FAILED when new liabilities have shrunk
@@ -388,7 +388,7 @@ pub(crate) struct PhoenixdOutgoing {
     /// phoenixd's `completedAt`, epoch MILLIS, ABSENT while the payment is in flight. See the
     /// measured truth table on the recovery arm in `pay_inner`. A completed unpaid record is the
     /// measured terminal-failure response used by
-    /// [`PaymentBackend::outbound_status_by_payment_hash`]. `pay_inner` deliberately needs stronger
+    /// [`PaymentBackend::outbound_status_by_ref`]. `pay_inner` deliberately needs stronger
     /// per-attempt attribution before it unlocks a retry; that separate rule is documented there.
     pub(crate) completed_at_ms: Option<i64>,
 }
@@ -2185,9 +2185,10 @@ impl PaymentBackend for PhoenixdPayment {
     /// see that arm. The 404's authority is bounded to the wallet answering now; the residual that
     /// leaves is lnrent-k0yl, and it is the same shape the restore programme already owns
     /// (lnrent-stale-failed-restore-double-pay-uxbd), not a new one this seam introduces.
-    async fn outbound_status_by_payment_hash(
+    async fn outbound_status_by_ref(
         &self,
         payment_hash: &str,
+        _bolt11: &str, // phoenixd's durable history is hash-keyed; the invoice adds nothing here
     ) -> Result<Option<PayStatus>> {
         // Read the MEASURED discriminator carried on the record: `completedAt` is absent while the
         // payment is in flight (`PhoenixdOutgoing::completed_at_ms`, `phoenixd_backend.rs:388-393`,

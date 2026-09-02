@@ -1947,3 +1947,62 @@ async fn balance_and_readiness_pass_through() {
         "no reachable gateway -> not ready"
     );
 }
+
+// --------------------------------------------------------------------------------------------------
+// lnrent-7wbo: the outbound evidence probe, answered from the FEDERATION's oplog
+// --------------------------------------------------------------------------------------------------
+
+/// The whole point of the seam: no `lnv2_pay` row exists (the index was lost, or the pay never
+/// started), and lnv2 still answers from the deterministic attempt-0 operation. `Missing` from the
+/// oplog is PROOF no send was ever made for this invoice, so the sweep may terminalize instead of
+/// parking its cap forever — the case the codex bot raised on PR #85.
+#[tokio::test]
+async fn outbound_status_by_ref_proves_absence_when_attempt_zero_never_existed() {
+    let fake = FakeLnv2Ops::new();
+    let be = backend_with(fake.clone(), clock(1_000));
+
+    // Nothing seeded: `send_operation_id` derives `prepared:<bolt11>`, which the oplog does not hold.
+    assert_eq!(
+        be.outbound_status_by_ref("hash-irrelevant", "lnbc-never-sent")
+            .await
+            .unwrap(),
+        Some(PayStatus::Failed),
+        "attempt-0 absent from the oplog proves no send was ever started"
+    );
+}
+
+/// An attempt-0 operation that DOES exist is not resolved here: `await_send_final` blocks, and a
+/// foreign `lnrent_key` on the same invoice is the [8A] cross-order collision. Both are "cannot
+/// answer", which parks the sweep rather than terminalizing it (lnrent-8l8c owns teaching this arm
+/// to report Succeeded/Pending).
+#[tokio::test]
+async fn outbound_status_by_ref_cannot_answer_once_an_attempt_exists() {
+    let fake = FakeLnv2Ops::new();
+    let be = backend_with(fake.clone(), clock(1_000));
+    let bolt11 = "lnbc-already-attempted";
+
+    fake.st
+        .lock()
+        .unwrap()
+        .op_keys
+        .insert(format!("prepared:{bolt11}"), "sweep:deadbeef".to_string());
+
+    assert_eq!(
+        be.outbound_status_by_ref("hash-irrelevant", bolt11).await.unwrap(),
+        None,
+        "an existing attempt is not evidence of failure, so the caller must not terminalize"
+    );
+}
+
+/// Defensive: with no invoice there is nothing to derive an operation from, so the honest answer is
+/// "cannot answer" — never the absence proof above.
+#[tokio::test]
+async fn outbound_status_by_ref_cannot_answer_without_an_invoice() {
+    let fake = FakeLnv2Ops::new();
+    let be = backend_with(fake, clock(1_000));
+
+    assert_eq!(
+        be.outbound_status_by_ref("hash-irrelevant", "").await.unwrap(),
+        None
+    );
+}

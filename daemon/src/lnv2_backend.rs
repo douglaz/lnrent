@@ -1257,6 +1257,40 @@ impl PaymentBackend for Lnv2Payment {
         Ok(pay_status_by_key(&self.index, idempotency_key)?.is_some())
     }
 
+    /// lnv2 answers this from the FEDERATION's oplog, not from `lnv2_pay` — which is the whole point
+    /// (lnrent-7wbo): the caller reaches this seam precisely when the local index may have lost the
+    /// row, and `payment_started_by_key` next door is a pure index read that answers `false` in that
+    /// case for a payment that really happened.
+    ///
+    /// The derivation needs no index at all. `send_operation_id` is DETERMINISTIC in the bolt11
+    /// (`Lnv2Ops::send_operation_id`, and `pay_inner` persists it BEFORE `send()`), and lnv2 only
+    /// advances to attempt-1 via `get_next_operation_id` AFTER attempt-0 exists and definitively
+    /// failed (module header). So attempt-0 missing from the oplog proves no send was ever started
+    /// for this invoice — no attempt exists to have paid or to still be in flight.
+    async fn outbound_status_by_ref(
+        &self,
+        _payment_hash: &str, // lnv2's durable history is operation-keyed, derived from the invoice
+        bolt11: &str,
+    ) -> Result<Option<PayStatus>> {
+        if bolt11.is_empty() {
+            return Ok(None);
+        }
+        let op = self.ops.send_operation_id(bolt11)?;
+        match self.ops.send_op_lnrent_key(&op).await? {
+            // No attempt-0 operation: nothing was ever sent for this invoice. The bounded authority
+            // is the same shape phoenixd's 404 has (lnrent-k0yl): this proves absence in the client
+            // db answering NOW, and a ROLLED-BACK `client.db` restore could hide an operation that
+            // did happen — the open question lnrent-lnv2-restore-fresh-hash-proof-l5kk owns.
+            SendOpLookup::Missing => Ok(Some(PayStatus::Failed)),
+            // An operation EXISTS. Resolving it needs `await_send_final`, which BLOCKS until the op
+            // reaches a terminal state — wrong for a read-only probe whose caller is deciding
+            // whether it may terminalize — and a foreign `lnrent_key` on the same invoice is the
+            // [8A] cross-order collision, whose outcome is not ours to adopt. Both are "cannot
+            // answer" here; teaching this arm to report Succeeded/Pending is lnrent-8l8c.
+            SendOpLookup::Present(_) => Ok(None),
+        }
+    }
+
     async fn available_balance_msat(&self) -> Result<Option<u64>> {
         Ok(Some(self.ops.balance_msat().await?))
     }
