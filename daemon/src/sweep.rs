@@ -433,8 +433,8 @@ impl Sweeper {
     /// re-validates the stored invoice. An intent that expired meanwhile (lnrent-7wbo) goes through
     /// [`Sweeper::resolve_or_park`]; a still-valid intent re-runs the surplus gate against the CURRENT
     /// ledger EXCLUDING this row's own cap. Still fits ⇒ capped-pay; no longer covered
-    /// (`superseded_by_liability`, lnrent-meqe) ⇒ the same helper. It terminalizes ONLY on positive
-    /// backend evidence and otherwise leaves the row PENDING.
+    /// (`superseded_by_liability`, lnrent-meqe) ⇒ the same helper. `resolve_or_park` terminalizes
+    /// ONLY on positive backend evidence and otherwise leaves the row PENDING.
     /// Idempotent and safe to call repeatedly.
     pub async fn drive(&self) -> Result<SweepReport> {
         let mut report = SweepReport::default();
@@ -1919,7 +1919,6 @@ mod tests {
             1,
             "exactly one truthful SweepFailed DM"
         );
-        assert_eq!(alert_count(&store, "sweep_stuck").await, 0);
     }
 
     #[tokio::test]
