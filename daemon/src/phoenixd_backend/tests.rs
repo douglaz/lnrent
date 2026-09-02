@@ -1531,6 +1531,15 @@ async fn index_loss_refuses_an_in_flight_record_and_records_no_failure() {
         "the operator must be told the shape, and must not be handed the other shape's \
          wording: {msg}"
     );
+    // The sweep consequence is shape-INDEPENDENT: it sits outside the message's shape conditional
+    // (`phoenixd_backend.rs:1435-1440`), so this pins the SAME sentence the terminal sibling below
+    // pins, on the other shape's rendered message — not a per-shape direction. What it guards is
+    // that neither shape re-acquires a SweepFailed promise: no-row recovery parks the sweep, and the
+    // hash probe cannot terminalize it (lnrent-7wbo).
+    assert!(
+        msg.contains("SweepStuck") && !msg.contains("SweepFailed"),
+        "an in-flight record parks a sweep PENDING, not FAILED: {msg}"
+    );
     assert!(
         ops.pay_calls().is_empty(),
         "refusing means refusing to POST, not POSTing and reporting an error"
@@ -1570,9 +1579,7 @@ async fn index_loss_refuses_a_terminal_unpaid_record_without_writing_failed() {
         .await
         .expect_err("an unattributable terminal record is not a licence to pay again");
 
-    // Both directions, matching the PREPARED siblings: collapsing the shape conditional to emit one
-    // string on both branches would otherwise leave the suite green while the operator is told an
-    // in-flight payment failed, or a failed one is still running.
+    // The record's own measured shape remains truthful in the operator message.
     let rendered = format!("{err:#}");
     assert!(
         rendered.contains("does carry a completion time")
@@ -1580,9 +1587,8 @@ async fn index_loss_refuses_a_terminal_unpaid_record_without_writing_failed() {
         "the terminal shape must use its own wording and not borrow the in-flight one: {rendered}"
     );
     assert!(
-        rendered.contains("SweepFailed") && !rendered.contains("SweepStuck"),
-        "a no-row sweep parks FAILED; promising SweepStuck would name an alert that never \
-         arrives: {rendered}"
+        rendered.contains("SweepStuck") && !rendered.contains("SweepFailed"),
+        "one unattributed failed record cannot terminalize the sweep: {rendered}"
     );
     assert!(ops.pay_calls().is_empty());
     assert_eq!(
@@ -1972,6 +1978,113 @@ async fn a_terminal_outgoing_record_stays_pending_but_reads_differently() {
     assert!(
         !rendered.contains("still IN FLIGHT"),
         "and must not be reported as in flight: {rendered}"
+    );
+}
+
+/// lnrent-7wbo: the read-only hash-keyed probe, over every `outgoingbyhash` response shape plus a
+/// transport failure. The measured discriminator classifies paid and in-flight records; a
+/// completed-unpaid record is not TREATED as hash-wide evidence while the endpoint's multi-attempt
+/// selection rule is unmeasured (lnrent-tk34), while a clean 404 is — no record for the hash in the
+/// history being answered from, which is bounded to the answering wallet (lnrent-k0yl).
+#[tokio::test]
+async fn outbound_status_by_ref_classifies_every_measured_shape() {
+    let ops = FakePhoenixdOps::new();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+
+    let record = |hash: &str, is_paid: bool, completed_at_ms: Option<i64>| PhoenixdOutgoing {
+        payment_id: format!("pay-{hash}"),
+        payment_hash: hash.to_string(),
+        is_paid,
+        fees_msat: 4_480,
+        completed_at_ms,
+    };
+
+    // isPaid=true (completedAt SET, as the live node always emits it) -> the money left.
+    ops.set_outgoing(record("aa", true, Some(MEASURED_COMPLETED_AT_MS)));
+    assert_eq!(
+        be.outbound_status_by_ref("aa", "").await.unwrap(),
+        Some(PayStatus::Succeeded)
+    );
+
+    // completedAt ABSENT is the measured IN-FLIGHT shape — never a licence to terminalize.
+    ops.set_outgoing(record("bb", false, None));
+    assert_eq!(
+        be.outbound_status_by_ref("bb", "").await.unwrap(),
+        Some(PayStatus::Pending)
+    );
+
+    // completedAt SET and NOT paid proves THIS record failed. Whether it proves the HASH failed
+    // depends on which record the endpoint returns when a hash has several attempts, which lnrent
+    // has NOT measured (lnrent-tk34) — so `None`, matching `pay_inner`'s refusal to resolve the same
+    // shape. This pins a DECISION under uncertainty, not a known property of the record.
+    ops.set_outgoing(record("cc", false, Some(MEASURED_COMPLETED_AT_MS)));
+    assert_eq!(be.outbound_status_by_ref("cc", "").await.unwrap(), None);
+
+    // An unseeded hash is phoenixd's clean 404: no record for this hash at all, so nothing is in
+    // flight and nothing succeeded. This is what lets a sweep whose pay never left resolve rather
+    // than park forever; its authority is wallet-scoped (lnrent-k0yl), not unbounded.
+    assert_eq!(
+        be.outbound_status_by_ref("dd", "").await.unwrap(),
+        Some(PayStatus::Failed)
+    );
+
+    // A transport failure is an `Err`, distinct from the authoritative clean 404 above; the caller
+    // must park rather than terminalize when the backend did not answer.
+    ops.fail_outgoing_by_hash();
+    assert!(
+        be.outbound_status_by_ref("aa", "").await.is_err(),
+        "an unanswered probe must never be read as evidence"
+    );
+}
+
+/// The probe's own echoed-hash guard. Nothing else can fire it: `set_outgoing` keys every record by
+/// the record's OWN hash, so only a deliberately mis-keyed one reaches the check — and a guard that
+/// cannot be shown to fire is not a guard. What it stands between: a record about someone else's
+/// payment and `Some(Succeeded)`, which would make the sweep adopt SENT and terminalize its row.
+#[tokio::test]
+async fn outbound_status_by_ref_refuses_a_record_naming_a_different_hash() {
+    let ops = FakePhoenixdOps::new();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let asked = "aa".repeat(32);
+
+    // The URL names our hash, the body names another. Classified rather than refused, `is_paid`
+    // would report SUCCEEDED and the caller would adopt a payment that is not ours.
+    ops.set_outgoing_for(
+        &asked,
+        PhoenixdOutgoing {
+            payment_id: "pay-some-other-payment".into(),
+            payment_hash: "ff".repeat(32),
+            is_paid: true,
+            fees_msat: 4_480,
+            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+        },
+    );
+    let err = be
+        .outbound_status_by_ref(&asked, "")
+        .await
+        .expect_err("a record about another hash answers nothing about this one");
+    assert!(
+        format!("{err:#}").contains("refusing to classify a different payment"),
+        "must be this probe's own pre-classification bail, not another check: {err:#}"
+    );
+
+    // And the comparison is case-INSENSITIVE on purpose (the echo's casing is unmeasured): an
+    // upper-case echo of the SAME hash must classify normally, not bail. A spurious mismatch here
+    // would park every expired sweep PENDING forever with its cap held.
+    ops.set_outgoing_for(
+        &asked,
+        PhoenixdOutgoing {
+            payment_id: "pay-ours".into(),
+            payment_hash: asked.to_uppercase(),
+            is_paid: true,
+            fees_msat: 4_480,
+            completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
+        },
+    );
+    assert_eq!(
+        be.outbound_status_by_ref(&asked, "").await.unwrap(),
+        Some(PayStatus::Succeeded),
+        "the same hash in another case is the same payment"
     );
 }
 

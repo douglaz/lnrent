@@ -125,15 +125,38 @@ docs/specs/gate1-alerting-operability.md §F — never by this authorization pat
   - **started** (durable evidence of a backend op): re-await by key (`payment_status_by_key`
     fast-skip on Succeeded) — funds are already committed; finishing is correct and cannot
     double-pay;
-  - **not started**: RE-RUN the surplus gate against the current ledger before the capped send
-    (new liabilities may have been captured since the intent was written) — **excluding the row
-    being recovered from its own `paid_out_msat`** (its cap is already subtracted the moment the
-    PENDING row exists; gating it against itself would demand the funds twice and falsely
-    supersede a sweep that fit exactly). Other PENDING/SENT sweeps still count. If the gate now
-    fails, mark the row FAILED with reason `superseded_by_liability` and alert — never send.
+  - **not started**: the recovery drive first RE-VALIDATES the stored bolt11 against the current
+    clock, because an intent written shortly before downtime can have expired since. Two sub-cases:
+    - **still payable**: RE-RUN the surplus gate against the current ledger before the capped send
+      (new liabilities may have been captured since the intent was written) — **excluding the row
+      being recovered from its own `paid_out_msat`** (its cap is already subtracted the moment the
+      PENDING row exists; gating it against itself would demand the funds twice and falsely
+      supersede a sweep that fit exactly). Other PENDING/SENT sweeps still count. If the gate now
+      fails, mark the row FAILED with reason `superseded_by_liability` and alert — never send.
+    - **no longer payable**: the row may NOT be terminalized on the key index's silence.
+      `payment_started_by_key` is a row-existence read over a LOCAL index, so an index loss over an
+      in-flight sweep pay is indistinguishable from a sweep that never started — and a FAILED row
+      returns its cap to surplus and DMs the operator, whose next `lnrent sweep` mints a NEW payment
+      hash the node's own dedup cannot catch. **Never terminalize a sweep without positive backend
+      evidence** (lnrent-7wbo). Ask the backend for outbound evidence about the intent itself
+      (`PaymentBackend::outbound_status_by_ref`, keyed by payment hash and bolt11 rather than by the
+      local key) and act on the answer:
+
+      | backend answers | outcome |
+      | --- | --- |
+      | the payment SUCCEEDED | adopt it: row → SENT, cap stays consumed, no `SweepFailed` |
+      | the payment is IN FLIGHT | stay PENDING; `SweepStuck` past the threshold |
+      | positively NOT paid and not in flight | FAILED, as before, and the `SweepFailed` DM is true |
+      | cannot answer, or the probe errors | stay PENDING; `SweepStuck` past the threshold |
+
+      A parked row keeps its cap out of surplus and holds the one-at-a-time slot below, which is
+      what refuses the operator's second payment. It re-drives every tick, so it resolves as soon as
+      the backend can answer; on a backend that never can, it waits for a human.
 - One in-flight sweep at a time (`WHERE status='PENDING'` count must be 0 to accept a new one):
   keeps the surplus math trivially serializable. `sweep_busy` error otherwise.
-- Expired bolt11 at execution → FAILED with the backend error; the operator re-issues and re-runs.
+- Expired bolt11 at `execute` (a NEW sweep request) → refused outright with the backend error; the
+  operator re-issues and re-runs. This is distinct from an intent that expires DURING recovery,
+  which takes the probe path above rather than failing.
 - Do NOT reuse the `refund_attempt` table — sweeps must never enter refund liability/readiness
   math, and INV-3 provenance would (correctly) reject them.
 
