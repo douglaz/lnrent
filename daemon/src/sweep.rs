@@ -430,11 +430,11 @@ impl Sweeper {
     /// Crash-recovery drive (boot + maintenance): finish every PENDING `sweep_attempt`. A terminal
     /// key status wins first (`Succeeded` => SENT, `Failed` => FAILED); an in-flight `Pending` key
     /// re-awaits by key. Only an `Unknown` key falls back to started evidence or, if not started,
-    /// re-validates the stored invoice and re-runs the surplus gate against the CURRENT ledger
-    /// EXCLUDING this row's own cap. A still-valid intent that still fits ⇒ capped-pay. BOTH other
-    /// exits — an intent that expired meanwhile (lnrent-7wbo) and one the surplus no longer covers
-    /// (`superseded_by_liability`, lnrent-meqe) — go through [`Sweeper::resolve_or_park`], which
-    /// terminalizes ONLY on positive backend evidence and otherwise leaves the row PENDING.
+    /// re-validates the stored invoice. An intent that expired meanwhile (lnrent-7wbo) goes through
+    /// [`Sweeper::resolve_or_park`]; a still-valid intent re-runs the surplus gate against the CURRENT
+    /// ledger EXCLUDING this row's own cap. Still fits ⇒ capped-pay; no longer covered
+    /// (`superseded_by_liability`, lnrent-meqe) ⇒ the same helper. It terminalizes ONLY on positive
+    /// backend evidence and otherwise leaves the row PENDING.
     /// Idempotent and safe to call repeatedly.
     pub async fn drive(&self) -> Result<SweepReport> {
         let mut report = SweepReport::default();
@@ -538,8 +538,8 @@ impl Sweeper {
                             // above, IDENTICAL hazard: the premise is still the key index's silence,
                             // so this exit needs the same evidence before it may terminalize
                             // (lnrent-meqe). The reason string keeps its `superseded_by_liability:`
-                            // token — `docs/specs/gate1-operator-sweep.md` names it and an operator
-                            // runbook greps for it.
+                            // token — `docs/specs/gate1-operator-sweep.md` names it, and
+                            // `commit_failed` carries it into the operator-visible SweepFailed DM.
                             self.resolve_or_park(
                                 &row,
                                 &bolt11,
@@ -1880,7 +1880,8 @@ mod tests {
         // `drive_never_terminalizes_a_superseded_intent_the_backend_cannot_answer_for`.
         let payment = Arc::new(ProbeablePayment::new());
         payment.answer("x", PayStatus::Failed);
-        let s = sweeper(&store, payment.clone());
+        let clock = Arc::new(TestClock::new(1_000));
+        let s = sweeper_with_alerts(&store, payment.clone(), clock);
 
         let report = s.drive().await.unwrap();
         assert_eq!(report.failed, 1);
@@ -1891,7 +1892,13 @@ mod tests {
             .read(|c| Ok(c.query_row("SELECT last_error FROM sweep_attempt WHERE id='sweep:x'", [], |r| r.get(0))?))
             .await
             .unwrap();
-        assert!(last_error.unwrap().contains("superseded_by_liability"));
+        assert!(last_error.unwrap().starts_with("superseded_by_liability:"));
+        assert_eq!(
+            alert_count(&store, "sweep_failed").await,
+            1,
+            "exactly one truthful SweepFailed DM"
+        );
+        assert_eq!(alert_count(&store, "sweep_stuck").await, 0);
     }
 
     #[tokio::test]
@@ -2230,50 +2237,6 @@ mod tests {
             1,
             "EXACTLY ONE outbound payment across the whole incident"
         );
-    }
-
-    #[tokio::test]
-    async fn drive_terminalizes_a_superseded_intent_the_backend_confirms_never_paid() {
-        // The other side of lnrent-meqe: a backend that POSITIVELY reports no outbound payment for
-        // this intent still terminalizes here, keeping the `superseded_by_liability` reason
-        // `docs/specs/gate1-operator-sweep.md` names, and its SweepFailed DM stays true — it is only
-        // the UNPROBED terminalization the fix removed.
-        let store = mem_store();
-        let clock = expiry_recovery_clock();
-        seed_superseded_pending_sweep(&store, "sweep:x").await;
-
-        let payment = Arc::new(ProbeablePayment::new());
-        payment.answer("x", PayStatus::Failed);
-        let s = sweeper_with_alerts(&store, payment.clone(), clock);
-
-        let report = s.drive().await.unwrap();
-        assert_eq!(report.failed, 1);
-        assert_eq!(payment.sends(), 0, "a superseded sweep is never paid");
-        assert_eq!(
-            single_sweep_status(&store).await,
-            "FAILED",
-            "positive evidence licenses terminalizing, freeing the in-flight slot"
-        );
-        let last_error: Option<String> = store
-            .read(|c| {
-                Ok(c.query_row(
-                    "SELECT last_error FROM sweep_attempt WHERE id='sweep:x'",
-                    [],
-                    |r| r.get(0),
-                )?)
-            })
-            .await
-            .unwrap();
-        assert!(
-            last_error.unwrap().starts_with("superseded_by_liability:"),
-            "the operator-greppable reason token survives the probe"
-        );
-        assert_eq!(
-            alert_count(&store, "sweep_failed").await,
-            1,
-            "exactly one truthful SweepFailed DM"
-        );
-        assert_eq!(alert_count(&store, "sweep_stuck").await, 0);
     }
 
     #[tokio::test]

@@ -120,10 +120,10 @@
 //!    not-started arm that refuse to send now share one probe of this backend by hash before they
 //!    may terminalize ([`PaymentBackend::outbound_status_by_ref`] via `Sweeper::resolve_or_park`,
 //!    `daemon/src/sweep.rs`): the expired intent (lnrent-7wbo) and the intent whose committed cap the
-//!    surplus no longer covers (lnrent-meqe). What still terminalizes unprobed there is the arm that
-//!    adopts a `PayStatus::Failed` key verbatim — the stale-`FAILED` shape described above, one layer
-//!    up, and it closes with uxbd rather than separately. `docs/go-live.md` is authoritative for what
-//!    an operator should do.
+//!    surplus no longer covers (lnrent-meqe). What still terminalizes unprobed in pre-pay recovery is
+//!    `drive`'s top-level arm that adopts a `PayStatus::Failed` key verbatim — the stale-`FAILED`
+//!    shape described above, one layer up, and it closes with uxbd rather than separately.
+//!    `docs/go-live.md` is authoritative for what an operator should do.
 //!
 //! ## Cross-order same-invoice guard (ported [8A], lnrent-85t)
 //! phoenixd dedups by payment hash across the WHOLE node, so if some other idempotency key already
