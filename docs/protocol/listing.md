@@ -75,11 +75,12 @@ fields inside the content MUST be ignored.
 positive integer followed by an optional unit: `s`, `m`, `h`, `d`, `w`. A bare integer is
 seconds. Examples: `"30d"`, `"12h"`, `"3600"`.
 
-A buyer parser MUST treat a `period` outside this grammar as unparseable and SHOULD not
-order against it. The reference daemon does not reject a malformed recipe duration at load:
-it substitutes a 30-day fallback for its own timers and still publishes the raw string
-(`hook-contract.md` §1), so a malformed `period` on the wire is a recipe-author error the
-buyer can observe.
+A `period` outside this grammar is a publisher error. A buyer client SHOULD refuse to order
+against one; the reference wire parser and buyer-core do **not** validate the grammar today
+(they copy the string through), so this is a client-side choice until the daemon rejects
+malformed durations at load (lnrent-pyq4). The reference daemon currently substitutes a
+30-day fallback for its own timers and still publishes the raw string (`hook-contract.md`
+§1), so a malformed `period` on the wire is a recipe-author error the buyer can observe.
 
 ## 4. Discovery and verification
 
