@@ -317,59 +317,55 @@ impl OpResult {
     }
 }
 
-/// The tagged union of every lnrent DM message (SPEC.md §5.1). The wire form is a JSON object
-/// whose `type` field selects the variant, e.g. `{"type":"order.request", ...}`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum Msg {
-    #[serde(rename = "order.request")]
-    OrderRequest(OrderRequest),
-    #[serde(rename = "order.invoice")]
-    OrderInvoice(OrderInvoice),
-    #[serde(rename = "order.error")]
-    OrderError(OrderError),
-    #[serde(rename = "provision.ready")]
-    ProvisionReady(ProvisionReady),
-    #[serde(rename = "delivery.resend.request")]
-    DeliveryResendRequest(DeliveryResendRequest),
-    #[serde(rename = "billing.invoice")]
-    BillingInvoice(BillingInvoice),
-    #[serde(rename = "billing.notice")]
-    BillingNotice(BillingNotice),
-    #[serde(rename = "billing.refund")]
-    BillingRefund(BillingRefund),
-    #[serde(rename = "renew.request")]
-    RenewRequest(RenewRequest),
-    #[serde(rename = "sub.cancel")]
-    SubCancel(SubCancel),
-    #[serde(rename = "op.request")]
-    OpRequest(OpRequest),
-    #[serde(rename = "op.result")]
-    OpResult(OpResult),
-    #[serde(rename = "operator.alert")]
-    OperatorAlert(OperatorAlert),
+/// Defines [`Msg`] together with its wire `type` spellings, [`Msg::type_str`] and
+/// [`Msg::ALL_TYPES`] from ONE list, so the enum, the serde rename and the closed type set cannot
+/// drift apart: a variant added here is in `ALL_TYPES` by construction, and the conformance
+/// vector suite (`wire/tests/vectors.rs`) then demands a fixture for it.
+macro_rules! define_msg {
+    ($( $variant:ident = $wire:literal ),* $(,)?) => {
+        /// The tagged union of every lnrent DM message (SPEC.md §5.1). The wire form is a JSON
+        /// object whose `type` field selects the variant, e.g. `{"type":"order.request", ...}`.
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[serde(tag = "type")]
+        pub enum Msg {
+            $(
+                #[serde(rename = $wire)]
+                $variant($variant),
+            )*
+        }
+
+        impl Msg {
+            /// Every wire `type` discriminator, in declaration order: the closed set every
+            /// conforming decoder must know (docs/protocol/dm-protocol.md §2).
+            pub const ALL_TYPES: &'static [&'static str] = &[ $( $wire ),* ];
+
+            /// The wire `type` discriminator, e.g. `"order.request"`.
+            pub fn type_str(&self) -> &'static str {
+                match self {
+                    $( Msg::$variant(_) => $wire, )*
+                }
+            }
+        }
+    };
+}
+
+define_msg! {
+    OrderRequest = "order.request",
+    OrderInvoice = "order.invoice",
+    OrderError = "order.error",
+    ProvisionReady = "provision.ready",
+    DeliveryResendRequest = "delivery.resend.request",
+    BillingInvoice = "billing.invoice",
+    BillingNotice = "billing.notice",
+    BillingRefund = "billing.refund",
+    RenewRequest = "renew.request",
+    SubCancel = "sub.cancel",
+    OpRequest = "op.request",
+    OpResult = "op.result",
+    OperatorAlert = "operator.alert",
 }
 
 impl Msg {
-    /// The wire `type` discriminator, e.g. `"order.request"`.
-    pub fn type_str(&self) -> &'static str {
-        match self {
-            Msg::OrderRequest(_) => "order.request",
-            Msg::OrderInvoice(_) => "order.invoice",
-            Msg::OrderError(_) => "order.error",
-            Msg::ProvisionReady(_) => "provision.ready",
-            Msg::DeliveryResendRequest(_) => "delivery.resend.request",
-            Msg::BillingInvoice(_) => "billing.invoice",
-            Msg::BillingNotice(_) => "billing.notice",
-            Msg::BillingRefund(_) => "billing.refund",
-            Msg::RenewRequest(_) => "renew.request",
-            Msg::SubCancel(_) => "sub.cancel",
-            Msg::OpRequest(_) => "op.request",
-            Msg::OpResult(_) => "op.result",
-            Msg::OperatorAlert(_) => "operator.alert",
-        }
-    }
-
     /// The client-chosen request `id` of a request message that carries one — `order.request`,
     /// `renew.request`, `op.request` (SPEC.md §5.1). `None` for every other message.
     pub fn id(&self) -> Option<&str> {

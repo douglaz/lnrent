@@ -80,7 +80,7 @@ yet make it fail closed.
 | invocation | executed directly (absolute path), no shell |
 | stdin | one JSON document, then EOF; shape per hook in §3 |
 | stdout | MUST be a single JSON value; the daemon parses all of stdout |
-| stderr | captured (and size-capped) but **discarded on success**; it is included in the failure message only when the hook exits non-zero, times out, or emits invalid stdout. Do not rely on stderr for progress or warnings the operator should see. |
+| stderr | captured (and size-capped) but **discarded on success**, and included in the operator's failure message **only on a non-zero exit**; a timeout or an invalid-stdout failure discards it too. Do not rely on stderr for diagnostics the operator should see. |
 | exit code | `0` = success; anything else = failure, and stdout is ignored |
 | timeout | **120 s**; on timeout the whole process group is killed and the hook is a failure |
 | output cap | **1 MiB** on each of stdout and stderr; exceeding either is a failure |

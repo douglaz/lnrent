@@ -66,8 +66,10 @@ it is written in. SHOULDs describe the reference daemon and may be varied.
     `billing.invoice`; reminders are best-effort and MUST NOT be the only way to renew.
 22. MUST answer an owner's `renew.request` per `dm-protocol.md` §3.9 and MUST stay silent to a
     non-owner or for an unknown subscription.
-23. At `paid_through`, unpaid, MUST run `suspend` and send `billing.notice { state: "SUSPENDED" }`;
-    the buyer's data MUST be kept for `retention`.
+23. At the **effective expiry** `max(paid_through, downtime-credit floor)` (item 28; the floor is
+    `paid_through` when no outage was credited), unpaid, MUST run `suspend` and send
+    `billing.notice { state: "SUSPENDED" }`; the buyer's data MUST be kept for `retention` from
+    that same effective boundary. `paid_through` itself is never moved by a credit.
 24. A late renewal within retention MUST resume the service; if `resume` fails permanently the
     renewal MUST be refunded, the subscription MUST return to SUSPENDED with its prior deadlines,
     and it MUST never be left in an in-flight state.
@@ -80,7 +82,9 @@ it is written in. SHOULDs describe the reference daemon and may be varied.
     that wedges the subscription.
 28. All deadlines MUST be absolute timestamps so a transition missed during downtime fires on
     restart; an implementation SHOULD credit its own downtime so a buyer is not suspended for
-    an outage they could not renew through.
+    an outage they could not renew through. A credit is expressed as a **floor** on the suspend
+    time (the reference daemon's `suspend_not_before`), never by moving `paid_through`; items
+    23 and 25 are then measured from `max(paid_through, floor)`.
 
 ## 5. Refunds
 
@@ -112,22 +116,26 @@ it is written in. SHOULDs describe the reference daemon and may be varied.
 38. MUST answer an owner's `delivery.resend.request` by re-sending the latest
     `provision.ready`, and MUST stay silent otherwise.
 39. Two durability models, by message class:
-    - **State-change announcements** (`provision.ready`; the `ACTIVE`, `SUSPENDED` and
+    - **Operator-initiated messages** (`provision.ready`; the `ACTIVE`, `SUSPENDED` and
       `CANCELLED` `billing.notice`s; every `billing.refund`; the soft-date `billing.invoice`;
-      `operator.alert`) MUST be committed to a durable, retrying outbox in the same transaction
-      as the state change they announce, and retried until a relay accepts them; a message that
-      can never be encoded is quarantined, not retried forever.
-    - **Replies to an inbound request** (`order.invoice`, `order.error`, a `renew.request`'s
-      `billing.invoice`, and BOTH `RESUMING` notices, the correlated one answering
-      `renew.request` and the uncorrelated one answering `sub.cancel`, and `op.result`) are
-      published once, directly, after the request's effect is committed; they are NOT queued.
-      Their recovery path is the cached reply of items 11 and 37: a buyer that re-sends the
-      **same request with the same `id`** MUST receive the cached reply without the effect
-      repeating. The operator owes the cache; it does not owe a retry. (Reference clients: the
-      CLI can pin an id with `--request-id` for exactly this; buyer-core does not retry on its
-      own; the web client cannot pin an id and has no recovery for a lost correlated reply.)
-      A lost `sub.cancel`-time `RESUMING` notice is UX only: cancel changes nothing in that
-      state either way, and the buyer re-sends `sub.cancel` once the resume lands.
+      `operator.alert`) MUST be committed to a durable, retrying outbox **in the same
+      transaction as the durable record that produced them** (the state change for a notice or
+      `provision.ready`; the invoice row for the soft-date invoice; the refund row for
+      `billing.refund`), and retried until a relay accepts them; a message that can never be
+      encoded is quarantined, not retried forever.
+    - **Replies to an inbound request** are published once, directly, after the request's
+      effect is committed; they are NOT queued. They split by recovery path:
+      - `order.invoice`, `order.error`, a `renew.request`'s `billing.invoice`, and every
+        `op.result` past the ACTIVE gate are **cached** (items 11 and 37): a buyer that re-sends
+        the **same request with the same `id`** MUST receive the cached reply without the
+        effect repeating. The operator owes the cache; it does not owe a retry.
+      - Both `RESUMING` notices (answering `renew.request` and `sub.cancel`), the renew
+        `unavailable` refusal, and the pre-ACTIVE `op.result` refusals are **not cached**
+        (`dm-protocol.md` §4): they describe a transient condition, so losing one costs
+        nothing and re-sending the request once the condition clears proceeds normally.
+      (Reference clients: the CLI can pin an id with `--request-id` for exactly this;
+      buyer-core does not retry on its own; the web client cannot pin an id and has no
+      recovery for a lost correlated reply.)
 
 ## 8. Things a conforming operator MUST NOT do
 

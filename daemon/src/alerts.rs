@@ -85,48 +85,55 @@ fn alert_payload(kind: AlertKind, subject: &str, detail: &str) -> String {
     .expect("serialize operator alert (three owned strings) is infallible")
 }
 
-/// The CLOSED set of alertable conditions (production-readiness.md PR-5 §A). Extended ONLY by the
-/// owning beads listed in the module doc — do not add free-form kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AlertKind {
-    /// A refund exhausted its retry budget (or a definitive backend failure) and was parked FAILED.
-    RefundParked,
-    /// A refund has sat PENDING past the stuck threshold without progressing.
-    RefundStuck,
-    /// A `destroy` hook failed and the orphaned instance was dead-lettered (wired by PR-6).
-    TeardownFailed,
-    /// The relay pool has zero connectivity (wired by PR-9c).
-    RelayBlackout,
-    /// Ledger-expected holdings fell below the operator's floor (wired by PR-16).
-    HoldingsLow,
-    /// A retention `destroy` raced a renewal settlement and tore down a box the buyer just paid for
-    /// (wired by PR-21). The subscription stays alive; a refund for the un-provided period follows.
-    PaidServiceDestroyed,
-    /// An operator sweep was parked FAILED (a gateway-fee rise refused the capped pay, or a
-    /// crash-recovered intent was superseded by a new liability) — gate1-operator-sweep (urw.3).
-    SweepFailed,
-    /// An operator sweep has sat PENDING past the stuck threshold without progressing.
-    SweepStuck,
-    /// A receipt cannot be booked: either the backend observed it paid, or index divergence made its
-    /// payment state unknowable. The fail-closed decision is unchanged; `detail` gives the remedy.
-    SettlementUnbookable,
+/// Defines [`AlertKind`], its wire spellings and [`AlertKind::ALL`] from ONE list, so the enum
+/// and the closed vocabulary docs/protocol/dm-protocol.md §3.13 quotes cannot drift apart: a
+/// variant added here is in `ALL` by construction, and the doc test below then demands it in
+/// the protocol doc.
+macro_rules! define_alert_kinds {
+    ($( $(#[$meta:meta])* $variant:ident = $wire:literal ),* $(,)?) => {
+        /// The CLOSED set of alertable conditions (production-readiness.md PR-5 §A). Extended
+        /// ONLY by the owning beads listed in the module doc — do not add free-form kinds.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum AlertKind {
+            $( $(#[$meta])* $variant, )*
+        }
+
+        impl AlertKind {
+            /// Every kind, in declaration order.
+            pub const ALL: &'static [AlertKind] = &[ $( AlertKind::$variant ),* ];
+
+            /// The stable wire spelling carried in `Msg::OperatorAlert.kind` and the outbox row id.
+            pub fn wire_str(self) -> &'static str {
+                match self {
+                    $( AlertKind::$variant => $wire, )*
+                }
+            }
+        }
+    };
 }
 
-impl AlertKind {
-    /// The stable wire spelling carried in `Msg::OperatorAlert.kind` and the outbox row id.
-    pub fn wire_str(self) -> &'static str {
-        match self {
-            AlertKind::RefundParked => "refund_parked",
-            AlertKind::RefundStuck => "refund_stuck",
-            AlertKind::TeardownFailed => "teardown_failed",
-            AlertKind::RelayBlackout => "relay_blackout",
-            AlertKind::HoldingsLow => "holdings_low",
-            AlertKind::PaidServiceDestroyed => "paid_service_destroyed",
-            AlertKind::SweepFailed => "sweep_failed",
-            AlertKind::SweepStuck => "sweep_stuck",
-            AlertKind::SettlementUnbookable => "settlement_unbookable",
-        }
-    }
+define_alert_kinds! {
+    /// A refund exhausted its retry budget (or a definitive backend failure) and was parked FAILED.
+    RefundParked = "refund_parked",
+    /// A refund has sat PENDING past the stuck threshold without progressing.
+    RefundStuck = "refund_stuck",
+    /// A `destroy` hook failed and the orphaned instance was dead-lettered (wired by PR-6).
+    TeardownFailed = "teardown_failed",
+    /// The relay pool has zero connectivity (wired by PR-9c).
+    RelayBlackout = "relay_blackout",
+    /// Ledger-expected holdings fell below the operator's floor (wired by PR-16).
+    HoldingsLow = "holdings_low",
+    /// A retention `destroy` raced a renewal settlement and tore down a box the buyer just paid for
+    /// (wired by PR-21). The subscription stays alive; a refund for the un-provided period follows.
+    PaidServiceDestroyed = "paid_service_destroyed",
+    /// An operator sweep was parked FAILED (a gateway-fee rise refused the capped pay, or a
+    /// crash-recovered intent was superseded by a new liability) — gate1-operator-sweep (urw.3).
+    SweepFailed = "sweep_failed",
+    /// An operator sweep has sat PENDING past the stuck threshold without progressing.
+    SweepStuck = "sweep_stuck",
+    /// A receipt cannot be booked: either the backend observed it paid, or index divergence made its
+    /// payment state unknowable. The fail-closed decision is unchanged; `detail` gives the remedy.
+    SettlementUnbookable = "settlement_unbookable",
 }
 
 /// The CLI shows recent alert history, not live backend state. Two cooldown windows keep the latest
@@ -424,46 +431,13 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    /// Every variant, in one place. Exhaustive by construction: the `match` below has no `_`
-    /// arm, so adding a variant to `AlertKind` fails to compile here until it is added to this
-    /// array too — which is what makes the doc check underneath it a real guard.
-    const ALL_KINDS: [AlertKind; 9] = [
-        AlertKind::RefundParked,
-        AlertKind::RefundStuck,
-        AlertKind::TeardownFailed,
-        AlertKind::RelayBlackout,
-        AlertKind::HoldingsLow,
-        AlertKind::PaidServiceDestroyed,
-        AlertKind::SweepFailed,
-        AlertKind::SweepStuck,
-        AlertKind::SettlementUnbookable,
-    ];
-
-    fn assert_listed(kind: AlertKind) {
-        match kind {
-            AlertKind::RefundParked
-            | AlertKind::RefundStuck
-            | AlertKind::TeardownFailed
-            | AlertKind::RelayBlackout
-            | AlertKind::HoldingsLow
-            | AlertKind::PaidServiceDestroyed
-            | AlertKind::SweepFailed
-            | AlertKind::SweepStuck
-            | AlertKind::SettlementUnbookable => {
-                assert!(ALL_KINDS.contains(&kind), "{kind:?} missing from ALL_KINDS");
-            }
-        }
-    }
-
     /// docs/protocol/dm-protocol.md §3.13 quotes the closed `operator.alert.kind` vocabulary as a
-    /// normative list. That list and this enum must be the SAME set in both directions: a
-    /// variant the doc omits, or a kind the doc names that the enum lacks, is a red test.
+    /// normative list. That list and `AlertKind::ALL` — generated by the same macro as the enum,
+    /// so nothing here is hand-maintained — must be the SAME set in both directions: a variant
+    /// the doc omits, or a kind the doc names that the enum lacks, is a red test.
     #[test]
     fn operator_alert_kinds_match_the_protocol_doc() {
         use std::collections::BTreeSet;
-        for k in ALL_KINDS {
-            assert_listed(k);
-        }
         let doc = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../docs/protocol/dm-protocol.md"
@@ -475,7 +449,7 @@ mod tests {
             .expect("dm-protocol.md §3.13 has the `kind` row that says `one of`");
         let after = &row[row.find("one of").unwrap()..];
         let documented: BTreeSet<&str> = after.split('`').skip(1).step_by(2).collect();
-        let enumerated: BTreeSet<&str> = ALL_KINDS.iter().map(|k| k.wire_str()).collect();
+        let enumerated: BTreeSet<&str> = AlertKind::ALL.iter().map(|k| k.wire_str()).collect();
         assert_eq!(
             documented, enumerated,
             "operator.alert `kind` vocabulary drifted between AlertKind::wire_str and dm-protocol.md §3.13"
