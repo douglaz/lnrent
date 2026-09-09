@@ -37,7 +37,7 @@ retention = "7d"
 
 [provisioning]
 backend = "cloud-do"          # host | incus | libvirt | proxmox | cloud-<anything>; not dispatched on
-isolation = "vm"              # free string
+isolation = "vm"              # none | container | vm; not dispatched on
 tier = "0"                    # "0" | "1" | "1.5" | "2"; published in the listing
 resources = { cpu = 1, mem_mb = 1024, disk_gb = 25 }   # counted against host capacity
 env = ["DO_TOKEN", "DO_REGION"]   # optional: operator env vars forwarded to hooks, §2
@@ -59,8 +59,8 @@ hook = "status"               # bare filename under ops/; no "/", no "..", non-e
 # params = [ ... ]            # optional, same shape as [[params]], ≤64
 ```
 
-Validation the daemon applies at load: `service.id` non-empty; `backend` one of the values
-above; `tier` in the four values;
+Validation the daemon applies at load: `service.id` non-empty; `backend` and `isolation` each
+one of the values above; `tier` in the four values;
 `os.supports` non-empty; `env` has at most **16** names, each `1..=64` chars of `[A-Z0-9_]`
 and never starting with `LNRENT`; every `hook` is a bare filename whose canonical path stays
 inside `ops/`; the five lifecycle hooks exist; params and operations within the bounds
@@ -143,7 +143,7 @@ stdin (identical shape for all three):
 stored or it fails to parse. When no instance row exists at all, `instance` and `handles` are
 absent and stdin is just `{ "subscription": { "id", "buyer_pubkey" } }`.
 
-stdout: any JSON; the daemon ignores its content and looks only at the exit code. By
+stdout: one JSON value (required, §2), whose content the daemon does not read. By
 convention `{ "ok": true, "state": "suspended" }`.
 
 **Idempotency:** each of these is guarded by a compare-and-swap on the daemon side but MAY be
@@ -194,8 +194,9 @@ hook, so a hook like `restart` may have side effects freely.
 
 Run by the operator's `lnrent preflight` command and before publication, never per order.
 stdin is `{}`. Exit `0` if the recipe's provisioning parameters (its `env` values, provider
-credentials, region or size slugs) are usable; any non-zero exit blocks publication. stdout is
-ignored.
+credentials, region or size slugs) are usable; any non-zero exit blocks publication. stdout
+MUST still be one JSON value (§2 applies to every hook; an empty stdout is a failure), but its
+content is not read. `{"ok":true}` is the convention.
 
 ## 4. Security expectations on a recipe
 

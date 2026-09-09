@@ -111,8 +111,18 @@ it is written in. SHOULDs describe the reference daemon and may be varied.
 
 38. MUST answer an owner's `delivery.resend.request` by re-sending the latest
     `provision.ready`, and MUST stay silent otherwise.
-39. Every operator→buyer message MUST be sent through a durable, retrying outbox; a message that
-    can never be encoded is quarantined, not retried forever.
+39. Two durability models, by message class, and a buyer MUST be able to rely on both:
+    - **Unsolicited messages** (`provision.ready`, every `billing.notice` and `billing.refund`,
+      the soft-date `billing.invoice`, `operator.alert`) MUST be committed to a durable, retrying
+      outbox in the same transaction as the state change they announce, and retried until a relay
+      accepts them; a message that can never be encoded is quarantined, not retried forever.
+    - **Request-correlated replies** (`order.invoice`, `order.error`, a `renew.request`'s
+      `billing.invoice` / `billing.notice`, `op.result`) are sent directly once the request's
+      effect is committed; they are NOT queued. Their durability is the cached reply of items 11
+      and 37: a reply lost to a relay failure is recovered by the buyer **re-sending the same
+      request with the same `id`**, which MUST return the cached reply without repeating the
+      effect. A buyer client that never retries a silent request has no recovery path, so buyer
+      clients MUST retry under the same `id` on timeout.
 
 ## 8. Things a conforming operator MUST NOT do
 

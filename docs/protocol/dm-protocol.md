@@ -131,7 +131,7 @@ Idempotent by nature, so it has no request id.
 | `bolt11` | string | |
 | `amount_sat` | integer | |
 | `due_at` | integer | the current `paid_through`; paying before it avoids interruption |
-| `expires_at` | integer | invoice expiry. Never longer than 3,600 s, and clipped to the remaining resumable window; the operator does not issue one with under 60 s left. |
+| `expires_at` | integer | invoice expiry. Differs by origin: a **buyer-requested** invoice is `min(3,600 s, remaining resumable window)` and is not issued at all with under 60 s left; the **operator-initiated soft-date** invoice is `max(remaining resumable window, 3,600 s)`, i.e. commonly days, so a buyer MUST NOT reject a long expiry. The resumable window ends at `max(paid_through, downtime credit) + retention`. |
 
 Paying it extends `paid_through` by `max(paid_through, settled_at) + period`.
 
@@ -252,6 +252,11 @@ listed so a decoder knows the `type`.
   `order.error` from an earlier request carries a different `request_id` and MUST be ignored.
 - A buyer MUST also check the reply's sender equals the operator it is talking to.
 - `sub.cancel` and `delivery.resend.request` have no id; re-sending them is safe.
+- Correlated replies are sent once, directly, and are **not** queued for retry by the operator.
+  If a reply does not arrive, the buyer MUST re-send the same request under the **same `id`**:
+  the operator answers from its cache without repeating the effect. Retrying under a new `id`
+  places a new order / invocation. (Unsolicited operator messages are queued and retried on the
+  operator side instead; `operator-conformance.md` §7.)
 - Responses share the dedupe key of the request they answer: `order.invoice`, `order.error`,
   `op.result`, and a `billing.invoice` or `billing.notice` that carries a `request_id`.
 

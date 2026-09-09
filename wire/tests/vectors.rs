@@ -27,8 +27,10 @@ fn read_json(name: &str) -> Value {
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{}: not JSON: {e}", path.display()))
 }
 
-/// The closed set of DM `type` discriminators (docs/protocol/dm-protocol.md §2). Adding a
-/// variant to `Msg` without a fixture here is the failure this list exists to catch.
+/// The closed set of DM `type` discriminators (docs/protocol/dm-protocol.md §2). Every fixture's
+/// type must be in it and every entry must have a fixture. It is tied to the enum by
+/// [`expected_type`], an exhaustive `match` over `Msg`: adding a variant without touching this
+/// file is a compile error there, and the arm you add sits next to this list.
 const DM_TYPES: [&str; 13] = [
     "order.request",
     "order.invoice",
@@ -44,6 +46,28 @@ const DM_TYPES: [&str; 13] = [
     "op.result",
     "operator.alert",
 ];
+
+/// The wire `type` each variant MUST carry, spelled out here independently of `Msg::type_str`
+/// so a serde rename in the crate and a stale fixture cannot agree with each other behind this
+/// test's back. Exhaustive on purpose (no `_` arm): a new `Msg` variant fails to compile until it
+/// is added here, and adding it here without a fixture fails the set assertion below.
+fn expected_type(msg: &Msg) -> &'static str {
+    match msg {
+        Msg::OrderRequest(_) => DM_TYPES[0],
+        Msg::OrderInvoice(_) => DM_TYPES[1],
+        Msg::OrderError(_) => DM_TYPES[2],
+        Msg::ProvisionReady(_) => DM_TYPES[3],
+        Msg::DeliveryResendRequest(_) => DM_TYPES[4],
+        Msg::BillingInvoice(_) => DM_TYPES[5],
+        Msg::BillingNotice(_) => DM_TYPES[6],
+        Msg::BillingRefund(_) => DM_TYPES[7],
+        Msg::RenewRequest(_) => DM_TYPES[8],
+        Msg::SubCancel(_) => DM_TYPES[9],
+        Msg::OpRequest(_) => DM_TYPES[10],
+        Msg::OpResult(_) => DM_TYPES[11],
+        Msg::OperatorAlert(_) => DM_TYPES[12],
+    }
+}
 
 #[test]
 fn every_dm_fixture_round_trips_to_the_same_json_value() {
@@ -61,8 +85,13 @@ fn every_dm_fixture_round_trips_to_the_same_json_value() {
             .unwrap_or_else(|e| panic!("{name}: codec rejects the fixture: {e}"));
         assert_eq!(
             fixture["type"].as_str(),
-            Some(msg.type_str()),
-            "{name}: `type` discriminator"
+            Some(expected_type(&msg)),
+            "{name}: `type` discriminator vs the variant it decoded to"
+        );
+        assert_eq!(
+            msg.type_str(),
+            expected_type(&msg),
+            "{name}: Msg::type_str drifted from the protocol spelling"
         );
         let reencoded = serde_json::to_value(&msg).expect("encode");
         assert_eq!(
