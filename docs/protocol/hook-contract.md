@@ -164,7 +164,8 @@ re-run after a crash. `suspend` on an already-stopped instance, `resume` on a ru
 | `provision` | retried with backoff; on permanent failure the daemon runs `destroy` (§3.1) and moves the subscription to REFUND_DUE. The buyer is refunded. |
 | `resume` | retried; on permanent failure the renewal is refunded and the subscription returns to SUSPENDED with its prior deadlines. |
 | `suspend` | **not retried; SUSPENDED is committed anyway** (the paid period is over). The error is logged; the instance is whatever the hook left it. |
-| `destroy` | **not retried in place; TERMINATED is committed anyway** and the instance is dead-lettered with its `handles` for periodic retry (the shape in §3.2's retry note) and a `teardown_failed` operator alert. |
+| `destroy` at retention end or after cancel | **not retried in place; TERMINATED is committed anyway** and the instance is dead-lettered with its `handles` for periodic retry (the shape in §3.2's retry note) and a `teardown_failed` operator alert. |
+| `destroy` as cleanup after a failed `provision` (§3.1) | the subscription is already REFUND_DUE and stays there; the failed cleanup is recorded as a pending intent and retried periodically with the same provision-shaped stdin. No TERMINATED, no dead letter; the refund proceeds regardless. |
 
 So `suspend` and `destroy` MUST leave the instance in a state a later `destroy` can clean up,
 because the daemon will call `destroy` again with the same `handles` rather than roll back.
@@ -210,8 +211,10 @@ stdout: **MUST be a JSON object**; it is returned to the buyer verbatim as `op.r
 non-object, non-JSON stdout, non-zero exit or timeout becomes `op.result { status: "error" }`
 with `hook_failed` or `timeout`.
 
-**Not assumed idempotent.** The daemon guarantees a duplicate `op.request` never re-runs the
-hook, so a hook like `restart` may have side effects freely.
+**Not assumed idempotent.** The daemon guarantees a duplicate `op.request` does not re-run the
+hook for as long as it retains the invocation record (120 days in the reference daemon,
+`dm-protocol.md` §4), so a hook like `restart` may have side effects freely; a same-id request
+arriving after that window is a new invocation.
 
 ### 3.5 `preflight` (optional)
 

@@ -48,7 +48,7 @@ operator's own alert peer.
 | `op.result` | O→B | | yes | result of an `op.request` |
 | `operator.alert` | O→O | | | operator self-alert; buyers never receive it |
 
-An operator MUST route only the five B→O types inbound and MUST drop any other type it
+An operator MUST route only the B→O rows of this table inbound and MUST drop any other type it
 receives, without acting on it. A buyer client SHOULD ignore B→O types and `operator.alert`
 if they arrive.
 
@@ -247,17 +247,22 @@ listed so a decoder knows the `type`.
   NOT reuse an order id for a renewal or vice versa: the second request receives the first
   one's cached reply (an `order.invoice` where a `billing.invoice` was expected). A duplicate
   `order.request` or `renew.request` gets the **cached reply** re-sent and MUST NOT create a
-  second reservation, order or invoice. A duplicate `op.request` MUST NOT re-run the hook:
+  second reservation, order or invoice. Both guarantees hold **while the cache entry is
+  retained** (see "The cache is finite" below). A duplicate `op.request` MUST NOT re-run the hook:
   a finished invocation re-sends its cached `op.result`; one still running normally attaches
   and returns that result when it finishes, but in a narrow window (the duplicate lands after
   the durable claim and before the running owner has registered in-process, or the owner
   exits without a terminal) the operator MAY answer nothing and the buyer re-sends; one
   orphaned by an operator restart is answered `error { code: "interrupted", retryable: false }`.
 - **The cache is finite.** The reference daemon keeps completed `(sender, id)` entries for
-  **120 days** and the transport dedupe of outer event ids for **90 days**; a re-send arriving
-  after that is treated as a new request (a new order, or a re-run of a non-idempotent op).
-  A conforming operator MUST state its retention if it differs, and a buyer MUST NOT rely on
-  same-id idempotency beyond 90 days, nor keep a relay-stored request replayable that long.
+  **120 days** and the transport dedupe of outer event ids for **90 days**. Two separate rules
+  follow: a same-`id` re-send arriving after the request-cache entry expired is a **new
+  request** (a new order, or a re-run of a non-idempotent op); a relay redelivery of the
+  identical wrap arriving after the outer-event entry expired is decoded again and then meets
+  the request cache, so it is harmless while that entry still exists and a new request once it
+  does not. A conforming operator MUST state its retention if it differs, and a buyer MUST NOT
+  rely on same-id idempotency beyond 90 days, nor keep a relay-stored request replayable that
+  long.
 - **What is cached, precisely.** For `order.request` / `renew.request`: every reply that
   created or refused an order or invoice. For `op.request`: only what happens **past the
   ACTIVE gate** (`unknown_op`, `invalid_params`, `timeout`, `hook_failed`, `interrupted`, and

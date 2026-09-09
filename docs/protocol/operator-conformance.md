@@ -16,9 +16,10 @@ it is written in. SHOULDs describe the reference daemon and may be varied.
 3. MUST route only `order.request`, `renew.request`, `sub.cancel`,
    `delivery.resend.request` and `op.request` inbound, and MUST drop any other message type.
 4. MUST enforce the transport bounds of `dm-protocol.md` §1 before decoding.
-5. MUST dedupe delivered wraps on the outer event id so a relay replay never re-runs a
-   completed handler, and MUST make every handler safe to re-run anyway (a crash between
-   handling and recording the dedupe is allowed to replay).
+5. MUST dedupe delivered wraps on the outer event id, for a retention it declares (90 days in
+   the reference daemon), so a relay replay within that window never re-runs a completed
+   handler; and MUST make every handler safe to re-run anyway (a crash between handling and
+   recording the dedupe is allowed to replay).
 6. SHOULD rate-limit buyer requests per sender pubkey and SHOULD cap a sender's concurrent
    unpaid holds; both are the operator's policy, and a refused hold is `capacity_full`.
 
@@ -108,8 +109,9 @@ it is written in. SHOULDs describe the reference daemon and may be varied.
 36. MUST run only operations declared in the recipe, resolve the hook strictly inside the
     recipe's `ops/` directory, and bound the hook by the timeout and output cap of
     `hook-contract.md` §2.
-37. MUST persist each `(sender, id)` invocation so a duplicate never re-runs the hook, and MUST
-    answer an invocation orphaned by a restart with `interrupted`.
+37. MUST persist each `(sender, id)` invocation for a retention it declares (120 days in the
+    reference daemon, `dm-protocol.md` §4) so a duplicate within that window never re-runs the
+    hook, and MUST answer an invocation orphaned by a restart with `interrupted`.
 
 ## 7. Delivery
 
@@ -128,7 +130,8 @@ it is written in. SHOULDs describe the reference daemon and may be varied.
       - `order.invoice`, `order.error`, a `renew.request`'s `billing.invoice`, and every
         `op.result` past the ACTIVE gate are **cached** (items 11 and 37): a buyer that re-sends
         the **same request with the same `id`** MUST receive the cached reply without the
-        effect repeating. The operator owes the cache; it does not owe a retry.
+        effect repeating, for as long as the entry is retained (items 11 and 37). The operator
+        owes the cache; it does not owe a retry.
       - Both `RESUMING` notices (answering `renew.request` and `sub.cancel`), the renew
         `unavailable` refusal, and the pre-ACTIVE `op.result` refusals are **not cached**
         (`dm-protocol.md` §4): they describe a transient condition, so losing one costs
