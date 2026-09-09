@@ -246,7 +246,8 @@ impl OrderIntake {
         }
 
         // 4. Deterministic external_id binds settlement → order (§6.6); create_invoice is
-        //    idempotent on it, so a crash-retry regenerates the same invoice.
+        //    create-once on it, so a crash-retry reuses the invoice while the backend still holds
+        //    it payable, and gets a fresh one only once the provider has terminated it (epj).
         let external_id = format!("order:{sender_hex}:{}", req.id);
         let amount_sat = listing.amount_sat as u64;
         let invoice = match self
@@ -287,8 +288,9 @@ impl OrderIntake {
             order_id: order_id.clone(),
             bolt11: invoice.bolt11.clone(),
             // Use the RETURNED invoice's amount, not the current listing price: create_invoice is
-            // idempotent on external_id, so a crash-retry (or reissue after a price edit) returns the
-            // ORIGINAL invoice — the reply/DB amount must match its bolt11, never drift (codex pass 4).
+            // create-once on external_id, so a crash-retry (or reissue after a price edit) returns the
+            // ORIGINAL invoice while it is still payable — the reply/DB amount must match its bolt11,
+            // never drift (codex pass 4). If the provider terminated it, this IS the fresh one (epj).
             amount_sat: invoice.amount_sat,
             period: self.recipe.pricing.period.clone(),
             expires_at: invoice.expires_at,
@@ -716,8 +718,9 @@ impl OrderIntake {
             request_id,
             bolt11: invoice.bolt11.clone(),
             // The returned invoice's amount, not the current recipe price: a deterministic-external_id
-            // reissue (esp. renew:auto:<sub>:<cycle_anchor>) returns the ORIGINAL invoice, so the
-            // advertised/stored amount must track its bolt11, never the edited price (codex pass 4).
+            // reissue (esp. renew:auto:<sub>:<cycle_anchor>) returns the ORIGINAL invoice while the
+            // backend still holds it payable (a fresh one once the provider terminated it — epj), so
+            // the advertised/stored amount must track its bolt11, never the edited price (codex pass 4).
             amount_sat: invoice.amount_sat,
             due_at,
             expires_at: invoice.expires_at,

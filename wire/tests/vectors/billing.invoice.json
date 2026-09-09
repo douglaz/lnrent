@@ -1,0 +1,9 @@
+{
+  "type": "billing.invoice",
+  "subscription_id": "sub_01J9EXAMPLE0000000000000",
+  "request_id": "rnw-2026-09-09-0001",
+  "bolt11": "lnbc300u1pexamplerenewalbolt11onlyforthevector",
+  "amount_sat": 30000,
+  "due_at": 1759968000,
+  "expires_at": 1757379600
+}

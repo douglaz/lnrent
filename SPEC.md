@@ -1,7 +1,12 @@
-# lnrent — Spec (draft v0.29)
+# lnrent — Spec (draft v0.30)
 
 > Working codename: **lnrent** (rename later). Daemon: `lnrentd`. CLI: `lnrent`.
 > Status: DRAFT for review. Author-time tooling = Claude skills. Runtime = pure Rust/bash.
+>
+> **This file is the design.** The normative interoperability contract — the exact DM JSON, the
+> 30402 listing event, the recipe hook stdin/stdout, and the MUSTs a conforming operator owes
+> buyers — lives in [`docs/protocol/`](docs/protocol/README.md), with language-neutral test
+> vectors under `wire/tests/vectors/`. Where this file and that folder disagree, that folder wins.
 
 ## 1. What this is
 
@@ -352,7 +357,9 @@ carries its orders, so it is idiomatic, not ad hoc.
 ### 5.1 lnrent DM protocol
 
 Each message is a JSON object with a `type` discriminator, sent as the content of a
-NIP-17 private DM between the buyer and operator pubkeys:
+NIP-17 private DM between the buyer and operator pubkeys. Field-level shapes, bounds and the
+per-message reply rules are normative in `docs/protocol/dm-protocol.md`; this table is the
+overview:
 
 | type | direction | payload |
 |--|--|--|
@@ -362,12 +369,13 @@ NIP-17 private DM between the buyer and operator pubkeys:
 | `provision.ready` | operator -> buyer | `subscription_id`, `payload` (the credentials) |
 | `delivery.resend.request` | buyer -> operator | `subscription_id` — re-send the latest `provision.ready` (dropped-DM resync; replaces the old overload of `renew.request` for this) |
 | `billing.invoice` | operator -> buyer | `subscription_id`, `request_id` (when answering a `renew.request`), `bolt11`, `amount_sat`, `due_at`, `expires_at` |
-| `billing.notice`  | operator -> buyer | `subscription_id`, `state`, `message` (renewal reminder / suspend / terminate) |
+| `billing.notice`  | operator -> buyer | `subscription_id`, `state`, `message`, `request_id` (present ONLY on the RESUMING reply to a `renew.request`; absent otherwise). States emitted today: `ACTIVE` (soft-date reminder), `SUSPENDED`, `RESUMING`, `CANCELLED` — no notice is sent on TERMINATED |
 | `billing.refund`  | operator -> buyer | `subscription_id`, `amount_sat`, `status` (sent / failed) |
 | `renew.request`   | buyer -> operator | `id` (unique request id), `subscription_id` (request a renewal invoice on demand). Answered by `billing.invoice`, by a request-correlated `billing.notice` while the subscription is transiently RESUMING, or — when the subscription's `recipe_id` names a recipe this daemon does not serve, so it cannot honestly quote a price for it — by `order.error { code: "unavailable" }`. An unknown or non-owned subscription — and a non-renewable one this daemon DOES serve — is dropped with no reply at all (an outsider must not learn a subscription id exists). The recipe check runs before the state check, so an owner asking to renew a subscription this daemon does not serve gets the `unavailable` refusal whatever state that subscription is in |
 | `sub.cancel`      | buyer -> operator | `subscription_id` |
 | `op.request`      | buyer -> operator | `id` (unique request id), `subscription_id`, `op` (operation name), `params` (object) — invoke a recipe-declared management operation (§7.4) |
 | `op.result`       | operator -> buyer | `request_id` (= the `op.request` `id`), `subscription_id`, `op`, `status` (ok / error), `data` (object: config / `url` / status fields) on ok, or `error` `{ code, message, retryable }` |
+| `operator.alert`  | operator -> operator's own alert peer | `kind` (one of the closed `AlertKind` spellings in `daemon/src/alerts.rs`), `subject`, `detail`. NOT a buyer message: the daemon DMs its configured alert pubkey through the same outbox. Buyers never receive it; the daemon drops it if received inbound |
 
 `op.request` / `op.result` are the request/response half of buyer service management
 (§7.4, ADR-0013): the buyer invokes a recipe-declared operation and the operator runs the
@@ -478,6 +486,7 @@ A Listing (kind `30402`) carries the standard NIP-99 fields (title, summary, pri
 lnrent-specific metadata the buyer needs to order AND to discover what the service can do:
 
 - the `operator` tag (§5.3) and the recipe id + version;
+- the recipe's honest security `tier` (§9.1), when it declares one;
 - the order `params` schema (§7.1) the buyer must fill in the `order.request`;
 - the recipe's **published operation declarations** — a JSON array (carried in the event
   `content`, under an `lnrent` object, with a schema `version`) of `{ name, label, kind,
@@ -492,8 +501,9 @@ same `(kind, pubkey, d)`), and that is what `order.request.listing_id` reference
 coordinate is stable across price edits, the operator detects a **stale-price order** by
 comparing the order against the current Listing (price/version) and, on mismatch, replies
 `order.error { code: "price_changed" }` rather than honoring a stale price. The exact
-tag/content layout (and the schema `version`) is pinned by the landed wire codec
-(`wire/src/listing.rs`, schema version 1), alongside the DM schema.
+tag/content layout (schema version 1) is normative in `docs/protocol/listing.md`;
+`wire/src/listing.rs` implements it and `wire/tests/vectors/listing.event.json` pins a signed
+example.
 
 ## 6. Payments and subscriptions
 
@@ -600,15 +610,15 @@ e.g. 7d).
 - **PROVISIONING -> REFUND_DUE** — provision failed permanently after retries. Before
   entering `REFUND_DUE` the daemon runs a **best-effort `destroy`** to purge any
   partially-created resources (VM / network / volume), so a refunded order leaves nothing
-  behind; a destroy failure is logged (alert once production-readiness PR-5 lands) and does not
-  block the refund.
+  behind; a destroy failure is dead-lettered for periodic retry and raises a `teardown_failed`
+  operator alert (GATE-1 PR-6/PR-5), and does not block the refund.
 
 **Refund path** (§6.4):
 - **REFUND_DUE -> REFUNDED** — auto-refund to the buyer's `refund_dest` succeeded
   (terminal).
 - **REFUND_DUE (stuck)** — the refund payment itself failed (payer offline, no
-  liquidity); operator warned in the log (push alert once PR-5 lands), manual resolution. Funds
-  never silently vanish.
+  liquidity); the operator gets a `refund_parked` / `refund_stuck` alert DM and resolves it by
+  hand (`lnrent refunds` / `refund-retry`). Funds never silently vanish.
 
 **Renewal** (prepaid, renew before the date, §6.2). Every renewal settlement sets
 `paid_through = max(paid_through, settled_at) + period` — so early renewals **stack** (the
@@ -695,8 +705,8 @@ provision succeeds (ADR-0003). Two consequences:
   pre-existing rows (deferred: BOLT12 needs onion-message offer-fetch the Fedimint gateway can't yet service).
   The resolver is backend-agnostic (it lives in the refund path, ahead of `pay()`, not in
   any backend) and is activated alongside the Fedimint backend (lnrent-o6p). If the refund
-  payment itself fails, the subscription stays `REFUND_DUE` and the operator is warned in the
-  log (push alert once PR-5 lands).
+  payment itself fails, the subscription stays `REFUND_DUE` and the operator is alerted
+  (`refund_parked` / `refund_stuck` DM).
 
 Operators who require true provision-then-capture atomicity can run an **LND payment
 backend** (native hold invoices) instead of phoenixd. That backend is a later option,
@@ -769,7 +779,13 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
   sends the DM only after commit. A crash after `create_invoice` but before that commit leaves
   an orphaned backend invoice that is never bound to a committed order and simply expires
   unpaid; a retry regenerates the same `external_id`, so `create_invoice` returns that same
-  invoice (no duplicate).
+  invoice (no duplicate) — **unless the backend has observed the provider TERMINATE it**
+  (lnv2: the federation's Expired terminal marks the row CANCELED), in which case the orphan is
+  unpayable forever and the retry gets a fresh invoice under the same `external_id`
+  (lnrent-9yz). A row merely past lnrent's local `expires_at` is NOT replaced on that basis —
+  local time is not authoritative for the provider — so an OPEN row is reused however stale its
+  timestamp. Call sites therefore use the RETURNED invoice's `amount_sat` / `expires_at`, never
+  what they asked for (lnrent-epj).
 - **Idempotent capture:** `UPDATE invoice SET status='PAID' WHERE id=? AND status='OPEN'`
   plus the `PENDING -> PROVISIONING` move in one transaction; a replayed settlement (ws
   reconnect) affects 0 rows and is a no-op, so `paid_through` can't double-extend.
@@ -786,9 +802,8 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
   *after* the call is equally safe: the key dedups (no double-refund) and no crash point can
   strand the intent (the durable `PENDING` row is always there to retry). `payment_status_by_key`
   lets restart skip a redundant `pay` when the prior one already `Succeeded`. After N failed
-  attempts the sub stays `REFUND_DUE` and the operator is warned in the log (push alert once
-  PR-5 lands); funds never vanish and never
-  double-pay.
+  attempts the sub stays `REFUND_DUE` and the operator is alerted (`refund_parked` /
+  `refund_stuck` DM); funds never vanish and never double-pay.
 
 Crash-recovery (step -> durable record in one txn -> restart action):
 
@@ -820,7 +835,8 @@ recipes/wireguard/
   suspend              # executable: stop, keep data
   resume               # executable: start again
   destroy              # executable: purge Instance resources
-  healthcheck          # executable: exit 0 if healthy
+  healthcheck          # executable: exit 0 if healthy (required to exist; not invoked by the daemon yet)
+  preflight            # optional: exit 0 if the operator's provisioning params are usable (`lnrent preflight`, publish gate)
   ops/                 # optional: buyer-facing management hooks, one per declared operation (§7.4)
   nixos/               # optional: declarative module fragments for NixOS hosts
   debian/              # optional: imperative install scripts for Debian hosts
@@ -886,8 +902,11 @@ hook = "status"             # bare name -> ops/status
 - Output: JSON on stdout. `provision` returns the **delivery payload** (the object
   DM'd to the buyer, e.g. a WireGuard config) plus internal handles the daemon
   records (container id, peer index) for later hooks.
-- Exit non-zero = failure; the daemon does not advance state and logs the failure loudly
-  (push alert once PR-5 lands).
+- Exit non-zero = failure; the daemon does not advance state and logs the failure loudly. A
+  failed `provision` ends in the refund path; a failed `destroy` is dead-lettered and raises a
+  `teardown_failed` alert.
+- The exact stdin document per hook, the stdout shape, the timeout (120 s), the output cap
+  (1 MiB per stream) and the env allowlist are normative in `docs/protocol/hook-contract.md`.
 - **Lifecycle hooks (provision/suspend/resume/destroy) MUST be idempotent (re-run safe).**
   The daemon guards each transition with a compare-and-swap on `(state, next_deadline)` (§6.5)
   but may re-run a hook after a crash, so a non-idempotent lifecycle hook is a recipe bug. (Management-op hooks are not assumed
@@ -961,10 +980,11 @@ subsystems they use; the manager wires them. The same subsystems serve self-use 
 rented Instances; only the rental layer differs.
 
 In the shipped daemon, provisioning is 100% **recipe-hook-driven** (§7): the recipe's
-`provisioning.backend` string selects hook behavior, and no subsystem trait is dispatched
-at runtime. The trait sketches below are the intended LATER seam — today
-`Compute`/`Network`/`Storage`/`Observability` exist only as dead M0 stubs slated for
-removal (production-readiness CUT-1) until a second real implementation forces the
+`provisioning.backend` string is validated (`host` / `incus` / `libvirt` / `proxmox` /
+`cloud-*`) but never dispatched on, and no subsystem trait exists at runtime. The trait
+sketches below are the intended LATER seam only — the M0 `Compute`/`Network`/`Storage`/
+`Observability` stubs were deleted (production-readiness CUT-1); the sole runtime trait is
+`PaymentBackend` (§6.1). They come back when a second real implementation forces the
 abstraction.
 
 ### 8.1 Compute (`ComputeBackend`)
@@ -1170,8 +1190,8 @@ sandboxed conversion).
 
 These never run in the serving path. They are how a human will drive lnrent. **Target surface,
 not shipped:** none of these skills exist in M1a — today's operator surface is `lnrentd
-bootstrap`, the `lnrent` CLI, and the docs/go-live.md runbook (production-readiness PR-14
-tracks the `doctor` functionality).
+bootstrap`, the `lnrent` CLI (including `lnrent preflight`, alias `doctor`, which is the
+shipped diagnostic — lnrent-y4m.9), and the docs/go-live.md runbook.
 
 - **lnrent-onboard** — given an existing box reachable over **SSH with sudo**,
   connect, install `lnrentd` (Nix on NixOS, apt+systemd on Debian), pick payment
@@ -1219,6 +1239,7 @@ CREATE TABLE invoice (
   payment_hash TEXT,
   kind TEXT,                         -- order | renewal
   bolt11 TEXT, amount_sat INTEGER, status TEXT,   -- OPEN|PAID|EXPIRED
+  received_msat INTEGER,             -- actual wallet credit NET of backend receive fees (ADR-0019); NULL on legacy rows
   expires_at INTEGER,                -- bolt11 expiry; the order reservation is released at this
   applied_at INTEGER,                -- when settlement was captured/applied (durable applied marker)
   issued_at INTEGER, settled_at INTEGER);
@@ -1307,7 +1328,27 @@ CREATE TABLE native_connect_session ( -- interactive-op authorization tickets (�
   ticket_json TEXT,                  -- the Iroh connection ticket delivered to the buyer
   state TEXT,                        -- ACTIVE|REVOKED  (revoked on suspend/cancel/destroy)
   expires_at INTEGER, created_at INTEGER);
+
+CREATE TABLE teardown_failure (      -- orphaned-instance dead-letter (GATE-1 PR-6, lnrent-urw.2)
+  id TEXT PRIMARY KEY,               -- `td:<subscription_id>:<hook>`; a repeat failure upserts
+  subscription_id TEXT NOT NULL, hook TEXT NOT NULL,   -- the lifecycle hook that failed (M1a: destroy)
+  handles_json TEXT,                 -- the instance handles the retry re-runs the hook with
+  attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+  first_failed_at INTEGER NOT NULL, last_attempt_at INTEGER NOT NULL,
+  resolved_at INTEGER);              -- NULL = still open (provider-side cleanup owed)
+
+CREATE TABLE sweep_attempt (         -- durable operator-sweep ledger (docs/specs/gate1-operator-sweep.md)
+  id TEXT PRIMARY KEY,               -- `sweep:<payment_hash>` (== the outbound pay key)
+  bolt11 TEXT, amount_sat INTEGER,
+  max_outlay_msat INTEGER NOT NULL,  -- the QUOTED outlay cap, subtracted from ledger surplus while PENDING/SENT
+  status TEXT NOT NULL,              -- PENDING|SENT|FAILED
+  attempts INTEGER NOT NULL DEFAULT 0, backend_payment_id TEXT, last_error TEXT,
+  created_at INTEGER, sent_at INTEGER);
 ```
+
+`daemon/src/store.rs` is the authoritative DDL (it also carries the migration history —
+`seen_message` and `suspend_not_before` arrive as migrations, not in the v1 baseline); this
+listing is the readable mirror.
 
 ## 12. Deployment
 
@@ -1394,9 +1435,12 @@ lnrent/
     core/                 # Rust buyer-core lib (DM protocol, order flow, gift-wrap; native + wasm32)
     cli/                  # thin native CLI over buyer-core
     web/                  # static WASM SPA over buyer-core (NIP-07 + WebLN + browser WS)
-  nix/                    # NixOS module — PLANNED (flake.nix ships the rest; see it for current outputs)
+  flake.nix               # packages for lnrentd / lnrent / lnrent-buyer + a container image (lnrent-m7g)
+  nix/                    # NixOS module — PLANNED
   packaging/debian/       # systemd unit + install script — PLANNED
-  docs/                   # protocol notes, NIP mapping, ADRs
+  docs/
+    protocol/             # NORMATIVE interoperability contract (DM, listing, hooks, operator conformance)
+    adr/ specs/ security/ go-live.md
 ```
 
 ## 15. Milestones

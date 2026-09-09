@@ -20,9 +20,17 @@ pub const DEV_SETTLE_UNSUPPORTED: &str = "dev settle is only supported on the mo
 /// already inside an `async fn`, so it just `.await`s here (no runtime-nesting bridge).
 #[async_trait]
 pub trait PaymentBackend: Send + Sync {
-    /// Create (or return the existing) invoice. **Idempotent on `external_id`**: a repeated
-    /// call with the same `external_id` MUST return the same invoice, not a duplicate — so a
-    /// retry after a crash regenerates the same `external_id` and reuses the invoice (§6.6).
+    /// Create (or return the existing) invoice. **Create-once on `external_id`** (§6.6,
+    /// lnrent-epj): a repeated call with the same `external_id` MUST return the existing invoice
+    /// while the backend still holds it as payable or paid — an OPEN row (however far past
+    /// lnrent's LOCAL `expires_at`; local time is not authoritative for the provider) or a
+    /// PAID / PAID_UNRECOVERED one. A row the backend has observed the PROVIDER terminate
+    /// (lnv2: the federation's Expired terminal → CANCELED) is ABSENT for this purpose and MUST
+    /// be replaced with a fresh invoice, never handed back as payable — implementing the older
+    /// unconditional "same invoice forever" rule re-introduces the lnrent-9yz dead-invoice
+    /// liveness bug. Callers therefore use the RETURNED invoice's `amount_sat` / `expires_at`.
+    /// `MockPayment` has no receive-terminal lifecycle, so its strict idempotence is a correct
+    /// (degenerate) implementation of this contract.
     async fn create_invoice(
         &self,
         amount_sat: u64,

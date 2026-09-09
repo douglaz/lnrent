@@ -132,7 +132,8 @@ $B order wait <order_id>              # -> access credentials (host/port/user)
 ## Docs
 
 - Current plan of record: the phased programme in [SPEC.md](./SPEC.md) §15 · delivered go-live roadmap (historical): [docs/specs/production-readiness.md](./docs/specs/production-readiness.md) · operator runbook: [docs/go-live.md](./docs/go-live.md)
-- Spec: [SPEC.md](./SPEC.md) (draft v0.29) · glossary: [CONTEXT.md](./CONTEXT.md)
+- Spec: [SPEC.md](./SPEC.md) (draft v0.30) · glossary: [CONTEXT.md](./CONTEXT.md)
+- **Protocol (normative, for other implementations):** [docs/protocol/](./docs/protocol/README.md) — DM messages, the 30402 listing, the recipe hook contract, operator conformance; test vectors in `wire/tests/vectors/`
 - Decisions: [docs/adr/](./docs/adr/) (numbered, sequential) · change specs: [docs/specs/](./docs/specs/)
 - Security/deployment notes: [docs/security/](./docs/security/)
 

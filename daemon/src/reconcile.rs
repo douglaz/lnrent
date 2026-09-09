@@ -1099,10 +1099,11 @@ impl Reconciler {
             (effective_suspend_at + retention_s - now).max(i64::from(RENEWAL_INVOICE_MIN_EXPIRY_S)),
         )
         .unwrap_or(u32::MAX);
-        // Idempotent on external_id: a re-fire (or crash-retry) reuses the same invoice rather than
-        // minting a second one. On a stale cursor the CAS below affects 0 rows and we never insert a
-        // DB invoice row; the backend invoice minted just above is harmless (same idempotent
-        // external_id, self-expiring), so no DB row is ever stranded.
+        // Create-once on external_id: a re-fire (or crash-retry) reuses the same invoice while the
+        // backend still holds it payable, and mints a fresh one only once the provider has
+        // terminated it (epj). On a stale cursor the CAS below affects 0 rows and we never insert a
+        // DB invoice row; the backend invoice minted just above is harmless (same external_id,
+        // self-expiring), so no DB row is ever stranded.
         let invoice = match self
             .payment
             .create_invoice(

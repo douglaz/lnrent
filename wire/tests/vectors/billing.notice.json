@@ -1,0 +1,6 @@
+{
+  "type": "billing.notice",
+  "subscription_id": "sub_01J9EXAMPLE0000000000000",
+  "state": "SUSPENDED",
+  "message": "subscription suspended for non-payment; renew to resume"
+}
