@@ -785,7 +785,9 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
   (lnrent-9yz). A row merely past lnrent's local `expires_at` is NOT replaced on that basis —
   local time is not authoritative for the provider — so an OPEN row is reused however stale its
   timestamp. Call sites therefore use the RETURNED invoice's `amount_sat` / `expires_at`, never
-  what they asked for (lnrent-epj).
+  what they asked for (lnrent-epj). A backend may also refuse outright when the repeated call
+  asks for a DIFFERENT amount than the stored invoice carries (phoenixd does, fail-closed): the
+  call site reports a create failure and never mints under a fresh id.
 - **Idempotent capture:** `UPDATE invoice SET status='PAID' WHERE id=? AND status='OPEN'`
   plus the `PENDING -> PROVISIONING` move in one transaction; a replayed settlement (ws
   reconnect) affects 0 rows and is a no-op, so `paid_through` can't double-extend.
@@ -902,9 +904,14 @@ hook = "status"             # bare name -> ops/status
 - Output: JSON on stdout. `provision` returns the **delivery payload** (the object
   DM'd to the buyer, e.g. a WireGuard config) plus internal handles the daemon
   records (container id, peer index) for later hooks.
-- Exit non-zero = failure; the daemon does not advance state and logs the failure loudly. A
-  failed `provision` ends in the refund path; a failed `destroy` is dead-lettered and raises a
-  `teardown_failed` alert.
+- Exit non-zero = failure, logged loudly. What the daemon then does is **per hook**, and it
+  usually DOES advance state: a failed `provision` (after bounded retries) runs a best-effort
+  `destroy` and moves the sub to `REFUND_DUE`; a failed `resume` (after bounded retries)
+  refunds the renewal and returns the sub to `SUSPENDED`; a failed `suspend` still commits
+  `SUSPENDED` (the deadline has passed; the error is logged and the buyer's data is kept); a
+  failed `destroy` still commits `TERMINATED` and dead-letters the instance for periodic retry,
+  raising a `teardown_failed` alert. Only `provision` and `resume` are retried before their
+  terminal outcome.
 - The exact stdin document per hook, the stdout shape, the timeout (120 s), the output cap
   (1 MiB per stream) and the env allowlist are normative in `docs/protocol/hook-contract.md`.
 - **Lifecycle hooks (provision/suspend/resume/destroy) MUST be idempotent (re-run safe).**

@@ -29,6 +29,11 @@ pub trait PaymentBackend: Send + Sync {
     /// be replaced with a fresh invoice, never handed back as payable — implementing the older
     /// unconditional "same invoice forever" rule re-introduces the lnrent-9yz dead-invoice
     /// liveness bug. Callers therefore use the RETURNED invoice's `amount_sat` / `expires_at`.
+    /// A backend MAY instead FAIL CLOSED on a repeated call whose `amount_sat` differs from the
+    /// stored invoice's — `PhoenixdPayment` does (`phoenixd_backend.rs`, "refusing to reuse or
+    /// replace it"), because a mismatch means lnrent and the provider disagree about the order —
+    /// and callers treat that `Err` as a create failure (`order.error { unavailable }` / a skipped
+    /// renewal issue), never as a reason to mint under a fresh id.
     /// `MockPayment` has no receive-terminal lifecycle, so its strict idempotence is a correct
     /// (degenerate) implementation of this contract.
     async fn create_invoice(

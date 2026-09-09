@@ -81,7 +81,7 @@ yet make it fail closed.
 | stdin | one JSON document, then EOF; shape per hook in §3 |
 | stdout | MUST be a single JSON value; the daemon parses all of stdout |
 | stderr | captured (and size-capped) but **discarded on success**, and included in the operator's failure message **only on a non-zero exit**; a timeout or an invalid-stdout failure discards it too. Do not rely on stderr for diagnostics the operator should see. |
-| exit code | `0` = success; anything else = failure, and stdout is ignored |
+| exit code | `0` = success; anything else = failure, and stdout is ignored. What a failure does to the subscription is per hook, §3 |
 | timeout | **120 s**; on timeout the whole process group is killed and the hook is a failure |
 | output cap | **1 MiB** on each of stdout and stderr; exceeding either is a failure |
 | process group | the hook is the leader of its own group; on failure, timeout or daemon shutdown the whole group is killed, so a hook MUST NOT rely on backgrounded children surviving it |
@@ -156,6 +156,18 @@ convention `{ "ok": true, "state": "suspended" }`.
 **Idempotency:** each of these is guarded by a compare-and-swap on the daemon side but MAY be
 re-run after a crash. `suspend` on an already-stopped instance, `resume` on a running one and
 `destroy` on a destroyed one MUST all succeed.
+
+**What a failure does** (a non-zero exit, timeout or invalid stdout), per hook:
+
+| hook | on failure |
+|--|--|
+| `provision` | retried with backoff; on permanent failure the daemon runs `destroy` (§3.1) and moves the subscription to REFUND_DUE. The buyer is refunded. |
+| `resume` | retried; on permanent failure the renewal is refunded and the subscription returns to SUSPENDED with its prior deadlines. |
+| `suspend` | **not retried; SUSPENDED is committed anyway** (the paid period is over). The error is logged; the instance is whatever the hook left it. |
+| `destroy` | **not retried in place; TERMINATED is committed anyway** and the instance is dead-lettered with its `handles` for periodic retry (the shape in §3.2's retry note) and a `teardown_failed` operator alert. |
+
+So `suspend` and `destroy` MUST leave the instance in a state a later `destroy` can clean up,
+because the daemon will call `destroy` again with the same `handles` rather than roll back.
 
 A `destroy` that fails is retried periodically by the daemon with the stdin shape:
 

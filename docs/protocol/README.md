@@ -33,9 +33,11 @@ going red is how the change is noticed.
 
 - **Listing content** carries `lnrent.version` (currently `1`). A parser MUST reject a version
   it does not understand.
-- **DM messages carry no version field.** Compatibility rests on two rules every peer MUST
-  follow: ignore unknown fields on decode, and never remove or retype a field. A change that
-  cannot be expressed that way is a new message `type`, never a mutation of an existing one.
+- **DM messages carry no version field.** Compatibility rests on three rules every peer MUST
+  follow: ignore unknown fields on decode; never remove or retype a field; and add a field only
+  as **optional on decode** (absent means the pre-change meaning), so a message from an older
+  sender still decodes. A change that cannot be expressed that way is a new message `type`,
+  never a mutation of an existing one.
 - **Recipe manifests** carry `service.version`, which is the recipe's own version, not the
   hook contract's. The hook contract is unversioned today; the same additive rule applies to
   the stdin document.

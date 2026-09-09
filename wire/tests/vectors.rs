@@ -67,6 +67,30 @@ fn every_dm_fixture_round_trips_to_the_same_json_value() {
     );
 }
 
+/// docs/protocol/dm-protocol.md §2 is the normative message catalogue. It and `Msg::ALL_TYPES`
+/// must be the same set in both directions: a variant the table omits, or a row the enum lacks,
+/// is a red test. Rows are recognised by their direction cell (`B→O` / `O→B` / `O→O`).
+#[test]
+fn protocol_doc_catalogue_matches_all_types() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/protocol/dm-protocol.md");
+    let doc = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let documented: BTreeSet<&str> = doc
+        .lines()
+        .filter(|l| l.starts_with("| `"))
+        .filter(|l| {
+            ["| B→O |", "| O→B |", "| O→O |"]
+                .iter()
+                .any(|d| l.contains(d))
+        })
+        .map(|l| l.trim_start_matches("| `").split('`').next().unwrap())
+        .collect();
+    let enumerated: BTreeSet<&str> = Msg::ALL_TYPES.iter().copied().collect();
+    assert_eq!(
+        documented, enumerated,
+        "dm-protocol.md §2 catalogue drifted from Msg::ALL_TYPES"
+    );
+}
+
 /// The optional-field variants the spec calls out (dm-protocol.md §3.6, §3.7): a request-correlated
 /// and an unsolicited `billing.invoice` / `billing.notice`. Pinned separately so the fixture set
 /// cannot silently drop one of the two shapes.
