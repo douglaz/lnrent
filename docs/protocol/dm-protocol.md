@@ -150,7 +150,7 @@ States the reference daemon emits and when:
 |--|--|--|
 | `ACTIVE` | the soft-date renewal reminder, sent with the auto `billing.invoice` | absent |
 | `SUSPENDED` | `paid_through` passed unpaid; the `suspend` hook ran | absent |
-| `RESUMING` | a `renew.request` or `sub.cancel` arrived while a late renewal's `resume` hook is still running; retry once it lands | echoed for `renew.request`, absent for `sub.cancel` |
+| `RESUMING` | a `renew.request` or `sub.cancel` arrived while a late renewal's `resume` hook is still running; retry once it lands. Both are direct replies to the request, not queued (§4). | echoed for `renew.request`, absent for `sub.cancel` |
 | `CANCELLED` | a `sub.cancel` took effect | absent |
 
 No notice is sent on TERMINATED today. A buyer MUST tolerate any `state` string.
@@ -237,9 +237,14 @@ listed so a decoder knows the `type`.
 ## 4. Request ids, correlation, idempotency
 
 - `order.request`, `renew.request` and `op.request` carry a client-chosen `id`. It MUST match
-  `[A-Za-z0-9_-]{1,128}`; the operator refuses anything else (`params_invalid` for
-  order/renew, `invalid_request_id` for op).
-- The operator keys idempotency on **`(sender_pubkey, id)`** per request class. A duplicate
+  `[A-Za-z0-9_-]{1,128}`. A malformed id is answered `order.error { params_invalid }` on an
+  `order.request`, `op.result { invalid_request_id }` on an `op.request`, and is **dropped
+  silently** on a `renew.request` (every renew reply echoes the id, so a malformed one has
+  nowhere to go; the buyer sees a timeout).
+- The operator keys idempotency on **`(sender_pubkey, id)`** in two namespaces: **one shared by
+  `order.request` and `renew.request`**, and a separate one for `op.request`. So a buyer MUST
+  NOT reuse an order id for a renewal or vice versa: the second request receives the first
+  one's cached reply (an `order.invoice` where a `billing.invoice` was expected). A duplicate
   `order.request` or `renew.request` gets the **cached reply** re-sent and MUST NOT create a
   second reservation, order or invoice. A duplicate `op.request` MUST NOT re-run the hook:
   a finished invocation re-sends its cached `op.result`; one still running attaches and returns
@@ -252,11 +257,12 @@ listed so a decoder knows the `type`.
   `order.error` from an earlier request carries a different `request_id` and MUST be ignored.
 - A buyer MUST also check the reply's sender equals the operator it is talking to.
 - `sub.cancel` and `delivery.resend.request` have no id; re-sending them is safe.
-- Correlated replies are sent once, directly, and are **not** queued for retry by the operator.
-  If a reply does not arrive, the buyer MUST re-send the same request under the **same `id`**:
-  the operator answers from its cache without repeating the effect. Retrying under a new `id`
-  places a new order / invocation. (Unsolicited operator messages are queued and retried on the
-  operator side instead; `operator-conformance.md` §7.)
+- Replies to a request are published once, directly, and are **not** queued for retry by the
+  operator. If a reply does not arrive, the way to recover it is to re-send the same request
+  under the **same `id`**: the operator answers from its cache without repeating the effect.
+  Retrying under a new `id` places a new order / invocation. The reference CLI pins an id with
+  `--request-id`; buyer-core does not retry by itself. (State-change announcements are queued
+  and retried on the operator side instead; `operator-conformance.md` item 39.)
 - Responses share the dedupe key of the request they answer: `order.invoice`, `order.error`,
   `op.result`, and a `billing.invoice` or `billing.notice` that carries a `request_id`.
 

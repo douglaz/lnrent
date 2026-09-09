@@ -111,18 +111,23 @@ it is written in. SHOULDs describe the reference daemon and may be varied.
 
 38. MUST answer an owner's `delivery.resend.request` by re-sending the latest
     `provision.ready`, and MUST stay silent otherwise.
-39. Two durability models, by message class, and a buyer MUST be able to rely on both:
-    - **Unsolicited messages** (`provision.ready`, every `billing.notice` and `billing.refund`,
-      the soft-date `billing.invoice`, `operator.alert`) MUST be committed to a durable, retrying
-      outbox in the same transaction as the state change they announce, and retried until a relay
-      accepts them; a message that can never be encoded is quarantined, not retried forever.
-    - **Request-correlated replies** (`order.invoice`, `order.error`, a `renew.request`'s
-      `billing.invoice` / `billing.notice`, `op.result`) are sent directly once the request's
-      effect is committed; they are NOT queued. Their durability is the cached reply of items 11
-      and 37: a reply lost to a relay failure is recovered by the buyer **re-sending the same
-      request with the same `id`**, which MUST return the cached reply without repeating the
-      effect. A buyer client that never retries a silent request has no recovery path, so buyer
-      clients MUST retry under the same `id` on timeout.
+39. Two durability models, by message class:
+    - **State-change announcements** (`provision.ready`; the `ACTIVE`, `SUSPENDED` and
+      `CANCELLED` `billing.notice`s; every `billing.refund`; the soft-date `billing.invoice`;
+      `operator.alert`) MUST be committed to a durable, retrying outbox in the same transaction
+      as the state change they announce, and retried until a relay accepts them; a message that
+      can never be encoded is quarantined, not retried forever.
+    - **Replies to an inbound request** (`order.invoice`, `order.error`, a `renew.request`'s
+      `billing.invoice`, and BOTH `RESUMING` notices, the correlated one answering
+      `renew.request` and the uncorrelated one answering `sub.cancel`, and `op.result`) are
+      published once, directly, after the request's effect is committed; they are NOT queued.
+      Their recovery path is the cached reply of items 11 and 37: a buyer that re-sends the
+      **same request with the same `id`** MUST receive the cached reply without the effect
+      repeating. The operator owes the cache; it does not owe a retry. (Reference clients: the
+      CLI can pin an id with `--request-id` for exactly this; buyer-core does not retry on its
+      own; the web client cannot pin an id and has no recovery for a lost correlated reply.)
+      A lost `sub.cancel`-time `RESUMING` notice is UX only: cancel changes nothing in that
+      state either way, and the buyer re-sends `sub.cancel` once the resume lands.
 
 ## 8. Things a conforming operator MUST NOT do
 

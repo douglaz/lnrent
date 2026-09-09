@@ -43,7 +43,7 @@ resources = { cpu = 1, mem_mb = 1024, disk_gb = 25 }   # counted against host ca
 env = ["DO_TOKEN", "DO_REGION"]   # optional: operator env vars forwarded to hooks, §2
 
 [os]
-supports = ["debian"]         # non-empty
+supports = ["debian"]         # non-empty; each entry is nixos | debian
 
 [[params]]                    # zero or more; published in the listing; ≤64
 key = "ssh_pubkey"
@@ -61,7 +61,7 @@ hook = "status"               # bare filename under ops/; no "/", no "..", non-e
 
 Validation the daemon applies at load: `service.id` non-empty; `backend` and `isolation` each
 one of the values above; `tier` in the four values;
-`os.supports` non-empty; `env` has at most **16** names, each `1..=64` chars of `[A-Z0-9_]`
+`os.supports` non-empty and every entry `nixos` or `debian`; `env` has at most **16** names, each `1..=64` chars of `[A-Z0-9_]`
 and never starting with `LNRENT`; every `hook` is a bare filename whose canonical path stays
 inside `ops/`; the five lifecycle hooks exist; params and operations within the bounds
 above.
