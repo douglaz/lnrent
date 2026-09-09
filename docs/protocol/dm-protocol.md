@@ -221,7 +221,8 @@ Authorization and refusal order on the operator: request id well-formed
 buyer (`unauthorized`, indistinguishable from an unknown subscription) → recipe served by this
 operator (`unavailable`) → subscription ACTIVE (`not_active`) → op declared (`unknown_op`) →
 params valid against the op's declared params (`invalid_params`) → run the hook (`timeout` /
-`hook_failed`). Only refusals past the owner check are cached against `(sender, id)`.
+`hook_failed`). Only what happens past the ACTIVE gate is cached against `(sender, id)`;
+see §4.
 
 ### 3.13 `operator.alert` — `vectors/operator.alert.json`
 
@@ -247,11 +248,19 @@ listed so a decoder knows the `type`.
   one's cached reply (an `order.invoice` where a `billing.invoice` was expected). A duplicate
   `order.request` or `renew.request` gets the **cached reply** re-sent and MUST NOT create a
   second reservation, order or invoice. A duplicate `op.request` MUST NOT re-run the hook:
-  a finished invocation re-sends its cached `op.result`; one still running attaches and returns
-  that result; one orphaned by an operator restart is answered
-  `error { code: "interrupted", retryable: false }`.
-- One reply is deliberately not cached: `order.error { code: "unavailable" }` refusing a
-  `renew.request`. Re-sending that `id` after the operator serves the recipe renews normally.
+  a finished invocation re-sends its cached `op.result`; one still running normally attaches
+  and returns that result when it finishes, but in a narrow window (the duplicate lands after
+  the durable claim and before the running owner has registered in-process, or the owner
+  exits without a terminal) the operator MAY answer nothing and the buyer re-sends; one
+  orphaned by an operator restart is answered `error { code: "interrupted", retryable: false }`.
+- **What is cached, precisely.** For `order.request` / `renew.request`: every reply that
+  created or refused an order or invoice. For `op.request`: only what happens **past the
+  ACTIVE gate** (`unknown_op`, `invalid_params`, `timeout`, `hook_failed`, `interrupted`, and
+  `ok`). Three replies are deliberately **not** cached, so that re-sending the same `id` once
+  the condition clears proceeds normally: `billing.notice { state: "RESUMING" }` answering a
+  `renew.request`; `order.error { code: "unavailable" }` refusing a `renew.request`; and the
+  `unavailable` / `not_active` / `unauthorized` / `invalid_request_id` refusals of an
+  `op.request`, which persist nothing.
 - A buyer MUST correlate replies by `request_id`, never by arrival order or by relay
   subscription id, because relays replay old wraps: a stale `billing.notice` or
   `order.error` from an earlier request carries a different `request_id` and MUST be ignored.

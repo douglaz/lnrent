@@ -424,6 +424,64 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    /// Every variant, in one place. Exhaustive by construction: the `match` below has no `_`
+    /// arm, so adding a variant to `AlertKind` fails to compile here until it is added to this
+    /// array too — which is what makes the doc check underneath it a real guard.
+    const ALL_KINDS: [AlertKind; 9] = [
+        AlertKind::RefundParked,
+        AlertKind::RefundStuck,
+        AlertKind::TeardownFailed,
+        AlertKind::RelayBlackout,
+        AlertKind::HoldingsLow,
+        AlertKind::PaidServiceDestroyed,
+        AlertKind::SweepFailed,
+        AlertKind::SweepStuck,
+        AlertKind::SettlementUnbookable,
+    ];
+
+    fn assert_listed(kind: AlertKind) {
+        match kind {
+            AlertKind::RefundParked
+            | AlertKind::RefundStuck
+            | AlertKind::TeardownFailed
+            | AlertKind::RelayBlackout
+            | AlertKind::HoldingsLow
+            | AlertKind::PaidServiceDestroyed
+            | AlertKind::SweepFailed
+            | AlertKind::SweepStuck
+            | AlertKind::SettlementUnbookable => {
+                assert!(ALL_KINDS.contains(&kind), "{kind:?} missing from ALL_KINDS");
+            }
+        }
+    }
+
+    /// docs/protocol/dm-protocol.md §3.13 quotes the closed `operator.alert.kind` vocabulary as a
+    /// normative list. That list and this enum must be the SAME set in both directions: a
+    /// variant the doc omits, or a kind the doc names that the enum lacks, is a red test.
+    #[test]
+    fn operator_alert_kinds_match_the_protocol_doc() {
+        use std::collections::BTreeSet;
+        for k in ALL_KINDS {
+            assert_listed(k);
+        }
+        let doc = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../docs/protocol/dm-protocol.md"
+        ))
+        .expect("docs/protocol/dm-protocol.md is readable from the daemon crate");
+        let row = doc
+            .lines()
+            .find(|l| l.starts_with("| `kind` |") && l.contains("one of"))
+            .expect("dm-protocol.md §3.13 has the `kind` row that says `one of`");
+        let after = &row[row.find("one of").unwrap()..];
+        let documented: BTreeSet<&str> = after.split('`').skip(1).step_by(2).collect();
+        let enumerated: BTreeSet<&str> = ALL_KINDS.iter().map(|k| k.wire_str()).collect();
+        assert_eq!(
+            documented, enumerated,
+            "operator.alert `kind` vocabulary drifted between AlertKind::wire_str and dm-protocol.md §3.13"
+        );
+    }
+
     fn mem_store() -> Store {
         let conn = Connection::open_in_memory().expect("open memory db");
         conn.execute_batch(SCHEMA).expect("apply schema");
