@@ -182,9 +182,10 @@ Silence (no reply at all) for: a non-owner, an unknown subscription, an owned su
 that is not renewable (terminal, or past retention), a malformed `id` (§4), and **an invoice
 that could not be minted** (payment backend outage, or a backend refusing a same-`external_id`
 call with a different amount, `operator-conformance.md` §2). In that last case nothing is
-cached, the operator retries the request when the relay redelivers it, and the buyer's
-same-`id` re-send is answered normally once minting works. A buyer client MUST time out and
-MAY re-send under the same `id`.
+cached and the wrap is **not** recorded as handled, so a relay redelivery of the same wrap is
+processed again (the transport dedupe of §4 records only wraps whose handling completed); a
+buyer's same-`id` re-send is likewise answered normally once minting works. A buyer client
+MUST time out and SHOULD re-send under the same `id` rather than wait for a redelivery.
 
 ### 3.10 `sub.cancel` — `vectors/sub.cancel.json`
 

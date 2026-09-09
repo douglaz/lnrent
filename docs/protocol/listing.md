@@ -19,11 +19,13 @@ reuses the same `(kind, pubkey, d)`.
 | `price` | `[<amount>, "SAT", <period>]` | yes | `amount` is a decimal unsigned integer of whole satoshis; currency MUST be `SAT`; `period` is the duration string of §3 |
 | `operator` | 64-hex Nostr pubkey | yes | the master (brand) pubkey. Today it equals the signing key. |
 
-A parser MUST use the **first occurrence that carries a value** of each single-valued tag (a
-bare `["d"]` with no second element is skipped as if absent, and a later `["d", "x"]` is then
-the one used), MUST tolerate unknown tags, and MUST reject a `d` that is missing or empty, a
-non-`SAT` currency, a non-integer amount, and an `operator` that is not a valid public key.
-Publishers MUST NOT emit a valueless single-valued tag.
+A parser MUST use the **first occurrence that carries a value** of `d`, `title`, `summary` and
+`operator` (a bare `["d"]` with no second element is skipped as if absent, and a later
+`["d", "x"]` is then the one used); for `price` it MUST use the **first occurrence** and
+reject the event if that occurrence is malformed (fewer than three values, non-`SAT`
+currency, non-integer amount). It MUST tolerate unknown tags, and MUST reject a `d` that is
+missing or empty and an `operator` that is not a valid public key. Publishers MUST NOT emit a
+valueless or partial single-valued tag.
 
 ## 2. Content
 

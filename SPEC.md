@@ -608,7 +608,8 @@ e.g. 7d).
 - **PROVISIONING -> ACTIVE** — provision succeeded; deliver credentials and set
   `paid_through = settled_at + period`.
 - **PROVISIONING -> REFUND_DUE** — provision failed permanently after retries. The daemon
-  **first commits** the CAS move to `REFUND_DUE` together with a durable cleanup intent (once
+  **first commits** the CAS move to `REFUND_DUE` together with the `refund_attempt` PENDING
+  row and a durable cleanup intent (once
   that commit wins, no concurrent activation can reclaim the sub, so the resources are
   unambiguously ours to purge; if the CAS loses, a racer owns the sub and is left alone), and
   **then** runs a **best-effort `destroy`** to purge any partially-created resources (VM /
@@ -817,7 +818,7 @@ Crash-recovery (step -> durable record in one txn -> restart action):
 | order placed | sub PENDING + invoice OPEN (external_id) | expired-invoice PENDING -> EXPIRED |
 | settlement | invoice PAID + sub PROVISIONING | replay no-ops (status guard) |
 | provision ok | sub ACTIVE + outbox row | unsent outbox -> resend |
-| provision fail | sub REFUND_DUE + cleanup intent (one txn), THEN best-effort `destroy`, THEN refund_attempt PENDING | retry the capped pay by `key` (`pay_refund_capped`, §6.1) — idempotent, safe before or after a prior call; an unfinished cleanup intent is retried |
+| provision fail | sub REFUND_DUE + refund_attempt PENDING + cleanup intent (ONE txn), THEN best-effort `destroy`, THEN the refund pay | retry the capped pay by `key` (`pay_refund_capped`, §6.1) — idempotent, safe before or after a prior call; an unfinished cleanup intent is retried too |
 | late settle on terminal sub | detached refund_attempt PENDING | retry the capped pay by `key` (order not resurrected) |
 
 Lifecycle hooks (provision / suspend / resume / destroy) **must be idempotent** (§7.2): each

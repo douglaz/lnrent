@@ -19,7 +19,10 @@ it is written in. SHOULDs describe the reference daemon and may be varied.
 5. MUST dedupe delivered wraps on the outer event id, for a retention it declares (90 days in
    the reference daemon), so a relay replay within that window never re-runs a completed
    handler; and MUST make every handler safe to re-run anyway (a crash between handling and
-   recording the dedupe is allowed to replay).
+   recording the dedupe is allowed to replay). Replay safety comes from the per-request
+   records, not from the hook: an `op.request` replay finds the invocation claim item 37
+   persists **before** the hook runs, and is answered from it (`interrupted` if the run was
+   orphaned), so a non-idempotent hook still runs at most once.
 6. SHOULD rate-limit buyer requests per sender pubkey and SHOULD cap a sender's concurrent
    unpaid holds; both are the operator's policy, and a refused hold is `capacity_full`.
 
@@ -56,10 +59,11 @@ it is written in. SHOULDs describe the reference daemon and may be varied.
     and on success MUST send `provision.ready` and set `paid_through = settled_at + period`.
 17. `provision.ready` MUST be durably queued in the same commit that marks the subscription
     ACTIVE, and retried until a relay accepts it, so a crash cannot strand a paid buyer.
-18. On permanent provision failure MUST **first commit** the move to REFUND_DUE (so no
-    concurrent activation can still win the subscription), **then** run `destroy` best-effort
-    against whatever the hook created, then refund; it MUST never keep the money, and a failed
-    cleanup MUST NOT block the refund.
+18. On permanent provision failure MUST **first commit**, in one transaction, the move to
+    REFUND_DUE plus the durable refund intent (so no concurrent activation can still win the
+    subscription and the money owed is recorded before anything else happens), **then** run
+    `destroy` best-effort against whatever the hook created, then pay the refund; it MUST
+    never keep the money, and a failed cleanup MUST NOT block the refund.
 19. A settlement arriving after the order invoice expired, or on a terminal subscription, MUST
     be refunded and MUST NOT resurrect the order.
 

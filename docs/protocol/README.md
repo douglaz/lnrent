@@ -29,6 +29,13 @@ of them byte-for-value. A second implementation should load the same files. A fi
 contract; when a message changes shape, the fixture changes in the same PR, and the Rust test
 going red is how the change is noticed.
 
+**What the suite proves and what it cannot.** It proves every fixture decodes and re-encodes
+to the same value, that every message `type` has a fixture, and that the §2 catalogue and the
+`operator.alert` vocabulary match the code. It **cannot** notice a newly added *optional*
+field that no fixture exercises: an old fixture still round-trips because the field defaults
+to absent. Adding such a field is a protocol change (Versioning, below) and MUST land with a
+fixture that carries it; reviewers check for that, the suite does not.
+
 ## Versioning
 
 - **Listing content** carries `lnrent.version` (currently `1`). A parser MUST reject a version

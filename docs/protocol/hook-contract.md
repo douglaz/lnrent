@@ -62,10 +62,13 @@ hook = "status"               # bare filename under ops/; no "/", no "..", non-e
 Validation the daemon applies at load: `service.id` non-empty; `backend` and `isolation` each
 one of the values above; `tier` in the four values;
 `os.supports` non-empty and every entry `nixos` or `debian`; `env` has at most **16** names, each `1..=64` chars of `[A-Z0-9_]`
-and never starting with `LNRENT`; every `hook` is a bare filename whose canonical path stays
-inside `ops/`; every `operation.kind` is `request` or `interactive`; **operation names are
-unique** within a recipe; the five lifecycle hooks exist; params and operations within the
-bounds above.
+and never starting with `LNRENT`; every `operation.kind` is `request` or `interactive`;
+**operation names are unique** within a recipe; the five lifecycle hooks **exist and are
+executable**; every `request` operation's `hook` is a bare filename that **exists, is
+executable, and whose canonical path stays inside `ops/`** (symlink escapes are rejected); an
+`interactive` operation's `hook` is checked only for being a safe bare name, since nothing
+dispatches it yet; params and operations within the bounds above. A file that exists without
+its execute bit fails the whole recipe at load.
 
 Not validated at load: the three `[pricing]` durations. A string outside the grammar of
 `listing.md` §3 (or a non-positive number) is **not rejected**; the reference daemon logs a
