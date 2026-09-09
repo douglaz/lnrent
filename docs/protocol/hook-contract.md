@@ -63,8 +63,15 @@ Validation the daemon applies at load: `service.id` non-empty; `backend` and `is
 one of the values above; `tier` in the four values;
 `os.supports` non-empty and every entry `nixos` or `debian`; `env` has at most **16** names, each `1..=64` chars of `[A-Z0-9_]`
 and never starting with `LNRENT`; every `hook` is a bare filename whose canonical path stays
-inside `ops/`; the five lifecycle hooks exist; params and operations within the bounds
-above.
+inside `ops/`; every `operation.kind` is `request` or `interactive`; **operation names are
+unique** within a recipe; the five lifecycle hooks exist; params and operations within the
+bounds above.
+
+Not validated at load: the three `[pricing]` durations. A string outside the grammar of
+`listing.md` §3 (or a non-positive number) is **not rejected**; the reference daemon logs a
+warning and bills on a **30-day fallback** while still publishing the raw string in the listing
+`price` tag and in `order.invoice.period`. A recipe MUST use the grammar; the daemon does not
+yet make it fail closed.
 
 ## 2. Process contract (all hooks)
 
@@ -180,8 +187,12 @@ stdin:
 }
 ```
 
-`instance` is `null` before provisioning. `params` is the buyer's `op.request.params`, passed
-through unvalidated beyond being a JSON object.
+`instance` is `null` before provisioning. `params` is the buyer's `op.request.params` **after
+the daemon validated it against the operation's declared `params`**: it is an object, every
+`required` key is present, each declared key has its declared type (same rules as order
+params), and **no undeclared key is present**. A hook therefore never sees a key it did not
+declare; a request that fails any of these is answered `invalid_params` and the hook is not
+run.
 
 stdout: **MUST be a JSON object**; it is returned to the buyer verbatim as `op.result.data`. A
 non-object, non-JSON stdout, non-zero exit or timeout becomes `op.result { status: "error" }`

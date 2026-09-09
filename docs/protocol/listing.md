@@ -71,6 +71,12 @@ fields inside the content MUST be ignored.
 positive integer followed by an optional unit: `s`, `m`, `h`, `d`, `w`. A bare integer is
 seconds. Examples: `"30d"`, `"12h"`, `"3600"`.
 
+A buyer parser MUST treat a `period` outside this grammar as unparseable and SHOULD not
+order against it. The reference daemon does not reject a malformed recipe duration at load:
+it substitutes a 30-day fallback for its own timers and still publishes the raw string
+(`hook-contract.md` §1), so a malformed `period` on the wire is a recipe-author error the
+buyer can observe.
+
 ## 4. Discovery and verification
 
 - A buyer discovers listings with a filter of kind `30402` and `authors` = the operator

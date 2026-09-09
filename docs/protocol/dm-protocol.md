@@ -285,11 +285,19 @@ Both error carriers nest the same object, never a top-level `code`:
 | `refund_dest_invalid` | §3.1 rules | false |
 | `rejected` | reserved; not emitted today | |
 
-`op.result` codes: `unauthorized`, `invalid_request_id`, `unknown_op`, `invalid_params`,
-`not_active`, `unavailable`, `timeout`, `hook_failed`, `interrupted`. `unavailable` is
-retryable only while the subscription is in a state that can still reach ACTIVE (PENDING,
-PROVISIONING, ACTIVE, RESUMING, SUSPENDED). `interrupted` is never retryable under the same
-`id`; the buyer decides whether to reissue under a new one.
+`op.result` codes. `retryable` answers "could this ever succeed", not "would it succeed now":
+
+| code | meaning | retryable |
+|--|--|--|
+| `unauthorized` | sender is not the buyer, or no such subscription | false |
+| `invalid_request_id` | `id` fails §4's grammar | false |
+| `unavailable` | the subscription's recipe is not served by this operator | true only while the state can still reach ACTIVE (PENDING, PROVISIONING, ACTIVE, RESUMING, SUSPENDED) |
+| `not_active` | subscription exists, is the sender's, but is not ACTIVE | false (renew or wait, then send a new request) |
+| `unknown_op` | `op` is not declared for this recipe | false |
+| `invalid_params` | §3.11 validation failed | false |
+| `timeout` | the hook exceeded its time budget | true |
+| `hook_failed` | non-zero exit, non-JSON or non-object stdout, output cap | false |
+| `interrupted` | the invocation was orphaned by an operator restart | false under the same `id`; the buyer decides whether to reissue under a new one |
 
 `code` is an open string: a buyer MUST tolerate codes it does not know.
 

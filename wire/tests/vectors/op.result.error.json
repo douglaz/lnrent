@@ -4,5 +4,5 @@
   "subscription_id": "sub_01J9EXAMPLE0000000000000",
   "op": "restart",
   "status": "error",
-  "error": { "code": "not_active", "message": "subscription is SUSPENDED", "retryable": true }
+  "error": { "code": "not_active", "message": "subscription is SUSPENDED", "retryable": false }
 }
