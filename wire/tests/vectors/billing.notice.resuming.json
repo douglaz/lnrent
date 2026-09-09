@@ -1,0 +1,7 @@
+{
+  "type": "billing.notice",
+  "subscription_id": "sub_01J9EXAMPLE0000000000000",
+  "request_id": "rnw-2026-09-09-0001",
+  "state": "RESUMING",
+  "message": "subscription is resuming; retry once the resume lands"
+}

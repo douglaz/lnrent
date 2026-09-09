@@ -1,0 +1,9 @@
+{
+  "type": "order.invoice",
+  "request_id": "ord-2026-09-09-0001",
+  "order_id": "sub_01J9EXAMPLE0000000000000",
+  "bolt11": "lnbc300u1pexamplebolt11invoiceonlyforthevector",
+  "amount_sat": 30000,
+  "period": "30d",
+  "expires_at": 1757376000
+}

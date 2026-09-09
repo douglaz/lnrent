@@ -1,0 +1,32 @@
+{
+  "id": "aa371fa62ddf85c453876e7abeb7ad1376b302f85dd92a9520ceb435d61041d2",
+  "pubkey": "af8e138ac8e3432f451ab6e4ad90693102f029c5a97d0636c716de761c17cadc",
+  "created_at": 1757376000,
+  "kind": 30402,
+  "tags": [
+    [
+      "d",
+      "do-vps"
+    ],
+    [
+      "title",
+      "Cloud VPS (DigitalOcean)"
+    ],
+    [
+      "summary",
+      "A dedicated cloud VPS with root SSH. 1 vCPU / 1 GB / 25 GB."
+    ],
+    [
+      "price",
+      "30000",
+      "SAT",
+      "30d"
+    ],
+    [
+      "operator",
+      "af8e138ac8e3432f451ab6e4ad90693102f029c5a97d0636c716de761c17cadc"
+    ]
+  ],
+  "content": "{\"lnrent\":{\"version\":1,\"recipe\":{\"id\":\"do-vps\",\"version\":\"0.1.0\"},\"tier\":\"0\",\"params\":[{\"key\":\"ssh_pubkey\",\"label\":\"Your SSH public key\",\"type\":\"string\",\"required\":true}],\"operations\":[{\"name\":\"status\",\"label\":\"VPS status\",\"kind\":\"request\",\"params\":[]},{\"name\":\"restart\",\"label\":\"Reboot the VPS\",\"kind\":\"request\",\"params\":[]}]}}",
+  "sig": "c2f8374aaff473dfdc1926f1f0c48237eaf5586a095950640f8d3c2849833affc820b78f344eec41e5eadfaba0d2079a58b810a7edfa32857b99d860ac089e32"
+}

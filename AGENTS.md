@@ -18,7 +18,8 @@ defect. Judge changes by whether someone who has never read this code could run 
 | Question | Read |
 |---|---|
 | What does this word mean? | **`CONTEXT.md`** — the glossary. Terms first; it does name concrete backends and CLI behaviour where the term needs it. |
-| How is the system supposed to behave? | **`SPEC.md`** — the protocol/state-machine spec. It mixes SHIPPED behaviour with target surface; sections mark what is not built yet, so check before assuming something exists. |
+| How is the system supposed to behave? | **`SPEC.md`** — the design/state-machine spec. It mixes SHIPPED behaviour with target surface; sections mark what is not built yet, so check before assuming something exists. |
+| What must a SECOND implementation match? | **`docs/protocol/`** — the normative wire, listing, hook and operator-conformance contract, pinned by the fixtures in `wire/tests/vectors/`. |
 | Why was it built this way? | **`docs/adr/`** — numbered decision records. |
 | What are the standing engineering contracts? | **`docs/specs/`** — see below; not all of it is live. |
 | What work exists, and what is next? | **`.beads/`** via the `br` CLI — see below. |
@@ -27,6 +28,12 @@ defect. Judge changes by whether someone who has never read this code could run 
 Where a spec and the code disagree on an enumeration or a count, **the code wins** — `docs/specs/
 gate1-alerting-operability.md` says so verbatim, and the refund contract points at the shipped enum
 rather than its own list.
+
+**The one exception is `docs/protocol/`, where the spec wins.** Those files describe what every
+implementation must do, not what this one happens to do. A code change that contradicts one of
+them is a protocol change: amend the file AND the fixture in `wire/tests/vectors/` in the same PR
+(`wire/tests/vectors.rs` goes red otherwise), and if the change would break an existing peer, it
+needs a new message `type` or a listing `version` bump — never a silent mutation.
 
 ### `docs/specs/` — live contracts vs archived history
 

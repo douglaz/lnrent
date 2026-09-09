@@ -1,0 +1,5 @@
+{
+  "type": "order.error",
+  "request_id": "ord-2026-09-09-0001",
+  "error": { "code": "capacity_full", "message": "no capacity for this order", "retryable": true }
+}

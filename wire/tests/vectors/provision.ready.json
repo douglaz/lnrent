@@ -1,0 +1,5 @@
+{
+  "type": "provision.ready",
+  "subscription_id": "sub_01J9EXAMPLE0000000000000",
+  "payload": { "host": "203.0.113.10", "port": 22, "user": "root" }
+}
