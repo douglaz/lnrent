@@ -178,8 +178,13 @@ Owner-only. Exactly one of these replies, each carrying `request_id = id`:
 | `billing.notice { state: "RESUMING" }` | a resume is in flight; retry later |
 | `order.error { code: "unavailable" }` | the subscription's recipe is not one this operator serves |
 
-Silence (no reply at all) for: a non-owner, an unknown subscription, or an owned subscription
-that is not renewable (terminal, or past retention). A buyer client MUST time out.
+Silence (no reply at all) for: a non-owner, an unknown subscription, an owned subscription
+that is not renewable (terminal, or past retention), a malformed `id` (§4), and **an invoice
+that could not be minted** (payment backend outage, or a backend refusing a same-`external_id`
+call with a different amount, `operator-conformance.md` §2). In that last case nothing is
+cached, the operator retries the request when the relay redelivers it, and the buyer's
+same-`id` re-send is answered normally once minting works. A buyer client MUST time out and
+MAY re-send under the same `id`.
 
 ### 3.10 `sub.cancel` — `vectors/sub.cancel.json`
 
@@ -299,8 +304,8 @@ Both error carriers nest the same object, never a top-level `code`:
 |--|--|--|
 | `capacity_full` | no host capacity, or the buyer's live-hold cap is reached | true |
 | `params_invalid` | §3.1 rules, or a malformed request `id` | false |
-| `price_changed` | the order's listing price no longer matches the published one | false; re-read the listing |
-| `unavailable` | the listing is not published, or (as a `renew.request` refusal) the recipe is not served here | true |
+| `price_changed` | the order's `listing_id` names **no listing this operator knows**, or the order's price no longer matches the published one | false; re-read the listing |
+| `unavailable` | the listing is known but not currently published (unpublished or withdrawn), or (as a `renew.request` refusal) the recipe is not served here | true |
 | `refund_dest_invalid` | §3.1 rules | false |
 | `rejected` | reserved; not emitted today | |
 

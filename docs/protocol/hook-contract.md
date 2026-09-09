@@ -127,7 +127,8 @@ stdout:
 second run for the same `subscription.id` MUST converge on the same resources, not create a
 second set.
 
-**Cleanup after a failed provision:** the daemon runs `destroy` before refunding. Its stdin is
+**Cleanup after a failed provision:** the daemon first commits REFUND_DUE, then runs `destroy`,
+then refunds. Its stdin is
 the **provision stdin above**, plus the last `handles` any attempt returned, mirrored as
 top-level `handles` and as `instance.handles`; if no attempt returned handles, neither key is
 present. So a `destroy` hook MUST tolerate the provision-shaped document, absent handles, and

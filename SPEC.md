@@ -607,11 +607,14 @@ e.g. 7d).
   `provision`, retried with backoff.
 - **PROVISIONING -> ACTIVE** — provision succeeded; deliver credentials and set
   `paid_through = settled_at + period`.
-- **PROVISIONING -> REFUND_DUE** — provision failed permanently after retries. Before
-  entering `REFUND_DUE` the daemon runs a **best-effort `destroy`** to purge any
-  partially-created resources (VM / network / volume), so a refunded order leaves nothing
-  behind; a destroy failure is dead-lettered for periodic retry and raises a `teardown_failed`
-  operator alert (GATE-1 PR-6/PR-5), and does not block the refund.
+- **PROVISIONING -> REFUND_DUE** — provision failed permanently after retries. The daemon
+  **first commits** the CAS move to `REFUND_DUE` together with a durable cleanup intent (once
+  that commit wins, no concurrent activation can reclaim the sub, so the resources are
+  unambiguously ours to purge; if the CAS loses, a racer owns the sub and is left alone), and
+  **then** runs a **best-effort `destroy`** to purge any partially-created resources (VM /
+  network / volume), so a refunded order leaves nothing behind. A destroy failure leaves the
+  cleanup intent for periodic retry (it is NOT the retention-time dead-letter path) and does
+  not block the refund. `daemon/src/provision.rs` `fail_to_refund_due` is the ordering.
 
 **Refund path** (§6.4):
 - **REFUND_DUE -> REFUNDED** — auto-refund to the buyer's `refund_dest` succeeded
@@ -814,7 +817,7 @@ Crash-recovery (step -> durable record in one txn -> restart action):
 | order placed | sub PENDING + invoice OPEN (external_id) | expired-invoice PENDING -> EXPIRED |
 | settlement | invoice PAID + sub PROVISIONING | replay no-ops (status guard) |
 | provision ok | sub ACTIVE + outbox row | unsent outbox -> resend |
-| provision fail | best-effort `destroy` + sub REFUND_DUE + refund_attempt PENDING | retry the capped pay by `key` (`pay_refund_capped`, §6.1) — idempotent, safe before or after a prior call |
+| provision fail | sub REFUND_DUE + cleanup intent (one txn), THEN best-effort `destroy`, THEN refund_attempt PENDING | retry the capped pay by `key` (`pay_refund_capped`, §6.1) — idempotent, safe before or after a prior call; an unfinished cleanup intent is retried |
 | late settle on terminal sub | detached refund_attempt PENDING | retry the capped pay by `key` (order not resurrected) |
 
 Lifecycle hooks (provision / suspend / resume / destroy) **must be idempotent** (§7.2): each

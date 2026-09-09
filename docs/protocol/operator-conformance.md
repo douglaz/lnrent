@@ -29,14 +29,17 @@ it is written in. SHOULDs describe the reference daemon and may be varied.
    `order.error`, correlated by `request_id`.
 8. MUST validate `params` and `refund_dest` per `dm-protocol.md` §3.1 before reserving
    capacity or minting an invoice.
-9. MUST refuse an order whose listing is not currently published (`unavailable`) and one
-   whose price no longer matches the published listing (`price_changed`).
+9. MUST refuse an order whose listing is known but not currently published (`unavailable`),
+   and one whose `listing_id` it does not know or whose price no longer matches the published
+   listing (`price_changed`).
 10. MUST reserve the recipe's declared resources for the order for the life of the invoice, so
     two concurrent orders cannot both take the last slot, and MUST release the reservation when
     the invoice expires unpaid.
-11. MUST make `(sender, id)` idempotent: a duplicate `order.request` re-sends the cached reply
-    and never creates a second reservation, order or invoice. The cached reply MUST be committed
-    atomically with the order it describes, so no crash leaves an order without a cached reply.
+11. MUST make `(sender, id)` idempotent for a retention it declares (120 days in the reference
+    daemon, `dm-protocol.md` §4): within that window a duplicate `order.request` re-sends the
+    cached reply and never creates a second reservation, order or invoice. The cached reply
+    MUST be committed atomically with the order it describes, so no crash leaves an order
+    without a cached reply.
 12. MUST issue the invoice for exactly `amount_sat` and MUST honour that amount even if the
     listing price is edited afterwards.
 13. MUST NOT trust any message claiming payment. Settlement is learned from the payment backend
@@ -53,8 +56,10 @@ it is written in. SHOULDs describe the reference daemon and may be varied.
     and on success MUST send `provision.ready` and set `paid_through = settled_at + period`.
 17. `provision.ready` MUST be durably queued in the same commit that marks the subscription
     ACTIVE, and retried until a relay accepts it, so a crash cannot strand a paid buyer.
-18. On permanent provision failure MUST run `destroy` best-effort, then refund, and MUST never
-    keep the money.
+18. On permanent provision failure MUST **first commit** the move to REFUND_DUE (so no
+    concurrent activation can still win the subscription), **then** run `destroy` best-effort
+    against whatever the hook created, then refund; it MUST never keep the money, and a failed
+    cleanup MUST NOT block the refund.
 19. A settlement arriving after the order invoice expired, or on a terminal subscription, MUST
     be refunded and MUST NOT resurrect the order.
 
@@ -119,12 +124,17 @@ it is written in. SHOULDs describe the reference daemon and may be varied.
     `provision.ready`, and MUST stay silent otherwise.
 39. Two durability models, by message class:
     - **Operator-initiated messages** (`provision.ready`; the `ACTIVE`, `SUSPENDED` and
-      `CANCELLED` `billing.notice`s; every `billing.refund`; the soft-date `billing.invoice`;
-      `operator.alert`) MUST be committed to a durable, retrying outbox **in the same
-      transaction as the durable record that produced them** (the state change for a notice or
-      `provision.ready`; the invoice row for the soft-date invoice; the refund row for
-      `billing.refund`), and retried until a relay accepts them; a message that can never be
-      encoded is quarantined, not retried forever.
+      `CANCELLED` `billing.notice`s; every `billing.refund`; the soft-date `billing.invoice`)
+      MUST be committed to a durable, retrying outbox **in the same transaction as the durable
+      record that produced them** (the state change for a notice or `provision.ready`; the
+      invoice row for the soft-date invoice; the refund row for `billing.refund`), and retried
+      until a relay accepts them; a message that can never be encoded is quarantined, not
+      retried forever. `operator.alert` rides the same outbox with two commit models: a
+      **terminal** alert (a refund or sweep parked FAILED, a settlement that cannot be booked)
+      is written in the transaction that terminalizes the record; a **recurring-condition**
+      alert (`refund_stuck`, `sweep_stuck`, `holdings_low`, `relay_blackout`) is enqueued in its
+      own transaction when a periodic check observes the condition, edge-triggered with a
+      per-`(kind, subject)` cooldown, so a restart may repeat one.
     - **Replies to an inbound request** are published once, directly, after the request's
       effect is committed; they are NOT queued. They split by recovery path:
       - `order.invoice`, `order.error`, a `renew.request`'s `billing.invoice`, and every
