@@ -130,11 +130,12 @@ it is written in. SHOULDs describe the reference daemon and may be varied.
       invoice row for the soft-date invoice; the refund row for `billing.refund`), and retried
       until a relay accepts them; a message that can never be encoded is quarantined, not
       retried forever. `operator.alert` rides the same outbox with two commit models: a
-      **terminal** alert (a refund or sweep parked FAILED, a settlement that cannot be booked)
-      is written in the transaction that terminalizes the record; a **recurring-condition**
-      alert (`refund_stuck`, `sweep_stuck`, `holdings_low`, `relay_blackout`) is enqueued in its
-      own transaction when a periodic check observes the condition, edge-triggered with a
-      per-`(kind, subject)` cooldown, so a restart may repeat one.
+      **terminal** alert (`refund_parked`, `sweep_failed`) is written in the transaction that
+      parks the record FAILED; every **other** kind (`refund_stuck`, `sweep_stuck`,
+      `holdings_low`, `relay_blackout`, `teardown_failed`, `paid_service_destroyed`,
+      `settlement_unbookable`) is enqueued in its own transaction when the condition is
+      observed, edge-triggered with a per-`(kind, subject)` cooldown, so a condition observed
+      again after the cooldown, or after a restart, may alert again.
     - **Replies to an inbound request** are published once, directly, after the request's
       effect is committed; they are NOT queued. They split by recovery path:
       - `order.invoice`, `order.error`, a `renew.request`'s `billing.invoice`, and every

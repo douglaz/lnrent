@@ -305,7 +305,8 @@ Both error carriers nest the same object, never a top-level `code`:
 | `capacity_full` | no host capacity, or the buyer's live-hold cap is reached | true |
 | `params_invalid` | §3.1 rules, or a malformed request `id` | false |
 | `price_changed` | the order's `listing_id` names **no listing this operator knows**, or the order's price no longer matches the published one | false; re-read the listing |
-| `unavailable` | the listing is known but not currently published (unpublished or withdrawn), or (as a `renew.request` refusal) the recipe is not served here | true |
+| `unavailable` (answering `order.request`) | the listing is known but not currently published (unpublished or withdrawn), **or** the payment backend could not mint the invoice (outage; a same-`external_id` amount refusal). The message text distinguishes them; the code does not. | true |
+| `unavailable` (answering `renew.request`) | the subscription's recipe is not served by this operator | true only while the subscription's state can still reach ACTIVE (PENDING, PROVISIONING, ACTIVE, RESUMING, SUSPENDED); false for a terminal one, so a client does not retry a dead subscription |
 | `refund_dest_invalid` | §3.1 rules | false |
 | `rejected` | reserved; not emitted today | |
 
