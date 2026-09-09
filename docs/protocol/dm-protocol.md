@@ -149,7 +149,7 @@ States the reference daemon emits and when:
 | `state` | when | `request_id` |
 |--|--|--|
 | `ACTIVE` | the soft-date renewal reminder, sent with the auto `billing.invoice` | absent |
-| `SUSPENDED` | `paid_through` passed unpaid; the `suspend` hook ran | absent |
+| `SUSPENDED` | the effective expiry `max(paid_through, downtime-credit floor)` passed unpaid (`operator-conformance.md` items 23 and 28); the `suspend` hook ran | absent |
 | `RESUMING` | a `renew.request` or `sub.cancel` arrived while a late renewal's `resume` hook is still running; retry once it lands. Both are direct replies to the request, not queued (§4). | echoed for `renew.request`, absent for `sub.cancel` |
 | `CANCELLED` | a `sub.cancel` took effect | absent |
 
@@ -253,6 +253,11 @@ listed so a decoder knows the `type`.
   the durable claim and before the running owner has registered in-process, or the owner
   exits without a terminal) the operator MAY answer nothing and the buyer re-sends; one
   orphaned by an operator restart is answered `error { code: "interrupted", retryable: false }`.
+- **The cache is finite.** The reference daemon keeps completed `(sender, id)` entries for
+  **120 days** and the transport dedupe of outer event ids for **90 days**; a re-send arriving
+  after that is treated as a new request (a new order, or a re-run of a non-idempotent op).
+  A conforming operator MUST state its retention if it differs, and a buyer MUST NOT rely on
+  same-id idempotency beyond 90 days, nor keep a relay-stored request replayable that long.
 - **What is cached, precisely.** For `order.request` / `renew.request`: every reply that
   created or refused an order or invoice. For `op.request`: only what happens **past the
   ACTIVE gate** (`unknown_op`, `invalid_params`, `timeout`, `hook_failed`, `interrupted`, and
@@ -321,6 +326,7 @@ Both error carriers nest the same object, never a top-level `code`:
    lands after `expires_at` is refunded to `refund_dest`, never resurrected.
 5. From `due_at - renew_lead` the operator sends a `billing.notice { state: "ACTIVE" }` plus a
    `billing.invoice`; the buyer may instead `renew.request` at any time.
-6. Unpaid at `paid_through`: `billing.notice { state: "SUSPENDED" }`; paid within retention:
+6. Unpaid at the effective expiry (`paid_through`, or later if the operator credited its own
+   downtime): `billing.notice { state: "SUSPENDED" }`; paid within retention:
    the service resumes; unpaid past retention: destroyed, no notice.
 7. `op.request` / `op.result` work while ACTIVE. `sub.cancel` at any time.

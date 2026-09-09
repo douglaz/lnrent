@@ -211,7 +211,9 @@ content is not read. `{"ok":true}` is the convention.
 
 ## 4. Security expectations on a recipe
 
-- Never print secrets to stderr; stderr goes to logs.
+- Never print secrets to stderr: on a non-zero exit it is embedded in the operator's failure
+  message and log line (§2). On every other outcome it is discarded, so it is also not a
+  channel for diagnostics.
 - Treat everything under `params` as buyer-supplied and hostile: quote it, never interpolate
   it into a shell command.
 - No LLM or remote model call in any hook. The daemon cannot verify this; it is a review
