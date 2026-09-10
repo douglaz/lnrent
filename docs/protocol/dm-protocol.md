@@ -288,8 +288,11 @@ listed so a decoder knows the `type`.
   Retrying under a new `id` places a new order / invocation. The reference CLI pins an id with
   `--request-id`; buyer-core does not retry by itself. (State-change announcements are queued
   and retried on the operator side instead; `operator-conformance.md` item 39.)
-- Responses share the dedupe key of the request they answer: `order.invoice`, `order.error`,
-  `op.result`, and a `billing.invoice` or `billing.notice` that carries a `request_id`.
+- Responses share the **correlation id** of the request they answer (`request_id` equals the
+  request's `id`): `order.invoice`, `order.error`, `op.result`, and a `billing.invoice` or
+  `billing.notice` that carries a `request_id`. They do **not** share its dedupe key: the
+  message-level key is `(sender, type, id-or-request_id)`, so a consumer's dedupe map MUST NOT
+  merge a sent request with the reply it receives.
 
 ## 5. Error shape and codes
 

@@ -65,9 +65,11 @@ Operation declaration: `{ name: string, label: string, kind: string, params: [pa
 streaming transport; not dispatchable today). The recipe's internal `hook` filename is never
 published.
 
-Bounds a parser MUST enforce while deserializing, before allocating: at most **64** entries in
-`params`, at most **64** in `operations`, at most **64** in any operation's `params`. Unknown
-fields inside the content MUST be ignored.
+Bounds a parser MUST enforce while deserializing: it MUST refuse to retain more than **64**
+entries in `params`, more than **64** in `operations`, or more than **64** in any operation's
+`params`, rejecting the array at the first excess element rather than after materializing the
+whole array. (The reference parser decodes that first excess element before rejecting; only
+retention is bounded.) Unknown fields inside the content MUST be ignored.
 
 ## 3. Duration strings
 

@@ -204,7 +204,7 @@ stdin:
 }
 ```
 
-`instance` is `null` before provisioning. `params` is the buyer's `op.request.params` **after
+`instance` is `null` before provisioning; when present it has the same shape as in §3.2. `params` is the buyer's `op.request.params` **after
 the daemon validated it against the operation's declared `params`**: it is an object, every
 `required` key is present, each declared key has its declared type (same rules as order
 params), and **no undeclared key is present**. A hook therefore never sees a key it did not
