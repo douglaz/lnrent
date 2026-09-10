@@ -805,17 +805,20 @@ impl OpDispatch {
     /// decoded backend `handles`, state), or `Value::Null` before provisioning. A real op targets
     /// the service via `instance.handles`. A read (no txn) — the claim already committed RUNNING.
     async fn load_instance(&self, sub_id: &str) -> Result<Value> {
-        let id = sub_id.to_string();
+        let sub_id = sub_id.to_string();
         self.store
             .read(move |c| {
                 Ok(c.query_row(
                     "SELECT id, box_id, kind, handles_json, state FROM instance
                       WHERE subscription_id=?1 LIMIT 1",
-                    params![id],
+                    params![sub_id],
                     |r| {
                         let handles_json: Option<String> = r.get(3)?;
                         Ok(json!({
                             "id": r.get::<_, String>(0)?,
+                            // Same shape as the lifecycle-hook `instance` (hook-contract.md §3.2/§3.4):
+                            // the stdin document is additive-only, so this field may not be dropped.
+                            "subscription_id": sub_id,
                             "box_id": r.get::<_, Option<String>>(1)?,
                             "kind": r.get::<_, Option<String>>(2)?,
                             "handles": handles_json
@@ -1539,6 +1542,54 @@ mod tests {
         );
         recipe.dir = dir;
         (recipe, marker)
+    }
+
+    // lnrent-2fm3: the op-hook `instance` is the SAME shape as the lifecycle hooks' (hook-contract.md
+    // §3.2/§3.4), `subscription_id` included — the stdin document is additive-only, so a recipe that
+    // reads it must keep working. The hook dumps its stdin so the test reads what the recipe would.
+    #[tokio::test]
+    async fn op_hook_instance_carries_subscription_id() {
+        let store = mem_store();
+        let buyer = Keys::generate();
+        seed_sub(&store, "sub-1", &buyer.public_key().to_hex(), "ACTIVE").await;
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO instance (id, subscription_id, box_id, kind, state, created_at, updated_at)
+                     VALUES ('inst:sub-1', 'sub-1', 'box-a', 'dummy', 'RUNNING', 0, 0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (recipe, marker) = marker_recipe("stdin-dump");
+        let dump = marker.with_file_name("stdin.json");
+        write_hook(
+            &recipe.dir,
+            "status",
+            &format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\ncat >'{}'\necho '{{\"state\":\"running\"}}'\n",
+                dump.display()
+            ),
+        );
+        let handler = dispatcher(store, TestClock::new(1000), recipe);
+
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                buyer.public_key(),
+                op_req("op-1", "sub-1", "status", json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+        assert_eq!(expect_op_result(&out).status, OpStatus::Ok);
+
+        let stdin: Value = serde_json::from_slice(&std::fs::read(&dump).unwrap()).unwrap();
+        assert_eq!(stdin["instance"]["id"], "inst:sub-1");
+        assert_eq!(stdin["instance"]["subscription_id"], "sub-1");
+        assert_eq!(stdin["instance"]["box_id"], "box-a");
     }
 
     async fn set_sub_recipe_id(store: &Store, id: &str, recipe_id: Option<&str>) {

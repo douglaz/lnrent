@@ -194,7 +194,7 @@ stdin:
 ```json
 {
   "subscription": { "id": "…", "buyer_pubkey": "<hex>", "state": "ACTIVE" },
-  "instance":     { "id": "inst:…", "box_id": "<box>", "kind": "do-vps",
+  "instance":     { "id": "inst:…", "subscription_id": "…", "box_id": "<box>", "kind": "do-vps",
                     "state": "RUNNING", "handles": { … } },
   "op":           "restart",
   "params":       { … },
@@ -204,8 +204,7 @@ stdin:
 }
 ```
 
-`instance` is `null` before provisioning. Unlike the lifecycle hooks (§3.2), the op-path
-`instance` carries no `subscription_id`; use `subscription.id`. `params` is the buyer's `op.request.params` **after
+`instance` is `null` before provisioning; when present it has the same shape as in §3.2. `params` is the buyer's `op.request.params` **after
 the daemon validated it against the operation's declared `params`**: it is an object, every
 `required` key is present, each declared key has its declared type (same rules as order
 params), and **no undeclared key is present**. A hook therefore never sees a key it did not
