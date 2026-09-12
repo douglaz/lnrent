@@ -184,6 +184,25 @@ bounded. (ADR-0016 / docs/specs/gate1-operator-sweep.md; `lnrent sweep <bolt11>`
 by default and pays only with `--yes`.)
 _Avoid_: withdrawal, payout (ambiguous with refunds), cash out.
 
+**Condition**:
+A durable, open situation the daemon has detected that it cannot resolve on its own right
+now and a human may have to act on: a paid receipt it refuses to book, an invoice the
+wallet has forgotten (phoenixd lost its own history), a refund that overran its cap. A Condition has a lifecycle — it is *open* from
+first observation until it is *resolved*, either by the daemon observing the cause gone or by
+the Operator clearing it by hand — and it stays open regardless of how many times, or whether,
+the Operator has been told. Any side of the money path may raise one; it is not receive-only.
+_Avoid_: incident (reserved, undefined), issue, error, flag, latch.
+
+**Alert**:
+One delivery to the Operator (v1: a Nostr DM) about something that needs their attention:
+a Condition, or an event with no Condition behind it (a parked refund, a failed teardown, a
+relay blackout). A condition-backed Alert is a consequence of the Condition and never the
+record of it: alert history says what the Operator was told, not what is currently open.
+`lnrent money` / `lnrent status` are to report Conditions, not Alerts (decided in ADR-0023,
+not yet built: the current build still reads alert history); event Alerts have no lifecycle
+there.
+_Avoid_: notification, event, alarm, warning (a log line, not a delivery).
+
 **Reconcile (operator act)**:
 The explicit, on-demand comparison of the wallet against the books, reporting whether
 they agree. The single sanctioned reading of the wallet balance; it informs a human and
