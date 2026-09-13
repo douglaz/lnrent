@@ -273,6 +273,18 @@ enum ReceiveFinal {
     Failure,
 }
 
+/// The CURRENT state of a receive operation, read WITHOUT blocking for its terminal — the legacy
+/// import's tiebreaker (ADR-0022). `Missing` = no such operation in the client's log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiveProbe {
+    Missing,
+    /// Not yet terminal (`Pending` or `Claiming`): still payable, or paid and being claimed.
+    Pending,
+    Claimed,
+    Expired,
+    Failure,
+}
+
 /// A gateway's advertised send-fee schedule, as the two `PaymentFee`s `RoutingInfo::send_parameters`
 /// chooses between: `default` (lightning swap) vs `minimum` (direct swap). We do not know at quote time
 /// which the (not-yet-minted) destination invoice will hit, so the INV-1 cap reserves the WORSE of the
@@ -305,6 +317,8 @@ trait Lnv2Ops: Send + Sync {
     ) -> Result<Lnv2NewInvoice>;
     /// Block until the receive operation reaches its terminal state.
     async fn await_receive_final(&self, op: &str) -> Result<ReceiveFinal>;
+    /// The operation's CURRENT receive state without blocking (the legacy import's tiebreaker).
+    async fn receive_state(&self, op: &str) -> Result<ReceiveProbe>;
     /// Ecash actually added by the claimed transaction, after every Fedimint consensus fee.
     async fn claimed_credit_msat(&self, op: &str) -> Result<u64>;
     /// Fund an outgoing contract for `bolt11` (idempotent on the invoice at the module), embedding
@@ -1532,6 +1546,32 @@ impl PaymentBackend for Lnv2Payment {
     }
 }
 
+/// The legacy import's tiebreaker (ADR-0022): the federation's CURRENT view of the receive operation
+/// an `lnv2-<op>` invoice id names. `Claimed`, `Failure` (the still-effective PAID_UNRECOVERED
+/// receive) and a not-yet-terminal op establish it; `Expired` is terminal-unpaid; a missing op proves
+/// nothing (a rolled-back `client.db` can have lost it).
+#[async_trait]
+impl crate::legacy_import::LegacyProbe for Lnv2Payment {
+    async fn receive_state(
+        &self,
+        _external_id: &str,
+        invoice_id: &str,
+        _payment_hash: &str,
+    ) -> Result<crate::legacy_import::ReceiveState> {
+        use crate::legacy_import::ReceiveState;
+        let Some(op) = invoice_id.strip_prefix(INVOICE_ID_PREFIX) else {
+            bail!("lnv2 legacy probe asked about a non-lnv2 invoice id {invoice_id}");
+        };
+        Ok(match self.ops.receive_state(op).await? {
+            ReceiveProbe::Missing => ReceiveState::Absent,
+            ReceiveProbe::Pending | ReceiveProbe::Claimed | ReceiveProbe::Failure => {
+                ReceiveState::Established
+            }
+            ReceiveProbe::Expired => ReceiveState::TerminalUnpaid,
+        })
+    }
+}
+
 /// A still-OPEN index row to (re-)subscribe to on `watch()`.
 struct OpenRow {
     external_id: String,
@@ -2177,9 +2217,11 @@ mod real {
     use futures_util::StreamExt;
     use lightning_invoice::Bolt11Invoice;
 
+    use fedimint_client::module::oplog::UpdateStreamOrOutcome;
+
     use super::{
-        extract_lnrent_key, GatewaySendFee, Lnv2NewInvoice, Lnv2Ops, ReceiveFinal, SendAttempt,
-        SendFinal, SendOpLookup, CLIENT_DB_DIR, PAY_AWAIT_TIMEOUT, ROOT_SECRET_SALT,
+        extract_lnrent_key, GatewaySendFee, Lnv2NewInvoice, Lnv2Ops, ReceiveFinal, ReceiveProbe,
+        SendAttempt, SendFinal, SendOpLookup, CLIENT_DB_DIR, PAY_AWAIT_TIMEOUT, ROOT_SECRET_SALT,
     };
     use crate::fedimint_paths::prepare_fedimint_paths;
 
@@ -2333,6 +2375,32 @@ mod real {
             Err(anyhow!(
                 "lnv2 receive state stream ended without a terminal"
             ))
+        }
+
+        async fn receive_state(&self, op: &str) -> Result<ReceiveProbe> {
+            let opid = OperationId::from_str(op).map_err(|e| anyhow!("bad op id: {e}"))?;
+            if self.client.operation_log().get_operation(opid).await.is_none() {
+                return Ok(ReceiveProbe::Missing);
+            }
+            // `outcome_or_updates` hands back the CACHED outcome for a finished operation and a live
+            // stream otherwise; the stream is never polled here, so an unfinished op reads as pending
+            // without waiting on the federation.
+            match self
+                .lnv2()?
+                .subscribe_receive_operation_state_updates(opid)
+                .await
+                .context("subscribing to lnv2 receive state for a probe")?
+            {
+                UpdateStreamOrOutcome::Outcome(state) => Ok(match state {
+                    ReceiveOperationState::Claimed => ReceiveProbe::Claimed,
+                    ReceiveOperationState::Expired => ReceiveProbe::Expired,
+                    ReceiveOperationState::Failure => ReceiveProbe::Failure,
+                    ReceiveOperationState::Pending | ReceiveOperationState::Claiming => {
+                        ReceiveProbe::Pending
+                    }
+                }),
+                UpdateStreamOrOutcome::UpdateStream(_) => Ok(ReceiveProbe::Pending),
+            }
         }
 
         async fn claimed_credit_msat(&self, op: &str) -> Result<u64> {

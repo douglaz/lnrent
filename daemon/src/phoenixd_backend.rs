@@ -1889,6 +1889,31 @@ impl PhoenixdPayment {
     }
 }
 
+/// The legacy import's tiebreaker (ADR-0022): phoenixd's CURRENT view of one receive, read by
+/// `externalId` and matched on the payment hash. Paid or still payable establishes the invoice; an
+/// `isExpired` unpaid record is terminal-unpaid; no record proves nothing (phoenixd forgets).
+#[async_trait]
+impl crate::legacy_import::LegacyProbe for PhoenixdPayment {
+    async fn receive_state(
+        &self,
+        external_id: &str,
+        _invoice_id: &str,
+        payment_hash: &str,
+    ) -> Result<crate::legacy_import::ReceiveState> {
+        use crate::legacy_import::ReceiveState;
+        let records = self
+            .ops
+            .incoming_by_external_id(external_id)
+            .await
+            .context("asking phoenixd for the incoming records of a legacy invoice")?;
+        Ok(match find_incoming_by_hash(&records, payment_hash) {
+            Some(r) if r.is_paid || !r.is_expired => ReceiveState::Established,
+            Some(_) => ReceiveState::TerminalUnpaid,
+            None => ReceiveState::Absent,
+        })
+    }
+}
+
 fn log_inv1_overrun(idempotency_key: &str, payout_msat: u128, fees_msat: u64, cap: PayCap) {
     if let Some(excess_msat) = inv1_overrun_msat(payout_msat, fees_msat, cap.ceiling_msat()) {
         tracing::error!(
