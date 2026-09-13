@@ -777,16 +777,27 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
   each generation's idempotency separate and stops a stale generation from re-paying (lnrent-ug8).
 - **Issuance ordering (the `bolt11` comes from the backend, so it can't be cached before the
   call):** the daemon derives `external_id` per the class above, calls
-  `create_invoice(external_id)` (which the backend makes **idempotent on `external_id`** — a
-  re-call returns the same invoice), THEN writes in one txn the PENDING sub
-  + the invoice row (with `bolt11` + backend ids) + the cached `inbound_request` response, and
+  `create_invoice(external_id)` (which the backend makes **idempotent on `external_id`
+  whenever a committed correlation row exists** — a re-call then returns the same invoice;
+  with no committed row the behaviour is the backend-specific crash story below), THEN
+  writes in one txn the PENDING sub
+  + the invoice row (with `bolt11` + backend ids) + the backend's own receive-map row
+  (ADR-0022: the correlation commits with the invoice it correlates, never in a side file)
+  + the cached `inbound_request` response, and
   sends the DM only after commit. A crash after `create_invoice` but before that commit leaves
-  an orphaned backend invoice that is never bound to a committed order and simply expires
-  unpaid; a retry regenerates the same `external_id`, so `create_invoice` returns that same
-  invoice (no duplicate) — **unless the backend has observed the provider TERMINATE it**
-  (lnv2: the federation's Expired terminal marks the row CANCELED), in which case the orphan is
-  unpayable forever and the retry gets a fresh invoice under the same `external_id`
-  (lnrent-9yz). A row merely past lnrent's local `expires_at` is NOT replaced on that basis —
+  an orphaned backend invoice that is never bound to a committed order, was never shown to a
+  buyer, and simply expires unpaid. What the deterministic-`external_id` retry then returns is
+  **backend-specific**: phoenixd is queried by `externalId` and the retry **recovers a live or
+  paid orphan** as the same invoice, but a **provider-expired unpaid orphan is replaced** with a
+  successor (`select_reusable_incoming` skips expired unpaid records before creating,
+  `phoenixd_backend.rs`), so a retry after the orphan expired hands the buyer a payable
+  replacement, not the dead bolt11; lnv2 draws a fresh tweak per `receive()` and, with no committed map row to
+  reuse (ADR-0022 commits it with the invoice), mints a fresh one — the orphan is harmless
+  because nobody holds its bolt11 (`lnv2_backend.rs` module doc). With a committed map row,
+  `create_invoice` returns the stored invoice — **unless the backend has observed the provider
+  TERMINATE it** (lnv2: the federation's Expired terminal marks the row CANCELED), in which
+  case the orphan is unpayable forever and the retry gets a fresh invoice under the same
+  `external_id` (lnrent-9yz). A row merely past lnrent's local `expires_at` is NOT replaced on that basis —
   local time is not authoritative for the provider — so an OPEN row is reused however stale its
   timestamp. Call sites therefore use the RETURNED invoice's `amount_sat` / `expires_at`, never
   what they asked for (lnrent-epj). A backend may also refuse outright when the repeated call
@@ -800,6 +811,24 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
   ACTIVE but before the DM cannot strand a paid buyer (also the dropped-DM resync answer).
   A structurally-undeliverable payload is quarantined **`FAILED`** (terminal, never
   overwrites `SENT`) instead of retrying forever.
+- **Condition ledger (ADR-0023; decided, not yet built — the current daemon still derives
+  this view from alert history):** a settlement the daemon observes but refuses to book (a
+  fee-credit refusal, a receipt phoenixd no longer recognises, an lnv2 payment confirmed but
+  unminted) is recorded as an open `condition` row (§11) in the same store, keyed by reason
+  and `external_id`, BEFORE any operator DM about it. The DM is a consequence of the row and
+  `lnrent money`/`status` read the rows, not the outbox. A daemon-resolvable condition closes
+  when the booking it was blocking commits (`settled_at` set, or a refund intent written), with
+  one named exception: `phoenixd_forgot_invoice` also closes whenever phoenixd's record for the
+  invoice reappears in any state, observed and applied by the phoenixd settlement poll: live and
+  still payable (nothing else to open), unpaid and `isExpired` (provider-terminal), or paid but
+  blocked from booking by fee credit, a balance read failure, or an unusable `completedAt`, in
+  which case the poll opens that actual blocker
+  (`fee_credit`, `getbalance_outage`, or `phoenixd_unusable_record`) and resolves the forgotten
+  row in the same transaction. The rest close either by `lnrent condition resolve` (an IPC command for a
+  running daemon; reporting-only, changes nothing in the books, and never a step in a remedy
+  that says "stop the daemon") or, for receipts the operator settled out of band with the
+  daemon stopped, by the accounting close-out, an offline `lnrentd` subcommand that clears the
+  row atomically with the books (ADR-0023 §7; a later bead).
 - **Refund ledger:** a `refund_attempt` row (dest, amount, a durable `idempotency_key`,
   status `PENDING` / `SENT` / `FAILED`, attempts) is persisted **`PENDING` (durable intent)
   BEFORE** calling the capped refund pay (`pay_refund_capped(bolt11, amount, gross, key)` —
@@ -807,7 +836,10 @@ The PENDING subscription **is** the order, so a settlement always has a row to b
   simply to **retry the capped pay for the key** of any non-terminal refund on restart — a crash *before* or
   *after* the call is equally safe: the key dedups (no double-refund) and no crash point can
   strand the intent (the durable `PENDING` row is always there to retry). `payment_status_by_key`
-  lets restart skip a redundant `pay` when the prior one already `Succeeded`. After N failed
+  lets restart skip a redundant `pay` when the prior one already `Succeeded`. The backend's
+  pre-send pay-map row (`PREPARED`, carrying the deterministic operation id / payment hash the
+  crash-window recovery reads) commits in the same transaction as the ledger transition that
+  authorises the send (ADR-0022). After N failed
   attempts the sub stays `REFUND_DUE` and the operator is alerted (`refund_parked` /
   `refund_stuck` DM); funds never vanish and never double-pay.
 
@@ -1279,6 +1311,10 @@ CREATE TABLE refund_attempt (        -- durable refund ledger (ADR-0009, §6.6; 
   resolved_bolt11 TEXT,              -- concrete bolt11 a LN-address/LNURL `dest` resolved to (cached; a retry re-pays the SAME invoice)
   resolved_expiry INTEGER,           -- the resolved invoice's expiry; only a CURRENT-gen Failed+expired invoice is ever re-resolved
   resolution_gen INTEGER NOT NULL DEFAULT 0,  -- 0 = bolt11 pass-through (no resolution); 1+ once resolved (binds each re-resolution to its own key)
+  migration_unverified_at INTEGER,   -- ADR-0022 fence (decided, not yet built): set by the legacy import on a non-terminal OR retryable FAILED attempt whose
+                                     --   pre-send witness may have been lost; while set, the driver refuses prepare_pay; cleared ONLY by
+                                     --   the backend's own clearance (uxbd's boot wallet audit for phoenixd; lnrent-lnv2-migration-unverified-clearance-gjwy
+                                     --   for lnv2 — the l5kk proof bead clears nothing), never by a retry
   created_at INTEGER, updated_at INTEGER);
 
 CREATE TABLE outbox (                -- pending operator->buyer NIP-17 DMs (ADR-0009)
@@ -1348,18 +1384,57 @@ CREATE TABLE teardown_failure (      -- orphaned-instance dead-letter (GATE-1 PR
   first_failed_at INTEGER NOT NULL, last_attempt_at INTEGER NOT NULL,
   resolved_at INTEGER);              -- NULL = still open (provider-side cleanup owed)
 
+-- The two tables below are ADR-0023: DECIDED, NOT YET BUILT (the current daemon derives its view from alert history).
+CREATE TABLE condition (             -- open money conditions a human may have to act on (ADR-0023; CONTEXT: Condition)
+  reason TEXT NOT NULL,              -- closed registry: ADR-0023 §2 is normative, mirrored by ONE Rust table; not enumerated here
+  subject TEXT NOT NULL,             -- the resolvable unit: invoice.external_id, or the wallet id for wallet-scoped reasons
+  backend_ref TEXT,                  -- the backend's own id the DM quotes; informational
+  first_observed_at INTEGER NOT NULL, last_observed_at INTEGER NOT NULL,
+  observations INTEGER NOT NULL DEFAULT 1,
+  last_evidence TEXT NOT NULL,       -- what the latest sighting rests on (the CURRENT backend invoice id for receive-side reasons,
+                                     --   so a replacement under the same external_id is new evidence; the attempt key for inv1_overrun)
+  resolved_at INTEGER,               -- NULL = open; alerts and `lnrent money` derive from open rows, never from outbox history
+  resolved_by TEXT, resolution_note TEXT,   -- daemon | operator; a daemon-resolved row re-opens as a fresh episode on re-observation,
+                                     --   an operator-cleared one only on NEW evidence (ADR-0023 §3)
+  provider_terminal_at INTEGER,      -- phoenixd_forgot_invoice only: the poll keeps observing the invoice, past any grace window and past
+                                     --   any resolution or clearance, until it stamps this (ADR-0023 §3)
+  closed_out_at INTEGER, closed_out_outcome TEXT,  -- the close-out marker, written only by `lnrentd condition closeout`
+                                     --   (served|refunded|unpaid); on the condition row, never the invoice (ADR-0023 §6)
+  last_detail TEXT,                  -- no alert timing here: that is `alert_group`'s
+  PRIMARY KEY (reason, subject));
+CREATE INDEX condition_open_idx ON condition(resolved_at);
+
+CREATE TABLE alert_group (           -- alert TIMING for ledger-backed alerts, one row per thing that gets a DM (ADR-0023 §5)
+  reason TEXT NOT NULL,
+  group_key TEXT NOT NULL,           -- the backend KIND for a per-reason grouped reason; the subject for a per-row one
+  generation INTEGER NOT NULL DEFAULT 1,  -- +1 each time the group goes from zero open condition rows to one
+  last_alerted_at INTEGER,           -- last DM ENQUEUED; the persisted cooldown (ALERT_COOLDOWN_S), stamped in the SAME txn as the outbox insert
+  PRIMARY KEY (reason, group_key));  -- outbox id = (reason, group_key, generation, stamp time)
+
 CREATE TABLE sweep_attempt (         -- durable operator-sweep ledger (docs/specs/gate1-operator-sweep.md)
   id TEXT PRIMARY KEY,               -- `sweep:<payment_hash>` (== the outbound pay key)
   bolt11 TEXT, amount_sat INTEGER,
   max_outlay_msat INTEGER NOT NULL,  -- the QUOTED outlay cap, subtracted from ledger surplus while PENDING/SENT
   status TEXT NOT NULL,              -- PENDING|SENT|FAILED
   attempts INTEGER NOT NULL DEFAULT 0, backend_payment_id TEXT, last_error TEXT,
+  migration_unverified_at INTEGER,   -- same ADR-0022 fence as refund_attempt
   created_at INTEGER, sent_at INTEGER);
 ```
 
 `daemon/src/store.rs` is the authoritative DDL (it also carries the migration history —
 `seen_message` and `suspend_not_before` arrive as migrations, not in the v1 baseline); this
 listing is the readable mirror.
+
+**Backend tables live here too (ADR-0022).** Each payment backend's receive map
+(`phoenixd_invoice`, `lnv2_invoice`: `external_id` -> the backend's invoice, hash, amounts,
+status) and pay map (`phoenixd_pay`, `lnv2_pay`: refund/sweep key -> the backend's payment
+identity and status) are tables in this same database, declared by the backend module and
+applied by the store. They commit in the same transaction as the `invoice` /
+`refund_attempt` / `sweep_attempt` row they correlate (§6.6), so the books cannot disagree
+with their own correlation. What stays outside is the wallet's own state: phoenixd's database
+on the phoenixd host, and the fedimint client's RocksDB (ADR-0015). *(Status: decided, not yet
+built — both maps are still side files `phoenixd_index.db` / `lnv2_index.db` at the time of
+writing.)*
 
 ## 12. Deployment
 
