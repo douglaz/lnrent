@@ -102,20 +102,22 @@
 //! selects by gateway API `SafeUrl`), so this backend does not consult it. Doctor/preflight performs
 //! the functional gateway check without making daemon startup depend on a remote diagnostic call.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::backends::{
-    Invoice, Lnv2Probe, PayStatus, PaymentBackend, PaymentStatus, RefundQuote, Settlement,
+    Invoice, Issued, Lnv2Probe, PayStatus, PaymentBackend, PaymentStatus, Prepared, RefundQuote,
+    Settlement,
 };
 use crate::clock::Clock;
+use crate::store::Store;
 
 /// HKDF salt wrapping lnrent's deterministic 32-byte Fedimint root secret (`identity.rs`, already
 /// domain-separated `lnrent:fedimint:v1`) into a fedimint `DerivableSecret`. Intentionally IDENTICAL
@@ -124,10 +126,11 @@ use crate::clock::Clock;
 /// semantics unchanged) whether reached through the lnv1 or lnv2 client.
 const ROOT_SECRET_SALT: &[u8] = b"lnrent:fedimint:client:v1";
 
-/// The lnv2-owned sqlite index (per federation data-dir): the status-aware `external_id -> invoice`
-/// receive map + the `idempotency_key -> operation` pay map. Distinct filename from lnv1's
-/// `lnrent_index.db` so a stale lnv1 index can never be mistaken for the lnv2 one.
-const INDEX_DB_FILE: &str = "lnv2_index.db";
+/// The PRE-ADR-0022 side file under `data_dir/fedimint/<federation_id>/` that held the two
+/// correlation maps. No longer opened by this backend: the boot-time legacy import
+/// (`legacy_import.rs`) folds it into `lnrent.sqlite` once and renames it `*.imported`. Distinct
+/// filename from lnv1's `lnrent_index.db` so a stale lnv1 index can never be mistaken for it.
+pub const LEGACY_INDEX_FILE: &str = "lnv2_index.db";
 const CLIENT_DB_DIR: &str = "client.db";
 
 /// Bound the terminal-send await so a wedged federation surfaces as an ambiguous (recoverable) refund
@@ -176,7 +179,11 @@ const RECEIVE_RESUBSCRIBE_BACKOFF: Duration = if cfg!(test) {
     Duration::from_secs(5)
 };
 
-const INDEX_SCHEMA: &str = "\
+/// This backend's correlation tables, applied by `store::open` to `lnrent.sqlite` on every open
+/// (ADR-0022 "Schema, static, all of it"). The receive map is status-aware (`OPEN | CANCELED | PAID |
+/// PAID_UNRECOVERED`); the pay map keys the deterministic attempt-0 operation. `CREATE ... IF NOT
+/// EXISTS` throughout; a later change to either is a migration in `store::MIGRATIONS`.
+pub const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS lnv2_invoice (
     external_id   TEXT PRIMARY KEY,
     operation_id  TEXT NOT NULL,
@@ -487,26 +494,40 @@ impl PayCap {
 // The backend
 // ---------------------------------------------------------------------------------------------------
 
-/// The lnv2 payment backend: the fedimint operations seam, the lnv2-owned idempotency index, the
-/// registered settlement sender, and a clock for observed-settlement timestamps.
+/// The lnv2 payment backend: the fedimint operations seam, the shared state-DB handle its
+/// correlation tables live in (ADR-0022), the registered settlement sender, and a clock for
+/// observed-settlement timestamps.
 pub struct Lnv2Payment {
     ops: Arc<dyn Lnv2Ops>,
-    index: Arc<Mutex<Connection>>,
-    settle_tx: Mutex<Option<mpsc::Sender<Settlement>>>,
+    /// The ONE store every other reader and writer uses (ADR-0001 sole writer). Reads and this
+    /// backend's own status transitions go through it; row CREATION rides the caller's transaction.
+    store: Store,
+    /// `Arc` so the post-commit hook `issue_invoice` hands the store can read whichever sender is
+    /// registered WHEN IT RUNS (after the caller's commit), not when the invoice was minted.
+    settle_tx: Arc<Mutex<Option<mpsc::Sender<Settlement>>>>,
     clock: Arc<dyn Clock>,
-    /// Serializes `create_invoice`'s check->mint->insert so two concurrent same-`external_id` callers
-    /// cannot both mint a gateway invoice (the loser would be stranded — absent from the index).
-    create_lock: tokio::sync::Mutex<()>,
-    /// Serializes the pay check->send->record critical section so two concurrent same-key callers
-    /// cannot both fund a contract before either recorded the operation. A wedged federation cannot hold
-    /// this lock indefinitely: the two federation round-trips it spans — `list_gateways()` (inside
-    /// `reachable_gateway_preferring`) and `send()` — are guardian jsonrpc calls over fedimint's ws
-    /// client, which is built with jsonrpsee's default per-request timeout (~60s; the builder in
-    /// fedimint-connectors ws.rs does not override it), so a silent-but-connected guardian surfaces as a
-    /// per-peer error rather than an unbounded await. The gateway routing-info probe (a direct gateway
-    /// HTTP call, not a guardian one) and the terminal await carry their own explicit bounds
-    /// (`GATEWAY_PROBE_TIMEOUT`, `PAY_AWAIT_TIMEOUT`).
-    pay_start_lock: tokio::sync::Mutex<()>,
+    /// Where the pre-ADR-0022 side file lived for this federation (`data_dir/fedimint/<id>/`), for
+    /// the boot-time legacy import. `None` for a test backend with no federation directory.
+    federation_dir: Option<PathBuf>,
+    /// Serializes `issue_invoice`'s check->mint->persist so two concurrent same-`external_id` callers
+    /// cannot both mint a gateway invoice (the loser would be stranded — absent from the map). `Arc` so
+    /// the OWNED guard leaves as `Issued::lease`: the store actor holds it through the caller's COMMIT
+    /// (ADR-0022), so the second caller's check runs against the committed row.
+    create_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes the pay critical section. Taken TWICE in sequence per payment (ADR-0022): once by
+    /// `prepare_pay`, across the local same-operation check and the PREPARED row creation, held as
+    /// `Prepared::lease` until the driver's authorising transaction commits; once by `pay(key)`,
+    /// through the durable `PENDING` write in `start_send`, and RELEASED before the terminal await
+    /// (`await_send_final`) — the committed `PENDING` row is the single-sender claim, and holding the
+    /// mutex through a wait that can run to `PAY_AWAIT_TIMEOUT` would serialise every unrelated refund
+    /// and sweep behind it. A wedged federation cannot hold this lock indefinitely: the two federation
+    /// round-trips it spans — `list_gateways()` (inside `reachable_gateway_preferring`) and `send()` —
+    /// are guardian jsonrpc calls over fedimint's ws client, which is built with jsonrpsee's default
+    /// per-request timeout (~60s; the builder in fedimint-connectors ws.rs does not override it), so a
+    /// silent-but-connected guardian surfaces as a per-peer error rather than an unbounded await. The
+    /// gateway routing-info probe (a direct gateway HTTP call, not a guardian one) and the terminal
+    /// await carry their own explicit bounds (`GATEWAY_PROBE_TIMEOUT`, `PAY_AWAIT_TIMEOUT`).
+    pay_start_lock: Arc<tokio::sync::Mutex<()>>,
     /// Throttles best-effort terminal-row GC on the public invoice-create path.
     last_index_gc_at: Mutex<i64>,
 }
@@ -557,44 +578,59 @@ impl Lnv2Payment {
     }
 
     /// Join (first run) or open (subsequent runs) the lnv2-enabled federation named by `invite_code`,
-    /// building a fedimint client with the lnv2 lightning module (+ mint + wallet), and opening the
-    /// lnv2-owned sqlite index alongside its rocksdb under `data_dir/fedimint/<federation_id>/`.
+    /// building a fedimint client with the lnv2 lightning module (+ mint + wallet) under
+    /// `data_dir/fedimint/<federation_id>/`. `store` is the daemon's already-open state DB, whose
+    /// `lnv2_*` tables the store applied on open (ADR-0022) — this backend opens no sqlite of its own.
     /// `root_secret` is lnrent's deterministic 32-byte seed (`identity.rs`), wrapped as a fedimint
     /// `DerivableSecret` under `StandardDoubleDerive`. There is NO oplog recovery pass (module header).
     pub async fn join_or_open(
         invite_code: &str,
         data_dir: &Path,
         root_secret: &[u8; 32],
+        store: Store,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
-        let (ops, index) = real::build(invite_code, data_dir, root_secret).await?;
-        Ok(Self::with_ops(Arc::new(ops), index, clock))
+        let (ops, federation_dir) = real::build(invite_code, data_dir, root_secret).await?;
+        let mut backend = Self::with_ops(Arc::new(ops), store, clock);
+        backend.federation_dir = Some(federation_dir);
+        Ok(backend)
     }
 
-    /// Assemble a backend around an already-built ops seam + index connection (shared by the real
+    /// Assemble a backend around an already-built ops seam + store handle (shared by the real
     /// constructor and the tests).
-    fn with_ops(ops: Arc<dyn Lnv2Ops>, index: Connection, clock: Arc<dyn Clock>) -> Self {
+    fn with_ops(ops: Arc<dyn Lnv2Ops>, store: Store, clock: Arc<dyn Clock>) -> Self {
         Self {
             ops,
-            index: Arc::new(Mutex::new(index)),
-            settle_tx: Mutex::new(None),
+            store,
+            settle_tx: Arc::new(Mutex::new(None)),
             clock,
-            create_lock: tokio::sync::Mutex::new(()),
-            pay_start_lock: tokio::sync::Mutex::new(()),
+            federation_dir: None,
+            create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pay_start_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_index_gc_at: Mutex::new(0),
         }
     }
 
-    /// Schedule bounded, best-effort terminal index cleanup after a successful invoice create. The
+    /// The pre-ADR-0022 side file for this federation, if the backend knows its directory.
+    pub fn legacy_index_path(&self) -> Option<PathBuf> {
+        self.federation_dir
+            .as_ref()
+            .map(|dir| dir.join(LEGACY_INDEX_FILE))
+    }
+
+    /// Schedule bounded, best-effort terminal-row cleanup after a successful invoice issue. The
     /// already-minted invoice result never depends on maintenance succeeding.
     fn gc_index_if_due(&self) {
         let now = self.clock.now();
         if !index_gc_due_and_stamp(&self.last_index_gc_at, now, INDEX_GC_INTERVAL_SECS) {
             return;
         }
-        let index = self.index.clone();
-        drop(tokio::task::spawn_blocking(move || {
-            match gc_lnv2_invoice_index(&index, now, INVOICE_INDEX_RETENTION_SECS) {
+        let store = self.store.clone();
+        drop(tokio::spawn(async move {
+            match store
+                .transaction(move |tx| gc_lnv2_invoice_index(tx, now, INVOICE_INDEX_RETENTION_SECS))
+                .await
+            {
                 Ok(0) => {}
                 Ok(reaped) => tracing::info!(
                     reaped,
@@ -605,7 +641,10 @@ impl Lnv2Payment {
                     "lnv2: best-effort invoice index GC failed; ignoring"
                 ),
             }
-            match gc_lnv2_pay_index(&index, now, PAY_INDEX_RETENTION_SECS) {
+            match store
+                .transaction(move |tx| gc_lnv2_pay_index(tx, now, PAY_INDEX_RETENTION_SECS))
+                .await
+            {
                 Ok(0) => {}
                 Ok(reaped) => {
                     tracing::info!(reaped, "lnv2: reaped failed pay index rows past retention")
@@ -616,6 +655,33 @@ impl Lnv2Payment {
                 ),
             }
         }));
+    }
+
+    /// The `lnv2_pay` row for `key`, read through the store.
+    async fn pay_row(&self, key: &str) -> Result<Option<PayRow>> {
+        let key = key.to_string();
+        self.store.read(move |c| pay_get(c, &key)).await
+    }
+
+    /// Bind `op` to the EXISTING row for `key` with `status` (a status transition through the store).
+    async fn set_op(&self, key: &str, op: &str, status: &str) -> Result<()> {
+        let (key, op, status) = (key.to_string(), op.to_string(), status.to_string());
+        self.store
+            .transaction(move |tx| pay_set_op(tx, &key, &op, &status))
+            .await
+    }
+
+    /// Terminal mark on the row for `key`, CAS on `op`, through the store.
+    async fn mark(&self, key: &str, op: &str, status: &str) -> Result<()> {
+        let (key, op, status, now) = (
+            key.to_string(),
+            op.to_string(),
+            status.to_string(),
+            self.clock.now(),
+        );
+        self.store
+            .transaction(move |tx| pay_mark(tx, &key, &op, &status, now))
+            .await
     }
 
     /// Select a reachable gateway + its fee schedule, preferring `preferred` (an advisory quote-time
@@ -701,7 +767,7 @@ impl Lnv2Payment {
         // Phase 1 (locked): pick the operation to await — re-await an existing op, or fund a new send.
         let op = {
             let _guard = self.pay_start_lock.lock().await;
-            match pay_get(&self.index, idempotency_key)? {
+            match self.pay_row(idempotency_key).await? {
                 Some(row) if row.status == "SUCCEEDED" => {
                     // Idempotent: never re-pay. The stored op is the backend payment id.
                     return Ok(row.operation_id);
@@ -731,18 +797,20 @@ impl Lnv2Payment {
                                 idempotency_key,
                                 cap,
                                 gateway_hint,
-                                Some(&row.operation_id),
+                                &row.operation_id,
                             )
                             .await?
                         }
                         SendOpLookup::Present(op_key)
                             if op_key.as_deref() == Some(idempotency_key) =>
                         {
-                            pay_set_op(&self.index, idempotency_key, &row.operation_id, "PENDING")?;
+                            self.set_op(idempotency_key, &row.operation_id, "PENDING")
+                                .await?;
                             row.operation_id
                         }
                         SendOpLookup::Present(op_key) => {
-                            self.fail_dedup_key(idempotency_key, bolt11, &row.operation_id, op_key)?
+                            self.fail_dedup_key(idempotency_key, bolt11, &row.operation_id, op_key)
+                                .await?
                         }
                     }
                 }
@@ -750,36 +818,29 @@ impl Lnv2Payment {
                     "lnv2 refund key {idempotency_key} has invalid persisted status {:?}",
                     row.status
                 ),
-                None => {
-                    self.start_send(bolt11, amount_sat, idempotency_key, cap, gateway_hint, None)
-                        .await?
-                }
+                // NO ROW. Under ADR-0022 `pay(key)` READS the PREPARED row the driver committed via
+                // `prepare_pay` in its authorising transaction and never creates one, so a missing
+                // row is a caller that skipped `prepare_pay` — a bug, refused without touching the
+                // federation. The key stays `Unknown`, which the drivers re-await, never terminalize.
+                None => bail!(
+                    "lnv2 pay key {idempotency_key} has no PREPARED row; the driver must run \
+                     prepare_pay inside its authorising transaction before pay (ADR-0022) — \
+                     refusing to send"
+                ),
             }
         };
 
         // Phase 2 (unlocked): await the truthful terminal and settle the row.
         match self.ops.await_send_final(&op).await {
             Ok(SendFinal::Success) => {
-                pay_mark(
-                    &self.index,
-                    idempotency_key,
-                    &op,
-                    "SUCCEEDED",
-                    self.clock.now(),
-                )?;
+                self.mark(idempotency_key, &op, "SUCCEEDED").await?;
                 Ok(op)
             }
             Ok(SendFinal::Refunded) | Ok(SendFinal::Failure) => {
                 // Truthful definitive failure: the destination was NOT paid. Park FAILED (so a fresh
                 // generation re-resolves) and return Err — the Refunder reads `payment_status_by_key`
                 // -> Failed and treats it as definite.
-                pay_mark(
-                    &self.index,
-                    idempotency_key,
-                    &op,
-                    "FAILED",
-                    self.clock.now(),
-                )?;
+                self.mark(idempotency_key, &op, "FAILED").await?;
                 bail!("lnv2 send {op} for key {idempotency_key} reached a definitive failure (not paid)")
             }
             Err(e) => {
@@ -793,10 +854,12 @@ impl Lnv2Payment {
     }
 
     /// Fund (or adopt an existing) send for `idempotency_key`, returning the operation id to await.
-    /// `prepared_op` is `Some` only when PREPARED recovery previously proved that op absent. We still
-    /// recheck immediately before funding: upstream advances a terminally-failed invoice to attempt 1,
-    /// so calling `send()` while attempt 0 already belongs to another key would bypass [8A] entirely.
-    /// Holds no lock itself — the caller serializes via `pay_start_lock`.
+    /// Reached ONLY from the PREPARED arm of `pay_inner`, whose recovery proved the stored op absent
+    /// from the operation log; `prepared_op` is that stored op. We still recheck immediately before
+    /// funding: upstream advances a terminally-failed invoice to attempt 1, so calling `send()` while
+    /// attempt 0 already belongs to another key would bypass [8A] entirely. Holds no lock itself — the
+    /// caller serializes via `pay_start_lock`. Never CREATES the pay row (ADR-0022): every write here
+    /// is a status transition on the PREPARED row `prepare_pay` committed.
     async fn start_send(
         &self,
         bolt11: &str,
@@ -804,15 +867,13 @@ impl Lnv2Payment {
         idempotency_key: &str,
         cap: PayCap,
         gateway_hint: Option<&str>,
-        prepared_op: Option<&str>,
+        prepared_op: &str,
     ) -> Result<String> {
         let op = self.ops.send_operation_id(bolt11)?;
-        if let Some(prepared_op) = prepared_op {
-            if prepared_op != op {
-                bail!(
-                    "lnv2 prepared operation mismatch for key {idempotency_key}: stored {prepared_op}, derived {op}"
-                );
-            }
+        if prepared_op != op {
+            bail!(
+                "lnv2 prepared operation mismatch for key {idempotency_key}: stored {prepared_op}, derived {op}"
+            );
         }
 
         // [8A] must run BEFORE send, not only on its dedup errors. `get_next_operation_id` advances a
@@ -821,15 +882,14 @@ impl Lnv2Payment {
         match self.ops.send_op_lnrent_key(&op).await? {
             SendOpLookup::Present(op_key) if op_key.as_deref() == Some(idempotency_key) => {
                 // Backend committed but the local mapping did not (fresh crash recovery), or a PREPARED
-                // recovery raced the durable op becoming visible. Persist/adopt it and await directly.
-                if prepared_op.is_none() {
-                    pay_insert_prepared(&self.index, idempotency_key, bolt11, &op)?;
-                }
-                pay_set_op(&self.index, idempotency_key, &op, "PENDING")?;
+                // recovery raced the durable op becoming visible. Adopt it and await directly.
+                self.set_op(idempotency_key, &op, "PENDING").await?;
                 return Ok(op);
             }
             SendOpLookup::Present(op_key) => {
-                return self.fail_dedup_key(idempotency_key, bolt11, &op, op_key);
+                return self
+                    .fail_dedup_key(idempotency_key, bolt11, &op, op_key)
+                    .await;
             }
             SendOpLookup::Missing => {}
         }
@@ -847,16 +907,7 @@ impl Lnv2Payment {
             // Checked msat conversion (spec §3.1 overflow discipline): an owed amount whose msat form
             // overflows u64 can never equal a real invoice amount, so it also lands here as a mismatch.
             if amount_sat.checked_mul(1000) != Some(inv_msat) {
-                if prepared_op.is_none() {
-                    pay_insert_prepared(&self.index, idempotency_key, bolt11, &op)?;
-                }
-                pay_mark(
-                    &self.index,
-                    idempotency_key,
-                    &op,
-                    "FAILED",
-                    self.clock.now(),
-                )?;
+                self.mark(idempotency_key, &op, "FAILED").await?;
                 bail!(
                     "lnv2 refund pay refused for key {idempotency_key}: invoice amount {inv_msat} msat \
                      != owed {amount_sat} sat ({} msat)",
@@ -876,18 +927,9 @@ impl Lnv2Payment {
                     // absent: no send exists to race, so recording a definitive no-operation `Failed` is
                     // [7A]-safe. This is load-bearing liveness: the Refunder advances to a fresh invoice
                     // generation and re-quotes; leaving Unknown/PREPARED would re-drive this same now-
-                    // over-cap invoice forever. Persist the key->invoice/op mapping even though no backend
-                    // call starts, preserving the durable idempotency contract on both paths.
-                    if prepared_op.is_none() {
-                        pay_insert_prepared(&self.index, idempotency_key, bolt11, &op)?;
-                    }
-                    pay_mark(
-                        &self.index,
-                        idempotency_key,
-                        &op,
-                        "FAILED",
-                        self.clock.now(),
-                    )?;
+                    // over-cap invoice forever. The key->invoice/op mapping is already durable (the
+                    // driver's PREPARED row); mark it terminal even though no backend call starts.
+                    self.mark(idempotency_key, &op, "FAILED").await?;
                     bail!(
                         "lnv2 refund pay refused: payout {amount_sat} sat via gateway {gw} has total \
                          ecash outlay {outlay_msat} msat (gateway + Fedimint consensus fees), exceeding \
@@ -900,11 +942,9 @@ impl Lnv2Payment {
             None => None,
         };
 
-        if prepared_op.is_none() {
-            // Commit the deterministic op BEFORE send() so both crash windows are recoverable.
-            pay_insert_prepared(&self.index, idempotency_key, bolt11, &op)?;
-        }
-
+        // The deterministic op is ALREADY durable as the driver's PREPARED row (ADR-0022: it committed
+        // with the ledger transition that authorised this send), so both crash windows are recoverable
+        // without a write here.
         match self
             .ops
             .send(
@@ -915,7 +955,7 @@ impl Lnv2Payment {
             .await
         {
             SendAttempt::Started(op) => {
-                pay_set_op(&self.index, idempotency_key, &op, "PENDING")?;
+                self.set_op(idempotency_key, &op, "PENDING").await?;
                 Ok(op)
             }
             SendAttempt::InProgress(op) => {
@@ -933,19 +973,15 @@ impl Lnv2Payment {
                 // The exact PREPARED op was absent before this call and the client rejected the invoice
                 // before funding. It cannot race a live attempt, so FAILED is truthful and lets the
                 // Refunder re-resolve a fresh invoice. This is the [7A]-safe terminal preflight case.
-                pay_mark(
-                    &self.index,
-                    idempotency_key,
-                    &op,
-                    "FAILED",
-                    self.clock.now(),
-                )?;
+                self.mark(idempotency_key, &op, "FAILED").await?;
                 bail!("lnv2 send for key {idempotency_key} rejected before funding: {e}")
             }
             SendAttempt::Retryable(e) => {
-                // The client proved it failed before funding (gateway/routing/guardian preflight). Remove
-                // PREPARED so the retry is NEW and must re-run INV-1; never park FAILED ([7A]).
-                pay_delete_prepared(&self.index, idempotency_key, &op)?;
+                // The client proved it failed before funding (gateway/routing/guardian preflight). The
+                // PREPARED row STAYS (ADR-0022: `pay` never creates rows, so deleting it would leave
+                // the next retry with nothing to read); its op is provably absent from the operation
+                // log, so the next `pay(key)` takes the PREPARED-recovery arm, re-proves absence, and
+                // re-runs INV-1 before funding — a genuinely NEW attempt. Never park FAILED ([7A]).
                 bail!("lnv2 send for key {idempotency_key} errored: {e}")
             }
         }
@@ -969,13 +1005,13 @@ impl Lnv2Payment {
         if op_key.as_deref() != Some(idempotency_key) {
             return self
                 .fail_dedup_key(idempotency_key, bolt11, op, op_key)
+                .await
                 .map(|_| ());
         }
-        pay_set_op(&self.index, idempotency_key, op, record_status)?;
-        Ok(())
+        self.set_op(idempotency_key, op, record_status).await
     }
 
-    fn fail_dedup_key(
+    async fn fail_dedup_key(
         &self,
         idempotency_key: &str,
         bolt11: &str,
@@ -996,7 +1032,13 @@ impl Lnv2Payment {
         // PENDING indefinitely. FAILED unlocks a fresh-invoice re-resolution at the next generation and
         // is [7A]-safe: the collision proves OUR key funded no operation, so there is no live attempt to
         // race. The sentinel op keeps us from ever binding to (or reporting) the foreign operation.
-        pay_park_collision_failed(&self.index, idempotency_key, bolt11, self.clock.now())?;
+        {
+            let (key, now) = (idempotency_key.to_string(), self.clock.now());
+            let _ = bolt11; // the row already carries the destination; only its status moves
+            self.store
+                .transaction(move |tx| pay_park_collision_failed(tx, &key, now))
+                .await?;
+        }
         bail!(
             "lnv2 [8A] guard: send() deduped key {idempotency_key} onto op {op} whose lnrent_key is \
              {op_key:?} (not ours) — failing closed to avoid a silent under-refund"
@@ -1008,18 +1050,53 @@ impl Lnv2Payment {
 impl PaymentBackend for Lnv2Payment {
     async fn create_invoice(
         &self,
+        _amount_sat: u64,
+        _memo: &str,
+        _expiry_s: u32,
+        external_id: &str,
+    ) -> Result<Invoice> {
+        // REFUSED on purpose (ADR-0022): committing the receive-map row on its own is exactly the
+        // split this backend no longer has. Production issues through `issue_invoice` and commits the
+        // returned `persist` beside the `invoice` row.
+        bail!(
+            "Lnv2Payment::create_invoice is not a valid entry point (external_id {external_id}): \
+             callers must use issue_invoice and commit its persist closure in their own transaction \
+             (ADR-0022)"
+        )
+    }
+
+    async fn issue_invoice(
+        &self,
         amount_sat: u64,
         memo: &str,
         expiry_s: u32,
         external_id: &str,
-    ) -> Result<Invoice> {
-        // Serialize check->mint->insert so two concurrent same-external_id callers can't both mint.
-        let create_guard = self.create_lock.lock().await;
+    ) -> Result<Issued> {
+        // Serialize check->mint->persist so two concurrent same-external_id callers can't both mint.
+        // The OWNED guard leaves as `Issued::lease`: the store actor holds it through the caller's
+        // commit, so the second caller's check runs against the COMMITTED row, never a still-invisible
+        // one — a guard released here (or captured by `persist`, which returns before the commit)
+        // would let it mint a second tweak.
+        let create_guard = self.create_lock.clone().lock_owned().await;
         // Reuse OPEN and paid rows. A CANCELED receive contract is unpayable, so mint a replacement;
         // `idx_insert` swaps it atomically without overwriting any other state.
-        match idx_get_by_external(&self.index, external_id)? {
-            Some((inv, status)) if status != "CANCELED" => return Ok(inv),
-            Some(_) | None => {}
+        let existing = {
+            let ext = external_id.to_string();
+            self.store
+                .read(move |c| idx_get_by_external(c, &ext))
+                .await?
+        };
+        if let Some((inv, status)) = existing {
+            if status != "CANCELED" {
+                // Nothing to write (the row is committed) and nothing to start (an OPEN row is
+                // already watched: by the create that minted it, or by `watch()`'s boot enumeration).
+                return Ok(Issued::new(
+                    inv,
+                    |_| Ok(()),
+                    Box::new(create_guard),
+                    None::<fn()>,
+                ));
+            }
         }
 
         let minted = self
@@ -1043,31 +1120,88 @@ impl PaymentBackend for Lnv2Payment {
             // Absolute expiry from our clock at creation (matches the field's contract + MockPayment).
             expires_at: self.clock.now() + i64::from(expiry_s),
         };
-        // The durable receive anchor: persist BEFORE returning, so the buyer never sees a bolt11 whose
-        // row is not durable (module header: this is why no oplog scan is needed).
-        idx_insert(&self.index, &inv, &minted.op)?;
-
-        // If a watcher is registered, drive this fresh (live) invoice's settlement now; otherwise the
-        // next watch() re-subscribes it from the index (status OPEN).
-        if let Some(tx) = self.settle_tx.lock().unwrap().clone() {
-            spawn_receive_task(
-                self.ops.clone(),
-                self.index.clone(),
-                tx,
-                self.clock.clone(),
-                OpenRow {
-                    external_id: inv.external_id.clone(),
-                    operation_id: minted.op,
-                    invoice_id: inv.id.clone(),
-                    amount_sat,
-                },
-                true, // live: a freshly-created invoice pushes Settlement on Claimed
-            );
-        }
-        // The GC is best-effort background work and must never run under the create serialization lock.
-        drop(create_guard);
+        // The durable receive anchor is the CALLER's commit of `persist` beside the `invoice` row
+        // (ADR-0022, SPEC §6.6): the buyer never sees a bolt11 whose row is not durable with its
+        // order, and a crash before that commit leaves an orphan nobody holds the bolt11 of (module
+        // header: this is why no oplog scan is needed).
+        let row = inv.clone();
+        let op = minted.op.clone();
+        let persist = move |tx: &Transaction| idx_insert(tx, &row, &op);
+        // The live receive watcher starts from the store ACTOR after the commit — never before it (a
+        // `Claimed` observed against an uncommitted row would CAS against nothing and be lost), never
+        // by the caller (who may be cancelled between enqueue and reply), and only if `persist` ran
+        // (`Issued::new` gates it). A crash between commit and hook is covered by `watch()`'s boot
+        // enumeration of OPEN rows.
+        let hook = {
+            let ops = self.ops.clone();
+            let store = self.store.clone();
+            let clock = self.clock.clone();
+            let settle_tx = self.settle_tx.clone();
+            let open = OpenRow {
+                external_id: inv.external_id.clone(),
+                operation_id: minted.op,
+                invoice_id: inv.id.clone(),
+                amount_sat,
+            };
+            move || {
+                // Read the sender WHEN THE HOOK RUNS: a watcher registered between mint and commit
+                // must observe this invoice too; with none registered the next `watch()` re-subscribes
+                // it from the map (status OPEN).
+                let tx = settle_tx.lock().unwrap().clone();
+                if let Some(tx) = tx {
+                    spawn_receive_task(ops, store, tx, clock, open, true);
+                }
+            }
+        };
+        // The GC is best-effort background work on its own task; the create lease is released by the
+        // actor after the commit, so it never runs under it.
         self.gc_index_if_due();
-        Ok(inv)
+        Ok(Issued::new(inv, persist, Box::new(create_guard), Some(hook)))
+    }
+
+    async fn prepare_pay(&self, idempotency_key: &str, bolt11: &str) -> Result<Prepared> {
+        // The pay guard, OWNED, so it rides `Prepared::lease` through the driver's commit: a second key
+        // targeting the same bolt11 (hence the same deterministic attempt-0 operation) cannot pass ITS
+        // check until this PREPARED row is visible — two PREPARED rows for one operation are
+        // impossible by construction (ADR-0022).
+        let guard = self.pay_start_lock.clone().lock_owned().await;
+        if self.pay_row(idempotency_key).await?.is_some() {
+            // Any existing row — PREPARED / PENDING / SUCCEEDED, or a FAILED that is terminal for this
+            // invoice (NO-RETRY: the Refunder re-resolves at the next generation under a NEW key) —
+            // is `pay(key)`'s to resolve. Nothing to write, nothing to hold.
+            drop(guard);
+            return Ok(Prepared::none());
+        }
+        let op = self.ops.send_operation_id(bolt11)?;
+        let (key, b11) = (idempotency_key.to_string(), bolt11.to_string());
+        // Local [8A] under the lease: another live key already claims this exact operation. Recorded
+        // as OUR key's terminal refusal under the sentinel op — never as a bare `Err`, never as a
+        // PREPARED row naming an operation recovery could adopt — so the driver's `pay` -> `Failed`
+        // -> re-resolve path advances it. The federation-side [8A] check in `start_send` still runs.
+        let collision = {
+            let (op_q, key_q) = (op.clone(), key.clone());
+            self.store
+                .read(move |c| pay_other_key_for_op(c, &op_q, &key_q))
+                .await?
+        };
+        if let Some(other_key) = collision {
+            tracing::error!(
+                key = idempotency_key,
+                other_key,
+                op,
+                "lnv2: refund destination bolt11 is already owned by a DIFFERENT idempotency key \
+                 ([8A] cross-order same-invoice collision) at prepare — recording the refusal"
+            );
+            let now = self.clock.now();
+            return Ok(Prepared {
+                persist: Box::new(move |tx| pay_insert_collision_failed(tx, &key, &b11, now)),
+                lease: Box::new(guard),
+            });
+        }
+        Ok(Prepared {
+            persist: Box::new(move |tx| pay_insert_prepared(tx, &key, &b11, &op)),
+            lease: Box::new(guard),
+        })
     }
 
     #[allow(clippy::disallowed_methods)] // the backend's own internal delegate, not a decider
@@ -1076,7 +1210,12 @@ impl PaymentBackend for Lnv2Payment {
     }
 
     async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
-        match idx_get_settlement(&self.index, id)? {
+        let invoice_id = id.to_string();
+        match self
+            .store
+            .read(move |c| idx_get_settlement(c, &invoice_id))
+            .await?
+        {
             Some((status, expires_at, settled_at)) => {
                 classify_indexed_settlement(id, &status, expires_at, settled_at, self.clock.now())
             }
@@ -1120,16 +1259,32 @@ impl PaymentBackend for Lnv2Payment {
         id: &str,
         external_id: &str,
     ) -> Result<(PaymentStatus, Option<i64>)> {
-        match idx_get_settlement_by_external(&self.index, external_id)? {
+        let ext = external_id.to_string();
+        match self
+            .store
+            .read(move |c| idx_get_settlement_by_external(c, &ext))
+            .await?
+        {
             Some((row_id, status, expires_at, settled_at)) if row_id == id => {
                 classify_indexed_settlement(id, &status, expires_at, settled_at, self.clock.now())
             }
             Some(_) => Ok((PaymentStatus::Expired, None)), // (b) retired id
-            None if id.starts_with(INVOICE_ID_PREFIX) => bail!(
-                "lnv2 invoice {id} (external_id {external_id}): index row missing — the receive \
-                 correlation is gone, so a settled payment would be indistinguishable from an \
-                 unpaid expiry; failing closed. Manual index/wallet recovery is required"
-            ),
+            None if id.starts_with(INVOICE_ID_PREFIX) => {
+                // (c) stays an ASSERTION (ADR-0022): the row commits with the `invoice` row it
+                // correlates and only the CANCELED reaper deletes one, so a missing row for an id the
+                // books still hold is a daemon bug, reported at `error`, never an operator condition.
+                tracing::error!(
+                    invoice = %id,
+                    external = %external_id,
+                    "lnv2_invoice row missing for an invoice the books hold — a correlation cannot \
+                     be lost under ADR-0022 (it commits with the invoice row); failing closed"
+                );
+                bail!(
+                    "lnv2 invoice {id} (external_id {external_id}): lnv2_invoice row missing — a \
+                     settled payment would be indistinguishable from an unpaid expiry; failing \
+                     closed (a daemon bug under ADR-0022)"
+                )
+            }
             None => {
                 tracing::warn!(
                     invoice = %id,
@@ -1243,18 +1398,26 @@ impl PaymentBackend for Lnv2Payment {
     }
 
     async fn payment_status(&self, payment_id: &str) -> Result<PayStatus> {
-        Ok(map_pay_status(pay_status_by_op(&self.index, payment_id)?))
+        let op = payment_id.to_string();
+        Ok(map_pay_status(
+            self.store.read(move |c| pay_status_by_op(c, &op)).await?,
+        ))
     }
 
     async fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus> {
-        Ok(map_pay_status(pay_status_by_key(
-            &self.index,
-            idempotency_key,
-        )?))
+        let key = idempotency_key.to_string();
+        Ok(map_pay_status(
+            self.store.read(move |c| pay_status_by_key(c, &key)).await?,
+        ))
     }
 
     async fn payment_started_by_key(&self, idempotency_key: &str) -> Result<bool> {
-        Ok(pay_status_by_key(&self.index, idempotency_key)?.is_some())
+        let key = idempotency_key.to_string();
+        Ok(self
+            .store
+            .read(move |c| pay_status_by_key(c, &key))
+            .await?
+            .is_some())
     }
 
     /// lnv2 answers this from the FEDERATION's oplog, not from `lnv2_pay` — which is the whole point
@@ -1296,7 +1459,8 @@ impl PaymentBackend for Lnv2Payment {
     }
 
     async fn received_amount_msat(&self, invoice_id: &str) -> Result<Option<u64>> {
-        idx_received_msat(&self.index, invoice_id)
+        let id = invoice_id.to_string();
+        self.store.read(move |c| idx_received_msat(c, &id)).await
     }
 
     async fn refund_gateway_ready(&self) -> Result<bool> {
@@ -1354,10 +1518,10 @@ impl PaymentBackend for Lnv2Payment {
         // never prove the settlement is live rather than replayed (see `await_receive_final`). A later
         // Claimed here stamps NULL and pushes nothing; settlement catch-up recovers it with a
         // conservative in-window timestamp (lnrent-zwk). Only freshly created invoices are live.
-        for row in idx_list_open(&self.index)? {
+        for row in self.store.read(idx_list_open).await? {
             spawn_receive_task(
                 self.ops.clone(),
-                self.index.clone(),
+                self.store.clone(),
                 tx.clone(),
                 self.clock.clone(),
                 row,
@@ -1385,7 +1549,7 @@ struct OpenRow {
 /// stream errors downgrades to recovery too, because settlement could have happened during the blind gap.
 fn spawn_receive_task(
     ops: Arc<dyn Lnv2Ops>,
-    index: Arc<Mutex<Connection>>,
+    store: Store,
     tx: mpsc::Sender<Settlement>,
     clock: Arc<dyn Clock>,
     row: OpenRow,
@@ -1424,11 +1588,15 @@ fn spawn_receive_task(
                                     // deterministic for its immutable transaction, so retrying forever would
                                     // leave a paid invoice OPEN until it appeared expired. Persist the existing
                                     // fail-closed liability state instead; never invent a spendable amount.
+                                    let op_w = op.clone();
                                     let persisted = persist_receive_terminal(
+                                        &store,
                                         &tx,
                                         &op,
                                         "marking exact-credit failure PAID_UNRECOVERED",
-                                        || idx_mark_paid_unrecovered(&index, &op),
+                                        Arc::new(move |c: &Transaction| {
+                                            idx_mark_paid_unrecovered(c, &op_w)
+                                        }),
                                     )
                                     .await;
                                     if persisted {
@@ -1444,9 +1612,16 @@ fn spawn_receive_task(
                                 }
                             };
                             let settled_at = if live { Some(clock.now()) } else { None };
-                            if !persist_receive_terminal(&tx, &op, "marking invoice PAID", || {
-                                idx_mark_paid(&index, &op, credited_msat, settled_at)
-                            })
+                            let op_w = op.clone();
+                            if !persist_receive_terminal(
+                                &store,
+                                &tx,
+                                &op,
+                                "marking invoice PAID",
+                                Arc::new(move |c: &Transaction| {
+                                    idx_mark_paid(c, &op_w, credited_msat, settled_at)
+                                }),
+                            )
                             .await
                             {
                                 return;
@@ -1467,9 +1642,14 @@ fn spawn_receive_task(
                         ReceiveFinal::Expired => {
                             // Take the row out of the OPEN re-subscribe set; a CAS guard keeps a late terminal
                             // from demoting an already-PAID row.
-                            persist_receive_terminal(&tx, &op, "marking invoice CANCELED", || {
-                                idx_mark_canceled(&index, &op)
-                            })
+                            let op_w = op.clone();
+                            persist_receive_terminal(
+                                &store,
+                                &tx,
+                                &op,
+                                "marking invoice CANCELED",
+                                Arc::new(move |c: &Transaction| idx_mark_canceled(c, &op_w)),
+                            )
                             .await;
                             return;
                         }
@@ -1478,11 +1658,13 @@ fn spawn_receive_task(
                             // Lightning payment is confirmed, then failure while awaiting the mint outputs. Keep
                             // a distinct durable liability, fail lookup closed, and alert loudly; pretending it
                             // was unpaid would let reconcile expire a buyer's confirmed payment silently.
+                            let op_w = op.clone();
                             if !persist_receive_terminal(
+                                &store,
                                 &tx,
                                 &op,
                                 "marking paid-but-unrecovered invoice",
-                                || idx_mark_paid_unrecovered(&index, &op),
+                                Arc::new(move |c: &Transaction| idx_mark_paid_unrecovered(c, &op_w)),
                             )
                             .await
                             {
@@ -1520,17 +1702,16 @@ fn spawn_receive_task(
 /// Retry one local receive-terminal transition until it is durable or the watcher is shutting down.
 /// A terminal observation is money evidence; logging a transient sqlite failure and abandoning its only
 /// task would leave a paid liability OPEN and later make it appear merely expired.
-async fn persist_receive_terminal<F>(
+async fn persist_receive_terminal(
+    store: &Store,
     tx: &mpsc::Sender<Settlement>,
     op: &str,
     action: &str,
-    mut persist: F,
-) -> bool
-where
-    F: FnMut() -> Result<()> + Send,
-{
+    persist: Arc<dyn Fn(&Transaction) -> Result<()> + Send + Sync>,
+) -> bool {
     loop {
-        match persist() {
+        let write = persist.clone();
+        match store.transaction(move |c| write(c)).await {
             Ok(()) => return true,
             Err(e) => {
                 tracing::error!(op, error = %e, action, "lnv2: receive terminal persistence failed; retrying")
@@ -1544,12 +1725,13 @@ where
 }
 
 // ---------------------------------------------------------------------------------------------------
-// sqlite index helpers (std::sync::Mutex; the lock never crosses an `.await`)
+// sqlite correlation-table helpers. Synchronous, over the connection the store actor hands a closure
+// (`&Connection` for reads, `&Transaction` — which derefs to it — for writes), so every one of them
+// runs on the sole-writer actor (ADR-0001) and inside whatever transaction the caller opened.
 // ---------------------------------------------------------------------------------------------------
 
 /// The stored row for `ext` and its status. Keep terminal/paid rows visible to callers.
-fn idx_get_by_external(index: &Mutex<Connection>, ext: &str) -> Result<Option<(Invoice, String)>> {
-    let conn = index.lock().unwrap();
+fn idx_get_by_external(conn: &Connection, ext: &str) -> Result<Option<(Invoice, String)>> {
     conn.query_row(
         "SELECT external_id, operation_id, invoice_id, bolt11, payment_hash, amount_sat, expires_at,
                 status
@@ -1574,8 +1756,10 @@ fn idx_get_by_external(index: &Mutex<Connection>, ext: &str) -> Result<Option<(I
     .context("reading lnv2_invoice by external_id")
 }
 
-fn idx_insert(index: &Mutex<Connection>, inv: &Invoice, op: &str) -> Result<()> {
-    let conn = index.lock().unwrap();
+/// Insert the receive-map row for a fresh mint, or replace a CANCELED predecessor in place. Runs in
+/// the CALLER's issuance transaction (`Issued::persist`, ADR-0022). `pub(crate)`: the legacy import's
+/// repair arm writes the same row shape.
+pub(crate) fn idx_insert(conn: &Connection, inv: &Invoice, op: &str) -> Result<()> {
     // OPEN rows have no trustworthy wallet credit yet: the contract face value excludes claim-time
     // consensus fees. Claimed atomically replaces this placeholder with the decoded wallet delta.
     //
@@ -1608,11 +1792,12 @@ fn idx_insert(index: &Mutex<Connection>, inv: &Invoice, op: &str) -> Result<()> 
         ],
     )
     .context("inserting lnv2_invoice")?;
-    // The caller only reaches here for an absent or CANCELED row (`create_lock` holds across
-    // check->mint->insert, and the mark helpers all CAS on `status='OPEN'`, so CANCELED is terminal
-    // until the GC deletes it). A miss would therefore mean the row moved under us — fail loudly
-    // rather than return a bolt11 whose row is not durable: an un-indexed op is never re-subscribed
-    // after a restart, so a payment to it would be received and never credited.
+    // The caller only reaches here for an absent or CANCELED row (the create lease holds across
+    // check->mint->COMMIT, and the mark helpers all CAS on `status='OPEN'`, so CANCELED is terminal
+    // until the GC deletes it). A miss would therefore mean the row moved under us — fail loudly,
+    // which rolls the caller's issuance transaction back, rather than commit an invoice whose row
+    // is not there: an un-indexed op is never re-subscribed after a restart, so a payment to it
+    // would be received and never credited.
     if rows == 0 {
         bail!(
             "lnv2_invoice row for external_id {} changed under create_invoice; not returning an \
@@ -1624,10 +1809,9 @@ fn idx_insert(index: &Mutex<Connection>, inv: &Invoice, op: &str) -> Result<()> 
 }
 
 fn idx_get_settlement(
-    index: &Mutex<Connection>,
+    conn: &Connection,
     invoice_id: &str,
 ) -> Result<Option<(String, i64, Option<i64>)>> {
-    let conn = index.lock().unwrap();
     conn.query_row(
         "SELECT status, expires_at, settled_at FROM lnv2_invoice WHERE invoice_id = ?1",
         params![invoice_id],
@@ -1645,10 +1829,9 @@ type IndexedSettlement = (String, String, i64, Option<i64>);
 /// invoice id, and carrying the `invoice_id` the index currently holds for it. That id is what
 /// separates a RETIRED id from a LOST index row in `lookup_settlement_by_ref`.
 fn idx_get_settlement_by_external(
-    index: &Mutex<Connection>,
+    conn: &Connection,
     external_id: &str,
 ) -> Result<Option<IndexedSettlement>> {
-    let conn = index.lock().unwrap();
     conn.query_row(
         "SELECT invoice_id, status, expires_at, settled_at FROM lnv2_invoice WHERE external_id = ?1",
         params![external_id],
@@ -1690,8 +1873,7 @@ fn classify_indexed_settlement(
     }
 }
 
-fn idx_received_msat(index: &Mutex<Connection>, invoice_id: &str) -> Result<Option<u64>> {
-    let conn = index.lock().unwrap();
+fn idx_received_msat(conn: &Connection, invoice_id: &str) -> Result<Option<u64>> {
     conn.query_row(
         "SELECT credited_msat FROM lnv2_invoice WHERE invoice_id = ?1",
         params![invoice_id],
@@ -1702,12 +1884,11 @@ fn idx_received_msat(index: &Mutex<Connection>, invoice_id: &str) -> Result<Opti
 }
 
 fn idx_mark_paid(
-    index: &Mutex<Connection>,
+    conn: &Connection,
     op: &str,
     credited_msat: u64,
     settled_at: Option<i64>,
 ) -> Result<()> {
-    let conn = index.lock().unwrap();
     // COALESCE so a NULL (recovery) never clobbers an existing live timestamp. CAS on OPEN, exactly like
     // idx_mark_canceled / idx_mark_paid_unrecovered: a late terminal must never demote a settled row —
     // in particular it must never flip a PAID_UNRECOVERED liability (Lightning-paid, mint-failed, lookup
@@ -1722,8 +1903,7 @@ fn idx_mark_paid(
     Ok(())
 }
 
-fn idx_mark_canceled(index: &Mutex<Connection>, op: &str) -> Result<()> {
-    let conn = index.lock().unwrap();
+fn idx_mark_canceled(conn: &Connection, op: &str) -> Result<()> {
     // CAS on OPEN so a late Expired/Failure cannot demote a PAID row.
     conn.execute(
         "UPDATE lnv2_invoice SET status='CANCELED' WHERE operation_id = ?1 AND status='OPEN'",
@@ -1733,8 +1913,7 @@ fn idx_mark_canceled(index: &Mutex<Connection>, op: &str) -> Result<()> {
     Ok(())
 }
 
-fn idx_mark_paid_unrecovered(index: &Mutex<Connection>, op: &str) -> Result<()> {
-    let conn = index.lock().unwrap();
+fn idx_mark_paid_unrecovered(conn: &Connection, op: &str) -> Result<()> {
     conn.execute(
         "UPDATE lnv2_invoice SET status='PAID_UNRECOVERED'
           WHERE operation_id = ?1 AND status='OPEN'",
@@ -1744,8 +1923,7 @@ fn idx_mark_paid_unrecovered(index: &Mutex<Connection>, op: &str) -> Result<()> 
     Ok(())
 }
 
-fn idx_list_open(index: &Mutex<Connection>) -> Result<Vec<OpenRow>> {
-    let conn = index.lock().unwrap();
+fn idx_list_open(conn: &Connection) -> Result<Vec<OpenRow>> {
     let mut stmt = conn.prepare(
         "SELECT external_id, operation_id, invoice_id, amount_sat
            FROM lnv2_invoice WHERE status='OPEN'",
@@ -1770,8 +1948,7 @@ struct PayRow {
     status: String,
 }
 
-fn pay_get(index: &Mutex<Connection>, key: &str) -> Result<Option<PayRow>> {
-    let conn = index.lock().unwrap();
+fn pay_get(conn: &Connection, key: &str) -> Result<Option<PayRow>> {
     conn.query_row(
         "SELECT operation_id, status FROM lnv2_pay WHERE idempotency_key = ?1",
         params![key],
@@ -1786,8 +1963,7 @@ fn pay_get(index: &Mutex<Connection>, key: &str) -> Result<Option<PayRow>> {
     .context("reading lnv2_pay by key")
 }
 
-fn pay_status_by_key(index: &Mutex<Connection>, key: &str) -> Result<Option<String>> {
-    let conn = index.lock().unwrap();
+fn pay_status_by_key(conn: &Connection, key: &str) -> Result<Option<String>> {
     conn.query_row(
         "SELECT status FROM lnv2_pay WHERE idempotency_key = ?1",
         params![key],
@@ -1797,8 +1973,7 @@ fn pay_status_by_key(index: &Mutex<Connection>, key: &str) -> Result<Option<Stri
     .context("reading lnv2_pay status by key")
 }
 
-fn pay_status_by_op(index: &Mutex<Connection>, op: &str) -> Result<Option<String>> {
-    let conn = index.lock().unwrap();
+fn pay_status_by_op(conn: &Connection, op: &str) -> Result<Option<String>> {
     conn.query_row(
         "SELECT status FROM lnv2_pay WHERE operation_id = ?1",
         params![op],
@@ -1808,9 +1983,9 @@ fn pay_status_by_op(index: &Mutex<Connection>, op: &str) -> Result<Option<String
     .context("reading lnv2_pay status by op")
 }
 
-/// Commit PREPARED with the deterministic attempt-0 op before `send()` — the crash-window witness.
-fn pay_insert_prepared(index: &Mutex<Connection>, key: &str, bolt11: &str, op: &str) -> Result<()> {
-    let conn = index.lock().unwrap();
+/// The PREPARED row with the deterministic attempt-0 op — the crash-window witness. CREATED only by
+/// `prepare_pay`'s closure inside the driver's authorising transaction (ADR-0022); `pay` never inserts.
+fn pay_insert_prepared(conn: &Connection, key: &str, bolt11: &str, op: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO lnv2_pay (idempotency_key, bolt11, operation_id, status)
          VALUES (?1, ?2, ?3, 'PREPARED')
@@ -1821,23 +1996,43 @@ fn pay_insert_prepared(index: &Mutex<Connection>, key: &str, bolt11: &str, op: &
     Ok(())
 }
 
-/// Remove a PREPARED row only after the client proved the send failed before funding. The CAS keeps a
-/// stale caller from deleting an op another path already confirmed.
-fn pay_delete_prepared(index: &Mutex<Connection>, key: &str, op: &str) -> Result<()> {
-    let conn = index.lock().unwrap();
-    conn.execute(
-        "DELETE FROM lnv2_pay
-          WHERE idempotency_key = ?1 AND operation_id = ?2 AND status = 'PREPARED'",
-        params![key, op],
+/// The FIRST other key whose live (non-`FAILED`) row already claims `op` — the local half of the [8A]
+/// cross-order same-invoice check `prepare_pay` runs under its lease. `FAILED` rows own no operation
+/// (the sentinel-op park never adopts the foreign one) and must not block a legitimate key.
+fn pay_other_key_for_op(conn: &Connection, op: &str, our_key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT idempotency_key FROM lnv2_pay
+          WHERE operation_id = ?1 AND idempotency_key <> ?2 AND status <> 'FAILED'
+          LIMIT 1",
+        params![op, our_key],
+        |r| r.get(0),
     )
-    .context("deleting retryable lnv2_pay PREPARED intent")?;
+    .optional()
+    .context("checking lnv2_pay for a cross-key operation collision")
+}
+
+/// Record OUR key's [8A] refusal at prepare time as a terminal FAILED row under the sentinel op, in the
+/// driver's authorising transaction. Never PREPARED (which would name an operation recovery could
+/// adopt), never the foreign op.
+fn pay_insert_collision_failed(
+    conn: &Connection,
+    key: &str,
+    bolt11: &str,
+    terminal_at: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO lnv2_pay (idempotency_key, bolt11, operation_id, status, terminal_at)
+         VALUES (?1, ?2, ?3, 'FAILED', ?4)
+         ON CONFLICT(idempotency_key) DO NOTHING",
+        params![key, bolt11, COLLISION_SENTINEL_OP, terminal_at],
+    )
+    .context("recording an lnv2 [8A] collision at prepare")?;
     Ok(())
 }
 
 /// Bind the operation to the PREPARED key, setting `status`. Every caller must already have committed
 /// that durable intent before `send()`; fabricating a partial row here would break the crash story.
-fn pay_set_op(index: &Mutex<Connection>, key: &str, op: &str, status: &str) -> Result<()> {
-    let conn = index.lock().unwrap();
+fn pay_set_op(conn: &Connection, key: &str, op: &str, status: &str) -> Result<()> {
     let changed = conn
         .execute(
             "UPDATE lnv2_pay SET operation_id = ?2, status = ?3 WHERE idempotency_key = ?1",
@@ -1852,14 +2047,7 @@ fn pay_set_op(index: &Mutex<Connection>, key: &str, op: &str, status: &str) -> R
 
 /// Terminal mark, CAS-guarded on the operation so a stale awaiter can't overwrite a row already rebound
 /// to a different op.
-fn pay_mark(
-    index: &Mutex<Connection>,
-    key: &str,
-    op: &str,
-    status: &str,
-    terminal_at: i64,
-) -> Result<()> {
-    let conn = index.lock().unwrap();
+fn pay_mark(conn: &Connection, key: &str, op: &str, status: &str, terminal_at: i64) -> Result<()> {
     conn.execute(
         "UPDATE lnv2_pay SET status = ?3, terminal_at = ?4
           WHERE idempotency_key = ?1 AND operation_id = ?2",
@@ -1875,50 +2063,45 @@ fn pay_mark(
 const COLLISION_SENTINEL_OP: &str = "(8a-collision)";
 
 /// Park OUR `idempotency_key` FAILED after an [8A] cross-order collision WITHOUT adopting the foreign
-/// operation (see [`Lnv2Payment::fail_dedup_key`] for why this liveness matters). Upsert: a fresh-key
-/// collision (caught by the pre-send operation-log check) has no PREPARED row yet, while a post-send or
-/// PREPARED-recovery collision already has one whose `operation_id` is the foreign op — either way OUR
-/// row ends FAILED with the SENTINEL op, never the foreign one.
-fn pay_park_collision_failed(
-    index: &Mutex<Connection>,
-    key: &str,
-    bolt11: &str,
-    terminal_at: i64,
-) -> Result<()> {
-    let conn = index.lock().unwrap();
-    conn.execute(
-        "INSERT INTO lnv2_pay (idempotency_key, bolt11, operation_id, status, terminal_at)
-         VALUES (?1, ?2, ?3, 'FAILED', ?4)
-         ON CONFLICT(idempotency_key)
-           DO UPDATE SET operation_id = ?3, status = 'FAILED', terminal_at = ?4",
-        params![key, bolt11, COLLISION_SENTINEL_OP, terminal_at],
-    )
-    .context("parking lnv2_pay FAILED after an [8A] collision")?;
+/// operation (see [`Lnv2Payment::fail_dedup_key`] for why this liveness matters). A status transition
+/// on the row the driver PREPARED (ADR-0022: `pay` never creates one) — whether its `operation_id` is
+/// still our deterministic op or the foreign one a dedup answer named, it ends FAILED with the
+/// SENTINEL op, never the foreign one. A missing row fails loudly: the collision was decided on a key
+/// nobody prepared, which cannot happen through the drivers.
+fn pay_park_collision_failed(conn: &Connection, key: &str, terminal_at: i64) -> Result<()> {
+    let changed = conn
+        .execute(
+            "UPDATE lnv2_pay SET operation_id = ?2, status = 'FAILED', terminal_at = ?3
+              WHERE idempotency_key = ?1",
+            params![key, COLLISION_SENTINEL_OP, terminal_at],
+        )
+        .context("parking lnv2_pay FAILED after an [8A] collision")?;
+    if changed != 1 {
+        bail!("parking lnv2 pay key {key} FAILED after an [8A] collision found no PREPARED row");
+    }
     Ok(())
 }
 
 /// Reap only old CANCELED invoices. OPEN may still settle; PAID and PAID_UNRECOVERED are durable money
-/// evidence. Chunking releases the sole index mutex between batches on a flooded DB.
-fn gc_lnv2_invoice_index(
-    index: &Mutex<Connection>,
+/// evidence. Chunked so one pass on a flooded table stays a bounded transaction on the sole-writer
+/// actor. `pub(crate)`: the legacy import applies the identical predicate to pre-reap the books.
+pub(crate) fn gc_lnv2_invoice_index(
+    conn: &Connection,
     now: i64,
     retention_secs: i64,
 ) -> Result<usize> {
     const BATCH: usize = 512;
     let mut total = 0;
     loop {
-        let deleted = {
-            let conn = index.lock().unwrap();
-            conn.execute(
-                "DELETE FROM lnv2_invoice WHERE rowid IN (
-                     SELECT rowid FROM lnv2_invoice
-                      WHERE status='CANCELED'
-                        AND expires_at > 0
-                        AND expires_at < MIN(unixepoch(), ?1) - ?2
-                      LIMIT ?3)",
-                params![now, retention_secs, BATCH],
-            )?
-        };
+        let deleted = conn.execute(
+            "DELETE FROM lnv2_invoice WHERE rowid IN (
+                 SELECT rowid FROM lnv2_invoice
+                  WHERE status='CANCELED'
+                    AND expires_at > 0
+                    AND expires_at < MIN(unixepoch(), ?1) - ?2
+                  LIMIT ?3)",
+            params![now, retention_secs, BATCH],
+        )?;
         total += deleted;
         if deleted < BATCH {
             return Ok(total);
@@ -1928,22 +2111,19 @@ fn gc_lnv2_invoice_index(
 
 /// Reap only old definitive/no-send FAILED mappings. PREPARED/PENDING may still move money and
 /// SUCCEEDED is the durable idempotency proof, so age can never make those rows disposable.
-fn gc_lnv2_pay_index(index: &Mutex<Connection>, now: i64, retention_secs: i64) -> Result<usize> {
+fn gc_lnv2_pay_index(conn: &Connection, now: i64, retention_secs: i64) -> Result<usize> {
     const BATCH: usize = 512;
     let mut total = 0;
     loop {
-        let deleted = {
-            let conn = index.lock().unwrap();
-            conn.execute(
-                "DELETE FROM lnv2_pay WHERE rowid IN (
-                     SELECT rowid FROM lnv2_pay
-                      WHERE status='FAILED'
-                        AND terminal_at IS NOT NULL
-                        AND terminal_at < MIN(unixepoch(), ?1) - ?2
-                      LIMIT ?3)",
-                params![now, retention_secs, BATCH],
-            )?
-        };
+        let deleted = conn.execute(
+            "DELETE FROM lnv2_pay WHERE rowid IN (
+                 SELECT rowid FROM lnv2_pay
+                  WHERE status='FAILED'
+                    AND terminal_at IS NOT NULL
+                    AND terminal_at < MIN(unixepoch(), ?1) - ?2
+                  LIMIT ?3)",
+            params![now, retention_secs, BATCH],
+        )?;
         total += deleted;
         if deleted < BATCH {
             return Ok(total);
@@ -1971,7 +2151,6 @@ mod real {
 
     use anyhow::{anyhow, Context, Result};
     use async_trait::async_trait;
-    use rusqlite::Connection;
     use serde_json::Value;
 
     use fedimint_client::module::transaction::TxSubmissionStates;
@@ -2000,22 +2179,23 @@ mod real {
 
     use super::{
         extract_lnrent_key, GatewaySendFee, Lnv2NewInvoice, Lnv2Ops, ReceiveFinal, SendAttempt,
-        SendFinal, SendOpLookup, CLIENT_DB_DIR, INDEX_DB_FILE, INDEX_SCHEMA, PAY_AWAIT_TIMEOUT,
-        ROOT_SECRET_SALT,
+        SendFinal, SendOpLookup, CLIENT_DB_DIR, PAY_AWAIT_TIMEOUT, ROOT_SECRET_SALT,
     };
     use crate::fedimint_paths::prepare_fedimint_paths;
 
-    /// Build the real lnv2 client + open the lnv2 index. Returns the ops seam + index connection.
+    /// Build the real lnv2 client. Returns the ops seam + the federation directory (where the
+    /// pre-ADR-0022 `lnv2_index.db` lived, for the boot-time legacy import). No sqlite is opened here:
+    /// the correlation tables live in the daemon's state DB (ADR-0022).
     pub(super) async fn build(
         invite_code: &str,
         data_dir: &Path,
         root_secret: &[u8; 32],
-    ) -> Result<(RealLnv2Ops, Connection)> {
+    ) -> Result<(RealLnv2Ops, std::path::PathBuf)> {
         let invite: InviteCode = invite_code
             .parse()
             .context("parsing federation invite code")?;
         let federation_id = invite.federation_id().to_string();
-        let paths = prepare_fedimint_paths(data_dir, &federation_id, CLIENT_DB_DIR, INDEX_DB_FILE)
+        let paths = prepare_fedimint_paths(data_dir, &federation_id, CLIENT_DB_DIR)
             .context("preparing lnv2 data paths")?;
 
         let db: Database = RocksDb::build(paths.client_db)
@@ -2058,11 +2238,7 @@ mod real {
                 .context("joining federation")?
         };
 
-        let conn = Connection::open(paths.index_db).context("opening lnv2 index db")?;
-        conn.execute_batch(INDEX_SCHEMA)
-            .context("initialising lnv2 index schema")?;
-
-        Ok((RealLnv2Ops { client }, conn))
+        Ok((RealLnv2Ops { client }, paths.federation_dir))
     }
 
     /// Thin production wrapper mapping `fedimint-lnv2-client` onto the plain-data `Lnv2Ops` seam. The

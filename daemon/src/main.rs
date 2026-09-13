@@ -454,7 +454,8 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
                 (mock.clone(), Some(mock))
             }
             PaymentMode::Fedimint => {
-                let backend = build_fedimint_backend(&operator, clock.clone()).await?;
+                let backend =
+                    build_fedimint_backend(&operator, store.clone(), clock.clone()).await?;
                 (backend, None)
             }
             // `phoenixd` (lnrent-xk3) is reachable here ONLY when the operator explicitly accepted an
@@ -463,7 +464,12 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
             // is where the refusal lives so nothing is persisted before it fires. It uses real time ->
             // NO clock-sync.
             PaymentMode::Phoenixd => {
-                let backend = build_phoenixd_backend(&operator, clock.clone(), alerts.clone())?;
+                let backend = build_phoenixd_backend(
+                    &operator,
+                    store.clone(),
+                    clock.clone(),
+                    alerts.clone(),
+                )?;
                 (backend, None)
             }
         };
@@ -526,6 +532,7 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
 #[cfg(feature = "fedimint")]
 async fn build_fedimint_backend(
     operator: &config::Operator,
+    store: lnrentd::store::Store,
     clock: Arc<dyn Clock>,
 ) -> Result<Arc<dyn PaymentBackend>> {
     let fedi = operator
@@ -537,6 +544,7 @@ async fn build_fedimint_backend(
         &fedi.invite,
         &operator.config.data_dir,
         operator.identity.fedimint_root_secret(),
+        store,
         clock,
     )
     .await
@@ -548,6 +556,7 @@ async fn build_fedimint_backend(
 #[cfg(not(feature = "fedimint"))]
 async fn build_fedimint_backend(
     _operator: &config::Operator,
+    _store: lnrentd::store::Store,
     _clock: Arc<dyn Clock>,
 ) -> Result<Arc<dyn PaymentBackend>> {
     anyhow::bail!("payment_backend=fedimint requires building lnrentd with --features fedimint")
@@ -559,6 +568,7 @@ async fn build_fedimint_backend(
 /// wedge daemon startup; readiness is reported by the preflight/doctor seams instead.
 fn build_phoenixd_backend(
     operator: &config::Operator,
+    store: lnrentd::store::Store,
     clock: Arc<dyn Clock>,
     alerts: Arc<AlertDispatcher>,
 ) -> Result<Arc<dyn PaymentBackend>> {
@@ -592,11 +602,11 @@ fn build_phoenixd_backend(
         &phoenixd.url,
         &phoenixd.api_password,
         fee_schedule.clone(),
-        &operator.config.data_dir,
+        store,
         clock,
     )
     .context("opening the phoenixd payment backend")?
-    // lnrent-gc7: report fee-credit refusal and index/state divergence through the durable sink.
+    // lnrent-gc7: report the fee-credit refusal through the durable sink.
     .with_alerts(alerts);
     tracing::info!(
         url = %phoenixd.url,

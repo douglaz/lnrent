@@ -43,6 +43,48 @@ pub trait PaymentBackend: Send + Sync {
         expiry_s: u32,
         external_id: &str, // binds settlement -> order (ADR-0009); deterministic per invoice class (§6.6)
     ) -> Result<Invoice>;
+    /// The ADR-0022 issuance seam every PRODUCTION caller uses: exactly
+    /// [`create_invoice`](Self::create_invoice)'s contract, but the backend's receive-map row is NOT
+    /// committed here. It comes back as [`Issued::persist`], which the caller runs inside ITS OWN
+    /// `Store::transaction_then` alongside the `invoice` insert/refresh (SPEC §6.6 issuance
+    /// ordering), handing [`Issued::lease`] and [`Issued::after_commit`] to the store. So a crash
+    /// between the backend call and the commit leaves an orphan at the wallet and never a
+    /// half-written correlation; the correlation cannot exist without the ledger row it correlates.
+    ///
+    /// Default: wrap `create_invoice` in a no-op [`Issued`] — correct for a backend that keeps no
+    /// correlation of its own (`MockPayment` and the test doubles). Both real backends override
+    /// this AND make `create_invoice` refuse, so a correlation can never be committed on its own.
+    async fn issue_invoice(
+        &self,
+        amount_sat: u64,
+        memo: &str,
+        expiry_s: u32,
+        external_id: &str,
+    ) -> Result<Issued> {
+        Ok(Issued::plain(
+            self.create_invoice(amount_sat, memo, expiry_s, external_id)
+                .await?,
+        ))
+    }
+    /// The ADR-0022 pre-send seam: the check-and-create half of an outbound payment for
+    /// `idempotency_key` targeting `bolt11`. Returns the backend's PREPARED pay-map row as
+    /// [`Prepared::persist`], which the refund/sweep DRIVER runs inside the transaction that
+    /// authorises the send (the `refund_attempt` / `sweep_attempt` transition), with
+    /// [`Prepared::lease`] — the backend's pay-start guard, held across the cross-key payment-hash
+    /// check and through the caller's commit — handed to `Store::transaction_then`. Two PREPARED rows
+    /// for one payment hash are therefore impossible by construction. `pay(key)` then READS that row
+    /// and never creates one of its own; the send itself is serialised separately, per backend.
+    ///
+    /// A key that already holds a row (SUCCEEDED / in flight) comes back as a no-op `Prepared`. A
+    /// refusal the backend can decide before any send (a hash another live key owns) is recorded as
+    /// the row's terminal status by `persist`, never as a bare `Err`, so the driver's ordinary
+    /// `pay` -> status path advances it exactly as today.
+    ///
+    /// Default: nothing to prepare (`MockPayment`, and any backend that dedups without a local map).
+    async fn prepare_pay(&self, idempotency_key: &str, bolt11: &str) -> Result<Prepared> {
+        let _ = (idempotency_key, bolt11);
+        Ok(Prepared::none())
+    }
     /// Invoice status alone. Both real backends answer it by delegating to
     /// [`lookup_settlement`](Self::lookup_settlement) (`lnv2_backend.rs`, `phoenixd_backend.rs`), so
     /// it inherits that bare-id seam's blind spot verbatim — lnv2 answers a MISSING index row
@@ -337,6 +379,94 @@ pub trait PaymentBackend: Send + Sync {
     /// Stream of settled payments (push). `Settlement.external_id` carries the order id
     /// (SPEC §6.1). M1a wires this to the Fedimint client settlement stream.
     async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>>;
+}
+
+/// A backend correlation-row writer the CALLER runs inside its own `Store::transaction_then`
+/// (ADR-0022 "Writes ride the caller's transaction"). Inserts — or, for a provider-terminated
+/// replacement, upserts — exactly one receive-map or pay-map row.
+pub type Persist = Box<dyn FnOnce(&rusqlite::Transaction) -> Result<()> + Send>;
+/// An OWNED guard the store actor drops only after the caller's commit (or rollback). A backend's
+/// `tokio::sync::OwnedMutexGuard`, or `Box::new(())` when there is nothing to hold. Typed as `Any`
+/// because the store neither reads nor cares what it is; it only controls WHEN it drops.
+pub type Lease = Box<dyn std::any::Any + Send>;
+/// A post-commit hook the store ACTOR runs (never the caller, who may be cancelled mid-await).
+pub type AfterCommit = Box<dyn FnOnce() + Send>;
+
+/// What [`PaymentBackend::issue_invoice`] hands back: the invoice to show the buyer plus the three
+/// things the caller's issuance transaction owes the backend. See `Store::transaction_then`.
+pub struct Issued {
+    pub invoice: Invoice,
+    /// Writes the receive-map row; the caller runs it INSIDE the issuance transaction.
+    pub persist: Persist,
+    /// The backend's per-`external_id` create guard, released by the store actor after commit.
+    pub lease: Lease,
+    /// Runs on the actor after the commit, and only if `persist` ran in that transaction (`Issued::new`
+    /// gates it on a flag `persist` sets). `None` when the backend has nothing to start.
+    pub after_commit: Option<AfterCommit>,
+}
+
+impl Issued {
+    /// Assemble an `Issued` whose hook is gated on `persist` having actually run: a transaction can
+    /// commit a refusal or a CAS no-op without persisting the invoice (the listing-withdrawn branch
+    /// of the order write, a lost soft-reminder CAS), and starting an lnv2 receive watcher for those
+    /// would leave a terminal task working against an absent row.
+    pub fn new<P, H>(invoice: Invoice, persist: P, lease: Lease, after_commit: Option<H>) -> Self
+    where
+        P: FnOnce(&rusqlite::Transaction) -> Result<()> + Send + 'static,
+        H: FnOnce() + Send + 'static,
+    {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_w = ran.clone();
+        let persist: Persist = Box::new(move |tx| {
+            let out = persist(tx);
+            if out.is_ok() {
+                ran_w.store(true, std::sync::atomic::Ordering::Release);
+            }
+            out
+        });
+        let after_commit: Option<AfterCommit> = after_commit.map(|hook| {
+            let hook: AfterCommit = Box::new(move || {
+                if ran.load(std::sync::atomic::Ordering::Acquire) {
+                    hook();
+                }
+            });
+            hook
+        });
+        Issued {
+            invoice,
+            persist,
+            lease,
+            after_commit,
+        }
+    }
+
+    /// No correlation row, nothing to lease, nothing to start — the shape of a backend with no local
+    /// map (`MockPayment`), and the trait default.
+    pub fn plain(invoice: Invoice) -> Self {
+        Issued {
+            invoice,
+            persist: Box::new(|_| Ok(())),
+            lease: Box::new(()),
+            after_commit: None,
+        }
+    }
+}
+
+/// What [`PaymentBackend::prepare_pay`] hands back: the PREPARED pay-map row writer plus the pay guard
+/// the driver's authorising transaction holds through its commit.
+pub struct Prepared {
+    pub persist: Persist,
+    pub lease: Lease,
+}
+
+impl Prepared {
+    /// Nothing to write and nothing to hold: the key already has its row, or the backend keeps none.
+    pub fn none() -> Self {
+        Prepared {
+            persist: Box::new(|_| Ok(())),
+            lease: Box::new(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

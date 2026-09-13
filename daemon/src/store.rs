@@ -438,6 +438,73 @@ UPDATE subscription SET next_deadline=NULL
 const M11_INVOICE_RECEIVED_MSAT: &str =
     "ALTER TABLE invoice ADD COLUMN received_msat INTEGER;";
 
+// ADR-0022 (lnrent-chgb): backend correlation state moves INTO this database. Two parts:
+//  - `migration_unverified_at` on `refund_attempt` / `sweep_attempt` — the legacy-import fence (SPEC
+//    §11): stamped on a non-terminal or retryable-FAILED attempt whose pre-send witness may have been
+//    lost with the side file; while set, the driver refuses `prepare_pay`. A COLUMN, never a status
+//    value or `last_error`, so an ordinary retry update cannot erase the fence. Applied like M3: the
+//    column lives ONLY here (not in the baseline), guarded by a `has_column` pre-check in
+//    `apply_one_migration`, so no duplicate-column dance.
+//  - the `migration` marker table: one row per legacy side file (`phoenixd_index.db` /
+//    `lnv2_index.db`) recording that this database is self-contained from here on. `content_hash` is
+//    the imported file's sha256, or the literal `fresh` / `parked` when there was nothing to import.
+//    The v3 backup writer keys on the row's presence (`backup.rs`).
+// The backend tables themselves (`phoenixd_invoice`, `phoenixd_pay`, `lnv2_invoice`, `lnv2_pay`)
+// are NOT a migration: each backend module declares its `SCHEMA` and `open()` applies every compiled
+// backend's schema unconditionally after the migrations (`apply_backend_schemas`).
+const M12_ADR0022_FENCE_AND_MARKER: &str = "
+CREATE TABLE IF NOT EXISTS migration (
+  name         TEXT PRIMARY KEY,   -- the legacy side file this row retires (phoenixd_index.db | lnv2_index.db)
+  content_hash TEXT NOT NULL,      -- sha256 hex of the imported file, or 'fresh' | 'parked'
+  completed_at INTEGER NOT NULL
+);
+";
+
+/// The two `migration_unverified_at` ALTERs of M12, added individually behind `has_column` so a
+/// partially-applied M12 (or a DB that somehow already carries one column) self-heals exactly like M4.
+fn ensure_migration_fence_columns(conn: &Connection) -> Result<()> {
+    for table in ["refund_attempt", "sweep_attempt"] {
+        if !has_column(conn, table, "migration_unverified_at")? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN migration_unverified_at INTEGER"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// Apply every COMPILED payment backend's correlation-table DDL (ADR-0022 "The interface"). Runs on
+/// EVERY open, after the migrations, unconditionally — not keyed on the selected backend: on a
+/// restart with `payment_backend` omitted the raw config resolves to `Mock` and the persisted backend
+/// is inherited only after the store is open (`config.rs`, pinned by
+/// `inherited_phoenixd_still_requires_the_opt_in_on_every_start`), so a mode-keyed open would skip the
+/// inherited backend's tables. Empty tables for an unused backend cost nothing. Each DDL is
+/// `CREATE ... IF NOT EXISTS`; a later change to a backend table is a migration in `MIGRATIONS`, never
+/// a backend-private `ALTER`.
+fn apply_backend_schemas(conn: &Connection) -> Result<()> {
+    conn.execute_batch(crate::phoenixd_backend::SCHEMA)
+        .map_err(|e| anyhow!("applying the phoenixd backend schema: {e}"))?;
+    #[cfg(feature = "fedimint")]
+    conn.execute_batch(crate::lnv2_backend::SCHEMA)
+        .map_err(|e| anyhow!("applying the lnv2 backend schema: {e}"))?;
+    Ok(())
+}
+
+/// Bring a raw connection to the full runtime schema: migrations + every compiled backend's tables.
+/// The one entry point `open` and the in-memory test stores share, so a backend unit test sees the
+/// exact tables the daemon does (ADR-0022: a backend is no longer testable on a throwaway file).
+pub fn prepare_connection(conn: &Connection) -> Result<()> {
+    migrate(conn)?;
+    apply_backend_schemas(conn)
+}
+
+/// An in-memory connection at the full runtime schema (tests + the backup/restore probes).
+pub fn open_memory() -> Result<Connection> {
+    let conn = Connection::open_in_memory()?;
+    prepare_connection(&conn)?;
+    Ok(conn)
+}
+
 /// Ordered migrations (lnrent-7fp.3): index `i` upgrades the DB from schema version `i` to
 /// `i+1`. Version 1 is the §11 schema; version 2 adds `seen_message` (lnrent-7fp.5); version 3 adds
 /// `subscription.suspend_not_before` (lnrent-7fp.22); version 4 adds the `refund_attempt` resolver
@@ -458,6 +525,7 @@ const MIGRATIONS: &[&str] = &[
     M9_TERMINAL_ROW_REAPER_INDEXES,
     M10_CLEAR_STALE_DEADLINE_CURSORS,
     M11_INVOICE_RECEIVED_MSAT,
+    M12_ADR0022_FENCE_AND_MARKER,
 ];
 
 /// The target schema version this binary expects (= number of migrations).
@@ -513,6 +581,11 @@ fn apply_one_migration(conn: &Connection, migrations: &[&str], current: i64) -> 
     // column already exists so migrate() stays idempotent for a DB that predates the baseline change
     // — no reliance on matching a duplicate-column error STRING.
     let skip = current == 2 && has_column(conn, "subscription", "suspend_not_before")?;
+    // M12's two ALTERs take the same per-column `has_column` guard (ADR-0022); the marker table in the
+    // batch itself is `IF NOT EXISTS`.
+    if current == 11 {
+        ensure_migration_fence_columns(conn)?;
+    }
     if !skip {
         if let Err(e) = conn.execute_batch(migrations[current as usize]) {
             if current == 3 && is_duplicate_refund_resolution(&e) {
@@ -631,7 +704,7 @@ pub fn open(path: impl AsRef<Path>) -> Result<Connection> {
             path.display()
         ));
     }
-    migrate(&conn)?;
+    prepare_connection(&conn)?;
     Ok(conn)
 }
 
@@ -793,6 +866,37 @@ impl Store {
         F: FnOnce(&Transaction) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        self.transaction_then(f, Box::new(()), None).await
+    }
+
+    /// [`Store::transaction`] plus the two ADR-0022 obligations a backend correlation write carries:
+    ///
+    /// - `lease` is an OWNED guard (a backend's per-`external_id` create guard or its pay-start
+    ///   guard, handed over as `Issued::lease` / `Prepared::lease`) that the ACTOR drops only after
+    ///   the commit succeeds — or after the rollback, on error. A guard captured by the closure would
+    ///   be released when the closure returns, which is BEFORE `txn.commit`, so a concurrent
+    ///   same-`external_id` caller could pass its check while the row is still invisible and mint a
+    ///   second invoice. Taking it as its own argument extends the critical section through the
+    ///   commit. Pass `Box::new(())` when there is nothing to lease.
+    /// - `after_commit` runs on the actor, after the commit, never by the caller: the actor commits an
+    ///   enqueued transaction even when the awaiting caller is cancelled (ADR-0021 shutdown), and a
+    ///   cancelled caller would drop a hook it still owned, leaving the row committed and (for lnv2)
+    ///   its live receive watcher never started until an unrelated restart. `Issued::new` wraps the
+    ///   hook so it is a no-op unless `persist` actually ran inside this transaction — a committed
+    ///   refusal or CAS no-op must not start a watcher against an absent row.
+    ///
+    /// Everything else — the degraded latch, the fatal-error trip, the rollback-on-`Err` — is exactly
+    /// [`Store::transaction`], which delegates here.
+    pub async fn transaction_then<T, F>(
+        &self,
+        f: F,
+        lease: crate::backends::Lease,
+        after_commit: Option<crate::backends::AfterCommit>,
+    ) -> Result<T>
+    where
+        F: FnOnce(&Transaction) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
         // Latching read-only guard (lnrent-y4m.3): the store write choke point used by the money
         // core (and maintenance writes). This closure runs serially on the sole-writer actor — the
         // authoritative serialization point — so the load/store on `degraded` need no extra lock,
@@ -800,6 +904,10 @@ impl Store {
         // degraded.
         let degraded = self.degraded.clone();
         self.run(move |conn| {
+            // The lease is owned by THIS job: it drops when the job returns, i.e. after the commit
+            // below succeeded, or after the early-return `?` rolled the transaction back. Moved in
+            // explicitly so the borrow checker keeps it alive to the end of the closure.
+            let lease = lease;
             // Refuse BEFORE opening a txn so a refused write cannot partially apply.
             if degraded.load(Ordering::Acquire) {
                 return Err(anyhow!(
@@ -816,6 +924,13 @@ impl Store {
                 .map_err(|e| trip_if_fatal_sqlite(&degraded, e))?;
             let out = f(&txn).map_err(|e| trip_if_fatal_anyhow(&degraded, e))?;
             txn.commit().map_err(|e| trip_if_fatal_sqlite(&degraded, e))?;
+            // Committed. The hook runs here, on the actor, so a caller cancelled between enqueue and
+            // reply cannot lose it; the lease is released last so a waiter for the same guard sees
+            // both the row AND whatever the hook started.
+            if let Some(hook) = after_commit {
+                hook();
+            }
+            drop(lease);
             Ok(out)
         })
         .await

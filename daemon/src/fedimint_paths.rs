@@ -1,18 +1,21 @@
-//! Shared, hardened data-dir path preparation for the payment backends. The live `lnv2_backend` lays
-//! its fedimint rocksdb + lnrent-owned sqlite index under `data_dir/fedimint/<federation_id>/`; this
-//! module owns the create-and-harden of that tree. (The retired lnv1 backend, which shared this
-//! module, was deleted by lnrent-8ym.) [`prepare_private_file`] is also reused directly by the
-//! phoenixd backend (lnrent-xk3) for its index db, so this module is NOT feature-gated — it is pure
-//! std/libc and pulls no fedimint dependency.
+//! Shared, hardened data-dir path preparation for the fedimint backend. The live `lnv2_backend` lays
+//! its fedimint rocksdb under `data_dir/fedimint/<federation_id>/`; this module owns the
+//! create-and-harden of that tree. (The retired lnv1 backend, which shared this module, was deleted by
+//! lnrent-8ym.) It is NOT feature-gated — pure std/libc, no fedimint dependency.
+//!
+//! Before ADR-0022 this module also laid down the backends' private sqlite index files
+//! (`lnv2_index.db` under the federation dir, `phoenixd_index.db` beside the state DB). Those
+//! correlation maps now live in `lnrent.sqlite`; the only remaining files here are the fedimint client's
+//! own. [`prepare_private_file`] stays for the legacy import, which needs to vet a pre-existing side
+//! file (symlink-refused, owner-only) before reading it.
 //!
 //! The confidentiality boundary is the **0700 directories** (`fedimint/`, `<federation>/`, the client
 //! db dir): once owner-only, the note/wallet material inside is unreadable to co-tenant local users
-//! regardless of the umask-derived perms rocksdb/sqlite give their churned files — so the per-file 0600
-//! on the index db's main file is belt-and-suspenders, not the load-bearing control. Each path's FINAL
-//! component is symlink-refused (lstat + `O_NOFOLLOW` re-open, perms set on the fd so there is no chmod
-//! TOCTOU). Swapping an INTERMEDIATE component for a symlink already requires write access to the
-//! operator's 0700 `data_dir` — i.e. being the service user/root — which is outside the co-tenant
-//! threat model this closes.
+//! regardless of the umask-derived perms rocksdb gives its churned files. Each path's FINAL component
+//! is symlink-refused (lstat + `O_NOFOLLOW` re-open, perms set on the fd so there is no chmod TOCTOU).
+//! Swapping an INTERMEDIATE component for a symlink already requires write access to the operator's
+//! 0700 `data_dir` — i.e. being the service user/root — which is outside the co-tenant threat model
+//! this closes.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -24,17 +27,19 @@ use anyhow::{anyhow, Context, Result};
 /// The hardened fedimint paths for one federation data-dir.
 pub struct FedimintPaths {
     pub client_db: PathBuf,
-    pub index_db: PathBuf,
+    /// `data_dir/fedimint/<federation_id>/` — where the pre-ADR-0022 `lnv2_index.db` lived; the
+    /// boot-time legacy import looks there.
+    pub federation_dir: PathBuf,
 }
 
-/// Create + harden `data_dir/fedimint/<federation_id>/{<client_db_dir>, <index_db_file>}` before any
-/// rocksdb/sqlite open. `client_db_dir` is a directory (rocksdb), `index_db_file` a regular file
-/// (sqlite). Returns their absolute paths.
+/// Create + harden `data_dir/fedimint/<federation_id>/<client_db_dir>` before the rocksdb open.
+/// Returns the absolute paths. Deliberately creates NO sqlite side file any more (ADR-0022): a fresh
+/// empty `lnv2_index.db` would read as a legacy index to import, and the import would then have to
+/// tell "empty because new" from "empty because lost".
 pub fn prepare_fedimint_paths(
     data_dir: &Path,
     federation_id: &str,
     client_db_dir: &str,
-    index_db_file: &str,
 ) -> Result<FedimintPaths> {
     let fedimint_dir = data_dir.join("fedimint");
     prepare_private_dir(&fedimint_dir, "fedimint root dir")?;
@@ -45,10 +50,10 @@ pub fn prepare_fedimint_paths(
     let client_db = federation_dir.join(client_db_dir);
     prepare_private_dir(&client_db, "fedimint client db dir")?;
 
-    let index_db = federation_dir.join(index_db_file);
-    prepare_private_file(&index_db, "fedimint lnrent index db")?;
-
-    Ok(FedimintPaths { client_db, index_db })
+    Ok(FedimintPaths {
+        client_db,
+        federation_dir,
+    })
 }
 
 fn prepare_private_dir(path: &Path, what: &str) -> Result<()> {
@@ -99,9 +104,8 @@ fn harden_private_dir(path: &Path, what: &str) -> Result<()> {
 }
 
 /// Create (0600, `O_NOFOLLOW`) or vet-and-harden ONE regular file inside an already-private data dir,
-/// refusing a symlinked or non-regular target. Also used directly by the phoenixd backend
-/// (lnrent-xk3) for its `phoenixd_index.db`, which lives beside the state DB rather than under a
-/// federation dir — hence `pub` rather than module-private.
+/// refusing a symlinked or non-regular target. Used by the legacy side-file import (ADR-0022) to vet
+/// a pre-existing `phoenixd_index.db` / `lnv2_index.db` before reading it — hence `pub`.
 pub fn prepare_private_file(path: &Path, what: &str) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) => {
