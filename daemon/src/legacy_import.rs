@@ -845,35 +845,45 @@ fn analyse(conn: &Connection, backend: Backend, legacy: &Legacy, now: i64) -> Re
     // Receive coverage.
     for b in load_book_invoices(conn, backend)? {
         let m = effective.get(b.external_id.as_str()).copied();
-        let map_missing_or_canceled = match m {
-            None => true,
-            Some(m) => m.status == "CANCELED" && m.invoice_id != b.id,
-        };
-        if map_missing_or_canceled {
-            if reap_eligible(conn, &b, now)? {
-                plan.reap.push(b.id.clone());
+        // The map is inspected FIRST: a book row already reapable under the store's own retention
+        // whose map row is absent or CANCELED is pre-reaped, never refused (the lnv2 reaper deletes
+        // CANCELED rows independently of `reap_terminal_rows`). Otherwise an absent row refuses, a
+        // CANCELED row for a DIFFERENT invoice refuses (never a replacement), and a CANCELED row for
+        // the book's OWN invoice is ordinary coverage (the invoice simply expired at the backend).
+        let m = match m {
+            None => {
+                if reap_eligible(conn, &b, now)? {
+                    plan.reap.push(b.id.clone());
+                } else {
+                    plan.refusal.get_or_insert(format!(
+                        "invoice {} (external_id {}) has no {} row in the legacy index",
+                        b.id,
+                        b.external_id,
+                        backend.receive_table()
+                    ));
+                }
                 continue;
             }
-            let reason = match m {
-                None => format!(
-                    "invoice {} (external_id {}) has no {} row in the legacy index",
-                    b.id,
-                    b.external_id,
-                    backend.receive_table()
-                ),
-                Some(m) => format!(
-                    "invoice {} (external_id {}) is correlated only to a CANCELED {} row {} that is \
-                     not its own invoice — a CANCELED row is never a replacement",
-                    b.id,
-                    b.external_id,
-                    backend.receive_table(),
-                    m.invoice_id
-                ),
-            };
-            plan.refusal.get_or_insert(reason);
-            continue;
-        }
-        let m = m.expect("checked above");
+            Some(m) if m.status == "CANCELED" => {
+                if reap_eligible(conn, &b, now)? {
+                    plan.reap.push(b.id.clone());
+                    continue;
+                }
+                if m.invoice_id != b.id {
+                    plan.refusal.get_or_insert(format!(
+                        "invoice {} (external_id {}) is correlated only to a CANCELED {} row {} \
+                         that is not its own invoice — a CANCELED row is never a replacement",
+                        b.id,
+                        b.external_id,
+                        backend.receive_table(),
+                        m.invoice_id
+                    ));
+                    continue;
+                }
+                m
+            }
+            Some(m) => m,
+        };
         if m.invoice_id == b.id {
             // Same invoice: the row IS the correlation. bolt11 / payment_hash / amount must agree;
             // expires_at may legitimately have moved (the backend reopened a still-payable local
@@ -1164,4 +1174,750 @@ fn rename_imported(side_file: &Path) -> Result<()> {
             Path::new(&renamed).display()
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    /// A scripted backend view: `invoice_id -> ReceiveState`, `Absent` for anything unscripted, and a
+    /// record of what was asked so a test can prove the tiebreak actually consulted the backend.
+    #[derive(Default)]
+    struct FakeProbe {
+        states: Mutex<HashMap<String, ReceiveState>>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl FakeProbe {
+        fn with(states: &[(&str, ReceiveState)]) -> Self {
+            let p = Self::default();
+            for (id, st) in states {
+                p.states.lock().unwrap().insert(id.to_string(), *st);
+            }
+            p
+        }
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LegacyProbe for FakeProbe {
+        async fn receive_state(
+            &self,
+            _external_id: &str,
+            invoice_id: &str,
+            _payment_hash: &str,
+        ) -> Result<ReceiveState> {
+            self.asked.lock().unwrap().push(invoice_id.to_string());
+            Ok(self
+                .states
+                .lock()
+                .unwrap()
+                .get(invoice_id)
+                .copied()
+                .unwrap_or(ReceiveState::Absent))
+        }
+    }
+
+    fn temp_dir() -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lnrent-legacy-import-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mem_store() -> Store {
+        Store::spawn(crate::store::open_memory().unwrap())
+    }
+
+    /// Write a legacy side file at the pre-ADR-0022 schema (identical DDL to the new tables) and let
+    /// the test seed it.
+    fn legacy_file(dir: &Path, backend: Backend, seed: impl FnOnce(&Connection)) -> PathBuf {
+        let path = dir.join(backend.side_file_name());
+        let conn = Connection::open(&path).unwrap();
+        match backend {
+            Backend::Phoenixd => conn
+                .execute_batch(crate::phoenixd_backend::SCHEMA)
+                .unwrap(),
+            Backend::Lnv2 => conn.execute_batch(LNV2_LEGACY_DDL).unwrap(),
+        }
+        seed(&conn);
+        path
+    }
+
+    /// The pre-ADR-0022 lnv2 side-file DDL (literal, so the phoenixd-only build can still exercise
+    /// the lnv2 shapes the import must handle).
+    const LNV2_LEGACY_DDL: &str = "
+CREATE TABLE IF NOT EXISTS lnv2_invoice (
+    external_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, invoice_id TEXT NOT NULL,
+    bolt11 TEXT NOT NULL, payment_hash TEXT NOT NULL, amount_sat INTEGER NOT NULL,
+    credited_msat INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'OPEN', settled_at INTEGER);
+CREATE TABLE IF NOT EXISTS lnv2_pay (
+    idempotency_key TEXT PRIMARY KEY, bolt11 TEXT NOT NULL, operation_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PREPARED', terminal_at INTEGER);";
+
+    fn seed_phx_receive(c: &Connection, ext: &str, hash: &str, bolt11: &str, expires_at: i64) {
+        c.execute(
+            "INSERT INTO phoenixd_invoice (external_id, invoice_id, bolt11, payment_hash, amount_sat, expires_at)
+             VALUES (?1, ?2, ?3, ?4, 100, ?5)",
+            params![ext, format!("phoenixd-{hash}"), bolt11, hash, expires_at],
+        )
+        .unwrap();
+    }
+
+    fn seed_phx_pay(c: &Connection, key: &str, bolt11: &str, pid: Option<&str>, status: &str) {
+        c.execute(
+            "INSERT INTO phoenixd_pay (idempotency_key, bolt11, payment_hash, node_id, payment_id, status)
+             VALUES (?1, ?2, 'h-pay', 'node', ?3, ?4)",
+            params![key, bolt11, pid, status],
+        )
+        .unwrap();
+    }
+
+    fn seed_lnv2_receive(c: &Connection, ext: &str, op: &str, bolt11: &str, expires_at: i64, status: &str) {
+        c.execute(
+            "INSERT INTO lnv2_invoice (external_id, operation_id, invoice_id, bolt11, payment_hash,
+                                       amount_sat, credited_msat, expires_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, 100, 0, ?6, ?7)",
+            params![ext, op, format!("lnv2-{op}"), bolt11, format!("h-{op}"), expires_at, status],
+        )
+        .unwrap();
+    }
+
+    /// A book invoice referencing the backend by id prefix. `hash` doubles as the phoenixd id suffix.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_book_invoice(
+        store: &Store,
+        id: &str,
+        ext: &str,
+        hash: &str,
+        bolt11: &str,
+        status: &str,
+        expires_at: i64,
+        settled_at: Option<i64>,
+    ) {
+        let (id, ext, hash, bolt11, status) = (
+            id.to_string(),
+            ext.to_string(),
+            hash.to_string(),
+            bolt11.to_string(),
+            status.to_string(),
+        );
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO invoice (id, external_id, backend_invoice_id, payment_hash, kind,
+                                          bolt11, amount_sat, status, expires_at, issued_at, settled_at)
+                     VALUES (?1, ?2, ?3, ?3, 'order', ?4, 100, ?5, ?6, ?6, ?7)",
+                    params![id, ext, hash, bolt11, status, expires_at, settled_at],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn seed_refund(
+        store: &Store,
+        ext: &str,
+        status: &str,
+        dest: &str,
+        resolved_bolt11: Option<&str>,
+        gen: i64,
+        backend_payment_id: Option<&str>,
+    ) {
+        let (ext, status, dest) = (ext.to_string(), status.to_string(), dest.to_string());
+        let resolved = resolved_bolt11.map(str::to_string);
+        let pid = backend_payment_id.map(str::to_string);
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO refund_attempt (id, subscription_id, dest, amount_sat, idempotency_key,
+                        backend_payment_id, status, attempts, resolved_bolt11, resolution_gen,
+                        created_at, updated_at)
+                     VALUES (?1, 's', ?2, 100, ?3, ?4, ?5, 0, ?6, ?7, 0, 0)",
+                    params![format!("ref-{ext}"), dest, format!("refund:{ext}"), pid, status, resolved, gen],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn seed_sweep(store: &Store, id: &str, status: &str, bolt11: &str, pid: Option<&str>) {
+        let (id, status, bolt11) = (id.to_string(), status.to_string(), bolt11.to_string());
+        let pid = pid.map(str::to_string);
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "INSERT INTO sweep_attempt (id, bolt11, amount_sat, max_outlay_msat, status,
+                                                attempts, backend_payment_id, created_at)
+                     VALUES (?1, ?2, 100, 100000, ?3, 0, ?4, 0)",
+                    params![id, bolt11, status, pid],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn count(store: &Store, sql: &str) -> i64 {
+        let sql = sql.to_string();
+        store
+            .read(move |c| Ok(c.query_row(&sql, [], |r| r.get(0))?))
+            .await
+            .unwrap()
+    }
+
+    async fn marker(store: &Store, backend: Backend) -> Option<String> {
+        let name = backend.side_file_name().to_string();
+        store.read(move |c| read_marker(c, &name)).await.unwrap()
+    }
+
+    async fn fence(store: &Store, table: &str, id: &str) -> Option<i64> {
+        let sql = format!("SELECT migration_unverified_at FROM {table} WHERE id=?1");
+        let id = id.to_string();
+        store
+            .read(move |c| Ok(c.query_row(&sql, params![id], |r| r.get(0))?))
+            .await
+            .unwrap()
+    }
+
+    const NOW: i64 = 100 * 24 * 3600;
+
+    // ---------------------------------------------------------------------------------------------
+    // The happy path, its crash recovery, and the ambiguous states
+    // ---------------------------------------------------------------------------------------------
+
+    /// A populated side file imports exactly once: rows land verbatim, the marker records the file's
+    /// hash in the SAME transaction, the file is renamed, and the next boot is an ordinary one.
+    #[tokio::test]
+    async fn a_populated_side_file_imports_exactly_once_and_is_renamed() {
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_book_invoice(&store, "phoenixd-h1", "e1", "h1", "lnbc1", "OPEN", NOW + 600, None).await;
+        // A SENT gen-1 refund (its map row is keyed :g1, NOT the stored bare key) with a NULL
+        // backend id — the recovery-committed shape — and a SUCCEEDED map row: covered.
+        seed_refund(&store, "e1", "SENT", "buyer@ln.example", Some("lnbc-r1"), 1, None).await;
+        let file = legacy_file(&dir, Backend::Phoenixd, |c| {
+            seed_phx_receive(c, "e1", "h1", "lnbc1", NOW + 600);
+            seed_phx_pay(c, "refund:e1:g1", "lnbc-r1", Some("pid-1"), "SUCCEEDED");
+        });
+        let bytes = std::fs::read(&file).unwrap();
+        let expected_hash = hex::encode(Sha256::digest(&bytes));
+
+        let probe = FakeProbe::default();
+        let out = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap();
+        assert_eq!(
+            out,
+            Outcome::Imported { receive_rows: 1, pay_rows: 1, repaired: 0, reaped: 0, stamped: 0 }
+        );
+        assert!(probe.asked().is_empty(), "nothing disagreed, so the backend was never asked");
+        assert_eq!(count(&store, "SELECT count(*) FROM phoenixd_invoice").await, 1);
+        assert_eq!(count(&store, "SELECT count(*) FROM phoenixd_pay").await, 1);
+        assert_eq!(marker(&store, Backend::Phoenixd).await.as_deref(), Some(expected_hash.as_str()));
+        assert!(!file.exists(), "the side file was renamed");
+        assert!(dir.join("phoenixd_index.db.imported").exists());
+
+        // The next boot: marker present, no file — nothing to do, nothing re-imported.
+        let out = run(&store, Backend::Phoenixd, &probe, &file, NOW + 1).await.unwrap();
+        assert_eq!(out, Outcome::AlreadyMigrated);
+        assert_eq!(count(&store, "SELECT count(*) FROM phoenixd_invoice").await, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crash AFTER the import commit and BEFORE the rename is recognised on the next boot (marker
+    /// present, hash matches): rename and continue, never refuse, never re-import. RED on "refuse if
+    /// both exist" (PR #90 round 3), which wedged the daemon on an ordinary crash in that window.
+    #[tokio::test]
+    async fn a_crash_between_commit_and_rename_is_recognised_on_the_next_boot() {
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_book_invoice(&store, "phoenixd-h1", "e1", "h1", "lnbc1", "OPEN", NOW + 600, None).await;
+        let file = legacy_file(&dir, Backend::Phoenixd, |c| {
+            seed_phx_receive(c, "e1", "h1", "lnbc1", NOW + 600);
+        });
+        let probe = FakeProbe::default();
+        run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap();
+        // Undo the rename: the crash happened before it.
+        std::fs::rename(dir.join("phoenixd_index.db.imported"), &file).unwrap();
+
+        let out = run(&store, Backend::Phoenixd, &probe, &file, NOW + 1).await.unwrap();
+        assert_eq!(out, Outcome::RenamedOnly);
+        assert!(!file.exists() && dir.join("phoenixd_index.db.imported").exists());
+        assert_eq!(count(&store, "SELECT count(*) FROM phoenixd_invoice").await, 1, "not re-imported");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The genuinely ambiguous state — side file present, new tables populated, no marker — refuses,
+    /// and so does a marker recorded for a DIFFERENT file (a restore from another instant).
+    #[tokio::test]
+    async fn ambiguous_provenance_refuses_to_boot() {
+        let dir = temp_dir();
+        let store = mem_store();
+        let file = legacy_file(&dir, Backend::Phoenixd, |c| {
+            seed_phx_receive(c, "e1", "h1", "lnbc1", NOW + 600);
+        });
+        store
+            .transaction(|tx| {
+                seed_phx_receive(tx, "e9", "h9", "lnbc9", NOW + 600);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let probe = FakeProbe::default();
+        let err = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap_err();
+        assert!(format!("{err:#}").contains("ambiguous provenance"), "{err:#}");
+        assert!(file.exists(), "nothing renamed on a refusal");
+
+        // Now a marker for a different hash: an imported file was swapped for another one.
+        store
+            .transaction(|tx| {
+                tx.execute("DELETE FROM phoenixd_invoice", [])?;
+                write_marker(tx, "phoenixd_index.db", "0000deadbeef", NOW)
+            })
+            .await
+            .unwrap();
+        let err = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap_err();
+        assert!(format!("{err:#}").contains("DIFFERENT"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A PRESENT file that lacks the correlation of a referenced invoice refuses the whole import:
+    /// nothing is imported, no marker is written, the file stays. RED on a file-present-only check,
+    /// which would import and mark complete over the gap.
+    #[tokio::test]
+    async fn a_present_side_file_missing_a_correlation_refuses() {
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_book_invoice(&store, "phoenixd-h1", "e1", "h1", "lnbc1", "OPEN", NOW + 600, None).await;
+        let file = legacy_file(&dir, Backend::Phoenixd, |_c| {});
+        let probe = FakeProbe::default();
+        let err = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("phoenixd-h1") && msg.contains("no phoenixd_invoice row"), "{msg}");
+        assert!(msg.contains(RUNBOOK));
+        assert_eq!(marker(&store, Backend::Phoenixd).await, None, "no marker on a refusal");
+        assert_eq!(count(&store, "SELECT count(*) FROM phoenixd_invoice").await, 0);
+        assert!(file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The absent-file branch
+    // ---------------------------------------------------------------------------------------------
+
+    /// Side file ABSENT + correlation-bearing books = a lost file: refuse to boot, per backend and per
+    /// predicate (the id prefix; a SENT attempt; an attempt with a backend payment id).
+    #[tokio::test]
+    async fn an_absent_side_file_over_correlation_bearing_books_refuses() {
+        let probe = FakeProbe::default();
+        // phoenixd: the invoice id prefix.
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_book_invoice(&store, "phoenixd-h1", "e1", "h1", "lnbc1", "OPEN", NOW + 600, None).await;
+        let err = run(&store, Backend::Phoenixd, &probe, &dir.join("phoenixd_index.db"), NOW)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("phoenixd_index.db is missing"), "{err:#}");
+        assert!(format!("{err:#}").contains("invoice phoenixd-h1"), "{err:#}");
+        assert_eq!(marker(&store, Backend::Phoenixd).await, None);
+
+        // lnv2: the same predicate on its prefix (the tables exist only with the feature).
+        if cfg!(feature = "fedimint") {
+            let store = mem_store();
+            seed_book_invoice(&store, "lnv2-op1", "e1", "op1", "lnbc1", "OPEN", NOW + 600, None).await;
+            let err = run(&store, Backend::Lnv2, &probe, &dir.join("lnv2_index.db"), NOW)
+                .await
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("lnv2_index.db is missing"), "{err:#}");
+        }
+
+        // A SENT attempt (no invoice at all) is correlation-bearing too — its pay-map row is the
+        // historical owner of a payment hash.
+        let store = mem_store();
+        seed_refund(&store, "e2", "SENT", "buyer@ln.example", Some("lnbc-r2"), 1, None).await;
+        let err = run(&store, Backend::Phoenixd, &probe, &dir.join("phoenixd_index.db"), NOW)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("refund_attempt ref-e2 (SENT)"), "{err:#}");
+
+        // And so is a non-terminal attempt that already carries a backend payment id.
+        let store = mem_store();
+        seed_sweep(&store, "sweep:h3", "PENDING", "lnbc-s3", Some("pid-3")).await;
+        let err = run(&store, Backend::Phoenixd, &probe, &dir.join("phoenixd_index.db"), NOW)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("sweep_attempt sweep:h3 (PENDING)"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The absent-file branch stamps every legacy non-terminal AND retryable-FAILED attempt without a
+    /// backend payment id — INCLUDING an unresolved-LNURL PENDING row (the books can be a rollback
+    /// from before the resolution while the wallet paid after) — parks them, and STILL writes a
+    /// marker (`parked`) so later backups are stamped v3. RED on a "fresh" predicate that keys on the
+    /// persisted selection or that skips the stamps.
+    #[tokio::test]
+    async fn an_absent_side_file_parks_unwitnessed_attempts_and_writes_a_parked_marker() {
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_refund(&store, "e1", "PENDING", "buyer@ln.example", None, 0, None).await; // unresolved LNURL
+        seed_refund(&store, "e2", "FAILED", "buyer@ln.example", Some("lnbc-r2"), 1, None).await; // retryable
+        seed_sweep(&store, "sweep:h3", "PENDING", "lnbc-s3", None).await;
+        seed_sweep(&store, "sweep:h4", "SENT", "lnbc-s4", None).await; // wait: SENT is correlation-bearing
+        // A SENT sweep would refuse the whole boot (previous test); remove it to isolate the stamps.
+        store
+            .transaction(|tx| {
+                tx.execute("DELETE FROM sweep_attempt WHERE id='sweep:h4'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let probe = FakeProbe::default();
+        let out = run(&store, Backend::Phoenixd, &probe, &dir.join("phoenixd_index.db"), NOW)
+            .await
+            .unwrap();
+        assert_eq!(out, Outcome::Parked { stamped: 3 });
+        assert_eq!(fence(&store, "refund_attempt", "ref-e1").await, Some(NOW));
+        assert_eq!(fence(&store, "refund_attempt", "ref-e2").await, Some(NOW));
+        assert_eq!(fence(&store, "sweep_attempt", "sweep:h3").await, Some(NOW));
+        assert_eq!(marker(&store, Backend::Phoenixd).await.as_deref(), Some("parked"));
+        // The next boot is ordinary.
+        let out = run(&store, Backend::Phoenixd, &probe, &dir.join("phoenixd_index.db"), NOW + 1)
+            .await
+            .unwrap();
+        assert_eq!(out, Outcome::AlreadyMigrated);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A FRESH bootstrap (persisted selection, no rows) boots AND writes a `fresh` marker, so its
+    /// later backups are stamped v3. The persisted selection alone is never a "lost file".
+    #[tokio::test]
+    async fn a_fresh_install_writes_a_fresh_marker() {
+        let dir = temp_dir();
+        let store = mem_store();
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO operator (payment_backend) VALUES ('phoenixd')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let probe = FakeProbe::default();
+        let out = run(&store, Backend::Phoenixd, &probe, &dir.join("phoenixd_index.db"), NOW)
+            .await
+            .unwrap();
+        assert_eq!(out, Outcome::Fresh);
+        assert_eq!(marker(&store, Backend::Phoenixd).await.as_deref(), Some("fresh"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Populated tables with NO marker and NO file are of unknown provenance: refuse.
+    #[tokio::test]
+    async fn populated_tables_without_a_marker_or_a_file_refuse() {
+        let dir = temp_dir();
+        let store = mem_store();
+        store
+            .transaction(|tx| {
+                seed_phx_receive(tx, "e1", "h1", "lnbc1", NOW + 600);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let probe = FakeProbe::default();
+        let err = run(&store, Backend::Phoenixd, &probe, &dir.join("phoenixd_index.db"), NOW)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("unknown provenance"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Receive coverage: pre-reap, replacement repair, refusals
+    // ---------------------------------------------------------------------------------------------
+
+    /// An EXPIRED book row already eligible under the store's retention whose map row the backend's
+    /// own reaper legitimately removed (or holds CANCELED) is pre-reaped, not refused — the map is
+    /// inspected FIRST. A book row the map holds OPEN is never reaped (the replacement rule repairs it).
+    #[cfg(feature = "fedimint")]
+    #[tokio::test]
+    async fn a_retention_eligible_expired_book_row_the_map_lacks_is_pre_reaped() {
+        let dir = temp_dir();
+        let store = mem_store();
+        let old = NOW - TERMINAL_ROW_RETENTION_SECS - 10;
+        seed_book_invoice(&store, "lnv2-opGone", "eGone", "h-opGone", "lnbcG", "EXPIRED", old, None).await;
+        seed_book_invoice(&store, "lnv2-opCan", "eCan", "h-opCan", "lnbcC", "EXPIRED", old, None).await;
+        // A RECENT expired row whose own invoice the map holds CANCELED is ordinary coverage: not
+        // reapable yet, not refused.
+        seed_book_invoice(&store, "lnv2-opRecent", "eRecent", "h-opRecent", "lnbcR", "EXPIRED", NOW - 10, None).await;
+        let file = legacy_file(&dir, Backend::Lnv2, |c| {
+            // eGone: no row at all (reaped by gc_lnv2_invoice_index); eCan: still CANCELED.
+            seed_lnv2_receive(c, "eCan", "opCan", "lnbcC", old, "CANCELED");
+            seed_lnv2_receive(c, "eRecent", "opRecent", "lnbcR", NOW - 10, "CANCELED");
+        });
+        let probe = FakeProbe::default();
+        let out = run(&store, Backend::Lnv2, &probe, &file, NOW).await.unwrap();
+        assert_eq!(
+            out,
+            Outcome::Imported { receive_rows: 2, pay_rows: 0, repaired: 0, reaped: 2, stamped: 0 }
+        );
+        assert_eq!(count(&store, "SELECT count(*) FROM invoice").await, 1, "the two old rows pre-reaped, the recent one kept");
+        assert!(probe.asked().is_empty(), "a same-id CANCELED row needs no tiebreak");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The lnv2 replacement shape (identity + status, never hash history): an unsettled EXPIRED book
+    /// row A under an external_id whose map row is a DIFFERENT invoice B that is OPEN — repaired to B
+    /// and reopened, ONLY because the backend positively establishes B and reports A terminal-unpaid.
+    /// The same with B PAID_UNRECOVERED repairs too (the condition backfill is ADR-0023's).
+    #[cfg(feature = "fedimint")]
+    #[tokio::test]
+    async fn a_live_lnv2_replacement_over_a_stale_book_row_is_repaired_and_reopened() {
+        for map_status in ["OPEN", "PAID", "PAID_UNRECOVERED"] {
+            let dir = temp_dir();
+            let store = mem_store();
+            seed_book_invoice(&store, "lnv2-opA", "e1", "opA", "lnbcA", "EXPIRED", NOW - 10, None).await;
+            let file = legacy_file(&dir, Backend::Lnv2, |c| {
+                seed_lnv2_receive(c, "e1", "opB", "lnbcB", NOW + 600, map_status);
+            });
+            let probe = FakeProbe::with(&[
+                ("lnv2-opB", ReceiveState::Established),
+                ("lnv2-opA", ReceiveState::TerminalUnpaid),
+            ]);
+            let out = run(&store, Backend::Lnv2, &probe, &file, NOW).await.unwrap();
+            assert_eq!(
+                out,
+                Outcome::Imported { receive_rows: 1, pay_rows: 0, repaired: 1, reaped: 0, stamped: 0 },
+                "map status {map_status}"
+            );
+            assert_eq!(probe.asked(), vec!["lnv2-opB".to_string(), "lnv2-opA".to_string()]);
+            let (id, bolt11, status): (String, String, String) = store
+                .read(|c| {
+                    Ok(c.query_row(
+                        "SELECT id, bolt11, status FROM invoice WHERE external_id='e1'",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )?)
+                })
+                .await
+                .unwrap();
+            assert_eq!((id.as_str(), bolt11.as_str(), status.as_str()), ("lnv2-opB", "lnbcB", "OPEN"));
+            assert_eq!(count(&store, "SELECT count(*) FROM event_log WHERE kind='adr0022_import_repair'").await, 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The mismatched-restore shape — NEWER books naming replacement B over an OLDER file naming
+    /// predecessor A — must NOT rewrite B back to A: the map's row is expired-unpaid (refuse), and
+    /// even when A reads established, B's absence from the backend proves nothing (refuse).
+    #[tokio::test]
+    async fn newer_books_over_an_older_map_are_never_rewritten_back() {
+        // 1. The map's A is terminal-unpaid at the backend: the map is the stale side.
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_book_invoice(&store, "phoenixd-hB", "e1", "hB", "lnbcB", "OPEN", NOW + 600, None).await;
+        let file = legacy_file(&dir, Backend::Phoenixd, |c| {
+            seed_phx_receive(c, "e1", "hA", "lnbcA", NOW - 10);
+        });
+        let probe = FakeProbe::with(&[("phoenixd-hA", ReceiveState::TerminalUnpaid)]);
+        let err = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap_err();
+        assert!(format!("{err:#}").contains("does not positively report the map's invoice"), "{err:#}");
+        assert_eq!(count(&store, "SELECT count(*) FROM invoice WHERE id='phoenixd-hB'").await, 1, "untouched");
+
+        // 2. A established, B ABSENT (phoenixd forgot B): absence proves nothing -> refuse.
+        let probe = FakeProbe::with(&[("phoenixd-hA", ReceiveState::Established)]);
+        let err = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap_err();
+        assert!(format!("{err:#}").contains("does not positively report the book's invoice terminal-unpaid"), "{err:#}");
+        assert_eq!(count(&store, "SELECT count(*) FROM invoice WHERE id='phoenixd-hB'").await, 1, "untouched");
+        assert_eq!(marker(&store, Backend::Phoenixd).await, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// phoenixd's map keeps the OLD row beside a replacement (its upsert conflicts on invoice_id), so
+    /// the import compares against the NEWEST rowid per external_id: a book row matching the OLD one
+    /// is repaired to the newest, not stamped complete over the buyer's live successor.
+    #[tokio::test]
+    async fn phoenixd_compares_against_the_newest_map_row_per_external_id() {
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_book_invoice(&store, "phoenixd-hOld", "e1", "hOld", "lnbcOld", "EXPIRED", NOW - 10, None).await;
+        let file = legacy_file(&dir, Backend::Phoenixd, |c| {
+            seed_phx_receive(c, "e1", "hOld", "lnbcOld", NOW - 10);
+            seed_phx_receive(c, "e1", "hNew", "lnbcNew", NOW + 600);
+        });
+        let probe = FakeProbe::with(&[
+            ("phoenixd-hNew", ReceiveState::Established),
+            ("phoenixd-hOld", ReceiveState::TerminalUnpaid),
+        ]);
+        let out = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap();
+        assert!(matches!(out, Outcome::Imported { repaired: 1, receive_rows: 2, .. }), "{out:?}");
+        let (id, status): (String, String) = store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT id, status FROM invoice WHERE external_id='e1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!((id.as_str(), status.as_str()), ("phoenixd-hNew", "OPEN"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A PAID / settled book row that disagrees with the map refuses: money was booked against data
+    /// the map no longer describes, and no rule can say which side is right.
+    #[tokio::test]
+    async fn a_settled_book_row_that_disagrees_refuses() {
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_book_invoice(&store, "phoenixd-hA", "e1", "hA", "lnbcA", "PAID", NOW + 600, Some(NOW)).await;
+        let file = legacy_file(&dir, Backend::Phoenixd, |c| {
+            seed_phx_receive(c, "e1", "hB", "lnbcB", NOW + 600);
+        });
+        let probe = FakeProbe::with(&[
+            ("phoenixd-hB", ReceiveState::Established),
+            ("phoenixd-hA", ReceiveState::TerminalUnpaid),
+        ]);
+        let err = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap_err();
+        assert!(format!("{err:#}").contains("settled invoice phoenixd-hA"), "{err:#}");
+        assert!(probe.asked().is_empty(), "a settled disagreement is refused before any probe");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A CANCELED map row is never a replacement.
+    #[cfg(feature = "fedimint")]
+    #[tokio::test]
+    async fn a_canceled_map_row_is_never_a_replacement() {
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_book_invoice(&store, "lnv2-opA", "e1", "opA", "lnbcA", "OPEN", NOW + 600, None).await;
+        let file = legacy_file(&dir, Backend::Lnv2, |c| {
+            seed_lnv2_receive(c, "e1", "opB", "lnbcB", NOW + 600, "CANCELED");
+        });
+        let probe = FakeProbe::with(&[("lnv2-opB", ReceiveState::Established)]);
+        let err = run(&store, Backend::Lnv2, &probe, &file, NOW).await.unwrap_err();
+        assert!(format!("{err:#}").contains("CANCELED"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every legacy `phoenixd_unbookable_settlement` timer must resolve to an imported receive row.
+    #[tokio::test]
+    async fn a_timer_without_a_receive_row_refuses() {
+        let dir = temp_dir();
+        let store = mem_store();
+        let file = legacy_file(&dir, Backend::Phoenixd, |c| {
+            c.execute(
+                "INSERT INTO phoenixd_unbookable_settlement (invoice_id, first_refusal_at)
+                 VALUES ('phoenixd-hZ', 5)",
+                [],
+            )
+            .unwrap();
+        });
+        let probe = FakeProbe::default();
+        let err = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap_err();
+        assert!(format!("{err:#}").contains("timer for invoice phoenixd-hZ"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Pay coverage
+    // ---------------------------------------------------------------------------------------------
+
+    /// SENT coverage joins on the DERIVED pay key: a gen-1 LNURL refund must match its `:g1` row
+    /// (never the bare gen-0 key), a NULL backend id on the attempt passes against a SUCCEEDED row,
+    /// and a SENT attempt over an older FAILED map row REFUSES (the paid hash would be unowned).
+    #[tokio::test]
+    async fn sent_coverage_uses_the_derived_key_and_requires_a_succeeded_row() {
+        // gen-1 SENT, NULL id, :g1 SUCCEEDED row -> covered (the bare key has no row on purpose).
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_refund(&store, "e1", "SENT", "buyer@ln.example", Some("lnbc-r1"), 1, None).await;
+        let file = legacy_file(&dir, Backend::Phoenixd, |c| {
+            seed_phx_pay(c, "refund:e1:g1", "lnbc-r1", Some("pid-1"), "SUCCEEDED");
+        });
+        let probe = FakeProbe::default();
+        assert!(run(&store, Backend::Phoenixd, &probe, &file, NOW).await.is_ok());
+
+        // A row under the BARE key only (gen 0) does not cover a gen-1 attempt.
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_refund(&store, "e1", "SENT", "buyer@ln.example", Some("lnbc-r1"), 1, None).await;
+        let file = legacy_file(&dir, Backend::Phoenixd, |c| {
+            seed_phx_pay(c, "refund:e1", "lnbc-r1", Some("pid-1"), "SUCCEEDED");
+        });
+        let err = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap_err();
+        assert!(format!("{err:#}").contains("pay key refund:e1:g1"), "{err:#}");
+
+        // SENT over a FAILED map row for the same key/bolt11 refuses.
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_refund(&store, "e1", "SENT", "buyer@ln.example", Some("lnbc-r1"), 1, None).await;
+        let file = legacy_file(&dir, Backend::Phoenixd, |c| {
+            seed_phx_pay(c, "refund:e1:g1", "lnbc-r1", None, "FAILED");
+        });
+        let err = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap_err();
+        assert!(format!("{err:#}").contains("map status FAILED acceptable: false"), "{err:#}");
+
+        // A backend id on the attempt must match the map's payment id.
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_refund(&store, "e1", "SENT", "buyer@ln.example", Some("lnbc-r1"), 1, Some("pid-other")).await;
+        let file = legacy_file(&dir, Backend::Phoenixd, |c| {
+            seed_phx_pay(c, "refund:e1:g1", "lnbc-r1", Some("pid-1"), "SUCCEEDED");
+        });
+        let err = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap_err();
+        assert!(format!("{err:#}").contains("backend id agrees: false"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A PENDING attempt without an id but WITH a present pay row must agree with it: a stale PREPARED
+    /// row naming a different bolt11 is the shape that lets recovery adopt payment B for liability A.
+    #[tokio::test]
+    async fn a_present_prepared_row_naming_a_different_bolt11_refuses() {
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_refund(&store, "e1", "PENDING", "buyer@ln.example", Some("lnbc-r1"), 1, None).await;
+        let file = legacy_file(&dir, Backend::Phoenixd, |c| {
+            seed_phx_pay(c, "refund:e1:g1", "lnbc-OTHER", None, "PREPARED");
+        });
+        let probe = FakeProbe::default();
+        let err = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap_err();
+        assert!(format!("{err:#}").contains("bolt11 agrees: false"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A present file that omits the map row of a PENDING (or retryable FAILED) attempt without an id
+    /// cannot tell 'never started' from 'witness lost': the attempt is stamped and parked, and the
+    /// import still completes.
+    #[tokio::test]
+    async fn a_present_file_omitting_an_unwitnessed_attempt_stamps_it() {
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_refund(&store, "e1", "FAILED", "buyer@ln.example", Some("lnbc-r1"), 1, None).await;
+        seed_sweep(&store, "sweep:h2", "PENDING", "lnbc-s2", None).await;
+        let file = legacy_file(&dir, Backend::Phoenixd, |_c| {});
+        let probe = FakeProbe::default();
+        let out = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap();
+        assert_eq!(
+            out,
+            Outcome::Imported { receive_rows: 0, pay_rows: 0, repaired: 0, reaped: 0, stamped: 2 }
+        );
+        assert_eq!(fence(&store, "refund_attempt", "ref-e1").await, Some(NOW));
+        assert_eq!(fence(&store, "sweep_attempt", "sweep:h2").await, Some(NOW));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
