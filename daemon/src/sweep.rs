@@ -1151,7 +1151,7 @@ mod tests {
     use crate::backends::{Invoice, MockPayment, PaymentStatus, Settlement};
     use crate::clock::TestClock;
     use crate::refund_resolver::mint_bolt11;
-    use crate::store::{Store, SCHEMA};
+    use crate::store::Store;
     use async_trait::async_trait;
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -1160,9 +1160,8 @@ mod tests {
     const META: &str = r#"[["text/plain","lnrent sweep"]]"#;
 
     fn mem_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        conn
+        // The FULL runtime schema (migrations + the ADR-0022 backend tables), not the raw baseline.
+        crate::store::open_memory().unwrap()
     }
 
     fn mem_store() -> Store {

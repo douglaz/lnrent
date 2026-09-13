@@ -3192,4 +3192,325 @@ mod tests {
         );
         rm_all(&corrupt);
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // ADR-0022 (lnrent-chgb): backend tables on open, the leased transaction, the gated hook, and
+    // the renewal-replacement refresh rule.
+    // ---------------------------------------------------------------------------------------------
+
+    /// Every COMPILED backend's correlation tables exist after `open`, plus the `migration` marker
+    /// table and the `migration_unverified_at` fence columns — unconditionally, not keyed on the
+    /// selected backend (the persisted backend is inherited only AFTER the store is open).
+    #[test]
+    fn open_applies_every_compiled_backend_schema_and_the_adr0022_columns() {
+        let conn = open_memory().unwrap();
+        let mut expect = vec![
+            "phoenixd_invoice",
+            "phoenixd_pay",
+            "phoenixd_unbookable_settlement",
+            "migration",
+        ];
+        if cfg!(feature = "fedimint") {
+            expect.extend(["lnv2_invoice", "lnv2_pay"]);
+        }
+        for table in expect {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "table {table} must exist after open");
+        }
+        for table in ["refund_attempt", "sweep_attempt"] {
+            assert!(
+                has_column(&conn, table, "migration_unverified_at").unwrap(),
+                "{table}.migration_unverified_at (M12) must exist"
+            );
+        }
+        // Re-opening is idempotent (`IF NOT EXISTS` throughout): a second prepare is a no-op.
+        prepare_connection(&conn).unwrap();
+    }
+
+    /// M12 on a LEGACY database: the fence columns are added exactly once even when a prior partial
+    /// M12 already added one of them (the `has_column` guard, like M3/M4).
+    #[test]
+    fn m12_self_heals_a_partially_applied_fence_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Bring the DB to version 11, then hand-add ONE of the two columns (a crash mid-M12).
+        apply_migrations(&conn, &MIGRATIONS[..11]).unwrap();
+        conn.execute_batch("ALTER TABLE refund_attempt ADD COLUMN migration_unverified_at INTEGER")
+            .unwrap();
+        migrate(&conn).unwrap();
+        assert!(has_column(&conn, "refund_attempt", "migration_unverified_at").unwrap());
+        assert!(has_column(&conn, "sweep_attempt", "migration_unverified_at").unwrap());
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// The lease rides `Store::transaction_then` as its OWN argument and is dropped by the ACTOR
+    /// after the commit — not when the closure returns. Pinned from both sides: while the caller
+    /// holds the `Issued`/`Prepared` value the guard is still taken (a concurrent same-key caller
+    /// cannot pass its check), and once `transaction_then` returns it is free.
+    #[tokio::test]
+    async fn transaction_then_holds_the_lease_until_after_the_commit() {
+        let store = Store::spawn(open_memory().unwrap());
+        let mutex = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = mutex.clone().lock_owned().await;
+        let lease: crate::backends::Lease = Box::new(guard);
+        assert!(
+            mutex.try_lock().is_err(),
+            "RED baseline: the guard is held while the lease value is alive"
+        );
+        store
+            .transaction_then(
+                |tx| {
+                    tx.execute_batch("INSERT INTO daemon_state (last_heartbeat) VALUES (1)")?;
+                    Ok(())
+                },
+                lease,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            mutex.try_lock().is_ok(),
+            "the actor released the lease after the commit"
+        );
+        // And on the ROLLBACK path the lease is released too — a failed issuance must not wedge the
+        // backend's create guard forever.
+        let guard = mutex.clone().lock_owned().await;
+        let err = store
+            .transaction_then(
+                |_tx| -> Result<()> { Err(anyhow!("refused")) },
+                Box::new(guard),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refused"));
+        assert!(mutex.try_lock().is_ok(), "released after the rollback as well");
+    }
+
+    /// `after_commit` runs on the actor after the commit, ONLY when `persist` ran in that transaction
+    /// (a committed refusal / lost-CAS no-op must not start an lnv2 watcher against an absent row),
+    /// and never when the transaction rolled back.
+    #[tokio::test]
+    async fn after_commit_hook_runs_only_when_persist_ran_and_the_commit_succeeded() {
+        use crate::backends::{Invoice, Issued};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = Store::spawn(open_memory().unwrap());
+        let inv = Invoice {
+            id: "i".into(),
+            external_id: "x".into(),
+            backend_invoice_id: "b".into(),
+            payment_hash: "h".into(),
+            bolt11: "ln".into(),
+            amount_sat: 1,
+            expires_at: 1,
+        };
+        let hooks = Arc::new(AtomicUsize::new(0));
+        let issued = |hooks: Arc<AtomicUsize>| {
+            Issued::new(
+                inv.clone(),
+                |tx: &Transaction| {
+                    tx.execute_batch("INSERT INTO daemon_state (last_heartbeat) VALUES (7)")?;
+                    Ok(())
+                },
+                Box::new(()),
+                Some(move || {
+                    hooks.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+        };
+
+        // 1. persist ran + commit -> hook runs once.
+        let i = issued(hooks.clone());
+        let persist = i.persist;
+        store
+            .transaction_then(move |tx| persist(tx), i.lease, i.after_commit)
+            .await
+            .unwrap();
+        assert_eq!(hooks.load(Ordering::SeqCst), 1);
+
+        // 2. the closure commits WITHOUT calling persist (a refusal branch) -> no hook.
+        let i = issued(hooks.clone());
+        let _unused = i.persist;
+        store
+            .transaction_then(|_tx| Ok(()), i.lease, i.after_commit)
+            .await
+            .unwrap();
+        assert_eq!(hooks.load(Ordering::SeqCst), 1, "a committed no-op starts nothing");
+
+        // 3. persist ran but the transaction ROLLED BACK -> no hook, and no row.
+        let i = issued(hooks.clone());
+        let persist = i.persist;
+        let err = store
+            .transaction_then(
+                move |tx| {
+                    persist(tx)?;
+                    Err::<(), _>(anyhow!("later step failed"))
+                },
+                i.lease,
+                i.after_commit,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("later step failed"));
+        assert_eq!(hooks.load(Ordering::SeqCst), 1, "no hook on rollback");
+        let rows: i64 = store
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM daemon_state", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "only the first (committed) insert exists");
+    }
+
+    /// The actor commits an enqueued transaction even when the awaiting caller is CANCELLED, and runs
+    /// the hook itself — a caller-owned hook would be dropped with the caller and the committed row's
+    /// watcher never started until an unrelated restart (ADR-0022 "The interface").
+    #[tokio::test]
+    async fn a_cancelled_caller_still_gets_its_commit_and_its_hook() {
+        use crate::backends::{Invoice, Issued};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = Store::spawn(open_memory().unwrap());
+        // Occupy the actor so the caller's job is QUEUED (not yet run) when we cancel the caller.
+        let blocker = store.clone();
+        let blocked = tokio::spawn(async move {
+            blocker
+                .read(|_c| {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        let hooks = Arc::new(AtomicUsize::new(0));
+        let h = hooks.clone();
+        let issued = Issued::new(
+            Invoice {
+                id: "i".into(),
+                external_id: "x".into(),
+                backend_invoice_id: "b".into(),
+                payment_hash: "h".into(),
+                bolt11: "ln".into(),
+                amount_sat: 1,
+                expires_at: 1,
+            },
+            |tx: &Transaction| {
+                tx.execute_batch("INSERT INTO daemon_state (last_heartbeat) VALUES (9)")?;
+                Ok(())
+            },
+            Box::new(()),
+            Some(move || {
+                h.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let s = store.clone();
+        let caller = tokio::spawn(async move {
+            let persist = issued.persist;
+            s.transaction_then(move |tx| persist(tx), issued.lease, issued.after_commit)
+                .await
+        });
+        // Let the caller enqueue its job (the channel has capacity, so `send` completes on the first
+        // poll), then cancel it before the actor gets to the job.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        caller.abort();
+        let _ = caller.await;
+        blocked.await.unwrap().unwrap();
+        // The actor still ran the job: row committed, hook run — by the actor, since the caller is gone.
+        let rows: i64 = store
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM daemon_state", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "the enqueued transaction committed despite the cancelled caller");
+        assert_eq!(hooks.load(Ordering::SeqCst), 1, "and the actor ran the post-commit hook");
+    }
+
+    /// The ADR-0022 replacement rule: a renewal re-issue under the same `external_id` whose backend
+    /// invoice was REPLACED refreshes the row (id, backend id, hash, bolt11, amount, expiry) and
+    /// resets EXPIRED -> OPEN, so capture books the successor's payment; a PAID or settled row is
+    /// never touched. RED on master: the pre-ADR-0022 `ON CONFLICT DO NOTHING` kept the retired
+    /// bolt11 and hash beside a fresh correlation.
+    #[tokio::test]
+    async fn upsert_renewal_invoice_refreshes_a_replacement_and_never_a_settled_row() {
+        let store = Store::spawn(open_memory().unwrap());
+        let row = |id: &str, bolt11: &str| RenewalInvoiceRow {
+            id: id.to_string(),
+            subscription_id: "s1".into(),
+            external_id: "renew:auto:s1:100".into(),
+            backend_invoice_id: format!("b-{id}"),
+            payment_hash: format!("h-{id}"),
+            bolt11: bolt11.to_string(),
+            amount_sat: 500,
+            expires_at: 1_000,
+            now: 1,
+        };
+        let (a, b) = (row("lnv2-A", "lnbcA"), row("lnv2-B", "lnbcB"));
+        store
+            .transaction(move |tx| {
+                upsert_renewal_invoice(tx, &a)?;
+                // The predecessor expired locally (reconcile), then the backend replaced it.
+                tx.execute(
+                    "UPDATE invoice SET status='EXPIRED' WHERE external_id='renew:auto:s1:100'",
+                    [],
+                )?;
+                upsert_renewal_invoice(tx, &b)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (id, bolt11, hash, status) = store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT id, bolt11, payment_hash, status FROM invoice
+                      WHERE external_id='renew:auto:s1:100'",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    },
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (id.as_str(), bolt11.as_str(), hash.as_str(), status.as_str()),
+            ("lnv2-B", "lnbcB", "h-lnv2-B", "OPEN"),
+            "the replacement refreshed the row and reopened it"
+        );
+
+        // A PAID row is money already booked: the same upsert must leave it alone.
+        let c = row("lnv2-C", "lnbcC");
+        store
+            .transaction(move |tx| {
+                tx.execute(
+                    "UPDATE invoice SET status='PAID', settled_at=5 WHERE external_id='renew:auto:s1:100'",
+                    [],
+                )?;
+                upsert_renewal_invoice(tx, &c)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (id, status) = store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT id, status FROM invoice WHERE external_id='renew:auto:s1:100'",
+                    [],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!((id.as_str(), status.as_str()), ("lnv2-B", "PAID"), "a settled row is never refreshed");
+    }
+
 }

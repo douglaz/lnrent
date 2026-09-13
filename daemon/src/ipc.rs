@@ -1942,9 +1942,9 @@ mod tests {
     }
 
     fn mem_store() -> Store {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        Store::spawn(conn)
+        // The FULL runtime schema (migrations + the ADR-0022 backend tables), not the raw baseline:
+        // the drivers read `migration_unverified_at`, which only migration 12 adds.
+        Store::spawn(crate::store::open_memory().unwrap())
     }
 
     async fn money_data(store: &Store, payment: &Arc<dyn PaymentBackend>) -> Value {

@@ -3712,3 +3712,119 @@ async fn the_same_unbookable_settlement_alerts_once_per_cooldown_window() {
     be.received_amount_msat(&inv.id).await.unwrap_err();
     assert_eq!(operator_alerts(&store).await.len(), 2, "after cooldown");
 }
+
+// --------------------------------------------------------------------------------------------------
+// ADR-0022 (lnrent-chgb): prepare_pay, the pay-start lease, and the issuance crash story.
+// --------------------------------------------------------------------------------------------------
+
+/// `pay(key)` READS the PREPARED row the driver committed and never creates one: a key nobody
+/// prepared is refused before phoenixd is even asked.
+#[tokio::test]
+async fn pay_without_a_prepared_row_is_refused_before_any_post() {
+    let ops = FakePhoenixdOps::new();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let bolt11 = mint_bolt11(120_000, 90);
+    let err = be
+        .pay_refund_capped(&bolt11, 120, 130, "refund:order:90:g1")
+        .await
+        .expect_err("no PREPARED row -> refuse");
+    assert!(format!("{err:#}").contains("no PREPARED row"), "{err:#}");
+    assert!(ops.pay_calls().is_empty());
+    assert!(ops.incoming_calls().is_empty(), "phoenixd was not consulted at all");
+    assert_eq!(
+        be.payment_status_by_key("refund:order:90:g1").await.unwrap(),
+        PayStatus::Unknown
+    );
+}
+
+/// Two concurrent keys targeting ONE bolt11 yield exactly one PREPARED row for its payment hash: the
+/// pay guard rides `Prepared::lease` through the first caller's commit, so the second key's [8A]
+/// check runs after that row is visible and records a terminal refusal instead. Its `pay` then
+/// refuses without a POST. RED on a guard released at `prepare_pay` return (or captured by the
+/// closure): both keys would pass [8A] and both hold PREPARED for one hash.
+#[tokio::test]
+async fn two_concurrent_keys_targeting_one_bolt11_yield_exactly_one_prepared_row() {
+    let ops = FakePhoenixdOps::new();
+    let be = Arc::new(backend(ops.clone(), TestClock::new(1_000)));
+    let bolt11 = mint_bolt11(120_000, 91);
+    let hash = hash_of(&bolt11);
+    let first = be.prepare_pay("refund:order:91a:g1", &bolt11).await.unwrap();
+    // The second prepare blocks on the lease until the first commits.
+    let (b, b11) = (be.clone(), bolt11.clone());
+    let second = tokio::spawn(async move { b.prepare_t("refund:order:91b:g1", &b11).await });
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(!second.is_finished(), "the second prepare waits for the first's commit");
+    let persist = first.persist;
+    be.store
+        .transaction_then(move |tx| persist(tx), first.lease, None)
+        .await
+        .unwrap();
+    second.await.unwrap().unwrap();
+
+    let h = hash.clone();
+    let (prepared, failed): (i64, i64) = be
+        .store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT sum(status='PREPARED'), sum(status='FAILED') FROM phoenixd_pay
+                  WHERE payment_hash=?1",
+                params![h],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!((prepared, failed), (1, 1), "one PREPARED owner, one recorded [8A] refusal");
+    let err = be
+        .pay_refund_capped(&bolt11, 120, 130, "refund:order:91b:g1")
+        .await
+        .expect_err("the refused key never POSTs");
+    assert!(format!("{err:#}").contains("already owned by idempotency key"), "{err:#}");
+    assert!(ops.pay_calls().is_empty());
+}
+
+/// While the caller holds a `Prepared`, the pay guard is still taken; the actor releases it after the
+/// commit — and `pay(key)` then RE-ACQUIRES it for the POST (two acquisitions, never one span).
+#[tokio::test]
+async fn the_pay_lease_is_held_until_the_callers_commit_then_reacquired_by_pay() {
+    let ops = FakePhoenixdOps::new();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let bolt11 = mint_bolt11(120_000, 92);
+    let prepared = be.prepare_pay("refund:order:92:g1", &bolt11).await.unwrap();
+    assert!(be.pay_start_lock.try_lock().is_err(), "held inside Prepared::lease");
+    let persist = prepared.persist;
+    be.store
+        .transaction_then(move |tx| persist(tx), prepared.lease, None)
+        .await
+        .unwrap();
+    assert!(be.pay_start_lock.try_lock().is_ok(), "released after the commit");
+    be.pay_refund_capped(&bolt11, 120, 130, "refund:order:92:g1")
+        .await
+        .expect("the POST re-acquires the guard and pays");
+    assert_eq!(ops.pay_calls().len(), 1);
+}
+
+/// The issuance crash story (SPEC §6.6, phoenixd half): an `issue_invoice` whose commit never
+/// happened leaves NO row in the books or the receive map; phoenixd holds the orphan, and the
+/// deterministic-`external_id` retry RECOVERS it (live or paid) as the same invoice.
+#[tokio::test]
+async fn an_uncommitted_issue_leaves_no_row_and_the_retry_recovers_the_orphan() {
+    let ops = FakePhoenixdOps::new();
+    let be = backend(ops.clone(), TestClock::new(1_000));
+    let orphan = be
+        .issue_invoice(25_000, "memo", 600, "ext:crash")
+        .await
+        .unwrap();
+    let first = orphan.invoice.clone();
+    drop(orphan); // the crash: persist never ran, the lease is dropped with the value
+    let rows: i64 = be
+        .store
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM phoenixd_invoice", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "no half-written correlation");
+    assert_eq!(ops.create_calls().len(), 1, "phoenixd holds one orphan");
+    let again = be.create_invoice_t(25_000, "memo", 600, "ext:crash").await.unwrap();
+    assert_eq!(again.payment_hash, first.payment_hash, "the retry recovered the orphan by externalId");
+    assert_eq!(ops.create_calls().len(), 1, "no second createinvoice");
+}

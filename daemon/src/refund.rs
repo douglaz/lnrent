@@ -1395,17 +1395,17 @@ mod tests {
     use super::*;
     use crate::backends::{Invoice, PaymentStatus, Settlement};
     use crate::clock::TestClock;
-    use crate::store::{Store, SCHEMA};
+    use crate::store::Store;
     use async_trait::async_trait;
-    use rusqlite::{Connection, OptionalExtension};
+    use rusqlite::OptionalExtension;
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
     use tokio::sync::mpsc;
 
     fn mem_store() -> Store {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        Store::spawn(conn)
+        // The FULL runtime schema (migrations + the ADR-0022 backend tables), not the raw baseline:
+        // the drivers read `migration_unverified_at`, which only migration 12 adds.
+        Store::spawn(crate::store::open_memory().unwrap())
     }
 
     /// A configurable PaymentBackend for the refunder's tests. By default it dedups `pay` on the key

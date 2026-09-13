@@ -41,6 +41,8 @@ struct FakeState {
     // tests using amountless fake bolt11s pass unchanged); a registered value drives the mismatch guard.
     invoice_amounts: HashMap<String, u64>,
     op_final: HashMap<String, SendFinalScript>,
+    /// Ops whose `await_send_final` never returns (a federation that never settles the terminal).
+    send_hangs: HashSet<String>,
     receive_final: HashMap<String, ReceiveFinal>,
     /// Ops `receive_state` reports MISSING from the operation log (a rolled-back client db).
     receive_missing: HashSet<String>,
@@ -101,6 +103,7 @@ impl FakeLnv2Ops {
                 op_keys: HashMap::new(),
                 invoice_amounts: HashMap::new(),
                 op_final: HashMap::new(),
+                send_hangs: HashSet::new(),
                 receive_final: HashMap::new(),
                 receive_missing: HashSet::new(),
                 receive_subscriptions: HashMap::new(),
@@ -145,6 +148,10 @@ impl FakeLnv2Ops {
     }
     fn set_send_final(&self, op: &str, s: SendFinalScript) {
         self.st.lock().unwrap().op_final.insert(op.to_string(), s);
+    }
+    /// Make `await_send_final(op)` hang forever (the terminal never arrives).
+    fn set_send_hangs(&self, op: &str) {
+        self.st.lock().unwrap().send_hangs.insert(op.to_string());
     }
     /// Script `receive_state(op)` to answer MISSING (the op is gone from the client's log).
     #[allow(dead_code)]
@@ -342,6 +349,10 @@ impl Lnv2Ops for FakeLnv2Ops {
     }
 
     async fn await_send_final(&self, op: &str) -> Result<SendFinal> {
+        if self.st.lock().unwrap().send_hangs.contains(op) {
+            pending::<()>().await;
+            unreachable!("pending future never completes");
+        }
         match self.st.lock().unwrap().op_final.get(op).copied() {
             Some(SendFinalScript::Terminal(f)) => Ok(f),
             Some(SendFinalScript::Ambiguous) => Err(anyhow!("ambiguous / timed out")),
@@ -2182,4 +2193,209 @@ async fn outbound_status_by_ref_cannot_answer_without_an_invoice() {
         be.outbound_status_by_ref("hash-irrelevant", "").await.unwrap(),
         None
     );
+}
+
+// --------------------------------------------------------------------------------------------------
+// ADR-0022 (lnrent-chgb): the leased issuance, the actor-run watcher hook, prepare_pay, and the
+// two-phase pay lock.
+// --------------------------------------------------------------------------------------------------
+
+/// Two concurrent same-`external_id` issuances mint EXACTLY one lnv2 invoice. The create guard rides
+/// `Issued::lease` through the caller's commit, so the second caller's check runs against the
+/// committed row. RED on a guard released at `issue_invoice` return (or captured by `persist`, which
+/// returns before the commit): both callers would pass the check and mint two tweaks, stranding one.
+#[tokio::test]
+async fn two_concurrent_same_external_id_issuances_mint_exactly_once() {
+    let fake = FakeLnv2Ops::new();
+    let backend = Arc::new(backend_with(fake.clone(), clock(1_000)));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..2 {
+        let b = backend.clone();
+        tasks.spawn(async move {
+            let issued = b.issue_invoice(1000, "m", 3600, "extRace").await.unwrap();
+            // A deliberate yield between issuing and committing widens the window a released guard
+            // would open.
+            tokio::task::yield_now().await;
+            let persist = issued.persist;
+            b.store
+                .transaction_then(move |tx| persist(tx), issued.lease, issued.after_commit)
+                .await
+                .unwrap();
+            issued.invoice
+        });
+    }
+    let mut invoices = Vec::new();
+    while let Some(inv) = tasks.join_next().await {
+        invoices.push(inv.unwrap());
+    }
+    assert_eq!(
+        fake.st.lock().unwrap().next_inv,
+        1,
+        "exactly one receive was minted at the federation"
+    );
+    assert_eq!(invoices[0].bolt11, invoices[1].bolt11, "both callers hold the SAME invoice");
+    let rows: i64 = backend
+        .store
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM lnv2_invoice", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+/// While the caller holds an `Issued`, the create guard is still taken; the store actor releases it
+/// only after the commit. A second issuer for the same key blocks until then and finds the row.
+#[tokio::test]
+async fn the_create_lease_is_held_until_the_callers_commit() {
+    let fake = FakeLnv2Ops::new();
+    let backend = backend_with(fake.clone(), clock(1_000));
+    let issued = backend.issue_invoice(1000, "m", 3600, "extLease").await.unwrap();
+    assert!(
+        backend.create_lock.try_lock().is_err(),
+        "the guard is alive inside Issued::lease, not released at return"
+    );
+    let persist = issued.persist;
+    backend
+        .store
+        .transaction_then(move |tx| persist(tx), issued.lease, issued.after_commit)
+        .await
+        .unwrap();
+    assert!(backend.create_lock.try_lock().is_ok(), "released by the actor after the commit");
+}
+
+/// The live receive watcher starts from the store actor's post-commit hook, and ONLY if `persist`
+/// ran: a transaction that commits a refusal without the invoice (the listing-withdrawn order write,
+/// the lost soft-reminder CAS) must not start a watcher against an absent row. RED with the hook
+/// unconditional: the first branch would subscribe to an op whose row was never written.
+#[tokio::test]
+async fn the_live_watcher_starts_only_after_commit_and_only_if_persist_ran() {
+    let fake = FakeLnv2Ops::new();
+    fake.set_receive_credit_msat(995_500);
+    let backend = backend_with(fake.clone(), clock(5_000));
+    let mut rx = backend.watch().await.unwrap();
+
+    // 1. A committed NO-OP (the caller's closure never calls persist): no watcher.
+    let issued = backend.issue_invoice(1000, "m", 3600, "extNoop").await.unwrap();
+    let op_noop = issued.invoice.backend_invoice_id.clone();
+    let _dropped = issued.persist;
+    backend
+        .store
+        .transaction_then(|_tx| Ok(()), issued.lease, issued.after_commit)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        fake.receive_subscribe_count(&op_noop),
+        0,
+        "a committed refusal starts no watcher"
+    );
+
+    // 2. persist ran: the watcher subscribes after the commit, and its Claimed is LIVE.
+    let issued = backend.issue_invoice(1000, "m", 3600, "extLive").await.unwrap();
+    let inv = issued.invoice.clone();
+    assert_eq!(
+        fake.receive_subscribe_count(&inv.backend_invoice_id),
+        0,
+        "nothing subscribes BEFORE the commit (a Claimed against an uncommitted row would be lost)"
+    );
+    let persist = issued.persist;
+    backend
+        .store
+        .transaction_then(move |tx| persist(tx), issued.lease, issued.after_commit)
+        .await
+        .unwrap();
+    fake.set_receive_final(&inv.backend_invoice_id, ReceiveFinal::Claimed);
+    let settlement = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("the post-commit watcher observes the payment")
+        .expect("channel open");
+    assert_eq!(settlement.external_id, "extLive");
+    assert_eq!(settlement.settled_at, 5_000, "live provenance: the true clock");
+}
+
+/// `pay(key)` READS the PREPARED row the driver committed and never creates one: a key nobody
+/// prepared is refused before any federation call.
+#[tokio::test]
+async fn pay_without_a_prepared_row_is_refused_before_any_send() {
+    let fake = FakeLnv2Ops::new();
+    let backend = backend_with(fake.clone(), clock(1_000));
+    let err = backend
+        .pay_refund_capped("lnbcUnprepared", 500, 500, "keyUnprepared")
+        .await
+        .expect_err("no PREPARED row -> refuse");
+    assert!(
+        format!("{err:#}").contains("no PREPARED row"),
+        "names the missing prepare: {err:#}"
+    );
+    assert_eq!(fake.send_count(), 0, "nothing reached the federation");
+    assert_eq!(
+        backend.payment_status_by_key("keyUnprepared").await.unwrap(),
+        PayStatus::Unknown
+    );
+}
+
+/// The pay lock is held through the durable PENDING write and RELEASED before `await_send_final`
+/// (ADR-0022 "The lease covers the check-and-create only"): a pay stuck awaiting finality must not
+/// block an unrelated sweep's pay. RED with the lock held across the await: the second pay would
+/// never start.
+#[tokio::test]
+async fn an_lnv2_pay_awaiting_finality_does_not_block_an_unrelated_pay() {
+    let fake = FakeLnv2Ops::new();
+    let backend = Arc::new(backend_with(fake.clone(), clock(1_000)));
+    // The first send's op never reaches a terminal.
+    fake.set_send_hangs("op1");
+    let b = backend.clone();
+    let stuck = tokio::spawn(async move { b.pay_refund_capped_t("lnbcStuck", 500, 500, "keyStuck").await });
+    // Give it time to fund and enter the unlocked await.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(fake.send_count(), 1, "the first pay funded and is awaiting");
+    let other = tokio::time::timeout(
+        Duration::from_secs(2),
+        backend.pay_capped_t("lnbcOther", 100, 100_000, "sweep:other"),
+    )
+    .await
+    .expect("an unrelated pay completes while the first awaits finality")
+    .unwrap();
+    assert_eq!(other, "op2");
+    stuck.abort();
+}
+
+/// Two keys targeting ONE bolt11 (hence one deterministic attempt-0 op) yield exactly one PREPARED
+/// row: the second key's `prepare_pay` runs its local [8A] check under the lease, after the first
+/// row is visible, and records its own terminal refusal instead. Its `pay` then never sends.
+#[tokio::test]
+async fn two_keys_targeting_one_bolt11_prepare_exactly_one_prepared_row() {
+    let fake = FakeLnv2Ops::new();
+    let backend = Arc::new(backend_with(fake.clone(), clock(1_000)));
+    let first = backend.prepare_pay("keyOne", "lnbcShared2").await.unwrap();
+    // The second prepare blocks on the lease until the first commits.
+    let b = backend.clone();
+    let second = tokio::spawn(async move { b.prepare_t("keyTwo", "lnbcShared2").await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!second.is_finished(), "the second prepare waits for the first's commit");
+    let persist = first.persist;
+    backend
+        .store
+        .transaction_then(move |tx| persist(tx), first.lease, None)
+        .await
+        .unwrap();
+    second.await.unwrap().unwrap();
+    let (prepared, failed): (i64, i64) = backend
+        .store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT sum(status='PREPARED'), sum(status='FAILED') FROM lnv2_pay
+                  WHERE bolt11='lnbcShared2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!((prepared, failed), (1, 1), "one PREPARED owner, one recorded refusal");
+    let err = backend
+        .pay_refund_capped("lnbcShared2", 500, 500, "keyTwo")
+        .await
+        .expect_err("the refused key never sends");
+    assert!(format!("{err:#}").contains("previously failed definitively"), "{err:#}");
+    assert_eq!(fake.send_count(), 0);
 }
