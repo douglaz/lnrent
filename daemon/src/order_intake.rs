@@ -4241,4 +4241,103 @@ mod tests {
             "the capacity hold is released"
         );
     }
+
+    /// ADR-0022 "The interface": the listing-withdrawn refusal commits WITHOUT the invoice, so the
+    /// backend's `after_commit` hook (the lnv2 live watcher) must NOT run — it would leave a terminal
+    /// task working against an absent row. A committed order runs it exactly once. Pinned at the
+    /// ORDER WRITE level (the ADR names this branch), not only on the store primitive.
+    struct HookCounting {
+        inner: MockPayment,
+        store: Store,
+        withdraw_listing: Option<String>,
+        hooks: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl PaymentBackend for HookCounting {
+        async fn create_invoice(&self, a: u64, m: &str, e: u32, x: &str) -> Result<Invoice> {
+            self.inner.create_invoice(a, m, e, x).await
+        }
+        async fn issue_invoice(&self, a: u64, m: &str, e: u32, x: &str) -> Result<crate::backends::Issued> {
+            if let Some(id) = self.withdraw_listing.clone() {
+                self.store
+                    .transaction(move |tx| {
+                        tx.execute("UPDATE listing SET state='WITHDRAWN' WHERE id=?1", params![id])?;
+                        Ok(())
+                    })
+                    .await?;
+            }
+            let invoice = self.inner.create_invoice(a, m, e, x).await?;
+            let hooks = self.hooks.clone();
+            Ok(crate::backends::Issued::new(
+                invoice,
+                |_tx: &rusqlite::Transaction| Ok(()),
+                Box::new(()),
+                Some(move || {
+                    hooks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }),
+            ))
+        }
+        async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
+            self.inner.lookup(id).await
+        }
+        async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            self.inner.lookup_settlement(id).await
+        }
+        async fn pay(&self, d: &str, a: u64, k: &str) -> Result<String> {
+            self.inner.pay(d, a, k).await
+        }
+        async fn payment_status(&self, id: &str) -> Result<PayStatus> {
+            self.inner.payment_status(id).await
+        }
+        async fn payment_status_by_key(&self, k: &str) -> Result<PayStatus> {
+            self.inner.payment_status_by_key(k).await
+        }
+        async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
+            self.inner.watch().await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_listing_withdrawn_refusal_never_runs_the_backends_post_commit_hook() {
+        for (withdraw, expected_hooks, expected_invoices) in [(false, 1usize, 1i64), (true, 0, 0)] {
+            let store = mem_store();
+            let recipe = dummy_recipe();
+            let listing_id = "30402:op:dummy-1";
+            seed_listing(&store, listing_id, "dummy", recipe.pricing.amount_sat as i64).await;
+            let hooks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let handler = OrderIntake::new(
+                store.clone(),
+                Arc::new(HookCounting {
+                    inner: MockPayment::new(),
+                    store: store.clone(),
+                    withdraw_listing: withdraw.then(|| listing_id.to_string()),
+                    hooks: hooks.clone(),
+                }),
+                Arc::new(TestClock::new(1000)),
+                recipe,
+                budget_with_room(),
+                u32::MAX,
+            );
+            let out = RecordingOutbound::default();
+            handler
+                .handle(
+                    Keys::generate().public_key(),
+                    order("q-hook", listing_id, json!({})),
+                    &out,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                count(&store, "SELECT count(*) FROM invoice").await,
+                expected_invoices,
+                "withdraw={withdraw}"
+            );
+            assert_eq!(
+                hooks.load(std::sync::atomic::Ordering::SeqCst),
+                expected_hooks,
+                "withdraw={withdraw}: the hook runs iff the invoice was persisted"
+            );
+        }
+    }
 }

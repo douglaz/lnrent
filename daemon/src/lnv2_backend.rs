@@ -971,13 +971,13 @@ impl Lnv2Payment {
                 Ok(op)
             }
             SendAttempt::InProgress(op) => {
-                self.adopt_deduped(idempotency_key, bolt11, &op, "PENDING")
+                self.adopt_deduped(idempotency_key, &op, "PENDING")
                     .await?;
                 Ok(op)
             }
             SendAttempt::AlreadyPaid(op) => {
                 // Already succeeded under this op — adopt as SUCCEEDED, but only after the [8A] check.
-                self.adopt_deduped(idempotency_key, bolt11, &op, "SUCCEEDED")
+                self.adopt_deduped(idempotency_key, &op, "SUCCEEDED")
                     .await?;
                 Ok(op)
             }
@@ -1003,13 +1003,7 @@ impl Lnv2Payment {
     /// `lnrent_key` matches. A mismatch is a cross-order same-invoice collision (a foreign order paid
     /// this bolt11): fail CLOSED (Err + warn) and record NOTHING, so we never silently under-refund by
     /// crediting someone else's payment. `record_status` = the status to persist on a match.
-    async fn adopt_deduped(
-        &self,
-        idempotency_key: &str,
-        bolt11: &str,
-        op: &str,
-        record_status: &str,
-    ) -> Result<()> {
+    async fn adopt_deduped(&self, idempotency_key: &str, op: &str, record_status: &str) -> Result<()> {
         let op_key = match self.ops.send_op_lnrent_key(op).await? {
             SendOpLookup::Missing => None,
             SendOpLookup::Present(key) => key,

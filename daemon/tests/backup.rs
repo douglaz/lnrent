@@ -1443,6 +1443,15 @@ fn a_self_contained_snapshot_is_stamped_v3_and_restores_in_both_modes() {
     let pre = backup(&data_dir, &base.join("pre"), None).unwrap();
     assert_eq!((pre.version, pre.self_contained), (1, false));
 
+    // Any marker content earns v3: `fresh`, `parked` (attempts fenced at the first boot) or a hash.
+    let parked_dir = base.join("parked");
+    fs::create_dir_all(&parked_dir).unwrap();
+    populate_state_db(&parked_dir);
+    mark_self_contained(&parked_dir, "parked");
+    let parked = backup(&parked_dir, &base.join("parked-backup"), None).unwrap();
+    assert_eq!((parked.version, parked.self_contained), (3, true), "a parked dir's backups are v3");
+    restore(&base.join("parked-backup"), &base.join("parked-restored"), false, None).unwrap();
+
     mark_self_contained(&data_dir, "fresh");
     let plaintext = backup(&data_dir, &base.join("plaintext"), None).unwrap();
     assert_eq!((plaintext.version, plaintext.self_contained), (3, true));

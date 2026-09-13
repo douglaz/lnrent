@@ -3828,3 +3828,25 @@ async fn an_uncommitted_issue_leaves_no_row_and_the_retry_recovers_the_orphan() 
     assert_eq!(again.payment_hash, first.payment_hash, "the retry recovered the orphan by externalId");
     assert_eq!(ops.create_calls().len(), 1, "no second createinvoice");
 }
+
+/// Two concurrent `pay(key)` for ONE prepared key POST exactly once: `pay_inner` re-acquires the pay
+/// guard and holds it through the terminal write's commit, so the second caller reads SUCCEEDED.
+#[tokio::test]
+async fn two_concurrent_pays_for_one_prepared_key_post_exactly_once() {
+    let ops = FakePhoenixdOps::new();
+    let be = Arc::new(backend(ops.clone(), TestClock::new(1_000)));
+    let bolt11 = mint_bolt11(120_000, 93);
+    be.prepare_t("refund:order:93:g1", &bolt11).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..2 {
+        let (b, b11) = (be.clone(), bolt11.clone());
+        tasks.spawn(async move { b.pay_refund_capped(&b11, 120, 130, "refund:order:93:g1").await });
+    }
+    let mut ids = Vec::new();
+    while let Some(r) = tasks.join_next().await {
+        ids.push(r.unwrap().expect("both callers see a paid key"));
+    }
+    assert_eq!(ids[0], ids[1], "one payment id for both");
+    assert_eq!(ops.pay_calls().len(), 1, "exactly one payinvoice POST");
+}
+

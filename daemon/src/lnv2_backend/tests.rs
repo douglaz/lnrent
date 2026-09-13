@@ -2399,3 +2399,25 @@ async fn two_keys_targeting_one_bolt11_prepare_exactly_one_prepared_row() {
     assert!(format!("{err:#}").contains("previously failed definitively"), "{err:#}");
     assert_eq!(fake.send_count(), 0);
 }
+
+/// The issuance crash story (SPEC §6.6, lnv2 half): an `issue_invoice` whose commit never happened
+/// leaves NO row, and the retry mints a FRESH invoice — lnv2 draws a new tweak per `receive()` and
+/// has no committed map row to reuse; the orphan is harmless because nobody holds its bolt11.
+#[tokio::test]
+async fn an_uncommitted_issue_leaves_no_row_and_the_retry_mints_fresh() {
+    let fake = FakeLnv2Ops::new();
+    let backend = backend_with(fake.clone(), clock(1_000));
+    let orphan = backend.issue_invoice(1000, "m", 3600, "extCrash").await.unwrap();
+    let first = orphan.invoice.clone();
+    drop(orphan); // the crash: persist never ran
+    let rows: i64 = backend
+        .store
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM lnv2_invoice", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "no half-written correlation");
+    let again = backend.create_invoice_t(1000, "m", 3600, "extCrash").await.unwrap();
+    assert_ne!(again.bolt11, first.bolt11, "a fresh mint, never the orphan's bolt11");
+    assert_eq!(fake.st.lock().unwrap().next_inv, 2, "two receives at the federation, one orphan");
+}
+

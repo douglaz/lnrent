@@ -292,7 +292,7 @@ pub async fn run(
         }
         repairs.push(m.map.clone());
     }
-    let repaired = repairs.len();
+    let repaired = repairs.len() + plan.refresh_expiry.len();
     let reaped = plan.reap.len();
     let stamped = plan.stamp.len();
     let receive_rows = legacy.receive.len();
@@ -311,16 +311,28 @@ pub async fn run(
             for map in &repairs {
                 repair_invoice(tx, map, now)?;
             }
+            for (ext, expires_at) in &plan.refresh_expiry {
+                tx.execute(
+                    "UPDATE invoice SET expires_at=?2
+                      WHERE external_id=?1 AND status <> 'PAID' AND settled_at IS NULL",
+                    params![ext, expires_at],
+                )?;
+            }
             let recheck = analyse(tx, backend, &legacy, now)?;
             if let Some(reason) = recheck.refusal {
                 bail!("refusing to boot: after repair, {reason}. {RUNBOOK}");
             }
-            if !recheck.mismatches.is_empty() || !recheck.reap.is_empty() {
+            if !recheck.mismatches.is_empty()
+                || !recheck.reap.is_empty()
+                || !recheck.refresh_expiry.is_empty()
+            {
                 bail!(
                     "refusing to boot: the import's repair did not converge ({} disagreements, {} \
-                     reap candidates remain) — a daemon bug; nothing was committed. {RUNBOOK}",
+                     reap candidates, {} window refreshes remain) — a daemon bug; nothing was \
+                     committed. {RUNBOOK}",
                     recheck.mismatches.len(),
-                    recheck.reap.len()
+                    recheck.reap.len(),
+                    recheck.refresh_expiry.len()
                 );
             }
             for (table, id) in &plan.stamp {
@@ -723,6 +735,9 @@ struct Plan {
     reap: Vec<String>,
     /// Disagreements that need the backend's tiebreak.
     mismatches: Vec<Mismatch>,
+    /// `(external_id, expires_at)` same-invoice rows whose only drift is the local window: repaired
+    /// from the map without a probe.
+    refresh_expiry: Vec<(String, i64)>,
     /// `(table, id)` attempts to stamp `migration_unverified_at`.
     stamp: Vec<(&'static str, String)>,
     /// The FIRST hard refusal, if any (reported verbatim).
@@ -912,11 +927,11 @@ fn analyse(conn: &Connection, backend: Backend, legacy: &Legacy, now: i64) -> Re
                 continue;
             }
             if !b.settled() && b.expires_at != Some(m.expires_at) {
-                plan.mismatches.push(Mismatch {
-                    book: b,
-                    map: m.clone(),
-                    same_id: true,
-                });
+                // The backend reopened a still-payable local window in its own map while the old
+                // renewal write left the books untouched: the row IS the correlation, so no tiebreak
+                // is needed (an expired or forgotten same-id invoice must not wedge the upgrade) —
+                // the books just take the map's window.
+                plan.refresh_expiry.push((b.external_id.clone(), m.expires_at));
             }
             continue;
         }
@@ -1777,6 +1792,39 @@ CREATE TABLE IF NOT EXISTS lnv2_pay (
             .await
             .unwrap();
         assert_eq!((id.as_str(), status.as_str()), ("phoenixd-hNew", "OPEN"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A same-invoice row whose only drift is `expires_at` (phoenixd reopened the local window in its
+    /// own map while the old renewal write left the books alone) is the correlation, not a
+    /// disagreement: the books take the map's window WITHOUT a probe — an expired or forgotten legacy
+    /// invoice must not wedge the upgrade — and a settled row keeps its own. RED on routing it through
+    /// the tiebreak: the probe answers TerminalUnpaid/Absent for an expired invoice and refuses.
+    #[tokio::test]
+    async fn a_same_invoice_window_drift_is_repaired_without_a_probe() {
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_book_invoice(&store, "phoenixd-h1", "e1", "h1", "lnbc1", "EXPIRED", NOW - 500, None).await;
+        seed_book_invoice(&store, "phoenixd-h2", "e2", "h2", "lnbc2", "PAID", NOW - 500, Some(NOW - 400)).await;
+        let file = legacy_file(&dir, Backend::Phoenixd, |c| {
+            seed_phx_receive(c, "e1", "h1", "lnbc1", NOW - 100); // window reopened, then lapsed
+            seed_phx_receive(c, "e2", "h2", "lnbc2", NOW - 100);
+        });
+        let probe = FakeProbe::default(); // everything Absent: phoenixd forgot both
+        let out = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap();
+        assert!(matches!(out, Outcome::Imported { repaired: 1, .. }), "{out:?}");
+        assert!(probe.asked().is_empty(), "no tiebreak for a same-id window drift");
+        let (e1, e2): (i64, i64) = store
+            .read(|c| {
+                Ok((
+                    c.query_row("SELECT expires_at FROM invoice WHERE external_id='e1'", [], |r| r.get(0))?,
+                    c.query_row("SELECT expires_at FROM invoice WHERE external_id='e2'", [], |r| r.get(0))?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(e1, NOW - 100, "the unsettled row took the map's window");
+        assert_eq!(e2, NOW - 500, "the settled row kept its own");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

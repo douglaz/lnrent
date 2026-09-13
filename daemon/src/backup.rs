@@ -517,6 +517,12 @@ fn backup_encrypted(
 /// Restore a backup produced by [`backup`] from `src` INTO `data_dir`, returning the [`Manifest`]
 /// describing what was restored.
 ///
+/// Formats (ADR-0022): v3 is self-contained and restores as is. v2 restores the captured
+/// `phoenixd_index.db` beside the state DB and the NEXT daemon boot runs the one legacy import
+/// (`legacy_import`) — the restore itself imports nothing, because the import's coverage tiebreak
+/// needs the live backend. v1 is refused when its books reference phoenixd
+/// (`refuse_v1_referencing_phoenixd`); a mock or lnv2-only v1 restores as before.
+///
 /// Refuses to clobber a non-empty `data_dir` unless `force` is set (the CLI maps `--force` here); the
 /// default is a fresh/empty target. The whole backup set is validated against the manifest BEFORE any
 /// file is written, so an incomplete/corrupt backup fails before touching the target rather than
