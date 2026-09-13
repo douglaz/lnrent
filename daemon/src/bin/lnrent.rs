@@ -76,6 +76,13 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// ADR-0022 legacy-import fences. A refund/sweep attempt stamped `migration_unverified` at the
+    /// first migrated boot is parked (never paid, never retried) because its pre-send witness may
+    /// have been lost with the old index file; the daemon never releases it on absence.
+    Migration {
+        #[command(subcommand)]
+        cmd: MigrationCmd,
+    },
     /// Admin: force-suspend a subscription.
     Suspend { id: String },
     /// Admin: force-resume a suspended subscription.
@@ -91,6 +98,25 @@ enum Cmd {
 enum DevCmd {
     /// Settle the open MockPayment invoice for a subscription.
     Settle { subscription_id: String },
+}
+
+#[derive(Subcommand)]
+enum MigrationCmd {
+    /// Release the fence on ONE attempt so the driver re-prepares it as a first attempt. Only you
+    /// can weigh the wallet's own outgoing records, its balance and the buyer's word: check them
+    /// first, say what you checked in --note (journaled), and confirm with --yes. Same authority as
+    /// `sweep --yes` — this can let a refund be paid.
+    #[command(name = "clear-fence")]
+    ClearFence {
+        /// The refund_attempt or sweep_attempt id (`lnrent refunds` lists refunds).
+        id: String,
+        /// What you verified before releasing it (required; journaled to event_log).
+        #[arg(long)]
+        note: String,
+        /// Confirm the release (without it the command only explains what it would do).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -196,6 +222,22 @@ async fn main() -> ExitCode {
         Cmd::Listing {
             cmd: ListingCmd::Withdraw,
         } => (Request::ListingWithdraw, HumanRender::Listing),
+        Cmd::Migration {
+            cmd: MigrationCmd::ClearFence { id, note, yes },
+        } => {
+            if !yes {
+                eprintln!(
+                    "refusing without --yes: clearing the fence on `{id}` lets the daemon prepare and \
+                     pay it as a first attempt. Check the wallet's own outgoing records for it first, \
+                     then re-run with --yes --note \"<what you checked>\"."
+                );
+                return exit_for("bad_request");
+            }
+            (
+                Request::MigrationClearFence { id, note },
+                HumanRender::Generic,
+            )
+        }
         Cmd::Suspend { id } => (Request::AdminSuspend { id }, HumanRender::Generic),
         Cmd::Resume { id } => (Request::AdminResume { id }, HumanRender::Generic),
         Cmd::Dev {
