@@ -1669,14 +1669,13 @@ async fn a_prepared_key_refuses_a_terminal_unpaid_record_without_writing_failed(
         .expect_err("an unattributable terminal record is not a licence to pay again");
 
     // The record's own measured shape remains truthful in the operator message.
-    let rendered = format!("{err:#}");
+    let rendered = format!("{err:#}").to_lowercase();
     assert!(
-        rendered.contains("does carry a completion time")
-            && !rendered.contains("still IN FLIGHT"),
+        rendered.contains("does carry a completion time") && !rendered.contains("still in flight"),
         "the terminal shape must use its own wording and not borrow the in-flight one: {rendered}"
     );
     assert!(
-        rendered.contains("SweepStuck") && !rendered.contains("SweepFailed"),
+        rendered.contains("sweepstuck") && !rendered.contains("sweepfailed"),
         "one unattributed failed record cannot terminalize the sweep: {rendered}"
     );
     assert!(ops.pay_calls().is_empty());
@@ -1936,7 +1935,9 @@ async fn recovery_rejects_a_paid_record_for_a_different_hash() {
         .expect_err("ambiguous");
 
     // Model a corrupt/unexpected response body: the requested URL names the PREPARED hash, but the
-    // record body names another hash. The success CAS must reject it and preserve the witness.
+    // record body names another hash. The recovery arm validates the echoed hash BEFORE classifying
+    // (so a record about another destination can neither be adopted nor read as failure) and
+    // preserves the witness.
     ops.set_outgoing_for(
         &prepared_hash,
         PhoenixdOutgoing {
@@ -1951,7 +1952,10 @@ async fn recovery_rejects_a_paid_record_for_a_different_hash() {
         .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:51:g1")
         .await
         .expect_err("a mismatched recovery record cannot be adopted");
-    assert!(format!("{err:#}").contains("persisted recovery witness was not changed"));
+    assert!(
+        format!("{err:#}").contains("refusing to classify key"),
+        "the pre-classification hash check must fire: {err:#}"
+    );
     assert_eq!(
         be.payment_status_by_key("refund:order:51:g1")
             .await
@@ -3311,8 +3315,8 @@ async fn a_getbalance_outage_does_not_masquerade_as_a_fee_credit_refusal() {
 // red if phoenixd silently reverted to the trait default (false) — the CLI would simply stop warning
 // on the one backend that CAN produce the condition, which is a silent regression of the whole
 // disabled-sink surface.
-#[test]
-fn phoenixd_reports_that_it_can_leave_settlements_unbookable() {
+#[tokio::test]
+async fn phoenixd_reports_that_it_can_leave_settlements_unbookable() {
     let be = backend(FakePhoenixdOps::new(), TestClock::new(1_000));
     assert!(
         be.reports_unbookable_settlements(),
@@ -3640,13 +3644,13 @@ async fn a_full_length_unbookable_detail_is_not_truncated() {
     be.received_amount_msat(&inv.id).await.unwrap_err();
     clock.advance(THE_OPERATORS_PROBLEM_S);
     be.received_amount_msat(&inv.id).await.unwrap_err();
-    // A same-shape id the index has never seen — the divergence arm, with a full-length id too.
-    be.lookup_settlement(&format!("phoenixd-{}", "f".repeat(64)))
-        .await
-        .unwrap_err();
 
     let alerts = operator_alerts(&store).await;
-    assert_eq!(alerts.len(), 2, "one of each reason: {alerts:?}");
+    assert_eq!(
+        alerts.len(),
+        1,
+        "the fee-credit refusal is the one surviving SettlementUnbookable reason (ADR-0022): {alerts:?}"
+    );
     for a in &alerts {
         assert!(
             !a.detail.ends_with('…'),

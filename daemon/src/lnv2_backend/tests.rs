@@ -1752,12 +1752,17 @@ async fn receive_subscription_error_resubscribes_and_still_settles() {
     let fake = FakeLnv2Ops::new();
     let backend = backend_with(fake.clone(), clock(5_000));
     let mut rx = backend.watch().await.unwrap();
+    // Script the blip BEFORE issuing: the live watcher now starts from the store actor's post-commit
+    // hook (ADR-0022), so it can be polled before this test resumes, and an error scripted after the
+    // fact could land in a task that has already subscribed cleanly. The fake mints deterministic op
+    // ids (`rop<n>`), so the first receive is `rop1`.
+    fake.set_receive_errors("rop1", 2);
     let inv = backend
         .create_invoice_t(1000, "m", 3600, "extErr")
         .await
         .unwrap();
+    assert_eq!(inv.backend_invoice_id, "rop1", "the scripted op is the one just minted");
     // First two subscription attempts error (a federation blip), then the terminal is observable.
-    fake.set_receive_errors(&inv.backend_invoice_id, 2);
     fake.set_receive_final(&inv.backend_invoice_id, ReceiveFinal::Claimed);
 
     let mut settled = None;

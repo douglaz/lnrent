@@ -1507,8 +1507,10 @@ mod tests {
             .unwrap();
         // The §11 schema (15 tables) plus `seen_message` (migration 2, lnrent-7fp.5) plus
         // `teardown_failure` (SCHEMA + migration 7, lnrent-urw.2) plus `sweep_attempt` (SCHEMA +
-        // migration 8, gate1-operator-sweep, urw.3).
-        assert_eq!(n, 18);
+        // migration 8, gate1-operator-sweep, urw.3) plus the ADR-0022 `migration` marker table
+        // (migration 12). The backend correlation tables are NOT migrations: `open` applies them
+        // after `migrate` (`apply_backend_schemas`), pinned separately below.
+        assert_eq!(n, 19);
     }
 
     // lnrent-y4m.5: a migration + its user_version bump is ONE transaction. A synthetic migration
