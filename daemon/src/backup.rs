@@ -63,7 +63,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -89,12 +89,132 @@ const MANIFEST_FILE: &str = "MANIFEST.json";
 const BACKUP_AGE_FILE: &str = "backup.age";
 /// The manifest `schema` stamp — restore refuses anything that is not an lnrent backup.
 const BACKUP_SCHEMA: &str = "lnrent-backup";
-/// The newest backup-format version this build writes and understands. Version 2 adds the
-/// commitment-bearing `phoenixd_index.db`; backups without that artifact remain version 1 so older
-/// restorers can still read them.
-const BACKUP_FORMAT_VERSION: u32 = 2;
-/// Old plaintext/encrypted v1 backups remain readable by this build.
+/// The newest backup-format version this build writes and understands (ADR-0022). Version 3 means
+/// SELF-CONTAINED: every backend correlation lives inside `lnrent.sqlite`, proven by the `migration`
+/// marker the first migrated boot wrote (`legacy_import`). It is stamped ONLY when that marker is in
+/// the snapshotted database: `lnrentd backup` is an offline path that can run on an upgraded binary
+/// BEFORE the first migrated boot, and a writer that stamped that snapshot v3 while the correlations
+/// were still in the side files would produce a backup restore accepts as self-contained and that has
+/// lost every correlation. Absent the marker the writer keeps the pre-ADR-0022 rule exactly: version 2
+/// iff `phoenixd_index.db` is captured (an lnv2-only pre-migration backup is v1 and carries
+/// `lnv2_index.db` inside `fedimint/`), else version 1.
+const BACKUP_FORMAT_VERSION: u32 = 3;
+/// The pre-ADR-0022 "phoenixd side file captured" format.
+const PHOENIXD_SIDE_FILE_FORMAT_VERSION: u32 = 2;
+/// Old plaintext/encrypted v1 backups remain readable by this build — but see [`restore`]: a v1 backup
+/// whose books reference phoenixd is REFUSED, because v1 carries no phoenixd correlation at all.
 const MIN_SUPPORTED_BACKUP_FORMAT_VERSION: u32 = 1;
+
+/// Decide the manifest version from what the snapshot carries (the ONE rule, shared by both modes).
+fn format_version(self_contained: bool, phoenixd_index: bool) -> u32 {
+    if self_contained {
+        BACKUP_FORMAT_VERSION
+    } else if phoenixd_index {
+        PHOENIXD_SIDE_FILE_FORMAT_VERSION
+    } else {
+        MIN_SUPPORTED_BACKUP_FORMAT_VERSION
+    }
+}
+
+/// Whether a state-DB snapshot carries the ADR-0022 `migration` marker (any backend): the predicate
+/// that earns a backup format v3. Read from the SNAPSHOT (the bytes the restore will get), never the
+/// live file.
+fn snapshot_is_self_contained(snapshot_db: &Path) -> Result<bool> {
+    let conn = Connection::open_with_flags(
+        snapshot_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening snapshot {} to read the migration marker", snapshot_db.display()))?;
+    crate::legacy_import::any_marker(&conn)
+}
+
+/// Does this (v1) backup's state DB REFERENCE phoenixd (ADR-0022's exact predicate)? An `invoice.id`
+/// with the `phoenixd-` prefix — the prefix `invoice_id_for` puts on the store's id column, while
+/// `backend_invoice_id` holds the bare payment hash and matches nothing — or, while the persisted
+/// `payment_backend` is phoenixd, any SENT refund/sweep attempt or any attempt carrying a
+/// `backend_payment_id` (refund/sweep keys are not backend-specific, and a v1 backup carries no
+/// phoenixd pay map to join them against). NEVER the persisted selection alone: a fresh bootstrap
+/// writes it before any correlation exists.
+fn v1_references_phoenixd(state_db: &Path) -> Result<Option<String>> {
+    let conn = Connection::open_with_flags(
+        state_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening backup state DB {}", state_db.display()))?;
+    let has_table = |t: &str| -> Result<bool> {
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [t],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    };
+    if has_table("invoice")? {
+        let inv: Option<String> = conn
+            .query_row(
+                "SELECT id FROM invoice WHERE id LIKE 'phoenixd-%' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = inv {
+            return Ok(Some(format!("invoice {id}")));
+        }
+    }
+    let phoenixd_selected = has_table("operator")?
+        && conn
+            .query_row(
+                "SELECT count(*) FROM operator WHERE payment_backend='phoenixd'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )?
+            > 0;
+    if phoenixd_selected {
+        for table in ["refund_attempt", "sweep_attempt"] {
+            if !has_table(table)? {
+                continue;
+            }
+            let row: Option<(String, String)> = conn
+                .query_row(
+                    &format!(
+                        "SELECT id, status FROM {table}
+                          WHERE status='SENT' OR backend_payment_id IS NOT NULL LIMIT 1"
+                    ),
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((id, status)) = row {
+                return Ok(Some(format!(
+                    "{table} {id} ({status}) with payment_backend=phoenixd"
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The v1 refusal (ADR-0022 Consequences): restoring a v1 backup that references phoenixd would yield
+/// books with empty correlation tables — precisely the state ADR-0022 declares unreachable and
+/// ADR-0023 no longer reports — and there is no safe reconstruction. Given at RESTORE, not at the next
+/// boot. A v1 backup of a mock or lnv2-only deployment restores as before (lnv2's side file lives
+/// under `fedimint/` and is captured in v1; the first boot imports it).
+fn refuse_v1_referencing_phoenixd(manifest: &Manifest, state_db: &Path) -> Result<()> {
+    if manifest.version != MIN_SUPPORTED_BACKUP_FORMAT_VERSION {
+        return Ok(());
+    }
+    if let Some(row) = v1_references_phoenixd(state_db)? {
+        bail!(
+            "refusing to restore: this is a format-1 backup (no phoenixd correlation captured) but \
+             its state DB references phoenixd ({row}). Restoring it would leave books whose \
+             phoenixd_invoice / phoenixd_pay correlations are gone — refunds already paid could be \
+             paid again and settled invoices could not be booked or expired. Restore a format-2 \
+             backup (which carries {PHOENIXD_INDEX_FILE}) or a format-3 one instead; there is no safe \
+             reconstruction from this one (ADR-0022)"
+        );
+    }
+    Ok(())
+}
 
 /// The backup self-description (`MANIFEST.json`). Restore reads this FIRST and uses it to verify the
 /// set is complete — every artifact recorded `true` here MUST be present in the backup dir, else the
@@ -104,7 +224,8 @@ const MIN_SUPPORTED_BACKUP_FORMAT_VERSION: u32 = 1;
 pub struct Manifest {
     /// Always [`BACKUP_SCHEMA`]; restore rejects a foreign/corrupt manifest.
     pub schema: String,
-    /// The backup-format version; v2 iff `phoenixd_index.db` is captured, otherwise v1.
+    /// The backup-format version: v3 iff the state DB is self-contained (ADR-0022 marker present);
+    /// else v2 iff `phoenixd_index.db` is captured; else v1. See [`format_version`].
     pub version: u32,
     /// Wall-clock seconds since the unix epoch when the backup was taken (audit only).
     pub created_unix: u64,
@@ -118,6 +239,11 @@ pub struct Manifest {
     /// restorable by this v2 reader; backups carrying it use v2 so a v1 reader fails closed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub phoenixd_index: bool,
+    /// ADR-0022: the snapshotted `lnrent.sqlite` carries the `migration` marker, so every backend
+    /// correlation is INSIDE it (format v3). Defaulted so older manifests deserialize; only a v3
+    /// manifest writes it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub self_contained: bool,
     /// The `fedimint/` subtree was present and captured.
     pub fedimint_dir: bool,
     /// The federation ids (the `fedimint/<id>/` subdir names) captured, sorted for determinism.
@@ -254,6 +380,8 @@ fn backup_plaintext(data_dir: &Path, dest: &Path, src_db: &Path) -> Result<Manif
         &data_dir.join(PHOENIXD_INDEX_FILE),
         &dest.join(PHOENIXD_INDEX_FILE),
     )?;
+    // ADR-0022: v3 iff the SNAPSHOT carries the migration marker (read from the bytes restore gets).
+    let self_contained = snapshot_is_self_contained(&dest_db)?;
 
     // 4. Make every DATA file's directory entry durable BEFORE the manifest. With this fsync ordering
     //    the manifest is the last entry to hit disk, so its presence on recovery truly implies a
@@ -263,16 +391,13 @@ fn backup_plaintext(data_dir: &Path, dest: &Path, src_db: &Path) -> Result<Manif
     // 5. The manifest — written + fsynced LAST, so its presence also marks the backup as complete.
     let manifest = Manifest {
         schema: BACKUP_SCHEMA.to_string(),
-        version: if phoenixd_index {
-            BACKUP_FORMAT_VERSION
-        } else {
-            MIN_SUPPORTED_BACKUP_FORMAT_VERSION
-        },
+        version: format_version(self_contained, phoenixd_index),
         created_unix: now_unix(),
         state_db: true,
         fedimint_config,
         operator_seed,
         phoenixd_index,
+        self_contained,
         fedimint_dir,
         federations,
         encrypted: false,
@@ -331,9 +456,12 @@ fn backup_encrypted(
         now_nanos()
     ));
     let age_path = dest.join(BACKUP_AGE_FILE);
+    let mut self_contained = false;
     let bundled = (|| -> Result<()> {
         vacuum_into(src_db, &vacuum_tmp)?;
         harden_file_0600(&vacuum_tmp)?;
+        // ADR-0022: v3 iff the SNAPSHOT carries the migration marker.
+        self_contained = snapshot_is_self_contained(&vacuum_tmp)?;
         let phoenixd_snapshot = if artifacts.phoenixd_index {
             vacuum_into(
                 &data_dir.join(PHOENIXD_INDEX_FILE),
@@ -370,16 +498,13 @@ fn backup_encrypted(
 
     let manifest = Manifest {
         schema: BACKUP_SCHEMA.to_string(),
-        version: if phoenixd_index {
-            BACKUP_FORMAT_VERSION
-        } else {
-            MIN_SUPPORTED_BACKUP_FORMAT_VERSION
-        },
+        version: format_version(self_contained, phoenixd_index),
         created_unix: now_unix(),
         state_db: true,
         fedimint_config,
         operator_seed,
         phoenixd_index,
+        self_contained,
         fedimint_dir,
         federations,
         encrypted: true,
@@ -449,18 +574,22 @@ pub fn restore(
             BACKUP_FORMAT_VERSION
         );
     }
-    // The format defines v2 IFF `phoenixd_index.db` is captured, so the pair must agree. A manifest
-    // that violates it (hand-edited, corrupted, or downgraded) is REFUSED rather than accepted as
-    // "compatible": an older v1 restorer ignores the unknown `phoenixd_index` field entirely and
-    // would restore the commitment-bearing sqlite WITHOUT lnrent's phoenixd payment/idempotency map,
-    // so already-completed refunds could be re-adopted under fresh keys and paid twice. Checking the
-    // range alone cannot catch that, because the lie is in the pairing, not in either field.
-    if manifest.phoenixd_index != (manifest.version >= BACKUP_FORMAT_VERSION) {
+    // The format is DEFINED by what is captured (`format_version`), so the pairing must agree: v3 iff
+    // `self_contained`; below that, v2 iff `phoenixd_index.db` is captured. A manifest that violates
+    // it (hand-edited, corrupted, or downgraded) is REFUSED rather than accepted as "compatible": an
+    // older v1 restorer ignores the unknown fields entirely and would restore the commitment-bearing
+    // sqlite WITHOUT lnrent's phoenixd payment/idempotency map, so already-completed refunds could be
+    // re-adopted under fresh keys and paid twice. Checking the range alone cannot catch that, because
+    // the lie is in the pairing, not in either field.
+    if manifest.version != format_version(manifest.self_contained, manifest.phoenixd_index) {
         bail!(
-            "backup manifest is inconsistent: version {} with phoenixd_index={} (the format is \
-             version {BACKUP_FORMAT_VERSION} if and only if {PHOENIXD_INDEX_FILE} is captured); \
-             refusing to restore a manifest whose version and index disagree",
+            "backup manifest is inconsistent: version {} with self_contained={} and \
+             phoenixd_index={} (the format is version {BACKUP_FORMAT_VERSION} if and only if the \
+             state DB is self-contained, else version {PHOENIXD_SIDE_FILE_FORMAT_VERSION} if and \
+             only if {PHOENIXD_INDEX_FILE} is captured); refusing to restore a manifest whose \
+             version and contents disagree",
             manifest.version,
+            manifest.self_contained,
             manifest.phoenixd_index
         );
     }
@@ -505,6 +634,9 @@ pub fn restore(
                 src_db.display()
             );
         }
+        // ADR-0022: a v1 backup referencing phoenixd has no correlation to restore. Refused HERE,
+        // before the target is touched, rather than producing a directory the next boot refuses.
+        refuse_v1_referencing_phoenixd(&manifest, &src_db)?;
         if manifest.fedimint_config && !is_regular_file(&src.join(FEDIMINT_CONFIG_FILE)) {
             bail!(
                 "backup is incomplete/corrupt: manifest records {FEDIMINT_CONFIG_FILE} but it is missing"
@@ -939,6 +1071,9 @@ fn finalize_decrypted_staging(stage: &Path, manifest: &Manifest) -> Result<()> {
             }
         }
     }
+    // ADR-0022: the v1 phoenixd-reference refusal, applied to the DECRYPTED state DB inside staging —
+    // the swap never runs, so the target stays untouched.
+    refuse_v1_referencing_phoenixd(manifest, &db)?;
     harden_and_fsync_tree(stage)
 }
 
