@@ -11,15 +11,15 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use serde_json::{json, Value};
 
 use super::*;
-use crate::backends::{Lnv2Probe, PayStatus, PaymentBackend, PaymentStatus};
+use crate::backends::{Invoice, Lnv2Probe, PayStatus, PaymentBackend, PaymentStatus};
 use crate::clock::{Clock, TestClock};
 use crate::recipe::Recipe;
 use crate::reconcile::Reconciler;
-use crate::store::{migrate, Store};
+use crate::store::Store;
 
 // --------------------------------------------------------------------------------------------------
 // Scripted fake fedimint seam
@@ -42,6 +42,8 @@ struct FakeState {
     invoice_amounts: HashMap<String, u64>,
     op_final: HashMap<String, SendFinalScript>,
     receive_final: HashMap<String, ReceiveFinal>,
+    /// Ops `receive_state` reports MISSING from the operation log (a rolled-back client db).
+    receive_missing: HashSet<String>,
     receive_subscriptions: HashMap<String, usize>,
     // Per-op count of transient errors `await_receive_final` returns before the scripted terminal
     // (models a federation stream blip); each call consumes one.
@@ -100,6 +102,7 @@ impl FakeLnv2Ops {
                 invoice_amounts: HashMap::new(),
                 op_final: HashMap::new(),
                 receive_final: HashMap::new(),
+                receive_missing: HashSet::new(),
                 receive_subscriptions: HashMap::new(),
                 receive_errors: HashMap::new(),
                 claimed_credit_msat: None,
@@ -143,6 +146,16 @@ impl FakeLnv2Ops {
     fn set_send_final(&self, op: &str, s: SendFinalScript) {
         self.st.lock().unwrap().op_final.insert(op.to_string(), s);
     }
+    /// Script `receive_state(op)` to answer MISSING (the op is gone from the client's log).
+    #[allow(dead_code)]
+    fn set_receive_missing(&self, op: &str) {
+        self.st
+            .lock()
+            .unwrap()
+            .receive_missing
+            .insert(op.to_string());
+    }
+
     fn set_receive_final(&self, op: &str, r: ReceiveFinal) {
         self.st
             .lock()
@@ -279,6 +292,19 @@ impl Lnv2Ops for FakeLnv2Ops {
         Ok(ReceiveFinal::Expired)
     }
 
+    async fn receive_state(&self, op: &str) -> Result<ReceiveProbe> {
+        let st = self.st.lock().unwrap();
+        if st.receive_missing.contains(op) {
+            return Ok(ReceiveProbe::Missing);
+        }
+        Ok(match st.receive_final.get(op).copied() {
+            Some(ReceiveFinal::Claimed) => ReceiveProbe::Claimed,
+            Some(ReceiveFinal::Expired) => ReceiveProbe::Expired,
+            Some(ReceiveFinal::Failure) => ReceiveProbe::Failure,
+            None => ReceiveProbe::Pending,
+        })
+    }
+
     async fn claimed_credit_msat(&self, _op: &str) -> Result<u64> {
         let st = self.st.lock().unwrap();
         if let Some(error) = &st.claimed_credit_error {
@@ -383,10 +409,118 @@ impl Lnv2Ops for FakeLnv2Ops {
     }
 }
 
+/// An in-memory state DB at the full runtime schema (ADR-0022: the backend's correlation tables live
+/// in `lnrent.sqlite`, so a backend test needs the store, not a throwaway file).
+fn test_store() -> Store {
+    Store::spawn(crate::store::open_memory().expect("in-memory store"))
+}
+
 fn backend_with(fake: Arc<FakeLnv2Ops>, clock: Arc<dyn Clock>) -> Lnv2Payment {
-    let conn = Connection::open_in_memory().expect("in-memory sqlite");
-    conn.execute_batch(INDEX_SCHEMA).expect("schema");
-    Lnv2Payment::with_ops(fake, conn, clock)
+    Lnv2Payment::with_ops(fake, test_store(), clock)
+}
+
+/// The CALLER's half of the ADR-0022 contract, as the daemon's issuance and send drivers perform it:
+/// `issue_invoice` + commit of its `persist` under `Store::transaction_then` (lease + hook), and
+/// `prepare_pay` + commit of its PREPARED row before `pay`. Every test that used to call the backend's
+/// row-creating entry points directly goes through these, so the flows under test are the production
+/// ones.
+#[async_trait]
+trait TestBackend {
+    async fn create_invoice_t(
+        &self,
+        amount_sat: u64,
+        memo: &str,
+        expiry_s: u32,
+        external_id: &str,
+    ) -> Result<Invoice>;
+    async fn prepare_t(&self, key: &str, bolt11: &str) -> Result<()>;
+    async fn pay_refund_capped_t(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        gross_sat: u64,
+        key: &str,
+    ) -> Result<String>;
+    async fn pay_refund_capped_via_t(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        gross_sat: u64,
+        key: &str,
+        gateway_hint: Option<&str>,
+    ) -> Result<String>;
+    async fn pay_capped_t(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        max_outlay_msat: u128,
+        key: &str,
+    ) -> Result<String>;
+}
+
+#[async_trait]
+impl TestBackend for Lnv2Payment {
+    async fn create_invoice_t(
+        &self,
+        amount_sat: u64,
+        memo: &str,
+        expiry_s: u32,
+        external_id: &str,
+    ) -> Result<Invoice> {
+        let issued = self
+            .issue_invoice(amount_sat, memo, expiry_s, external_id)
+            .await?;
+        let persist = issued.persist;
+        self.store
+            .transaction_then(move |tx| persist(tx), issued.lease, issued.after_commit)
+            .await?;
+        Ok(issued.invoice)
+    }
+
+    async fn prepare_t(&self, key: &str, bolt11: &str) -> Result<()> {
+        let prepared = self.prepare_pay(key, bolt11).await?;
+        let persist = prepared.persist;
+        self.store
+            .transaction_then(move |tx| persist(tx), prepared.lease, None)
+            .await
+    }
+
+    async fn pay_refund_capped_t(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        gross_sat: u64,
+        key: &str,
+    ) -> Result<String> {
+        self.prepare_t(key, bolt11).await?;
+        self.pay_refund_capped(bolt11, amount_sat, gross_sat, key)
+            .await
+    }
+
+    async fn pay_refund_capped_via_t(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        gross_sat: u64,
+        key: &str,
+        gateway_hint: Option<&str>,
+    ) -> Result<String> {
+        self.prepare_t(key, bolt11).await?;
+        self.pay_refund_capped_via(bolt11, amount_sat, gross_sat, key, gateway_hint)
+            .await
+    }
+
+    async fn pay_capped_t(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        max_outlay_msat: u128,
+        key: &str,
+    ) -> Result<String> {
+        self.prepare_t(key, bolt11).await?;
+        self.pay_capped(bolt11, amount_sat, max_outlay_msat, key)
+            .await
+    }
 }
 
 fn clock(now: i64) -> Arc<dyn Clock> {
@@ -501,13 +635,13 @@ async fn caps_dry_run_both_gateway_schedules_when_mint_funding_is_non_monotone()
     let backend = backend_with(fake.clone(), clock(1));
 
     let refund_err = backend
-        .pay_refund_capped("lnbcNonMonotoneRefund", 1000, 1150, "keyNonMonotoneRefund")
+        .pay_refund_capped_t("lnbcNonMonotoneRefund", 1000, 1150, "keyNonMonotoneRefund")
         .await
         .expect_err("the direct-swap funding outlay exceeds the refund cap");
     assert!(format!("{refund_err:#}").contains("INV-1 cap"));
 
     let sweep_err = backend
-        .pay_capped(
+        .pay_capped_t(
             "lnbcNonMonotoneSweep",
             1000,
             1_150_000,
@@ -570,11 +704,11 @@ async fn duplicate_key_same_invoice_dedups_to_one_send() {
     let fake = FakeLnv2Ops::new();
     let backend = backend_with(fake.clone(), clock(1000));
     let a = backend
-        .pay_refund_capped("lnbcD", 500, 500, "keyD")
+        .pay_refund_capped_t("lnbcD", 500, 500, "keyD")
         .await
         .expect("first pay succeeds");
     let b = backend
-        .pay_refund_capped("lnbcD", 500, 500, "keyD")
+        .pay_refund_capped_t("lnbcD", 500, 500, "keyD")
         .await
         .expect("second pay is idempotent");
     assert_eq!(a, b, "same key -> same op id");
@@ -594,7 +728,7 @@ async fn different_key_same_invoice_fails_closed_8a() {
     let backend = backend_with(fake.clone(), clock(1000));
 
     let err = backend
-        .pay_refund_capped("lnbcX", 500, 500, "key2")
+        .pay_refund_capped_t("lnbcX", 500, 500, "key2")
         .await
         .expect_err("[8A] must fail closed on a cross-order same-invoice collision");
     assert!(
@@ -630,7 +764,7 @@ async fn different_key_same_invoice_after_failure_fails_before_attempt_advance()
     fake.set_send_final(&op0, SendFinalScript::Terminal(SendFinal::Failure));
 
     let err = backend
-        .pay_refund_capped("lnbcFailedElsewhere", 500, 500, "key2")
+        .pay_refund_capped_t("lnbcFailedElsewhere", 500, 500, "key2")
         .await
         .expect_err("[8A] must reject an existing foreign attempt before lnv2 advances it");
     assert!(format!("{err:#}").contains("[8A]"), "{err:#}");
@@ -668,7 +802,7 @@ async fn collision_failed_key_never_resends_and_stays_failed() {
     let backend = backend_with(fake.clone(), clock(1000));
 
     backend
-        .pay_refund_capped("lnbcShared", 500, 500, "key2")
+        .pay_refund_capped_t("lnbcShared", 500, 500, "key2")
         .await
         .expect_err("[8A] collision fails closed");
     assert_eq!(
@@ -679,7 +813,7 @@ async fn collision_failed_key_never_resends_and_stays_failed() {
 
     // Re-drive the SAME key: the FAILED row short-circuits before any send (NO-RETRY on the same bolt11).
     backend
-        .pay_refund_capped("lnbcShared", 500, 500, "key2")
+        .pay_refund_capped_t("lnbcShared", 500, 500, "key2")
         .await
         .expect_err("a FAILED collision key never re-pays the same invoice");
     assert_eq!(
@@ -706,7 +840,7 @@ async fn invoice_amount_larger_than_owed_is_refused_before_send() {
     let backend = backend_with(fake.clone(), clock(1000));
 
     let err = backend
-        .pay_refund_capped("lnbcBig", 500, 500, "keyBig")
+        .pay_refund_capped_t("lnbcBig", 500, 500, "keyBig")
         .await
         .expect_err("an over-amount invoice must be refused before funding");
     assert!(
@@ -735,7 +869,7 @@ async fn invoice_amount_equal_to_owed_pays_normally() {
     let backend = backend_with(fake.clone(), clock(1000));
 
     backend
-        .pay_refund_capped("lnbcExact", 500, 500, "keyExact")
+        .pay_refund_capped_t("lnbcExact", 500, 500, "keyExact")
         .await
         .expect("a matching-amount invoice pays through the preflight");
     assert_eq!(fake.send_count(), 1, "the send actually fired ([9A])");
@@ -751,10 +885,15 @@ async fn crash_before_send_commits_recovers_by_resending() {
     let backend = backend_with(fake.clone(), clock(1000));
     // Simulate the process dying after the PREPARED intent commit but before `send()` committed an op.
     let op0 = fake.send_operation_id("lnbcC").unwrap();
-    pay_insert_prepared(&backend.index, "keyC", "lnbcC", &op0).unwrap();
+    let op_w = op0.clone();
+    backend
+        .store
+        .transaction(move |tx| pay_insert_prepared(tx, "keyC", "lnbcC", &op_w))
+        .await
+        .unwrap();
 
     let op = backend
-        .pay_refund_capped("lnbcC", 500, 500, "keyC")
+        .pay_refund_capped_t("lnbcC", 500, 500, "keyC")
         .await
         .expect("PREPARED+missing recovery rechecks the cap and sends");
     assert_eq!(op, "op1");
@@ -778,10 +917,15 @@ async fn prepared_mapping_for_a_different_invoice_fails_closed() {
     let fake = FakeLnv2Ops::new();
     let backend = backend_with(fake.clone(), clock(1000));
     let op_a = fake.send_operation_id("lnbcA").unwrap();
-    pay_insert_prepared(&backend.index, "keyMismatch", "lnbcA", &op_a).unwrap();
+    let op_w = op_a.clone();
+    backend
+        .store
+        .transaction(move |tx| pay_insert_prepared(tx, "keyMismatch", "lnbcA", &op_w))
+        .await
+        .unwrap();
 
     let err = backend
-        .pay_refund_capped("lnbcB", 500, 500, "keyMismatch")
+        .pay_refund_capped_t("lnbcB", 500, 500, "keyMismatch")
         .await
         .expect_err("a durable key cannot be rebound to another invoice");
     assert!(
@@ -793,7 +937,12 @@ async fn prepared_mapping_for_a_different_invoice_fails_closed() {
         0,
         "mapping mismatch fails before any backend send ([9A])"
     );
-    let row = pay_get(&backend.index, "keyMismatch").unwrap().unwrap();
+    let row = backend
+        .store
+        .read(|c| pay_get(c, "keyMismatch"))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.operation_id, op_a, "the original mapping is unchanged");
     assert_eq!(row.status, "PREPARED");
 }
@@ -820,7 +969,7 @@ async fn definitive_prefunding_send_error_is_terminal() {
     let backend = backend_with(fake.clone(), clock(1000));
 
     let err = backend
-        .pay_refund_capped("lnbcExpired", 500, 500, "keyExpired")
+        .pay_refund_capped_t("lnbcExpired", 500, 500, "keyExpired")
         .await
         .expect_err("a definitive invoice rejection cannot succeed on a retry");
     assert!(format!("{err:#}").contains("invoice expired"));
@@ -842,12 +991,17 @@ async fn crash_after_send_commits_adopts_the_inflight_op() {
     let backend = backend_with(fake.clone(), clock(1000));
     // Simulate the crash window: the intent row is persisted but the op was never recorded.
     let op0 = fake.send_operation_id("lnbcA").unwrap();
-    pay_insert_prepared(&backend.index, "keyA", "lnbcA", &op0).unwrap();
+    let op_w = op0.clone();
+    backend
+        .store
+        .transaction(move |tx| pay_insert_prepared(tx, "keyA", "lnbcA", &op_w))
+        .await
+        .unwrap();
     // The federation already funded op0 under OUR key; recovery finds and awaits it directly.
     fake.set_op_key(&op0, "keyA");
 
     let op = backend
-        .pay_refund_capped("lnbcA", 500, 500, "keyA")
+        .pay_refund_capped_t("lnbcA", 500, 500, "keyA")
         .await
         .expect("adopts the in-flight op and awaits it to Success");
     assert_eq!(
@@ -878,7 +1032,7 @@ async fn definitive_failure_parks_failed_and_never_resends_same_bolt11() {
     let backend = backend_with(fake.clone(), clock(1000));
 
     let err = backend
-        .pay_refund_capped("lnbcF", 500, 500, "keyF")
+        .pay_refund_capped_t("lnbcF", 500, 500, "keyF")
         .await
         .expect_err("a Refunded send is a definitive failure");
     assert!(format!("{err:#}").contains("definitive failure"));
@@ -890,7 +1044,7 @@ async fn definitive_failure_parks_failed_and_never_resends_same_bolt11() {
 
     // NO-RETRY: re-driving the SAME key must NOT send the same bolt11 again.
     let err2 = backend
-        .pay_refund_capped("lnbcF", 500, 500, "keyF")
+        .pay_refund_capped_t("lnbcF", 500, 500, "keyF")
         .await
         .expect_err("a FAILED key stays terminal");
     assert!(format!("{err2:#}").contains("previously failed"));
@@ -910,7 +1064,7 @@ async fn ambiguous_await_stays_pending_and_reawaits_same_op() {
     let backend = backend_with(fake.clone(), clock(1000));
 
     let err = backend
-        .pay_refund_capped("lnbcAmb", 500, 500, "keyAmb")
+        .pay_refund_capped_t("lnbcAmb", 500, 500, "keyAmb")
         .await
         .expect_err("an ambiguous await surfaces as a transient error");
     assert!(format!("{err:#}").contains("still pending"));
@@ -923,7 +1077,7 @@ async fn ambiguous_await_stays_pending_and_reawaits_same_op() {
     // The op later settles; re-driving the key re-awaits the SAME op — no second send.
     fake.set_send_final("opAmb", SendFinalScript::Terminal(SendFinal::Success));
     let op = backend
-        .pay_refund_capped("lnbcAmb", 500, 500, "keyAmb")
+        .pay_refund_capped_t("lnbcAmb", 500, 500, "keyAmb")
         .await
         .expect("re-await lands");
     assert_eq!(op, "opAmb");
@@ -946,7 +1100,7 @@ async fn over_cap_records_definitive_no_send_failure_7a() {
 
     // payout 500 + fee 100 = 600 > gross 500 -> refuse.
     let err = backend
-        .pay_refund_capped("lnbcCap", 500, 500, "keyCap")
+        .pay_refund_capped_t("lnbcCap", 500, 500, "keyCap")
         .await
         .expect_err("over-cap must refuse");
     assert!(format!("{err:#}").contains("INV-1 cap"));
@@ -974,7 +1128,7 @@ async fn fee_rise_between_quote_and_pay_refuses() {
     // INV-1 cap — this exercises the CAP refusal, not the send-policy skip.
     fake.set_gateway_fee("gw://a", Some(flat_fee(50_000, 0))); // 50-sat flat
     let err = backend
-        .pay_refund_capped_via("lnbcFR", 1000, 1000, "keyFR", quote.gateway_hint.as_deref())
+        .pay_refund_capped_via_t("lnbcFR", 1000, 1000, "keyFR", quote.gateway_hint.as_deref())
         .await
         .expect_err("a fee that rose past the cap must refuse");
     assert!(format!("{err:#}").contains("INV-1 cap"));
@@ -999,7 +1153,7 @@ async fn consensus_fees_reduce_quote_and_are_enforced_at_pay() {
     );
 
     let err = backend
-        .pay_refund_capped("lnbcConsensusFee", 999, 1000, "keyConsensusFee")
+        .pay_refund_capped_t("lnbcConsensusFee", 999, 1000, "keyConsensusFee")
         .await
         .expect_err("999 sat + 1.5 sat consensus fees exceeds the 1000-sat cap");
     assert!(format!("{err:#}").contains("INV-1 cap"), "{err:#}");
@@ -1020,7 +1174,7 @@ async fn retry_after_prefunding_error_rechecks_the_cap() {
     let backend = backend_with(fake.clone(), clock(1000));
 
     backend
-        .pay_refund_capped("lnbcRetryCap", 500, 500, "keyRetryCap")
+        .pay_refund_capped_t("lnbcRetryCap", 500, 500, "keyRetryCap")
         .await
         .expect_err("the first gateway preflight fails before funding");
     assert_eq!(
@@ -1031,7 +1185,7 @@ async fn retry_after_prefunding_error_rechecks_the_cap() {
 
     fake.set_gateway_fee("gw://a", Some(flat_fee(100_000, 0))); // 500 + 100 > 500 gross
     let err = backend
-        .pay_refund_capped("lnbcRetryCap", 500, 500, "keyRetryCap")
+        .pay_refund_capped_t("lnbcRetryCap", 500, 500, "keyRetryCap")
         .await
         .expect_err("the retry must not bypass INV-1 after the fee rises");
     assert!(format!("{err:#}").contains("INV-1 cap"));
@@ -1121,7 +1275,7 @@ async fn pay_fails_over_past_a_send_incompatible_gateway() {
 
     // A capped pay routes via the compliant gateway and lands.
     backend
-        .pay_refund_capped_via("lnbcFO", 1000, 1000, "keyFO", quote.gateway_hint.as_deref())
+        .pay_refund_capped_via_t("lnbcFO", 1000, 1000, "keyFO", quote.gateway_hint.as_deref())
         .await
         .expect("the pay routes via the send-usable gateway");
     assert_eq!(
@@ -1169,11 +1323,11 @@ async fn create_invoice_is_idempotent_on_external_id() {
     let fake = FakeLnv2Ops::new();
     let backend = backend_with(fake.clone(), clock(1000));
     let a = backend
-        .create_invoice(1000, "m", 3600, "extI")
+        .create_invoice_t(1000, "m", 3600, "extI")
         .await
         .unwrap();
     let b = backend
-        .create_invoice(9999, "other", 60, "extI")
+        .create_invoice_t(9999, "other", 60, "extI")
         .await
         .unwrap();
     assert_eq!(a.id, b.id, "same external_id -> same invoice");
@@ -1193,18 +1347,20 @@ async fn canceled_invoice_is_replaced_by_a_fresh_payable_one() {
     let ext = "renew:auto:sub1:42";
     let fake = FakeLnv2Ops::new();
     let backend = backend_with(fake.clone(), clock(1_000));
-    let dead = backend.create_invoice(1000, "m", 3600, ext).await.unwrap();
+    let dead = backend.create_invoice_t(1000, "m", 3600, ext).await.unwrap();
     backend
-        .index
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE lnv2_invoice SET status = 'CANCELED' WHERE external_id = ?1",
-            params![ext],
-        )
+        .store
+        .transaction(move |tx| {
+            tx.execute(
+                "UPDATE lnv2_invoice SET status = 'CANCELED' WHERE external_id = ?1",
+                params![ext],
+            )?;
+            Ok(())
+        })
+        .await
         .unwrap();
 
-    let fresh = backend.create_invoice(1000, "m", 3600, ext).await.unwrap();
+    let fresh = backend.create_invoice_t(1000, "m", 3600, ext).await.unwrap();
     assert_ne!(
         fresh.bolt11, dead.bolt11,
         "the expired bolt11 must never be handed back as payable"
@@ -1213,7 +1369,12 @@ async fn canceled_invoice_is_replaced_by_a_fresh_payable_one() {
         fresh.backend_invoice_id, dead.backend_invoice_id,
         "a fresh receive operation backs the replacement"
     );
-    let (stored, status) = idx_get_by_external(&backend.index, ext).unwrap().unwrap();
+    let (stored, status) = backend
+        .store
+        .read(move |c| idx_get_by_external(c, ext))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(status, "OPEN");
     assert_eq!(
         stored.backend_invoice_id, fresh.backend_invoice_id,
@@ -1246,7 +1407,7 @@ async fn a_lost_index_row_over_a_paid_invoice_fails_closed() {
     let backend = backend_with(fake.clone(), clock(5_000));
     let mut rx = backend.watch().await.unwrap();
     let inv = backend
-        .create_invoice(1000, "m", 3600, "extLOST")
+        .create_invoice_t(1000, "m", 3600, "extLOST")
         .await
         .unwrap();
     fake.set_receive_final(&inv.backend_invoice_id, ReceiveFinal::Claimed);
@@ -1267,8 +1428,11 @@ async fn a_lost_index_row_over_a_paid_invoice_fails_closed() {
     // The incident: the lnv2 index row is gone. The MAIN store still holds the invoice and still
     // asks about it by the same id AND external_id.
     {
-        let conn = backend.index.lock().unwrap();
-        let n = conn.execute("DELETE FROM lnv2_invoice", []).unwrap();
+        let n = backend
+            .store
+            .transaction(|tx| Ok(tx.execute("DELETE FROM lnv2_invoice", [])?))
+            .await
+            .unwrap();
         assert_eq!(n, 1, "exactly the one row under test was removed");
     }
 
@@ -1278,7 +1442,7 @@ async fn a_lost_index_row_over_a_paid_invoice_fails_closed() {
         .expect_err("a paid invoice whose index row is gone must never report an unpaid expiry");
     let err = format!("{err:#}");
     assert!(
-        err.contains("index row missing"),
+        err.contains("row missing"),
         "the diagnostic names the condition an operator greps for: {err}"
     );
     assert!(
@@ -1297,17 +1461,19 @@ async fn a_retired_invoice_id_still_reports_expired_through_the_ref_lookup() {
     let ext = "renew:auto:sub1:42";
     let fake = FakeLnv2Ops::new();
     let backend = backend_with(fake.clone(), clock(1_000));
-    let dead = backend.create_invoice(1000, "m", 3600, ext).await.unwrap();
+    let dead = backend.create_invoice_t(1000, "m", 3600, ext).await.unwrap();
     backend
-        .index
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE lnv2_invoice SET status = 'CANCELED' WHERE external_id = ?1",
-            params![ext],
-        )
+        .store
+        .transaction(move |tx| {
+            tx.execute(
+                "UPDATE lnv2_invoice SET status = 'CANCELED' WHERE external_id = ?1",
+                params![ext],
+            )?;
+            Ok(())
+        })
+        .await
         .unwrap();
-    let fresh = backend.create_invoice(1000, "m", 3600, ext).await.unwrap();
+    let fresh = backend.create_invoice_t(1000, "m", 3600, ext).await.unwrap();
     assert_ne!(
         fresh.id, dead.id,
         "[9A]: the replacement retired the old id"
@@ -1348,9 +1514,7 @@ async fn a_foreign_backend_invoice_id_expires_order_and_releases_reservation() {
         "a foreign-prefix id must never stall reconcile behind a permanent Err"
     );
 
-    let conn = Connection::open_in_memory().unwrap();
-    migrate(&conn).unwrap();
-    let store = Store::spawn(conn);
+    let store = test_store();
     store
         .transaction(|tx| {
             tx.execute_batch(
@@ -1412,21 +1576,24 @@ async fn paid_and_unrecovered_rows_are_still_reused_by_create_invoice() {
     for status in ["PAID", "PAID_UNRECOVERED"] {
         let ext = format!("ext{status}");
         let original = backend
-            .create_invoice(1000, "m", 3600, &ext)
+            .create_invoice_t(1000, "m", 3600, &ext)
             .await
             .unwrap();
+        let ext_w = ext.clone();
         backend
-            .index
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE lnv2_invoice SET status = ?1 WHERE external_id = ?2",
-                params![status, ext],
-            )
+            .store
+            .transaction(move |tx| {
+                tx.execute(
+                    "UPDATE lnv2_invoice SET status = ?1 WHERE external_id = ?2",
+                    params![status, ext_w],
+                )?;
+                Ok(())
+            })
+            .await
             .unwrap();
 
         let repeated = backend
-            .create_invoice(9999, "other", 60, &ext)
+            .create_invoice_t(9999, "other", 60, &ext)
             .await
             .unwrap();
         assert_eq!(
@@ -1434,8 +1601,12 @@ async fn paid_and_unrecovered_rows_are_still_reused_by_create_invoice() {
             (original.id, original.bolt11),
             "{status} settlement provenance must be reused, not replaced"
         );
+        let ext_r = ext.clone();
         assert_eq!(
-            idx_get_by_external(&backend.index, &ext)
+            backend
+                .store
+                .read(move |c| idx_get_by_external(c, &ext_r))
+                .await
                 .unwrap()
                 .unwrap()
                 .1,
@@ -1451,7 +1622,7 @@ async fn live_settlement_pushes_true_timestamp() {
     let backend = backend_with(fake.clone(), clock(5_000));
     let mut rx = backend.watch().await.unwrap();
     let inv = backend
-        .create_invoice(1000, "m", 3600, "extL")
+        .create_invoice_t(1000, "m", 3600, "extL")
         .await
         .unwrap();
     // The customer pays: the LIVE receive task observes Claimed.
@@ -1489,7 +1660,7 @@ async fn recovery_settlement_marks_paid_without_a_timestamp_or_push() {
     let backend = backend_with(fake.clone(), clock(7_000));
     // Create the invoice with NO watcher yet (so it is OPEN), then script it already-Claimed.
     let inv = backend
-        .create_invoice(1000, "m", 3600, "extR")
+        .create_invoice_t(1000, "m", 3600, "extR")
         .await
         .unwrap();
     fake.set_receive_final(&inv.backend_invoice_id, ReceiveFinal::Claimed);
@@ -1532,7 +1703,7 @@ async fn pending_at_restart_then_claimed_is_recovery_not_reconnect_time() {
     let backend = backend_with(fake.clone(), clock(7_500));
     // The invoice predates watch/restart (created with no watcher) but has NOT been paid yet.
     let inv = backend
-        .create_invoice(1000, "m", 3600, "extRestartPending")
+        .create_invoice_t(1000, "m", 3600, "extRestartPending")
         .await
         .unwrap();
     let mut rx = backend.watch().await.unwrap();
@@ -1582,7 +1753,7 @@ async fn receive_subscription_error_resubscribes_and_still_settles() {
     let backend = backend_with(fake.clone(), clock(5_000));
     let mut rx = backend.watch().await.unwrap();
     let inv = backend
-        .create_invoice(1000, "m", 3600, "extErr")
+        .create_invoice_t(1000, "m", 3600, "extErr")
         .await
         .unwrap();
     // First two subscription attempts error (a federation blip), then the terminal is observable.
@@ -1620,7 +1791,7 @@ async fn receive_mint_failure_is_persisted_as_paid_unrecovered() {
     let backend = backend_with(fake.clone(), clock(5_000));
     let mut rx = backend.watch().await.unwrap();
     let inv = backend
-        .create_invoice(1000, "m", 3600, "extMintFailure")
+        .create_invoice_t(1000, "m", 3600, "extMintFailure")
         .await
         .unwrap();
 
@@ -1644,15 +1815,17 @@ async fn receive_mint_failure_is_persisted_as_paid_unrecovered() {
             .is_some_and(|e| e.contains("Lightning payment") && e.contains("manual")),
         "[9A]: the paid-but-unrecovered arm must surface a durable operator-facing error"
     );
+    let inv_id = inv.id.clone();
     let status: String = backend
-        .index
-        .lock()
-        .unwrap()
-        .query_row(
-            "SELECT status FROM lnv2_invoice WHERE invoice_id=?1",
-            params![inv.id],
-            |r| r.get(0),
-        )
+        .store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT status FROM lnv2_invoice WHERE invoice_id=?1",
+                params![inv_id],
+                |r| r.get(0),
+            )?)
+        })
+        .await
         .unwrap();
     assert_eq!(
         status, "PAID_UNRECOVERED",
@@ -1671,7 +1844,7 @@ async fn claimed_credit_decode_failure_is_paid_unrecovered_not_open() {
     let backend = backend_with(fake.clone(), clock(5_000));
     let mut rx = backend.watch().await.unwrap();
     let inv = backend
-        .create_invoice(1000, "m", 3600, "extCreditDecodeFailure")
+        .create_invoice_t(1000, "m", 3600, "extCreditDecodeFailure")
         .await
         .unwrap();
 
@@ -1706,18 +1879,20 @@ async fn claimed_terminal_retries_sqlite_persistence_before_push() {
     let backend = backend_with(fake.clone(), clock(5_000));
     let mut rx = backend.watch().await.unwrap();
     let inv = backend
-        .create_invoice(1000, "m", 3600, "extPersistRetry")
+        .create_invoice_t(1000, "m", 3600, "extPersistRetry")
         .await
         .unwrap();
     backend
-        .index
-        .lock()
-        .unwrap()
-        .execute_batch(
-            "CREATE TRIGGER fail_lnv2_terminal
-             BEFORE UPDATE OF status ON lnv2_invoice
-             BEGIN SELECT RAISE(ABORT, 'forced terminal write failure'); END;",
-        )
+        .store
+        .transaction(|tx| {
+            tx.execute_batch(
+                "CREATE TRIGGER fail_lnv2_terminal
+                 BEFORE UPDATE OF status ON lnv2_invoice
+                 BEGIN SELECT RAISE(ABORT, 'forced terminal write failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await
         .unwrap();
 
     fake.set_receive_final(&inv.backend_invoice_id, ReceiveFinal::Claimed);
@@ -1732,10 +1907,12 @@ async fn claimed_terminal_retries_sqlite_persistence_before_push() {
         "Settlement is not pushed before PAID is durable"
     );
     backend
-        .index
-        .lock()
-        .unwrap()
-        .execute_batch("DROP TRIGGER fail_lnv2_terminal;")
+        .store
+        .transaction(|tx| {
+            tx.execute_batch("DROP TRIGGER fail_lnv2_terminal;")?;
+            Ok(())
+        })
+        .await
         .unwrap();
 
     let settlement = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -1839,8 +2016,7 @@ fn terminal_index_gc_reaps_only_safe_old_rows() {
     let now = 2 * PAY_INDEX_RETENTION_SECS;
     let old_invoice = now - INVOICE_INDEX_RETENTION_SECS - 1;
     let old_pay = now - PAY_INDEX_RETENTION_SECS - 1;
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(INDEX_SCHEMA).unwrap();
+    let conn = crate::store::open_memory().unwrap();
 
     for (ext, status, expires_at) in [
         ("canceled-old", "CANCELED", old_invoice),
@@ -1878,21 +2054,18 @@ fn terminal_index_gc_reaps_only_safe_old_rows() {
         )
         .unwrap();
     }
-    let index = Mutex::new(conn);
-
     assert_eq!(
-        gc_lnv2_invoice_index(&index, now, INVOICE_INDEX_RETENTION_SECS).unwrap(),
+        gc_lnv2_invoice_index(&conn, now, INVOICE_INDEX_RETENTION_SECS).unwrap(),
         1,
         "only old canceled traffic is disposable"
     );
     assert_eq!(
-        gc_lnv2_pay_index(&index, now, PAY_INDEX_RETENTION_SECS).unwrap(),
+        gc_lnv2_pay_index(&conn, now, PAY_INDEX_RETENTION_SECS).unwrap(),
         1,
         "only old, dated definitive failures are disposable"
     );
 
     let invoice_statuses: Vec<String> = {
-        let conn = index.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT status FROM lnv2_invoice ORDER BY external_id")
             .unwrap();
@@ -1906,7 +2079,6 @@ fn terminal_index_gc_reaps_only_safe_old_rows() {
         vec!["CANCELED", "OPEN", "PAID", "PAID_UNRECOVERED"]
     );
     let pay_statuses: Vec<String> = {
-        let conn = index.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT status FROM lnv2_pay ORDER BY idempotency_key")
             .unwrap();

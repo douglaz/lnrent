@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use rusqlite::Connection;
 
 use super::*;
+use crate::backends::Invoice;
+use crate::store::Store;
 
 /// phoenixd's `completedAt` from the 2026-07-26 live measurement, epoch MILLIS. Used wherever a test
 /// builds a record the measured truth table says must carry one: `isPaid=true` implies the marker is
@@ -358,10 +359,97 @@ fn scripted_http_error(what: &str, status: u16) -> anyhow::Error {
 // Fixtures
 // --------------------------------------------------------------------------------------------------
 
+/// An in-memory state DB at the full runtime schema (ADR-0022: the backend's correlation tables live
+/// in `lnrent.sqlite`, so a backend test needs the store, not a throwaway file).
+fn test_store() -> Store {
+    Store::spawn(crate::store::open_memory().expect("in-memory store"))
+}
+
 fn backend(ops: Arc<FakePhoenixdOps>, clock: TestClock) -> PhoenixdPayment {
-    let index = Connection::open_in_memory().expect("in-memory index");
-    index.execute_batch(INDEX_SCHEMA).expect("index schema");
-    PhoenixdPayment::with_ops(ops, index, Arc::new(clock), FeeSchedule::default())
+    PhoenixdPayment::with_ops(ops, test_store(), Arc::new(clock), FeeSchedule::default())
+}
+
+/// The CALLER's half of the ADR-0022 contract, as the daemon's issuance and send drivers perform it:
+/// `issue_invoice` + commit of its `persist` under `Store::transaction_then` (lease + hook), and
+/// `prepare_pay` + commit of its PREPARED row before `pay`. Every test that used to call the backend's
+/// row-creating entry points directly goes through these, so the flows under test are the production
+/// ones.
+#[async_trait]
+trait TestBackend {
+    async fn create_invoice_t(
+        &self,
+        amount_sat: u64,
+        memo: &str,
+        expiry_s: u32,
+        external_id: &str,
+    ) -> Result<Invoice>;
+    async fn prepare_t(&self, key: &str, bolt11: &str) -> Result<()>;
+    async fn pay_refund_capped_t(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        gross_sat: u64,
+        key: &str,
+    ) -> Result<String>;
+    async fn pay_capped_t(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        max_outlay_msat: u128,
+        key: &str,
+    ) -> Result<String>;
+}
+
+#[async_trait]
+impl TestBackend for PhoenixdPayment {
+    async fn create_invoice_t(
+        &self,
+        amount_sat: u64,
+        memo: &str,
+        expiry_s: u32,
+        external_id: &str,
+    ) -> Result<Invoice> {
+        let issued = self
+            .issue_invoice(amount_sat, memo, expiry_s, external_id)
+            .await?;
+        let persist = issued.persist;
+        self.store
+            .transaction_then(move |tx| persist(tx), issued.lease, issued.after_commit)
+            .await?;
+        Ok(issued.invoice)
+    }
+
+    async fn prepare_t(&self, key: &str, bolt11: &str) -> Result<()> {
+        let prepared = self.prepare_pay(key, bolt11).await?;
+        let persist = prepared.persist;
+        self.store
+            .transaction_then(move |tx| persist(tx), prepared.lease, None)
+            .await
+    }
+
+    async fn pay_refund_capped_t(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        gross_sat: u64,
+        key: &str,
+    ) -> Result<String> {
+        self.prepare_t(key, bolt11).await?;
+        self.pay_refund_capped(bolt11, amount_sat, gross_sat, key)
+            .await
+    }
+
+    async fn pay_capped_t(
+        &self,
+        bolt11: &str,
+        amount_sat: u64,
+        max_outlay_msat: u128,
+        key: &str,
+    ) -> Result<String> {
+        self.prepare_t(key, bolt11).await?;
+        self.pay_capped(bolt11, amount_sat, max_outlay_msat, key)
+            .await
+    }
 }
 
 /// Mint a valid SIGNED bolt11 with a payment hash derived from `seed`, so the pay tests can use
@@ -530,11 +618,11 @@ async fn create_invoice_is_idempotent_on_external_id() {
     let ops = FakePhoenixdOps::new();
     let be = backend(ops.clone(), TestClock::new(1_000));
     let a = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .unwrap();
     let b = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .unwrap();
     assert_eq!(a.id, b.id, "same external_id -> the same invoice");
@@ -556,7 +644,7 @@ async fn create_invoice_replaces_a_cached_invoice_phoenixd_reports_expired() {
     let clock = TestClock::new(1_000);
     let be = backend(ops.clone(), clock.clone());
     let first = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .unwrap();
     ops.set_incoming(
@@ -574,7 +662,7 @@ async fn create_invoice_replaces_a_cached_invoice_phoenixd_reports_expired() {
     );
 
     let replacement = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .expect("an actually-expired unpaid mapping must be replaceable");
 
@@ -599,7 +687,7 @@ async fn create_invoice_rejects_a_mismatched_createinvoice_amount() {
     let be = backend(ops.clone(), TestClock::new(1_000));
 
     let err = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .expect_err("phoenixd must not be allowed to change the billed amount");
 
@@ -629,7 +717,7 @@ async fn create_invoice_reuses_an_invoice_phoenixd_already_holds() {
     );
     let be = backend(ops.clone(), TestClock::new(1_000));
     let inv = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .unwrap();
     assert_eq!(inv.bolt11, "lnbcorphan", "the orphaned invoice is adopted");
@@ -659,7 +747,7 @@ async fn a_reused_paid_invoice_keeps_its_original_window_instead_of_a_fresh_one(
     );
     let be = backend(ops.clone(), TestClock::new(2_000));
     let inv = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .unwrap();
     assert_eq!(
@@ -673,7 +761,7 @@ async fn a_reused_paid_invoice_keeps_its_original_window_instead_of_a_fresh_one(
     ops.set_incoming("ext:2", vec![live_measured_receive("abcd")]);
     let be = backend(ops.clone(), TestClock::new(2_000));
     let inv = be
-        .create_invoice(25_000, "memo", 600, "ext:2")
+        .create_invoice_t(25_000, "memo", 600, "ext:2")
         .await
         .unwrap();
     assert_eq!(inv.expires_at, 2_600);
@@ -693,7 +781,7 @@ async fn create_invoice_refuses_a_stored_invoice_for_a_different_amount() {
     );
     let be = backend(ops.clone(), TestClock::new(1_000));
     let err = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .expect_err("a mismatched stored amount must fail closed");
     assert!(
@@ -710,7 +798,7 @@ async fn received_credit_is_net_of_the_phoenixd_receive_fee() {
     let ops = FakePhoenixdOps::new();
     let be = backend(ops.clone(), TestClock::new(1_000));
     let inv = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .unwrap();
     ops.set_incoming("ext:1", vec![live_measured_receive(&inv.payment_hash)]);
@@ -732,7 +820,7 @@ async fn lookup_settlement_reports_paid_with_the_true_completed_at() {
     let ops = FakePhoenixdOps::new();
     let be = backend(ops.clone(), TestClock::new(1_000));
     let inv = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .unwrap();
     assert_eq!(
@@ -756,7 +844,7 @@ async fn lookup_expires_on_lnrents_own_window_but_a_paid_invoice_stays_paid() {
     let clock = TestClock::new(1_000);
     let be = backend(ops.clone(), clock.clone());
     let inv = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .unwrap();
     clock.set(1_600);
@@ -780,7 +868,7 @@ async fn settlement_poll_delivers_a_payment_after_lnrents_local_expiry() {
     let clock = TestClock::new(1_000);
     let be = backend(ops.clone(), clock.clone());
     let inv = be
-        .create_invoice(25_000, "memo", 10, "ext:1")
+        .create_invoice_t(25_000, "memo", 10, "ext:1")
         .await
         .unwrap();
     clock.set(1_020);
@@ -816,7 +904,7 @@ async fn a_delivered_settlement_is_not_polled_or_delivered_again() {
     let be = backend(ops.clone(), clock.clone());
     let clock_dyn: Arc<dyn Clock> = Arc::new(clock);
     let inv = be
-        .create_invoice(25_000, "memo", 600, "ext:paid")
+        .create_invoice_t(25_000, "memo", 600, "ext:paid")
         .await
         .unwrap();
     ops.set_incoming("ext:paid", vec![live_measured_receive(&inv.payment_hash)]);
@@ -826,7 +914,7 @@ async fn a_delivered_settlement_is_not_polled_or_delivered_again() {
     let mut retired: HashSet<String> = HashSet::new();
 
     assert!(
-        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+        poll_settlements_once(&ops_dyn, &be.store, &clock_dyn, &be.alerts, &tx, &mut retired).await
     );
     let settlement = rx.recv().await.expect("the first poll delivers the payment");
     assert_eq!(settlement.invoice_id, inv.id);
@@ -834,7 +922,7 @@ async fn a_delivered_settlement_is_not_polled_or_delivered_again() {
     let polls_after_delivery = ops.incoming_calls().len();
 
     assert!(
-        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+        poll_settlements_once(&ops_dyn, &be.store, &clock_dyn, &be.alerts, &tx, &mut retired).await
     );
     assert_eq!(
         ops.incoming_calls().len(),
@@ -856,11 +944,11 @@ async fn an_expired_unpaid_invoice_retires_but_a_live_one_keeps_being_polled() {
     let clock = TestClock::new(1_000);
     let be = backend(ops.clone(), clock.clone());
     let lapsed = be
-        .create_invoice(25_000, "memo", 10, "ext:lapsed")
+        .create_invoice_t(25_000, "memo", 10, "ext:lapsed")
         .await
         .unwrap();
     let live = be
-        .create_invoice(25_000, "memo", 10, "ext:live")
+        .create_invoice_t(25_000, "memo", 10, "ext:live")
         .await
         .unwrap();
     ops.set_incoming(
@@ -885,10 +973,10 @@ async fn an_expired_unpaid_invoice_retires_but_a_live_one_keeps_being_polled() {
     let mut retired: HashSet<String> = HashSet::new();
 
     assert!(
-        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+        poll_settlements_once(&ops_dyn, &be.store, &clock_dyn, &be.alerts, &tx, &mut retired).await
     );
     assert!(
-        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+        poll_settlements_once(&ops_dyn, &be.store, &clock_dyn, &be.alerts, &tx, &mut retired).await
     );
     let polls: Vec<String> = ops.incoming_calls();
     assert_eq!(
@@ -918,7 +1006,7 @@ async fn an_expired_unpaid_invoice_retires_but_a_live_one_keeps_being_polled() {
         }],
     );
     assert!(
-        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+        poll_settlements_once(&ops_dyn, &be.store, &clock_dyn, &be.alerts, &tx, &mut retired).await
     );
     let settlement = rx.recv().await.expect("the late payment still lands");
     assert_eq!(settlement.invoice_id, live.id);
@@ -949,7 +1037,7 @@ async fn a_missing_live_incoming_record_fails_closed_instead_of_reporting_expire
     let clock = TestClock::new(1_000);
     let be = backend(ops.clone(), clock.clone());
     let inv = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .unwrap();
     ops.set_incoming("ext:1", Vec::new());
@@ -972,7 +1060,7 @@ async fn received_amount_fails_closed_instead_of_reporting_none() {
     let ops = FakePhoenixdOps::new();
     let be = backend(ops.clone(), TestClock::new(1_000));
     let inv = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .unwrap();
 
@@ -998,7 +1086,7 @@ async fn a_receipt_no_spendable_balance_could_back_is_refused_not_booked() {
     let ops = FakePhoenixdOps::new();
     let be = backend(ops.clone(), TestClock::new(1_000));
     let inv = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .unwrap();
     ops.set_incoming("ext:1", vec![live_measured_receive(&inv.payment_hash)]);
@@ -1023,7 +1111,7 @@ async fn a_receipt_no_spendable_balance_could_back_is_refused_not_booked() {
     let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_000));
     let mut retired: HashSet<String> = HashSet::new();
     assert!(
-        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+        poll_settlements_once(&ops_dyn, &be.store, &clock_dyn, &be.alerts, &tx, &mut retired).await
     );
     assert!(
         rx.try_recv().is_err(),
@@ -1038,7 +1126,7 @@ async fn a_receipt_no_spendable_balance_could_back_is_refused_not_booked() {
         Some(2_723_000)
     );
     assert!(
-        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+        poll_settlements_once(&ops_dyn, &be.store, &clock_dyn, &be.alerts, &tx, &mut retired).await
     );
     assert_eq!(
         rx.recv().await.expect("now deliverable").received_msat,
@@ -1057,7 +1145,7 @@ async fn a_fee_credit_larger_than_the_receipt_does_not_wedge_a_funded_wallet() {
     let ops = FakePhoenixdOps::new();
     let be = backend(ops.clone(), TestClock::new(1_000));
     let inv = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .unwrap();
     ops.set_incoming("ext:1", vec![live_measured_receive(&inv.payment_hash)]);
@@ -1075,7 +1163,7 @@ async fn a_fee_credit_larger_than_the_receipt_does_not_wedge_a_funded_wallet() {
     let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_000));
     let mut retired: HashSet<String> = HashSet::new();
     assert!(
-        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+        poll_settlements_once(&ops_dyn, &be.store, &clock_dyn, &be.alerts, &tx, &mut retired).await
     );
     assert_eq!(
         rx.recv().await.expect("the settlement reaches capture").received_msat,
@@ -1136,7 +1224,7 @@ async fn the_measured_fee_credit_only_receive_is_refused_end_to_end() {
     let ops = FakePhoenixdOps::new();
     let be = backend(ops.clone(), TestClock::new(1_000));
     let inv = be
-        .create_invoice(1_000, "lnrent-itw fee-credit measurement", 86_400, "ext:itw")
+        .create_invoice_t(1_000, "lnrent-itw fee-credit measurement", 86_400, "ext:itw")
         .await
         .unwrap();
     // The measured record, in every field `PhoenixdIncoming` carries — this drives the RULE, over
@@ -1182,7 +1270,7 @@ async fn the_measured_fee_credit_only_receive_is_refused_end_to_end() {
     let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_000));
     let mut retired: HashSet<String> = HashSet::new();
     assert!(
-        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+        poll_settlements_once(&ops_dyn, &be.store, &clock_dyn, &be.alerts, &tx, &mut retired).await
     );
     assert!(
         rx.try_recv().is_err(),
@@ -1202,7 +1290,7 @@ async fn the_measured_fee_credit_only_receive_is_refused_end_to_end() {
         Some(1_000_000)
     );
     assert!(
-        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+        poll_settlements_once(&ops_dyn, &be.store, &clock_dyn, &be.alerts, &tx, &mut retired).await
     );
     let delivered = rx.recv().await.expect("now deliverable");
     assert_eq!(delivered.received_msat, 1_000_000);
@@ -1235,7 +1323,7 @@ async fn pay_records_the_key_and_never_pays_twice() {
     let bolt11 = mint_bolt11(120_000, 1);
 
     let id = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:1:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:1:g1")
         .await
         .unwrap();
     assert_eq!(ops.pay_calls().len(), 1);
@@ -1250,7 +1338,7 @@ async fn pay_records_the_key_and_never_pays_twice() {
         .unwrap());
 
     let again = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:1:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:1:g1")
         .await
         .unwrap();
     assert_eq!(
@@ -1276,7 +1364,7 @@ async fn a_receipt_less_response_without_a_record_stays_pending() {
     }));
 
     let err = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:3:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:3:g1")
         .await
         .expect_err("no paid record => not a success");
     assert!(format!("{err:#}").contains("leaving the attempt in flight"));
@@ -1298,7 +1386,7 @@ async fn recovery_treats_a_404_as_never_paid_and_retries() {
     // A first attempt dies with an ambiguous transport error, leaving the PREPARED witness.
     ops.script_pay(Err("connection reset".into()));
     let err = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:4:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:4:g1")
         .await
         .expect_err("a transport error is ambiguous");
     assert!(format!("{err:#}").contains("stays pending"));
@@ -1310,7 +1398,7 @@ async fn recovery_treats_a_404_as_never_paid_and_retries() {
 
     // phoenixd 404s the hash -> the money never moved -> the retry pays for real.
     let id = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:4:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:4:g1")
         .await
         .unwrap();
     assert_eq!(
@@ -1337,7 +1425,7 @@ async fn recovery_never_retries_a_404_from_a_different_phoenixd_wallet() {
     let key = "refund:order:41:g1";
 
     ops.script_pay(Err("connection reset".into()));
-    be.pay_refund_capped(&bolt11, 120, 130, key)
+    be.pay_refund_capped_t(&bolt11, 120, 130, key)
         .await
         .expect_err("a transport error is ambiguous");
     assert_eq!(
@@ -1348,7 +1436,7 @@ async fn recovery_never_retries_a_404_from_a_different_phoenixd_wallet() {
     // The operator repoints lnrent at a different wallet, which has never seen this hash.
     ops.set_node_id("03deadbeefnode");
     let err = be
-        .pay_refund_capped(&bolt11, 120, 130, key)
+        .pay_refund_capped_t(&bolt11, 120, 130, key)
         .await
         .expect_err("another node's 404 is no evidence about our attempt");
     let rendered = format!("{err:#}");
@@ -1369,7 +1457,7 @@ async fn recovery_never_retries_a_404_from_a_different_phoenixd_wallet() {
 
     // Point it back at the wallet that owns the attempt and the proven-unpaid retry proceeds.
     ops.set_node_id("027e48node");
-    be.pay_refund_capped(&bolt11, 120, 130, key)
+    be.pay_refund_capped_t(&bolt11, 120, 130, key)
         .await
         .expect("the original wallet's 404 still proves the attempt never landed");
     assert_eq!(ops.pay_calls().len(), 2);
@@ -1385,7 +1473,7 @@ async fn recovery_refuses_an_invoice_that_expired_after_an_ambiguous_attempt() {
 
     // The first POST becomes ambiguous while the invoice is live, leaving a PREPARED witness.
     ops.script_pay(Err("connection reset".into()));
-    be.pay_refund_capped(&bolt11, 120, 130, key)
+    be.pay_refund_capped_t(&bolt11, 120, 130, key)
         .await
         .expect_err("a transport error is ambiguous");
     assert_eq!(
@@ -1398,7 +1486,7 @@ async fn recovery_refuses_an_invoice_that_expired_after_an_ambiguous_attempt() {
     // records a definite no-start refusal directly, without a second payinvoice POST.
     clock.advance(3_600);
     let err = be
-        .pay_refund_capped(&bolt11, 120, 130, key)
+        .pay_refund_capped_t(&bolt11, 120, 130, key)
         .await
         .expect_err("an expired invoice cannot be reposted after clean-404 recovery");
     assert!(format!("{err:#}").contains("destination invoice expired"));
@@ -1422,7 +1510,7 @@ async fn recovery_adopts_a_paid_record_without_paying_again() {
     let hash = hash_of(&bolt11);
 
     ops.script_pay(Err("timeout waiting for payinvoice".into()));
-    be.pay_refund_capped(&bolt11, 120, 130, "refund:order:5:g1")
+    be.pay_refund_capped_t(&bolt11, 120, 130, "refund:order:5:g1")
         .await
         .expect_err("ambiguous");
 
@@ -1435,7 +1523,7 @@ async fn recovery_adopts_a_paid_record_without_paying_again() {
         completed_at_ms: Some(MEASURED_COMPLETED_AT_MS),
     });
     let id = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:5:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:5:g1")
         .await
         .unwrap();
     assert_eq!(id, "pay-landed");
@@ -1466,7 +1554,7 @@ async fn recovery_adopts_a_paid_record_without_paying_again() {
 /// what sends the Refunder to `resolve_dest` for a fresh invoice (`daemon/src/refund.rs:614-644`) —
 /// a second real payment. The refund must instead be recognised as ALREADY COMPLETE.
 #[tokio::test]
-async fn index_loss_adopts_a_paid_record_instead_of_re_resolving_an_expired_destination() {
+async fn a_prepared_key_adopts_a_paid_record_instead_of_re_resolving_an_expired_destination() {
     let ops = FakePhoenixdOps::new();
     let bolt11 = mint_bolt11(120_000, 71);
     let hash = hash_of(&bolt11);
@@ -1483,7 +1571,7 @@ async fn index_loss_adopts_a_paid_record_instead_of_re_resolving_an_expired_dest
     // A fresh index over the same wallet, well past the destination's expiry.
     let recovered = backend(ops.clone(), TestClock::new(1_004_000));
     let id = recovered
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:71:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:71:g1")
         .await
         .expect("a payment phoenixd reports as paid is adopted, not refused");
 
@@ -1506,7 +1594,7 @@ async fn index_loss_adopts_a_paid_record_instead_of_re_resolving_an_expired_dest
 /// Index lost while a payment is still IN FLIGHT. Nothing may be recorded as failed, because a
 /// recorded failure is what would let the refund re-resolve past a payment that can still settle.
 #[tokio::test]
-async fn index_loss_refuses_an_in_flight_record_and_records_no_failure() {
+async fn a_prepared_key_refuses_an_in_flight_record_and_records_no_failure() {
     let ops = FakePhoenixdOps::new();
     let bolt11 = mint_bolt11(120_000, 72);
     let hash = hash_of(&bolt11);
@@ -1521,7 +1609,7 @@ async fn index_loss_refuses_an_in_flight_record_and_records_no_failure() {
 
     let recovered = backend(ops.clone(), TestClock::new(1_000));
     let err = recovered
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:72:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:72:g1")
         .await
         .expect_err("an in-flight payment must never be sent a second time");
 
@@ -1549,8 +1637,9 @@ async fn index_loss_refuses_an_in_flight_record_and_records_no_failure() {
             .payment_status_by_key("refund:order:72:g1")
             .await
             .unwrap(),
-        PayStatus::Unknown,
-        "no row at all — the Refunder re-awaits an Unknown key and never re-quotes it"
+        PayStatus::Pending,
+        "the PREPARED row the driver committed stays PREPARED — the Refunder re-awaits a Pending \
+         key and never re-quotes it; nothing terminal was written"
     );
 }
 
@@ -1560,7 +1649,7 @@ async fn index_loss_refuses_an_in_flight_record_and_records_no_failure() {
 /// record per hash, so it cannot be proven to be this attempt — and writing `FAILED` on an expired
 /// destination re-resolves to a new hash. Refuse, and record nothing.
 #[tokio::test]
-async fn index_loss_refuses_a_terminal_unpaid_record_without_writing_failed() {
+async fn a_prepared_key_refuses_a_terminal_unpaid_record_without_writing_failed() {
     let ops = FakePhoenixdOps::new();
     let bolt11 = mint_bolt11(120_000, 73);
     let hash = hash_of(&bolt11);
@@ -1575,7 +1664,7 @@ async fn index_loss_refuses_a_terminal_unpaid_record_without_writing_failed() {
 
     let recovered = backend(ops.clone(), TestClock::new(1_004_000));
     let err = recovered
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:73:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:73:g1")
         .await
         .expect_err("an unattributable terminal record is not a licence to pay again");
 
@@ -1596,11 +1685,10 @@ async fn index_loss_refuses_a_terminal_unpaid_record_without_writing_failed() {
             .payment_status_by_key("refund:order:73:g1")
             .await
             .unwrap(),
-        PayStatus::Unknown,
-        "NO row, asserted exactly rather than merely `!= Failed`: a FAILED row would re-resolve the \
-         refund to a NEW payment hash that phoenixd's same-invoice dedup cannot catch, and a \
-         PREPARED row would name a hash phoenixd has a record for, which recovery then ADOPTS - \
-         the transient the module forbids outright"
+        PayStatus::Pending,
+        "asserted exactly rather than merely `!= Failed`: a FAILED row would re-resolve the refund \
+         to a NEW payment hash that phoenixd's same-invoice dedup cannot catch. The driver's \
+         PREPARED row stays as it was (the unpaid record is adopted by nothing)"
     );
 }
 
@@ -1613,7 +1701,7 @@ async fn a_clean_404_still_terminalizes_an_expired_destination() {
     let bolt11 = mint_bolt11(120_000, 75);
     let be = backend(ops.clone(), TestClock::new(1_004_000));
 
-    be.pay_refund_capped(&bolt11, 120, 130, "refund:order:75:g1")
+    be.pay_refund_capped_t(&bolt11, 120, 130, "refund:order:75:g1")
         .await
         .expect_err("an expired destination cannot be paid");
 
@@ -1635,7 +1723,7 @@ async fn a_clean_404_still_terminalizes_an_expired_destination() {
 /// Match wording unique to this bail rather than the shared "when asked about" phrasing, so the
 /// assertion still identifies which check fired if another gains a similar message.
 #[tokio::test]
-async fn index_loss_refuses_a_paid_record_naming_a_different_hash() {
+async fn a_prepared_key_refuses_a_paid_record_naming_a_different_hash() {
     let ops = FakePhoenixdOps::new();
     let bolt11 = mint_bolt11(120_000, 77);
     let asked = hash_of(&bolt11);
@@ -1654,7 +1742,7 @@ async fn index_loss_refuses_a_paid_record_naming_a_different_hash() {
 
     let recovered = backend(ops.clone(), TestClock::new(1_000));
     let err = recovered
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:77:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:77:g1")
         .await
         .expect_err("a record for a different hash is not ours to adopt");
 
@@ -1668,8 +1756,9 @@ async fn index_loss_refuses_a_paid_record_naming_a_different_hash() {
             .payment_status_by_key("refund:order:77:g1")
             .await
             .unwrap(),
-        PayStatus::Unknown,
-        "a mismatched record credits nothing and records nothing"
+        PayStatus::Pending,
+        "a mismatched record credits nothing and records nothing terminal; the PREPARED witness \
+         stays"
     );
 }
 
@@ -1698,7 +1787,7 @@ async fn a_record_appearing_between_the_probe_and_the_post_is_adopted_not_paid_t
 
     let be = backend(ops.clone(), TestClock::new(1_000));
     let id = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:78:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:78:g1")
         .await
         .expect("a receipt-less POST over a paid record is adopted");
 
@@ -1741,7 +1830,7 @@ async fn an_upper_case_adopted_hash_is_stored_canonically_so_8a_still_fires() {
 
     let be = backend(ops.clone(), TestClock::new(1_000));
     let id = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:79:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:79:g1")
         .await
         .expect("a case-variant echo is still our payment");
     assert_eq!(id, "pay-upper");
@@ -1749,7 +1838,7 @@ async fn an_upper_case_adopted_hash_is_stored_canonically_so_8a_still_fires() {
 
     // The load-bearing half: a DIFFERENT key on the same destination must now be refused by [8A].
     let err = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:OTHER-79:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:OTHER-79:g1")
         .await
         .expect_err("[8A] must see the adopted row despite phoenixd's casing");
     assert!(
@@ -1810,13 +1899,13 @@ async fn only_phoenixds_own_404_body_counts_as_a_clean_miss() {
 
 /// Fail closed on an unreadable probe. phoenixd not answering is not phoenixd saying "no payment".
 #[tokio::test]
-async fn an_unreadable_outgoing_probe_refuses_to_pay_a_no_row_key() {
+async fn an_unreadable_outgoing_probe_refuses_to_pay_a_prepared_key() {
     let ops = FakePhoenixdOps::new();
     let bolt11 = mint_bolt11(120_000, 76);
     ops.fail_outgoing_by_hash();
 
     let be = backend(ops.clone(), TestClock::new(1_000));
-    be.pay_refund_capped(&bolt11, 120, 130, "refund:order:76:g1")
+    be.pay_refund_capped_t(&bolt11, 120, 130, "refund:order:76:g1")
         .await
         .expect_err("an unanswered probe must never be read as a clean 404");
 
@@ -1828,8 +1917,9 @@ async fn an_unreadable_outgoing_probe_refuses_to_pay_a_no_row_key() {
         be.payment_status_by_key("refund:order:76:g1")
             .await
             .unwrap(),
-        PayStatus::Unknown,
-        "nothing durable is recorded, so the next drive simply retries the probe"
+        PayStatus::Pending,
+        "nothing terminal is recorded: the driver's PREPARED row stays, so the next drive simply \
+         retries the probe"
     );
 }
 
@@ -1841,7 +1931,7 @@ async fn recovery_rejects_a_paid_record_for_a_different_hash() {
     let prepared_hash = hash_of(&bolt11);
 
     ops.script_pay(Err("timeout waiting for payinvoice".into()));
-    be.pay_refund_capped(&bolt11, 120, 130, "refund:order:51:g1")
+    be.pay_refund_capped_t(&bolt11, 120, 130, "refund:order:51:g1")
         .await
         .expect_err("ambiguous");
 
@@ -1858,7 +1948,7 @@ async fn recovery_rejects_a_paid_record_for_a_different_hash() {
         },
     );
     let err = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:51:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:51:g1")
         .await
         .expect_err("a mismatched recovery record cannot be adopted");
     assert!(format!("{err:#}").contains("persisted recovery witness was not changed"));
@@ -1923,7 +2013,7 @@ async fn a_receipt_less_post_reports_terminal_and_in_flight_records_differently(
         }));
 
         let err = be
-            .pay_refund_capped(&bolt11, 120, 130, key)
+            .pay_refund_capped_t(&bolt11, 120, 130, key)
             .await
             .expect_err("a receipt-less POST is never a success");
         assert_eq!(
@@ -1949,7 +2039,7 @@ async fn a_terminal_outgoing_record_stays_pending_but_reads_differently() {
     let hash = hash_of(&bolt11);
 
     ops.script_pay(Err("timeout".into()));
-    be.pay_refund_capped(&bolt11, 120, 130, "refund:order:7:g1")
+    be.pay_refund_capped_t(&bolt11, 120, 130, "refund:order:7:g1")
         .await
         .expect_err("ambiguous");
     ops.set_outgoing(PhoenixdOutgoing {
@@ -1961,7 +2051,7 @@ async fn a_terminal_outgoing_record_stays_pending_but_reads_differently() {
     });
 
     let err = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:7:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:7:g1")
         .await
         .expect_err("an unattributable terminal record is not a green light either");
     assert_eq!(
@@ -2096,7 +2186,7 @@ async fn recovery_never_retries_an_unpaid_outgoing_record() {
     let hash = hash_of(&bolt11);
 
     ops.script_pay(Err("timeout".into()));
-    be.pay_refund_capped(&bolt11, 120, 130, "refund:order:6:g1")
+    be.pay_refund_capped_t(&bolt11, 120, 130, "refund:order:6:g1")
         .await
         .expect_err("ambiguous");
     ops.set_outgoing(PhoenixdOutgoing {
@@ -2108,7 +2198,7 @@ async fn recovery_never_retries_an_unpaid_outgoing_record() {
     });
 
     let err = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:6:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:6:g1")
         .await
         .expect_err("an unpaid record is ambiguous, not a green light");
     // The in-flight shape must SAY in flight: this is the message an operator reads off a stuck
@@ -2145,7 +2235,7 @@ async fn inv1_refuses_a_payout_whose_reserve_exceeds_the_receipt() {
 
     // 120 sat payout costs 124_480 msat with the reserve; a 124-sat receipt cannot cover it.
     let err = be
-        .pay_refund_capped(&bolt11, 120, 124, "refund:order:7:g1")
+        .pay_refund_capped_t(&bolt11, 120, 124, "refund:order:7:g1")
         .await
         .expect_err("payout + reserve exceeds the net credit");
     assert!(
@@ -2163,7 +2253,7 @@ async fn inv1_refuses_a_payout_whose_reserve_exceeds_the_receipt() {
     );
 
     // One sat more of receipt and the same payout fits exactly.
-    be.pay_refund_capped(&bolt11, 120, 125, "refund:order:7:g1")
+    be.pay_refund_capped_t(&bolt11, 120, 125, "refund:order:7:g1")
         .await
         .expect("124_480 msat fits a 125_000 msat cap");
     assert_eq!(ops.pay_calls().len(), 1);
@@ -2176,13 +2266,13 @@ async fn pay_capped_refuses_when_the_outlay_ceiling_is_too_low() {
     let bolt11 = mint_bolt11(120_000, 8);
 
     let err = be
-        .pay_capped(&bolt11, 120, 124_479, "sweep:1")
+        .pay_capped_t(&bolt11, 120, 124_479, "sweep:1")
         .await
         .expect_err("one msat short of the true outlay");
     assert!(format!("{err:#}").contains("exceeding the INV-1 cap"));
     assert!(ops.pay_calls().is_empty());
 
-    be.pay_capped(&bolt11, 120, 124_480, "sweep:1")
+    be.pay_capped_t(&bolt11, 120, 124_480, "sweep:1")
         .await
         .expect("the exact outlay is allowed");
     assert_eq!(ops.pay_calls().len(), 1);
@@ -2223,7 +2313,7 @@ async fn a_destination_for_a_different_amount_is_refused_before_paying() {
     let bolt11 = mint_bolt11(500_000, 9); // 500 sat invoice, but we owe 120
 
     let err = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:9:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:9:g1")
         .await
         .expect_err("invoice amount != owed");
     assert!(format!("{err:#}").contains("!= owed 120 sat"));
@@ -2257,7 +2347,7 @@ async fn an_amountless_destination_is_refused_before_paying() {
     };
 
     let err = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:10:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:10:g1")
         .await
         .expect_err("an amountless invoice cannot be bounded");
     assert!(format!("{err:#}").contains("encodes no amount"));
@@ -2272,13 +2362,13 @@ async fn a_destination_owned_by_another_key_is_refused_without_paying() {
     let be = backend(ops.clone(), TestClock::new(1_000));
     let bolt11 = mint_bolt11(120_000, 11);
 
-    be.pay_refund_capped(&bolt11, 120, 130, "refund:order:11:g1")
+    be.pay_refund_capped_t(&bolt11, 120, 130, "refund:order:11:g1")
         .await
         .expect("the first key pays it");
     assert_eq!(ops.pay_calls().len(), 1);
 
     let err = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:OTHER:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:OTHER:g1")
         .await
         .expect_err("a second key must not adopt the first key's payment");
     assert!(
@@ -2301,7 +2391,7 @@ async fn a_destination_owned_by_another_key_is_refused_without_paying() {
     // PREPARED row naming a hash another key already paid is exactly what recovery would adopt. So a
     // re-drive re-refuses instead of resolving that hash into this key's success.
     let err = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:OTHER:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:OTHER:g1")
         .await
         .expect_err("a re-drive must re-refuse, never adopt the other key's payment");
     assert!(format!("{err:#}").contains("already owned by idempotency key"));
@@ -2325,7 +2415,7 @@ async fn a_failed_key_re_runs_the_preflight_on_the_same_invoice() {
     assert!(be.failed_refund_can_reuse_invoice());
     let bolt11 = mint_bolt11(120_000, 12);
 
-    be.pay_refund_capped(&bolt11, 120, 124, "refund:order:12:g1")
+    be.pay_refund_capped_t(&bolt11, 120, 124, "refund:order:12:g1")
         .await
         .expect_err("over cap");
     assert_eq!(
@@ -2336,7 +2426,7 @@ async fn a_failed_key_re_runs_the_preflight_on_the_same_invoice() {
     );
 
     let id = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:12:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:12:g1")
         .await
         .expect("a refused key retries the same bolt11 once it fits");
     assert_eq!(ops.pay_calls().len(), 1);
@@ -2348,19 +2438,18 @@ async fn a_succeeded_key_can_never_be_walked_back_to_prepared() {
     let ops = FakePhoenixdOps::new();
     let be = backend(ops.clone(), TestClock::new(1_000));
     let bolt11 = mint_bolt11(120_000, 13);
-    be.pay_refund_capped(&bolt11, 120, 130, "refund:order:13:g1")
+    be.pay_refund_capped_t(&bolt11, 120, 130, "refund:order:13:g1")
         .await
         .unwrap();
 
-    let index = be.index.clone();
-    let err = pay_upsert_prepared(
-        &index,
-        "refund:order:13:g1",
-        &bolt11,
-        &hash_of(&bolt11),
-        "027e48node",
-    )
-    .expect_err("a completed payment must never return to in-flight");
+    let hash = hash_of(&bolt11);
+    let err = be
+        .store
+        .transaction(move |tx| {
+            pay_upsert_prepared(tx, "refund:order:13:g1", &bolt11, &hash, "027e48node")
+        })
+        .await
+        .expect_err("a completed payment must never return to in-flight");
     assert!(format!("{err:#}").contains("already SUCCEEDED"));
 }
 
@@ -2392,7 +2481,7 @@ async fn incompatible_version_refuses_a_new_pay_before_prepared_or_post() {
     let bolt11 = mint_bolt11(120_000, 52);
 
     let err = be
-        .pay_refund_capped(&bolt11, 120, 130, "refund:order:52:g1")
+        .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:52:g1")
         .await
         .expect_err("an unverified fee schedule must fail closed");
     let rendered = format!("{err:#}");
@@ -2616,8 +2705,7 @@ async fn readiness_version_error_never_contains_the_api_password() {
 
     let ops = super::real::RealPhoenixdOps::new(&format!("http://{addr}/"), TEST_PASSWORD)
         .expect("loopback ops build");
-    let index = Connection::open_in_memory().unwrap();
-    index.execute_batch(INDEX_SCHEMA).unwrap();
+    let index = test_store();
     let be = PhoenixdPayment::with_ops(
         Arc::new(ops),
         index,
@@ -2660,8 +2748,7 @@ async fn the_doctor_probe_never_prints_the_api_password() {
     // Unreachable: port 1 on loopback refuses instantly, so the detail carries a REAL transport error.
     let dead = super::real::RealPhoenixdOps::new("http://127.0.0.1:1/", TEST_PASSWORD)
         .expect("loopback ops build");
-    let index = Connection::open_in_memory().unwrap();
-    index.execute_batch(INDEX_SCHEMA).unwrap();
+    let index = test_store();
     let be = PhoenixdPayment::with_ops(
         Arc::new(dead),
         index,
@@ -2698,8 +2785,7 @@ async fn the_doctor_probe_never_prints_the_api_password() {
     });
     let rejecting = super::real::RealPhoenixdOps::new(&format!("http://{addr}/"), TEST_PASSWORD)
         .expect("loopback ops build");
-    let index = Connection::open_in_memory().unwrap();
-    index.execute_batch(INDEX_SCHEMA).unwrap();
+    let index = test_store();
     let be = PhoenixdPayment::with_ops(
         Arc::new(rejecting),
         index,
@@ -2750,8 +2836,7 @@ async fn the_doctor_probe_never_prints_the_api_password() {
     let balance_failing =
         super::real::RealPhoenixdOps::new(&format!("http://{addr}/"), TEST_PASSWORD)
             .expect("loopback ops build");
-    let index = Connection::open_in_memory().unwrap();
-    index.execute_batch(INDEX_SCHEMA).unwrap();
+    let index = test_store();
     let be = PhoenixdPayment::with_ops(
         Arc::new(balance_failing),
         index,
@@ -2798,8 +2883,7 @@ async fn the_doctor_probe_never_prints_the_api_password() {
     });
     let echoing = super::real::RealPhoenixdOps::new(&format!("http://{addr}/"), TEST_PASSWORD)
         .expect("loopback ops build");
-    let index = Connection::open_in_memory().unwrap();
-    index.execute_batch(INDEX_SCHEMA).unwrap();
+    let index = test_store();
     let be = PhoenixdPayment::with_ops(
         Arc::new(echoing),
         index,
@@ -2898,7 +2982,7 @@ async fn create_invoice_pushes_lnrents_expiry_down_to_phoenixd() {
     let ops = FakePhoenixdOps::new();
     let be = backend(ops.clone(), TestClock::new(1_000));
     let inv = be
-        .create_invoice(25_000, "memo", 900, "ext:1")
+        .create_invoice_t(25_000, "memo", 900, "ext:1")
         .await
         .unwrap();
     assert_eq!(inv.expires_at, 1_900, "lnrent still keeps its own window");
@@ -2920,7 +3004,7 @@ async fn the_poll_retires_a_row_the_clock_says_can_no_longer_be_paid() {
     let clock = TestClock::new(1_000);
     let be = backend(ops.clone(), clock.clone());
     let inv = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .unwrap();
     // phoenixd stops returning the record entirely (never `isExpired`, so no evidence-based exit).
@@ -2933,7 +3017,7 @@ async fn the_poll_retires_a_row_the_clock_says_can_no_longer_be_paid() {
     let mut retired: HashSet<String> = HashSet::new();
 
     assert!(
-        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+        poll_settlements_once(&ops_dyn, &be.store, &clock_dyn, &be.alerts, &tx, &mut retired).await
     );
     assert_eq!(
         ops.incoming_calls().len(),
@@ -2942,7 +3026,9 @@ async fn the_poll_retires_a_row_the_clock_says_can_no_longer_be_paid() {
     );
     assert!(retired.is_empty());
     assert_eq!(
-        idx_pollable_invoices(&be.index, 1_000 - SETTLEMENT_POLL_GRACE_SECS)
+        be.store
+            .read(|c| idx_pollable_invoices(c, 1_000 - SETTLEMENT_POLL_GRACE_SECS))
+            .await
             .unwrap()
             .len(),
         1,
@@ -2951,15 +3037,18 @@ async fn the_poll_retires_a_row_the_clock_says_can_no_longer_be_paid() {
 
     clock.set(inv.expires_at + SETTLEMENT_POLL_GRACE_SECS + 1);
     assert!(
-        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+        poll_settlements_once(&ops_dyn, &be.store, &clock_dyn, &be.alerts, &tx, &mut retired).await
     );
     assert_eq!(
         ops.incoming_calls().len(),
         calls_after_create + 1,
         "past the grace the row costs no round-trip"
     );
+    let floor = clock.now() - SETTLEMENT_POLL_GRACE_SECS;
     assert!(
-        idx_pollable_invoices(&be.index, clock.now() - SETTLEMENT_POLL_GRACE_SECS)
+        be.store
+            .read(move |c| idx_pollable_invoices(c, floor))
+            .await
             .unwrap()
             .is_empty(),
         "past the grace the row is not even read: the poll's cost tracks LIVE invoices, not the \
@@ -2976,8 +3065,7 @@ async fn an_operator_verified_schedule_replaces_the_default_reserve_and_version(
         base_msat: 5_000,
         ppm: 6_000,
     };
-    let index = Connection::open_in_memory().unwrap();
-    index.execute_batch(INDEX_SCHEMA).unwrap();
+    let index = test_store();
     let ops = FakePhoenixdOps::new();
     ops.set_node_version("0.9.1");
     let be = PhoenixdPayment::with_ops(
@@ -3036,7 +3124,7 @@ async fn create_invoice_refuses_a_bolt11_whose_hash_disagrees_with_the_response(
     let be = backend(ops.clone(), TestClock::new(1_000));
 
     let err = be
-        .create_invoice(25_000, "memo", 600, "ext:hash-mismatch")
+        .create_invoice_t(25_000, "memo", 600, "ext:hash-mismatch")
         .await
         .expect_err("a bolt11 whose encoded hash disagrees with paymentHash must be refused");
 
@@ -3047,50 +3135,44 @@ async fn create_invoice_refuses_a_bolt11_whose_hash_disagrees_with_the_response(
     );
 }
 
+/// The alert sink and the backend share ONE store (ADR-0022): the outbox the DM lands in and the
+/// backend's correlation tables are the same database, exactly as in the daemon.
 fn backend_with_alerts(
     ops: Arc<FakePhoenixdOps>,
     clock: Arc<TestClock>,
 ) -> (PhoenixdPayment, crate::store::Store) {
-    let state = Connection::open_in_memory().expect("in-memory state db");
-    state.execute_batch(crate::store::SCHEMA).expect("state schema");
-    let store = crate::store::Store::spawn(state);
+    let store = test_store();
     let clock: Arc<dyn Clock> = clock;
     let alerts = Arc::new(crate::alerts::AlertDispatcher::new(
         store.clone(),
         clock.clone(),
         "op-npub-hex".into(),
     ));
-    let index = Connection::open_in_memory().expect("in-memory index");
-    index.execute_batch(INDEX_SCHEMA).expect("index schema");
-    let be = PhoenixdPayment::with_ops(ops, index, clock, FeeSchedule::default())
+    let be = PhoenixdPayment::with_ops(ops, store.clone(), clock, FeeSchedule::default())
         .with_alerts(alerts);
     (be, store)
 }
 
 /// Same wiring as [`backend_with_alerts`], except the timing table is DROPPED after the schema
 /// runs — so `idx_record_fee_credit_refusal` fails for real (no such table) instead of through a
-/// seam that could drift from the production error path. Models a read-only or corrupt index DB
-/// whose outbox is still writable.
+/// seam that could drift from the production error path. Models a corrupt timing table whose outbox
+/// is still writable.
 fn backend_with_alerts_and_no_timing_table(
     ops: Arc<FakePhoenixdOps>,
     clock: Arc<TestClock>,
 ) -> (PhoenixdPayment, crate::store::Store) {
-    let state = Connection::open_in_memory().expect("in-memory state db");
-    state.execute_batch(crate::store::SCHEMA).expect("state schema");
-    let store = crate::store::Store::spawn(state);
+    let conn = crate::store::open_memory().expect("in-memory store");
+    conn.execute_batch("DROP TABLE phoenixd_unbookable_settlement;")
+        .expect("drop the timing table");
+    let store = crate::store::Store::spawn(conn);
     let clock: Arc<dyn Clock> = clock;
     let alerts = Arc::new(crate::alerts::AlertDispatcher::new(
         store.clone(),
         clock.clone(),
         "op-npub-hex".into(),
     ));
-    let index = Connection::open_in_memory().expect("in-memory index");
-    index.execute_batch(INDEX_SCHEMA).expect("index schema");
-    index
-        .execute_batch("DROP TABLE phoenixd_unbookable_settlement;")
-        .expect("drop the timing table");
-    let be =
-        PhoenixdPayment::with_ops(ops, index, clock, FeeSchedule::default()).with_alerts(alerts);
+    let be = PhoenixdPayment::with_ops(ops, store.clone(), clock, FeeSchedule::default())
+        .with_alerts(alerts);
     (be, store)
 }
 
@@ -3143,7 +3225,7 @@ const THE_OPERATORS_PROBLEM_S: i64 = 60 * 60;
 /// of fee credit and 2_722 spendable — and return the invoice.
 async fn arrange_fee_credit_refusal(be: &PhoenixdPayment, ops: &Arc<FakePhoenixdOps>) -> Invoice {
     let inv = be
-        .create_invoice(25_000, "memo", 600, "ext:1")
+        .create_invoice_t(25_000, "memo", 600, "ext:1")
         .await
         .unwrap();
     ops.set_incoming("ext:1", vec![live_measured_receive(&inv.payment_hash)]);
@@ -3246,15 +3328,11 @@ fn phoenixd_reports_that_it_can_leave_settlements_unbookable() {
 async fn a_refusal_seen_while_alerts_are_disabled_still_records_its_first_sighting() {
     let ops = FakePhoenixdOps::new();
     let clock = Arc::new(TestClock::new(measured_receive_settled_at()));
-    let state = Connection::open_in_memory().expect("state");
-    state.execute_batch(crate::store::SCHEMA).expect("schema");
-    let store = crate::store::Store::spawn(state);
+    let store = test_store();
     let clk: Arc<dyn Clock> = clock.clone();
     // A DISABLED dispatcher: it writes no DM, and used to skip the timing row with it.
     let alerts = Arc::new(crate::alerts::AlertDispatcher::disabled(store.clone(), clk.clone()));
-    let index = Connection::open_in_memory().expect("index");
-    index.execute_batch(INDEX_SCHEMA).expect("index schema");
-    let be = PhoenixdPayment::with_ops(ops.clone(), index, clk, FeeSchedule::default())
+    let be = PhoenixdPayment::with_ops(ops.clone(), store.clone(), clk, FeeSchedule::default())
         .with_alerts(alerts);
     let inv = arrange_fee_credit_refusal(&be, &ops).await;
 
@@ -3268,7 +3346,7 @@ async fn a_refusal_seen_while_alerts_are_disabled_still_records_its_first_sighti
         "a disabled sink still sends nothing"
     );
     assert_eq!(
-        be.first_refusal_at_for_test(&inv.id),
+        be.first_refusal_at_for_test(&inv.id).await,
         Some(seen_at),
         "but the FIRST SIGHTING must be recorded, or enabling alerts later restarts the threshold \
          and the DM prints the enable time as the first refusal"
@@ -3465,7 +3543,7 @@ async fn the_settlement_poll_alerts_a_fee_credit_refusal_it_alone_observes() {
     let (be, store) = backend_with_alerts(ops.clone(), clock.clone());
     // A 10s window, paid late: lnrent's own expires_at is long past by the time the poll runs.
     let inv = be
-        .create_invoice(25_000, "memo", 10, "ext:1")
+        .create_invoice_t(25_000, "memo", 10, "ext:1")
         .await
         .unwrap();
     ops.set_incoming("ext:1", vec![live_measured_receive(&inv.payment_hash)]);
@@ -3481,12 +3559,12 @@ async fn the_settlement_poll_alerts_a_fee_credit_refusal_it_alone_observes() {
     let clock_dyn: Arc<dyn Clock> = clock.clone();
     let mut retired: HashSet<String> = HashSet::new();
     assert!(
-        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+        poll_settlements_once(&ops_dyn, &be.store, &clock_dyn, &be.alerts, &tx, &mut retired).await
     );
     assert!(operator_alerts(&store).await.is_empty(), "first refusal starts the threshold");
     clock.advance(UNBOOKABLE_SETTLEMENT_ALERT_S);
     assert!(
-        poll_settlements_once(&ops_dyn, &be.index, &clock_dyn, &be.alerts, &tx, &mut retired).await
+        poll_settlements_once(&ops_dyn, &be.store, &clock_dyn, &be.alerts, &tx, &mut retired).await
     );
 
     assert!(
@@ -3518,7 +3596,7 @@ async fn two_receipts_one_unfunded_wallet_is_one_alert_not_one_per_receipt() {
 
     let first = arrange_fee_credit_refusal(&be, &ops).await;
     let second = be
-        .create_invoice(25_000, "memo", 600, "ext:2")
+        .create_invoice_t(25_000, "memo", 600, "ext:2")
         .await
         .unwrap();
     ops.set_incoming("ext:2", vec![live_measured_receive(&second.payment_hash)]);
@@ -3580,138 +3658,53 @@ async fn a_full_length_unbookable_detail_is_not_truncated() {
     }
 }
 
+/// ADR-0022: a `phoenixd_invoice` row that is missing for an id the books hold is a BUG (the row
+/// commits with the invoice row it correlates; nothing deletes one), not an operator incident. Both
+/// seams still FAIL CLOSED — an `Err` every caller treats as "defer, retry next tick" — but the
+/// pre-ADR-0022 `index_diverged` operator condition, its DM and its runbook are gone with the side
+/// file that could produce it. Pinned from both sides: the refusal stays, and NO alert is enqueued.
 #[tokio::test]
-async fn an_index_divergence_alerts_with_a_distinct_reason_and_remedy() {
+async fn a_missing_correlation_fails_closed_without_raising_an_operator_condition() {
     let ops = FakePhoenixdOps::new();
     let clock = Arc::new(TestClock::new(1_000));
     let (be, store) = backend_with_alerts(ops, clock);
 
-    be.lookup_settlement("phoenixd-orphan").await.unwrap_err();
-
-    let alerts = operator_alerts(&store).await;
-    assert_eq!(alerts.len(), 1, "one durable operator DM: {alerts:?}");
-    assert_eq!(alerts[0].kind, "settlement_unbookable");
-    assert_eq!(alerts[0].subject, "index_diverged");
-    let detail = &alerts[0].detail;
-    assert!(
-        detail.contains("INDEX DIVERGENCE")
-            && detail.contains("phoenixd-orphan")
-            && detail.contains("UNKNOWN")
-            // This DM must NOT carry a restore command, and must not imply a safe restore
-            // EXISTS. Deciding a backup is safe needs to know which refunds already paid, and
-            // lnrent's only record of that is `phoenixd_pay` in the index whose loss IS the
-            // incident. Three schemes for proving it were refuted on lnrent-ole, every one a
-            // double pay. So the ABSENCE of a command is asserted, not merely the pointer.
-            && !detail.contains("lnrentd restore")
-            && detail.contains("docs/go-live.md")
-            && detail.contains("pay a refund a SECOND")
-            && detail.contains("original wallet")
-            && !detail.contains("FEE-CREDIT REFUSAL"),
-        "index reason and shipped recovery remedy must be self-contained: {detail}"
-    );
-    // "Just restore from last night" is the reflex this text exists to stop, and it must be
-    // stopped OUTRIGHT rather than deferred to a checklist: the runbook no longer has one. A DM
-    // that merely said "don't restore from this message alone" would still read as "there is a
-    // procedure, go find it".
-    // Both hazards, and both must be forbidden OUTRIGHT rather than deferred to a checklist: the
-    // runbook no longer has one. Restarting is the one an operator will reach for first — the
-    // service is down and unaffected subscribers are waiting — and it double-pays for the same
-    // reason a restore does, because the dedup record was in the index that was lost.
-    assert!(
-        detail.contains("do NOT restart it") && detail.contains("do NOT restore a backup"),
-        "the alert must forbid BOTH restarting and restoring, outright: {detail}"
-    );
-    // The no-safe-backup branch must give an instruction the operator can actually CARRY OUT.
-    // "reconcile by hand" was not one: `lnrent reconcile` is report-only, nothing reconstructs the
-    // missing rows, and writing the DB by hand is forbidden (sole sqlite writer, ADR-0001). Naming a
-    // procedure that does not exist is worse than naming none — it reads as a supported path.
-    // ORDER, not just presence. Both reviewers found the same defect independently: the DM used to
-    // say "stop the daemon, then ... stop new orders (`lnrent listing withdraw`)", and withdraw
-    // talks to the daemon over its socket — so followed literally, the one step that halts new
-    // orders could not run, and every order taken meanwhile is another buyer to settle by hand.
-    // Asserting only that the command APPEARS would have passed on the broken version.
-    {
-        let withdraw = detail.find("listing withdraw").expect("names the withdraw verb");
-        let stop_daemon = detail.find("THEN stop it").expect("names stopping the daemon");
+    for id in ["phoenixd-orphan-a", "phoenixd-orphan-b"] {
+        let err = be.lookup_settlement(id).await.unwrap_err();
         assert!(
-            withdraw < stop_daemon,
-            "withdraw must come BEFORE stopping the daemon — it needs the socket: {detail}"
+            format!("{err:#}").contains("must not be treated as expired"),
+            "still fails closed: {err:#}"
         );
-        assert!(
-            detail.contains("IN THIS ORDER"),
-            "and the remedy must flag that its order is load-bearing: {detail}"
-        );
-    }
-    // Saying "no repair" is only half an instruction. The operator is mid-incident with a buyer's
-    // money unbooked, so the DM must also name what they CAN do — and every verb here is real:
-    // `lnrent listing withdraw` exists, and phoenixd's own records are what settlement reads.
-    assert!(
-        detail.contains("listing withdraw")
-            && detail.contains("--data-dir")
-            && detail.contains("settle the affected buyers out of band"),
-        "and must give an ACTIONABLE next step, not just a refusal: {detail}"
-    );
-    // The subject is GLOBAL and the cooldown dedups, so this alert names ONE affected invoice
-    // however many there are. An operator who verifies a candidate backup against the named id
-    // alone can pick one that omits the others, and the whole-dir restore then drops those orders.
-    // The text must say so and give the rule for finding the rest.
-    // It must still say the named invoice is not the whole set — but NOT tell the operator to
-    // enumerate, which was an instruction with no procedure behind it once the shell was cut.
-    assert!(
-        detail.contains("ONE ALERT COVERS THEM ALL")
-            && detail.contains("not only this one")
-            && !detail.contains("enumerate"),
-        "the alert must say the named invoice is not the whole set, without instructing an \
-         enumeration the runbook no longer provides: {detail}"
-    );
-    // WHY a restore is unsafe, not just that it is. Without the mechanism an operator reads the
-    // refusal as excessive caution and restores anyway: the rollback drops lnrent's record of which
-    // refunds already paid while phoenixd keeps that history, so the second pay is not a risk but
-    // the expected outcome of re-driving a restored PENDING refund.
-    assert!(
-        detail.contains("the record of which refunds already \
-             paid lived in the lost index")
-            && detail.contains("while phoenixd keeps that history"),
-        "and must give the MECHANISM, so the refusal does not read as mere caution: {detail}"
-    );
-}
-
-// One lost `phoenixd_index.db` diverges EVERY open invoice, and catch-up re-observes each one every
-// tick. Keying the cooldown per invoice would put N copies of one identical remedy into the outbox
-// that also carries provision.ready/billing.* — every window, forever, since outbox rows are never
-// reaped. The condition is global, so the subject is.
-#[tokio::test]
-async fn a_whole_diverged_index_is_one_alert_not_one_per_invoice() {
-    let ops = FakePhoenixdOps::new();
-    let clock = Arc::new(TestClock::new(1_000));
-    let (be, store) = backend_with_alerts(ops, clock);
-
-    for id in ["phoenixd-orphan-a", "phoenixd-orphan-b", "phoenixd-orphan-c"] {
-        be.lookup_settlement(id).await.unwrap_err();
         be.received_amount_msat(id).await.unwrap_err();
     }
 
-    let alerts = operator_alerts(&store).await;
-    assert_eq!(
-        alerts.len(),
-        1,
-        "six sightings of ONE divergence are one DM: {alerts:?}"
+    assert!(
+        operator_alerts(&store).await.is_empty(),
+        "no `index_diverged` DM under ADR-0022 — the condition is unreachable, so a missing row is \
+         an assertion (error log + refusal), never an operator incident"
     );
-    assert_eq!(alerts[0].subject, "index_diverged");
 }
 
+/// The `SettlementUnbookable` cooldown still collapses repeats of ONE fee-credit refusal to one DM
+/// per window (the condition that survives ADR-0022).
 #[tokio::test]
 async fn the_same_unbookable_settlement_alerts_once_per_cooldown_window() {
     let ops = FakePhoenixdOps::new();
-    let clock = Arc::new(TestClock::new(1_000));
-    let (be, store) = backend_with_alerts(ops, clock.clone());
+    let first_refusal_at = measured_receive_settled_at();
+    let clock = Arc::new(TestClock::new(first_refusal_at));
+    let (be, store) = backend_with_alerts(ops.clone(), clock.clone());
+    let inv = arrange_fee_credit_refusal(&be, &ops).await;
 
-    be.lookup_settlement("phoenixd-orphan").await.unwrap_err();
-    clock.set(1_000 + crate::alerts::ALERT_COOLDOWN_S - 1);
-    be.lookup_settlement("phoenixd-orphan").await.unwrap_err();
+    // Past the age threshold the refusal DMs; a second sighting inside the cooldown does not.
+    be.received_amount_msat(&inv.id).await.unwrap_err();
+    clock.set(first_refusal_at + UNBOOKABLE_SETTLEMENT_ALERT_S);
+    be.received_amount_msat(&inv.id).await.unwrap_err();
+    assert_eq!(operator_alerts(&store).await.len(), 1, "first DM at the threshold");
+    clock.advance(crate::alerts::ALERT_COOLDOWN_S - 1);
+    be.received_amount_msat(&inv.id).await.unwrap_err();
     assert_eq!(operator_alerts(&store).await.len(), 1, "inside cooldown");
 
-    clock.set(1_000 + crate::alerts::ALERT_COOLDOWN_S);
-    be.lookup_settlement("phoenixd-orphan").await.unwrap_err();
+    clock.advance(1);
+    be.received_amount_msat(&inv.id).await.unwrap_err();
     assert_eq!(operator_alerts(&store).await.len(), 2, "after cooldown");
 }

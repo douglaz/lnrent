@@ -1422,9 +1422,26 @@ impl PhoenixdPayment {
             }
             Some(row) if row.status == STATUS_PREPARED => {
                 // Crash / ambiguity recovery. `outgoingbyhash` is the sole authority (fact 3).
-                match self.ops.outgoing_by_hash(&row.payment_hash).await? {
+                // Validate the echoed hash BEFORE classifying, so it protects every arm below: a
+                // record naming another hash is evidence about neither this payment's success nor
+                // its failure, and adopting it would credit someone else's payment to this key.
+                // Case-INSENSITIVE, since phoenixd's echo casing is unmeasured; the row keeps OUR
+                // canonical lowercase hash, which is what [8A]'s case-sensitive SQL `=` reads.
+                let probed = match self.ops.outgoing_by_hash(&row.payment_hash).await? {
+                    Some(record) if !record.payment_hash.eq_ignore_ascii_case(&row.payment_hash) => {
+                        bail!(
+                            "phoenixd returned an outgoing record for hash {} when asked about {}; \
+                             refusing to classify key {idempotency_key} on a record that is not \
+                             about its destination",
+                            record.payment_hash,
+                            row.payment_hash
+                        )
+                    }
+                    other => other,
+                };
+                match probed {
                     Some(record) if record.is_paid => {
-                        self.adopt_paid(idempotency_key, &record, amount_sat, cap)
+                        self.adopt_paid(idempotency_key, &record, &row.payment_hash, amount_sat, cap)
                             .await
                     }
                     // An unpaid record leaves the key `Pending`: the Refunder re-awaits it without
@@ -1742,7 +1759,7 @@ impl PhoenixdPayment {
                 );
                 match self.ops.outgoing_by_hash(&dest.payment_hash).await {
                     Ok(Some(record)) if record.is_paid => {
-                        self.adopt_paid(idempotency_key, &record, amount_sat, cap)
+                        self.adopt_paid(idempotency_key, &record, &dest.payment_hash, amount_sat, cap)
                             .await
                     }
                     // No paid record: nothing moved for this hash, but phoenixd also gave no proof
@@ -1845,15 +1862,19 @@ impl PhoenixdPayment {
     }
 
     /// Bind an EXISTING paid phoenixd payment to our key (crash recovery, or phoenixd's own dedup of
-    /// a bolt11 we already POSTed). Never starts a payment.
+    /// a bolt11 we already POSTed). Never starts a payment. `canonical_hash` is the hash WE parsed
+    /// from the bolt11 (the row's), never `record.payment_hash`: the two are equal only up to ASCII
+    /// case (the caller compared them case-insensitively), and the CAS in `pay_mark_succeeded` and
+    /// [8A]'s `pay_other_key_for_hash` both match with SQLite's case-sensitive `=`.
     async fn adopt_paid(
         &self,
         idempotency_key: &str,
         record: &PhoenixdOutgoing,
+        canonical_hash: &str,
         amount_sat: u64,
         cap: PayCap,
     ) -> Result<String> {
-        self.mark_succeeded(idempotency_key, &record.payment_hash, &record.payment_id)
+        self.mark_succeeded(idempotency_key, canonical_hash, &record.payment_id)
             .await?;
         log_inv1_overrun(
             idempotency_key,
