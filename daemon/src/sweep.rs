@@ -2414,4 +2414,34 @@ mod tests {
             "the FAILED park still fires the existing SweepFailed"
         );
     }
+
+    // ADR-0022 (lnrent-chgb): a `migration_unverified_at`-stamped sweep is PARKED — no prepare, no
+    // pay — its cap stays counted, and SweepStuck keeps firing. RED first: without the fence the
+    // not-started arm re-gates and pays.
+    #[tokio::test]
+    async fn a_migration_fenced_sweep_is_parked_never_paid_and_keeps_alerting_stuck() {
+        let store = mem_store();
+        let clock = Arc::new(TestClock::new(SWEEP_STUCK_ALERT_S + 1));
+        seed_final_receipt(&store, "order:A", "A", 100_000).await;
+        seed_pending_sweep(&store, "sweep:fenced", 0).await;
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "UPDATE sweep_attempt SET migration_unverified_at=42 WHERE id='sweep:fenced'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let payment = Arc::new(SweepPayment::new());
+        let alerts = Arc::new(AlertDispatcher::new(store.clone(), clock.clone(), "operator".into()));
+        let s = Sweeper::new(store.clone(), payment.clone(), clock).with_alerts(alerts);
+
+        let report = s.drive().await.unwrap();
+        assert_eq!((report.sent, report.failed, report.pending), (0, 0, 1));
+        assert_eq!(payment.sends(), 0, "nothing was sent");
+        assert_eq!(single_sweep_status(&store).await, "PENDING", "the cap stays counted");
+        assert_eq!(alert_count(&store, "sweep_stuck").await, 1, "SweepStuck fires for a parked row");
+    }
 }

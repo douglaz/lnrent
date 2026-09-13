@@ -54,6 +54,7 @@ pub trait PaymentBackend: Send + Sync {
     /// Default: wrap `create_invoice` in a no-op [`Issued`] — correct for a backend that keeps no
     /// correlation of its own (`MockPayment` and the test doubles). Both real backends override
     /// this AND make `create_invoice` refuse, so a correlation can never be committed on its own.
+    #[allow(clippy::disallowed_methods)] // the default body IS the sanctioned delegate
     async fn issue_invoice(
         &self,
         amount_sat: u64,

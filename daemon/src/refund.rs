@@ -3844,4 +3844,61 @@ mod tests {
             assert_eq!(refund_row(&store, id).await.0, "SENT");
         }
     }
+
+    // ADR-0022 (lnrent-chgb): the `migration_unverified_at` fence. A legacy attempt whose pre-send
+    // witness may have been lost is PARKED at the mint point — no resolution, no prepare, no POST —
+    // and only the stuck alert keeps firing. RED first: without the fence the drive resolves and pays.
+    #[tokio::test]
+    async fn a_migration_fenced_refund_is_parked_never_paid_and_keeps_alerting_stuck() {
+        let store = mem_store();
+        let payment = Arc::new(TestPayment::new());
+        let clock = TestClock::new(RESOLUTION_STUCK_ALERT_S + 1);
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        seed_refund(&store, "sub-1", Some(LN_ADDR), Some(500)).await;
+        seed_reservation(&store, "sub-1").await;
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "UPDATE refund_attempt SET migration_unverified_at=42 WHERE id='ref-order:sub-1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let r = refunder_with_alerts(&store, &payment, &clock, "op-npub-hex");
+
+        let report = r.drive().await.unwrap();
+        assert_eq!(
+            (report.sent, report.retried, report.failed),
+            (0, 0, 0),
+            "a fenced row is a no-op for the drive"
+        );
+        assert_eq!(payment.pay_calls(), 0, "nothing was POSTed");
+        let (status, gen, resolved): (String, i64, Option<String>) = store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT status, resolution_gen, resolved_bolt11 FROM refund_attempt
+                      WHERE id='ref-order:sub-1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (status.as_str(), gen, resolved),
+            ("PENDING", 0, None),
+            "no resolution was minted either — a new generation would be a new payment hash"
+        );
+        assert_eq!(
+            operator_alerts(&store).await,
+            vec![(
+                "op-npub-hex".to_string(),
+                "refund_stuck".to_string(),
+                "ref-order:sub-1".to_string()
+            )],
+            "RefundStuck keeps firing for a parked row"
+        );
+    }
 }

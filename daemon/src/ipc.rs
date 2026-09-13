@@ -3881,4 +3881,113 @@ mod tests {
         assert_eq!(data["last_sweep"]["id"], "sweep:h");
         assert_eq!(data["last_sweep"]["status"], "SENT");
     }
+
+    // ADR-0022 (lnrent-chgb): `refund-retry` refuses a FAILED row that carries the
+    // `migration_unverified_at` fence (a retry resets to PENDING and may re-resolve to a fresh hash),
+    // and `migration clear-fence` is the operator's journaled release.
+    #[tokio::test]
+    async fn refund_retry_refuses_a_fenced_row_and_clear_fence_releases_it() {
+        let store = mem_store();
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let payment: Arc<dyn PaymentBackend> = Arc::new(crate::backends::MockPayment::new());
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO refund_attempt (id, subscription_id, dest, amount_sat, idempotency_key,
+                        status, attempts, migration_unverified_at, created_at, updated_at)
+                     VALUES ('r-fenced', 's1', 'a@b.com', 500, 'refund:r-fenced', 'FAILED', 5, 77, 100, 200)",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO sweep_attempt (id, bolt11, amount_sat, max_outlay_msat, status,
+                        attempts, migration_unverified_at, created_at)
+                     VALUES ('sweep:fenced', 'lnbc1', 40000, 40000000, 'PENDING', 0, 77, 100)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let run = |req: Request| {
+            let (store, recipes, clock, payment) =
+                (store.clone(), recipes.clone(), clock.clone(), payment.clone());
+            async move {
+                dispatch(
+                    req,
+                    &store,
+                    &recipes,
+                    &clock,
+                    &payment,
+                    &RelayStatusCell::new(),
+                    &no_listing_relay(),
+                )
+                .await
+            }
+        };
+
+        let retry = run(Request::RefundRetry { id: "r-fenced".into() }).await;
+        assert!(!retry.ok, "a fenced row is not retryable");
+        let err = retry.error.unwrap();
+        assert_eq!(err.code, "invalid_state");
+        assert!(err.message.contains("migration_unverified") && err.message.contains("clear-fence"));
+        let (status, fenced): (String, Option<i64>) = store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT status, migration_unverified_at FROM refund_attempt WHERE id='r-fenced'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!((status.as_str(), fenced), ("FAILED", Some(77)), "nothing moved");
+
+        // A note is required (it is journaled).
+        let bad = run(Request::MigrationClearFence { id: "r-fenced".into(), note: "  ".into() }).await;
+        assert_eq!(bad.error.unwrap().code, "bad_request");
+
+        let cleared = run(Request::MigrationClearFence {
+            id: "r-fenced".into(),
+            note: "checked phoenixd outgoing: nothing for this hash".into(),
+        })
+        .await;
+        assert!(cleared.ok, "{:?}", cleared.error);
+        assert_eq!(cleared.data.unwrap()["table"], "refund_attempt");
+        let fenced: Option<i64> = store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT migration_unverified_at FROM refund_attempt WHERE id='r-fenced'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(fenced, None, "the fence is released");
+        let journal: String = store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT detail_json FROM event_log WHERE kind='migration_fence_cleared'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert!(journal.contains("r-fenced") && journal.contains("checked phoenixd outgoing"));
+
+        // Now the retry goes through, and the sweep row is cleared by the same verb.
+        assert!(run(Request::RefundRetry { id: "r-fenced".into() }).await.ok);
+        let cleared = run(Request::MigrationClearFence {
+            id: "sweep:fenced".into(),
+            note: "wallet shows no outgoing for this hash".into(),
+        })
+        .await;
+        assert_eq!(cleared.data.unwrap()["table"], "sweep_attempt");
+        // And an id with no fence is not_found.
+        let none = run(Request::MigrationClearFence { id: "sweep:fenced".into(), note: "again".into() }).await;
+        assert_eq!(none.error.unwrap().code, "not_found");
+        assert!(Request::MigrationClearFence { id: "x".into(), note: "n".into() }.is_mutating());
+    }
 }
