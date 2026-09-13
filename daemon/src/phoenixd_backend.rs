@@ -2050,7 +2050,6 @@ impl PaymentBackend for PhoenixdPayment {
         })
     }
 
-
     #[allow(clippy::disallowed_methods)] // the backend's own internal delegate, not a decider
     async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
         Ok(self.lookup_settlement(id).await?.0)
@@ -2469,9 +2468,8 @@ fn idx_get_by_invoice_id(conn: &Connection, invoice_id: &str) -> Result<Option<I
 }
 
 /// Insert the receive-map row, or refresh it in place for the same `invoice_id` (a still-payable
-/// bolt11 whose local window `resolve_invoice` reopened). `pub(crate)`: the legacy import's repair
-/// arm writes the same row shape.
-pub(crate) fn idx_upsert(conn: &Connection, inv: &Invoice) -> Result<()> {
+/// bolt11 whose local window `resolve_invoice` reopened).
+fn idx_upsert(conn: &Connection, inv: &Invoice) -> Result<()> {
     conn.execute(
         "INSERT INTO phoenixd_invoice
             (external_id, invoice_id, bolt11, payment_hash, amount_sat, expires_at)

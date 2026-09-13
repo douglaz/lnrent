@@ -1505,12 +1505,33 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // The §11 schema (15 tables) plus `seen_message` (migration 2, lnrent-7fp.5) plus
-        // `teardown_failure` (SCHEMA + migration 7, lnrent-urw.2) plus `sweep_attempt` (SCHEMA +
-        // migration 8, gate1-operator-sweep, urw.3) plus the ADR-0022 `migration` marker table
-        // (migration 12). The backend correlation tables are NOT migrations: `open` applies them
-        // after `migrate` (`apply_backend_schemas`), pinned separately below.
-        assert_eq!(n, 19);
+        // DERIVED, not hand-counted: the baseline's tables plus every `CREATE TABLE` a migration adds
+        // (`seen_message` from M2, the `migration` marker from M12; M7/M8 re-create baseline tables).
+        // The backend correlation tables are NOT migrations: `open` applies them after `migrate`
+        // (`apply_backend_schemas`), pinned separately below.
+        let baseline = Connection::open_in_memory().unwrap();
+        baseline.execute_batch(SCHEMA).unwrap();
+        let baseline_tables: i64 = baseline
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut migration_only = std::collections::HashSet::new();
+        for m in &MIGRATIONS[1..] {
+            for cap in m.split("CREATE TABLE IF NOT EXISTS ").skip(1) {
+                let name = cap.split_whitespace().next().unwrap().trim_end_matches('(');
+                if !SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {name}")) {
+                    migration_only.insert(name.to_string());
+                }
+            }
+        }
+        assert_eq!(
+            migration_only,
+            ["seen_message", "migration"].into_iter().map(String::from).collect()
+        );
+        assert_eq!(n, baseline_tables + migration_only.len() as i64);
     }
 
     // lnrent-y4m.5: a migration + its user_version bump is ONE transaction. A synthetic migration

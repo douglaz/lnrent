@@ -823,7 +823,7 @@ impl Lnv2Payment {
                             row.operation_id
                         }
                         SendOpLookup::Present(op_key) => {
-                            self.fail_dedup_key(idempotency_key, bolt11, &row.operation_id, op_key)
+                            self.fail_dedup_key(idempotency_key, &row.operation_id, op_key)
                                 .await?
                         }
                     }
@@ -901,9 +901,7 @@ impl Lnv2Payment {
                 return Ok(op);
             }
             SendOpLookup::Present(op_key) => {
-                return self
-                    .fail_dedup_key(idempotency_key, bolt11, &op, op_key)
-                    .await;
+                return self.fail_dedup_key(idempotency_key, &op, op_key).await;
             }
             SendOpLookup::Missing => {}
         }
@@ -1017,10 +1015,7 @@ impl Lnv2Payment {
             SendOpLookup::Present(key) => key,
         };
         if op_key.as_deref() != Some(idempotency_key) {
-            return self
-                .fail_dedup_key(idempotency_key, bolt11, op, op_key)
-                .await
-                .map(|_| ());
+            return self.fail_dedup_key(idempotency_key, op, op_key).await.map(|_| ());
         }
         self.set_op(idempotency_key, op, record_status).await
     }
@@ -1028,7 +1023,6 @@ impl Lnv2Payment {
     async fn fail_dedup_key(
         &self,
         idempotency_key: &str,
-        bolt11: &str,
         op: &str,
         op_key: Option<String>,
     ) -> Result<String> {
@@ -1048,7 +1042,6 @@ impl Lnv2Payment {
         // race. The sentinel op keeps us from ever binding to (or reporting) the foreign operation.
         {
             let (key, now) = (idempotency_key.to_string(), self.clock.now());
-            let _ = bolt11; // the row already carries the destination; only its status moves
             self.store
                 .transaction(move |tx| pay_park_collision_failed(tx, &key, now))
                 .await?;
@@ -1800,9 +1793,8 @@ fn idx_get_by_external(conn: &Connection, ext: &str) -> Result<Option<(Invoice, 
 }
 
 /// Insert the receive-map row for a fresh mint, or replace a CANCELED predecessor in place. Runs in
-/// the CALLER's issuance transaction (`Issued::persist`, ADR-0022). `pub(crate)`: the legacy import's
-/// repair arm writes the same row shape.
-pub(crate) fn idx_insert(conn: &Connection, inv: &Invoice, op: &str) -> Result<()> {
+/// the CALLER's issuance transaction (`Issued::persist`, ADR-0022).
+fn idx_insert(conn: &Connection, inv: &Invoice, op: &str) -> Result<()> {
     // OPEN rows have no trustworthy wallet credit yet: the contract face value excludes claim-time
     // consensus fees. Claimed atomically replaces this placeholder with the decoded wallet delta.
     //
@@ -2127,8 +2119,8 @@ fn pay_park_collision_failed(conn: &Connection, key: &str, terminal_at: i64) -> 
 
 /// Reap only old CANCELED invoices. OPEN may still settle; PAID and PAID_UNRECOVERED are durable money
 /// evidence. Chunked so one pass on a flooded table stays a bounded transaction on the sole-writer
-/// actor. `pub(crate)`: the legacy import applies the identical predicate to pre-reap the books.
-pub(crate) fn gc_lnv2_invoice_index(
+/// actor.
+fn gc_lnv2_invoice_index(
     conn: &Connection,
     now: i64,
     retention_secs: i64,

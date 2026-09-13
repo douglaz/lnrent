@@ -738,8 +738,11 @@ impl Sweeper {
         self.store
             .transaction_then(
                 move |tx| {
+                    // The CAS is the authorising transition: it re-asserts the row is still PENDING
+                    // and unfenced at commit time. `sweep_attempt` has no updated_at, so the write
+                    // itself changes nothing but the row count proves the guard held.
                     let n = tx.execute(
-                        "UPDATE sweep_attempt SET last_error=last_error
+                        "UPDATE sweep_attempt SET status='PENDING'
                           WHERE id=?1 AND status='PENDING' AND migration_unverified_at IS NULL",
                         params![id_s],
                     )?;

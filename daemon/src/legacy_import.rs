@@ -309,7 +309,7 @@ pub async fn run(
                 tx.execute("DELETE FROM invoice WHERE id=?1", params![id])?;
             }
             for map in &repairs {
-                repair_invoice(tx, map)?;
+                repair_invoice(tx, map, now)?;
             }
             let recheck = analyse(tx, backend, &legacy, now)?;
             if let Some(reason) = recheck.refusal {
@@ -478,7 +478,7 @@ fn has_table(conn: &Connection, table: &str) -> Result<bool> {
 fn read_legacy(path: &Path, backend: Backend) -> Result<Legacy> {
     let conn = Connection::open_with_flags(
         path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .context("opening the legacy index")?;
     let mut legacy = Legacy::default();
@@ -1017,7 +1017,7 @@ fn analyse(conn: &Connection, backend: Backend, legacy: &Legacy, now: i64) -> Re
 
 /// Rewrite the book row for `map.external_id` to the map's invoice (the ADR-0022 replacement rule):
 /// id, backend id, hash, bolt11, amount, expiry; `EXPIRED -> OPEN`, never from PAID.
-fn repair_invoice(tx: &Transaction, map: &ReceiveRow) -> Result<()> {
+fn repair_invoice(tx: &Transaction, map: &ReceiveRow, now: i64) -> Result<()> {
     let backend_invoice_id = map
         .operation_id
         .clone()
@@ -1046,12 +1046,13 @@ fn repair_invoice(tx: &Transaction, map: &ReceiveRow) -> Result<()> {
     }
     tx.execute(
         "INSERT INTO event_log (subscription_id, kind, detail_json, at)
-         SELECT subscription_id, 'adr0022_import_repair', ?2, strftime('%s','now')
+         SELECT subscription_id, 'adr0022_import_repair', ?2, ?3
            FROM invoice WHERE external_id=?1",
         params![
             map.external_id,
             serde_json::json!({ "external_id": map.external_id, "invoice_id": map.invoice_id })
-                .to_string()
+                .to_string(),
+            now
         ],
     )?;
     Ok(())
