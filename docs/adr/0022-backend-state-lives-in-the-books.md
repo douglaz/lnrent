@@ -1,9 +1,11 @@
 # 0022 — Backend correlation and pay state live in the books, not in a side file
 
-**Status: DECIDED, NOT YET BUILT.** At the time of writing both payment backends keep their
-own sqlite file beside the state DB: `phoenixd_index.db` (`daemon/src/phoenixd_backend.rs:197`)
-and `lnv2_index.db` under the federation directory (`daemon/src/lnv2_backend.rs:130`). Read every
-"is" below as "will" until the delivery beads close. The set is derivable, not listed:
+**Status: BUILT** by lnrent-chgb (2026-09): the correlation tables live in `lnrent.sqlite`
+(`store::apply_backend_schemas`), issuance and send ride the caller's transaction
+(`PaymentBackend::issue_invoice` / `prepare_pay`, `Store::transaction_then`), the legacy side files
+are imported once at boot (`daemon/src/legacy_import.rs`), and backups are format v3. The Context
+below describes the pre-ADR-0022 state it replaced. Follow-up beads still open against this ADR are
+derivable, not listed:
 
 ```bash
 set -o pipefail; br list --limit 0 --json -a | jq -r '.[] | select(.status!="closed")

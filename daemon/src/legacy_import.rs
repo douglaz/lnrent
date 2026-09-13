@@ -1284,6 +1284,7 @@ CREATE TABLE IF NOT EXISTS lnv2_pay (
         .unwrap();
     }
 
+    #[cfg_attr(not(feature = "fedimint"), allow(dead_code))] // the lnv2 shapes need the lnv2 tables
     fn seed_lnv2_receive(c: &Connection, ext: &str, op: &str, bolt11: &str, expires_at: i64, status: &str) {
         c.execute(
             "INSERT INTO lnv2_invoice (external_id, operation_id, invoice_id, bolt11, payment_hash,

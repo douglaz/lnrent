@@ -1739,6 +1739,9 @@ fn spawn_receive_task(
     });
 }
 
+/// One receive-terminal write, re-runnable on every retry (it is cloned into each store transaction).
+type TerminalWrite = Arc<dyn Fn(&Transaction) -> Result<()> + Send + Sync>;
+
 /// Retry one local receive-terminal transition until it is durable or the watcher is shutting down.
 /// A terminal observation is money evidence; logging a transient sqlite failure and abandoning its only
 /// task would leave a paid liability OPEN and later make it appear merely expired.
@@ -1747,7 +1750,7 @@ async fn persist_receive_terminal(
     tx: &mpsc::Sender<Settlement>,
     op: &str,
     action: &str,
-    persist: Arc<dyn Fn(&Transaction) -> Result<()> + Send + Sync>,
+    persist: TerminalWrite,
 ) -> bool {
     loop {
         let write = persist.clone();

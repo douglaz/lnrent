@@ -577,6 +577,10 @@ async fn drop_and_wait_for_ipc_down(running: RunningSupervisor, sock: PathBuf) {
 /// Create the MockPayment invoice for `external_id` (so a later `lookup`/`settle` resolves) and
 /// return the local invoice id + absolute expiry.
 async fn mint_invoice(payment: &Arc<MockPayment>, external_id: &str) -> (String, i64) {
+    // The raw seam on purpose: this seeds the MOCK's internal invoice for the crash matrix; the
+    // production issuance path (issue_invoice + the caller's transaction) is exercised by the
+    // OrderIntake-driven cases. clippy.toml denies it in production code only.
+    #[allow(clippy::disallowed_methods)]
     let inv = payment
         .create_invoice(100, &format!("lnrent {external_id}"), 3600, external_id)
         .await

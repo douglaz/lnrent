@@ -254,18 +254,17 @@ refuses orders it cannot service.
   outbox (edge-triggered, at most one per condition per 6h). One honest caveat: a total relay
   blackout is the one condition that cannot be delivered (it queues), so a prolonged silence from a
   daemon you know is up still warrants a direct check.
-- **A settlement lnrent cannot book (lnrent-gc7):** lnrent holds an invoice it will not book. Two
-  causes, one alert kind (`SettlementUnbookable`), different remedies — and they differ in what is
-  actually KNOWN about the money, which decides what you owe:
+- **A settlement lnrent cannot book (lnrent-gc7):** lnrent holds an invoice it will not book. One
+  alert kind (`SettlementUnbookable`), one shipped cause — the *fee-credit refusal*, after which
+  phoenixd HAS reported the invoice paid, so each held-back item is a real receipt and the buyer has
+  certainly paid. (The pre-ADR-0022 second cause, "index divergence — a missing `phoenixd_index.db`
+  row", no longer exists: the correlation maps live inside `lnrent.sqlite` and commit with the
+  invoice they correlate, so lnrent cannot lose its own correlation; see *Upgrading to the
+  self-contained state DB* below. The phoenixd-side case — phoenixd forgetting a receipt lnrent still
+  holds — is ADR-0023's `phoenixd_forgot_invoice` condition, not yet built.)
 
-  - after a *fee-credit refusal* phoenixd HAS reported the invoice paid, so each held-back item is a
-    real receipt and the buyer has certainly paid;
-  - after an *index divergence* the payment state is UNKNOWN — the correlation lnrent needs to ask
-    about that invoice is the thing that was lost, so an affected item may or may not have been
-    paid, and must be established from phoenixd's own records rather than assumed.
-
-  Both are judged whole-wallet or whole-index, so **one alert covers every item it holds back** and
-  names only one as an example.
+  It is judged whole-wallet, so **one alert covers every item it holds back** and names only one as
+  an example.
 
   - *Fee credit (ADR-0019).* phoenixd publishes no per-receipt fee-credit attribution, so the
     judgement is per WALLET. **Remedy: give the node spendable balance.** The DM names the
@@ -284,84 +283,6 @@ refuses orders it cannot service.
     after your local invoice had already expired: that is watched only for a grace window past the
     expiry, and past it lnrent cannot book it at all — settle that buyer from phoenixd's records.
 
-  - *Index divergence — a missing `phoenixd_index.db` row.* Payment state becomes UNKNOWN: lnrent
-    can neither observe, book, nor expire it. **There is no safe repair.** Read this whole entry
-    before touching anything; the only command in it is the first one.
-
-    1. **Stop new orders, while the daemon is still up.** `listing withdraw` reaches the daemon over
-       `<data-dir>/lnrent.sock`, so it cannot run once you have stopped it — and every order taken
-       from here is another buyer you will have to settle by hand:
-
-       ```sh
-       lnrent --data-dir /path/to/your/data-dir listing withdraw
-       ```
-
-       **If this fails with "store is in degraded read-only mode", that is expected and not a
-       problem here** — the same fatal DB error can put the store in read-only mode, and withdrawing
-       persists a `WITHDRAWN` row, so the write is refused (`store.rs`). Nothing is lost: a degraded
-       store refuses money writes generally, so no new order can be booked while it lasts. Go
-       straight to stopping the daemon.
-
-       **Do NOT follow that error's own advice.** It ends "restore from backup and restart", which
-       is correct for an ordinary degraded store and is precisely what must not happen here — see
-       the next step. `lnrent money` withholds the same remedy for the same reason, but the error
-       text from a failed command does not know a divergence is in progress.
-
-    2. **Do not restore from a backup.** Deciding a backup is safe means knowing which refunds
-       already went out, and lnrent's only record of that is `phoenixd_pay` — inside the very index
-       whose loss IS this incident. The phoenixd WALLET is also deliberately excluded from lnrent's
-       backups (`backup.rs:27-34`), so restoring reinstates lnrent's commitments without the wallet
-       that fulfilled them: a clean dedup map over payments phoenixd still holds. The daemon can
-       then re-drive a restored PENDING refund and **pay it a second time**. A restore can also
-       resurrect a subscription that was since terminated, and drops every order, capture and ledger
-       row committed after the backup. Three schemes for proving a restore safe were refuted across
-       eight review passes on lnrent-ole, every one a double pay; do not reconstruct them.
-
-    3. **Do not restart the daemon — and assume the double pays have ALREADY happened.** The dedup
-       map lives in the index you lost, so `pay_get` finds no row, which is indistinguishable from
-       "never paid". The refunder re-drives every PENDING `refund_attempt` at boot AND on each
-       maintenance pass (a few seconds apart, `supervisor.rs`), and the sweeper does the same for
-       `sweep_attempt` — so if the daemon has been running on the diverged index at all, any
-       PENDING row whose payment had already gone out was very likely re-sent within seconds of
-       that boot, long before this alert reached you. "Do not restart" is still right; it is not a
-       preventive measure so much as a way to stop the count rising.
-
-       A payment that is merely IN FLIGHT is not a negative answer either: it can still settle
-       while a new one is posted alongside it. The restore is not the hazard; the missing dedup map
-       is, and the incident already handed you that. (A sweep re-send pays the operator, so it
-       costs routing fees rather than a buyer's money — still a second payment.)
-
-    4. **Reconcile BOTH directions against phoenixd's own records.** phoenixd knows what it
-       received and what it sent; lnrent no longer does. Read them through phoenixd's own HTTP API,
-       with the API password from your `phoenix.conf`. `phoenixd_backend.rs` documents the exact
-       endpoints lnrent depends on and has MEASURED — `GET /payments/incoming?externalId=…` and
-       `GET /payments/outgoingbyhash/{hash}` — which are per-item lookups. phoenixd also exposes a
-       list form for enumerating a whole history; lnrent has never called or measured it, so treat
-       its shape as unverified here (tracked with lnrent-8scw, which needs it). Naming phoenixd's
-       interface is safe where naming an lnrent query was not: it is an external service's own API,
-       not a second implementation of lnrent's state semantics.
-
-       - *Incoming* — what buyers paid that lnrent never booked. These are the buyers to settle,
-         and lnrent's own view of them is incomplete in two ways that matter here: a settlement
-         that landed after lnrent expired its invoice is owed but has no OPEN row (lnrent-hh4q),
-         and `received_msat` is only written at capture, which never happened — so the net-of-fee
-         figure exists only at phoenixd.
-       - *Outgoing* — refunds that may have been sent TWICE by the re-drive above. Money already
-         left; you cannot unsend it, but you need to know the real position before settling
-         anything else, and a buyer refunded twice is not owed a third.
-
-    **Why this entry names no queries.** Enumerating the exposure and deciding whether a restart is
-    safe depend on daemon-internal semantics — which column holds the paid invoice, which states
-    count as unsafe, which tables hold pending money, which journal each database uses. A shell
-    procedure is a second implementation of that, in a medium with no test harness, maintained
-    beside the code rather than with it; every revision is an unverified claim, and its failure mode
-    is an empty result that reads like good news. ADR-0001 keeps those semantics in one audited
-    codebase, which is also why `lnrent reconcile` is deliberately report-only. The enumeration and
-    the pre-restart safety gate belong in the repair tool tracked as **lnrent-8scw**, where each
-    check is code a test can deliberately break. Until it exists, this incident is handled by
-    stopping, not by improvising.
-
-    Never recreate or expire an affected invoice.
 
   `lnrent money` and `lnrent status` show deduplicated alert HISTORY — one row per incident,
   carrying its subject, remedy and timestamp — over `ALERT_VIEW_WINDOW_S` (`alerts.rs`, derived as
@@ -417,11 +338,78 @@ refuses orders it cannot service.
 
 - Wrong config, no funds yet: safe to wipe the data dir + re-bootstrap.
 - After funds exist: NEVER wipe or regenerate the seed. Restore from a cold backup:
-  `lnrentd restore --from <backup-dir>`. **Not for a diverged `phoenixd_index.db`** — see the
-  unbookable-settlement section above; a restore there can pay a refund twice, because it rolls back
-  lnrent's only dedup record while phoenixd keeps the payment.
+  `lnrentd restore --from <backup-dir>`. A **format-3** backup (taken after the first ADR-0022 boot;
+  `MANIFEST.json` says `"version": 3`) is self-contained and restores as is. A **format-2** one
+  carries the old `phoenixd_index.db`, which the next boot imports (see *Upgrading to the
+  self-contained state DB*). A **format-1** backup whose books reference phoenixd is REFUSED at
+  restore: it carries no phoenixd correlation, so restoring it would leave refunds already paid
+  looking unpaid — there is no safe reconstruction; use a format-2 or format-3 backup. Any restore
+  is still a rollback of the books to the backup's instant while phoenixd keeps every payment it
+  made since; a PENDING refund the wallet already paid is the double-pay class lnrent-uxbd owns.
 - Federation/gateway down: the daemon can't mint invoices or pay refunds until it recovers; existing subs
   keep running, and reconcile catches up when it's back.
+
+## Upgrading to the self-contained state DB (ADR-0022)
+
+Before ADR-0022 each payment backend kept its correlation maps — which backend invoice belongs to
+which order, which refund key already paid — in a private sqlite file beside the state DB
+(`phoenixd_index.db`, or `fedimint/<federation>/lnv2_index.db`). Those maps are now tables inside
+`lnrent.sqlite`, written in the same transaction as the `invoice` / `refund_attempt` /
+`sweep_attempt` row they correlate, so the books cannot disagree with their own correlation.
+
+**The first boot on the new binary imports the side file, once.** With the daemon stopped, upgrade
+the binary and start it. On that boot lnrentd:
+
+1. reads the side file, validates that EVERY backend-referencing row in the books has a correlation
+   that agrees with it (invoice id, bolt11, payment hash, amount; for pay rows the bolt11 and, where
+   the attempt carries one, the backend payment id), repairs the books from the map ONLY where the
+   backend's own current state proves the map row is the effective invoice, and refuses to boot
+   otherwise, naming the first row it could not reconcile;
+2. stamps every non-terminal or retryable-FAILED refund/sweep attempt that has no backend payment id
+   and no pay-map row as `migration_unverified` — the file cannot tell "never started" from
+   "started, witness lost" — and PARKS it (never paid, never retried, `RefundStuck` / `SweepStuck`
+   keep alerting);
+3. records completion in the `migration` table in the SAME transaction, then renames the side file
+   `*.imported`. A crash between the two is recognised on the next boot and finished.
+
+Take a backup BEFORE the upgrade as usual. Note that `lnrentd backup` run on the upgraded binary
+before that first boot still produces the old format (2 with a phoenixd side file, else 1) — the
+writer stamps format 3 only once the marker exists, so a pre-boot backup keeps its side file and
+stays restorable.
+
+**Refusals and what they mean.** Every refusal names the row and points here. None of them can be
+fixed by editing the database by hand (ADR-0001: one audited writer).
+
+- *`<side file> is missing but the books reference this backend`*: the correlation file was lost
+  (a hand-copied data dir, a format-1 restore). Restore the data dir from a backup that carries the
+  file (format 2, or format 1 for an lnv2-only deployment), or settle the named rows by hand from
+  the wallet's own records and start from a fresh data dir.
+- *`… disagrees with its … row and the backend does not positively report …`*: the books and the
+  side file come from different instants (a mismatched restore) and the wallet's current view does
+  not settle which is current. Decide which is current from the wallet's own records, put the
+  matching pair back, and boot again. lnrent never guesses: rewriting the books to a stale map could
+  orphan a paid replacement.
+- *`… ambiguous provenance`* / *`… DIFFERENT …`*: the new tables are already populated, or the
+  marker names another file, yet a side file is present. Remove whichever copy you know is stale.
+- *`… has no … row in the legacy index`* on a pay row: a SENT attempt whose pay-map row — the owner
+  of its payment hash — is missing from the file. Same remedy as the mismatched restore above.
+
+**Parked attempts.** `lnrent refunds` lists refunds; a fenced one is refused by `lnrent
+refund-retry` with a message naming the fence. The daemon never clears a phoenixd fence on its own:
+phoenixd's outgoing list omits an in-flight payment, its clock is unrelated to lnrent's, and its own
+database can be wiped and restored with funds surviving by seed, so absence proves nothing. Check
+the wallet's own outgoing records for the attempt's destination, decide, then release it:
+
+```sh
+lnrent --data-dir /path/to/your/data-dir migration clear-fence <attempt id> \
+  --note "checked phoenixd outgoing: nothing for this hash" --yes
+```
+
+The note is journaled to `event_log`. After clearance the driver prepares and pays the attempt
+exactly as a first attempt. (A backend audit that ADOPTS a matching wallet record onto a parked
+attempt — never a re-send — is lnrent-uxbd for phoenixd and lnrent-gjwy for lnv2.)
+
+**Backups after the upgrade** are format 3 and self-contained; restore accepts them as is.
 
 ## Safety gates
 
