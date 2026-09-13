@@ -383,8 +383,26 @@ impl Sweeper {
             ));
         }
 
+        // ADR-0022: the backend's check-and-create for this key runs first, under its own pay guard,
+        // and the PREPARED row it hands back commits INSIDE the gate transaction below, beside the
+        // PENDING intent that authorises the send. A prepare failure (node unreachable, unparseable
+        // destination) refuses before any intent is written.
+        let prepared = self
+            .payment
+            .prepare_pay(&id, bolt11)
+            .await
+            .map_err(|e| SweepError::Unpriceable(format!("backend could not prepare the sweep: {e:#}")))?;
+
         match self
-            .gate_and_write(&id, bolt11, &payment_hash, amount_sat, outlay_msat, now)
+            .gate_and_write(
+                &id,
+                bolt11,
+                &payment_hash,
+                amount_sat,
+                outlay_msat,
+                now,
+                prepared,
+            )
             .await
             .map_err(SweepError::Internal)?
         {
@@ -439,6 +457,26 @@ impl Sweeper {
     pub async fn drive(&self) -> Result<SweepReport> {
         let mut report = SweepReport::default();
         for row in self.pending_sweeps().await? {
+            // ADR-0022 FENCE first: a legacy intent whose PREPARED witness may have been lost with the
+            // side file is PARKED — no `prepare_pay`, no pay — until the backend's audit or the
+            // operator clears the stamp. Its cap stays counted (PENDING) and SweepStuck keeps firing.
+            if let Some(stamped_at) = row.migration_unverified_at {
+                tracing::error!(
+                    sweep = %row.id,
+                    stamped_at,
+                    "sweep is fenced migration_unverified (ADR-0022): its pre-send witness may have \
+                     been lost with the legacy index; parked — clear with `lnrent migration \
+                     clear-fence` after checking the wallet's own records"
+                );
+                report.pending += 1;
+                self.maybe_alert_stuck(
+                    &row,
+                    self.clock.now(),
+                    "fenced migration_unverified (ADR-0022); needs the operator or the backend audit",
+                )
+                .await;
+                continue;
+            }
             let Some(bolt11) = row.bolt11.clone() else {
                 tracing::warn!(sweep = %row.id, "PENDING sweep has no bolt11; leaving for manual handling");
                 report.pending += 1;
@@ -520,6 +558,13 @@ impl Sweeper {
                                 .await?
                         };
                         if surplus.surplus_msat() >= row.max_outlay_msat {
+                            // A fresh send from recovery: re-prepare through the leased authorising
+                            // transaction exactly as a first attempt (ADR-0022) — `pay` only reads.
+                            // A lost CAS (terminalized or fenced under us) pays nothing.
+                            if !self.authorise_send(&row.id, &bolt11).await? {
+                                report.pending += 1;
+                                continue;
+                            }
                             Some(
                                 self.capped_pay(
                                     &row.id,
@@ -682,8 +727,40 @@ impl Sweeper {
             .map_err(|e| SweepError::Unpriceable(format!("gateway could not price the sweep: {e:#}")))
     }
 
+    /// The ADR-0022 authorising transaction for a RECOVERY send (`drive`'s not-started arm):
+    /// `prepare_pay`, then ONE transaction that CASes the intent as still `PENDING` and unfenced and
+    /// runs the backend's `persist` (the PREPARED row), the backend's pay guard leased to the actor
+    /// through the commit. `false` = the CAS lost; nothing persisted, do not pay.
+    async fn authorise_send(&self, id: &str, bolt11: &str) -> Result<bool> {
+        let prepared = self.payment.prepare_pay(id, bolt11).await?;
+        let id_s = id.to_string();
+        let persist = prepared.persist;
+        self.store
+            .transaction_then(
+                move |tx| {
+                    let n = tx.execute(
+                        "UPDATE sweep_attempt SET last_error=last_error
+                          WHERE id=?1 AND status='PENDING' AND migration_unverified_at IS NULL",
+                        params![id_s],
+                    )?;
+                    if n == 0 {
+                        return Ok(false);
+                    }
+                    persist(tx)?;
+                    Ok(true)
+                },
+                prepared.lease,
+                None,
+            )
+            .await
+    }
+
     /// The ONE serialized gate + durable-intent transaction (single-writer, ADR-0001): re-submit
-    /// short-circuit, busy refusal, surplus gate, then the PENDING write + `kind='sweep'` journal.
+    /// short-circuit, busy refusal, surplus gate, then the PENDING write + the backend's PREPARED
+    /// pay-map row (`prepared.persist`, ADR-0022 — same transaction, so a crash between the two is
+    /// impossible by construction) + `kind='sweep'` journal. `prepared.lease` (the backend's pay guard)
+    /// is held by the store actor through the commit and released after it, on every exit.
+    #[allow(clippy::too_many_arguments)]
     async fn gate_and_write(
         &self,
         id: &str,
@@ -692,6 +769,7 @@ impl Sweeper {
         amount_sat: u64,
         outlay_msat: u128,
         now: i64,
+        prepared: crate::backends::Prepared,
     ) -> Result<GateDecision> {
         // `execute` already refused an out-of-range value; convert (never clamp) so a future caller
         // cannot silently under-record the cap.
@@ -700,8 +778,9 @@ impl Sweeper {
         let amount_i64 = i64::try_from(amount_sat)
             .map_err(|_| anyhow::anyhow!("amount {amount_sat} sat exceeds the i64 ledger range"))?;
         let (id_s, bolt11_s, hash_s) = (id.to_string(), bolt11.to_string(), payment_hash.to_string());
+        let persist = prepared.persist;
         self.store
-            .transaction(move |tx| {
+            .transaction_then(move |tx| {
                 // Re-submit of the SAME invoice: a completed sweep returns its cached SENT row; a
                 // still-PENDING one is busy (the drive will finish it).
                 let existing: Option<(String, Option<i64>, i64, Option<String>)> = tx
@@ -757,6 +836,9 @@ impl Sweeper {
                         sent_at=NULL",
                     params![id_s, bolt11_s, amount_i64, outlay_i64, now],
                 )?;
+                // The backend's PREPARED pay-map row, in THIS transaction (ADR-0022): the pre-send
+                // witness commits with the intent that authorises the send, or neither does.
+                persist(tx)?;
                 journal_sweep(
                     tx,
                     &json!({
@@ -768,7 +850,7 @@ impl Sweeper {
                     now,
                 )?;
                 Ok(GateDecision::Proceed)
-            })
+            }, prepared.lease, None)
             .await
     }
 
@@ -938,7 +1020,8 @@ impl Sweeper {
         self.store
             .read(|c| {
                 let mut stmt = c.prepare(
-                    "SELECT id, bolt11, COALESCE(amount_sat, 0), max_outlay_msat, created_at
+                    "SELECT id, bolt11, COALESCE(amount_sat, 0), max_outlay_msat, created_at,
+                            migration_unverified_at
                        FROM sweep_attempt
                       WHERE status='PENDING'
                       ORDER BY created_at, id",
@@ -951,6 +1034,7 @@ impl Sweeper {
                             amount_sat: r.get::<_, i64>(2)?.max(0) as u64,
                             max_outlay_msat: u128::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
                             created_at: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                            migration_unverified_at: r.get(5)?,
                         })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -968,6 +1052,9 @@ struct PendingSweep {
     max_outlay_msat: u128,
     /// Intent creation time; a missing legacy value is treated as ancient.
     created_at: i64,
+    /// The ADR-0022 legacy-import fence (SPEC §11): `Some` parks the row at the mint point — no
+    /// `prepare_pay`, no pay — until the backend's audit or the operator clears it.
+    migration_unverified_at: Option<i64>,
 }
 
 /// Parse the operator's sweep invoice: `(payment_hash, amount_sat)`. A parse failure, an amountless

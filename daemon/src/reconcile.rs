@@ -50,11 +50,11 @@ use serde_json::{json, Value};
 use lnrent_wire::{BillingInvoice, BillingNotice, Msg};
 
 use crate::alerts::{Alert, AlertDispatcher, AlertKind};
-use crate::backends::{PaymentBackend, PaymentStatus};
+use crate::backends::{Issued, PaymentBackend, PaymentStatus, Persist};
 use crate::recipe::Recipe;
 use crate::reservation;
 use crate::runner::{run_hook, DEFAULT_TIMEOUT};
-use crate::store::Store;
+use crate::store::{upsert_renewal_invoice, RenewalInvoiceRow, Store};
 use crate::teardown;
 
 /// FLOOR for the soft-date auto-renewal invoice's Lightning expiry (seconds). The actual expiry is
@@ -1104,9 +1104,14 @@ impl Reconciler {
         // terminated it (epj). On a stale cursor the CAS below affects 0 rows and we never insert a
         // DB invoice row; the backend invoice minted just above is harmless (same external_id,
         // self-expiring), so no DB row is ever stranded.
-        let invoice = match self
+        let Issued {
+            invoice,
+            persist,
+            lease,
+            after_commit,
+        } = match self
             .payment
-            .create_invoice(
+            .issue_invoice(
                 self.recipe.pricing.amount_sat,
                 &format!("lnrent renewal {sub_id}"),
                 expiry_s,
@@ -1114,7 +1119,7 @@ impl Reconciler {
             )
             .await
         {
-            Ok(inv) => inv,
+            Ok(issued) => issued,
             Err(e) => {
                 // A transient backend outage must not abort the whole tick — leave the cursor so the
                 // next tick retries.
@@ -1151,9 +1156,15 @@ impl Reconciler {
             inv_expires_at: invoice.expires_at,
             billing_invoice_json: serde_json::to_string(&billing_invoice)?,
             billing_notice_json: serde_json::to_string(&billing_notice)?,
+            persist,
             now,
         };
-        self.store.transaction(move |tx| write.write(tx)).await
+        // ADR-0022: the backend's create lease is held by the store actor through this commit, and
+        // the lnv2 live watcher (`after_commit`) starts from the actor after it — only if the CAS
+        // below actually wrote the invoice (a lost CAS persists nothing and starts nothing).
+        self.store
+            .transaction_then(move |tx| write.write(tx), lease, after_commit)
+            .await
     }
 
     /// Transition 3 — suspend. Gate on the downtime-credit FLOOR first (§6.5): never suspend before
@@ -1493,6 +1504,9 @@ struct SoftReminderWrite {
     inv_expires_at: i64,
     billing_invoice_json: String,
     billing_notice_json: String,
+    /// The backend's receive-map row (ADR-0022), run beside the invoice upsert — after the CAS, so a
+    /// lost cursor race persists no correlation for an invoice it never wrote.
+    persist: Persist,
     now: i64,
 }
 
@@ -1515,25 +1529,24 @@ impl SoftReminderWrite {
         if n == 0 {
             return Ok(false);
         }
-        // Idempotent on external_id: one cycle = one OPEN renewal invoice.
-        tx.execute(
-            "INSERT INTO invoice
-                (id, subscription_id, external_id, backend_invoice_id, payment_hash, kind,
-                 bolt11, amount_sat, status, expires_at, issued_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'renewal', ?6, ?7, 'OPEN', ?8, ?9)
-             ON CONFLICT(external_id) DO NOTHING",
-            params![
-                self.inv_id,
-                self.sub_id,
-                self.external_id,
-                self.backend_invoice_id,
-                self.payment_hash,
-                self.bolt11,
-                self.amount_sat,
-                self.inv_expires_at,
-                self.now,
-            ],
+        // Idempotent on external_id: one cycle = one OPEN renewal invoice. A provider-terminated
+        // REPLACEMENT refreshes the row to the successor (ADR-0022), in the same transaction as the
+        // successor's correlation below.
+        upsert_renewal_invoice(
+            tx,
+            &RenewalInvoiceRow {
+                id: self.inv_id,
+                subscription_id: self.sub_id.clone(),
+                external_id: self.external_id,
+                backend_invoice_id: self.backend_invoice_id,
+                payment_hash: self.payment_hash,
+                bolt11: self.bolt11,
+                amount_sat: self.amount_sat,
+                expires_at: self.inv_expires_at,
+                now: self.now,
+            },
         )?;
+        (self.persist)(tx)?;
         // Stable outbox ids (per cycle) make a redelivery a no-op insert — belt-and-suspenders with
         // the CAS guard above, mirroring the provision outbox (lnrent-7fp.10).
         enqueue(

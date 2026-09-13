@@ -778,6 +778,67 @@ fn trip_if_fatal_anyhow(degraded: &AtomicBool, e: anyhow::Error) -> anyhow::Erro
     e
 }
 
+/// The OPEN renewal-invoice row an issuance transaction writes (SPEC §6.6, ADR-0022 replacement
+/// rule). One definition for both renewal writers (the buyer `renew.request` and the daemon's
+/// soft-date reminder) so the refresh rule cannot drift between them.
+pub struct RenewalInvoiceRow {
+    pub id: String,
+    pub subscription_id: String,
+    pub external_id: String,
+    pub backend_invoice_id: String,
+    pub payment_hash: String,
+    pub bolt11: String,
+    pub amount_sat: i64,
+    pub expires_at: i64,
+    pub now: i64,
+}
+
+/// Insert the OPEN renewal invoice, or — when the backend REPLACED a provider-terminated invoice
+/// under the same `external_id` (SPEC §6.6, lnrent-9yz) — REFRESH the existing row to the
+/// replacement in the same transaction that commits the replacement's correlation (ADR-0022).
+///
+/// The store's invoice `id` IS the backend-derived one (`settlement_catch_up` hands it back to
+/// `lookup_settlement_by_ref`, which classifies a retired id as Expired), so a stale id means a paid
+/// replacement is never captured; `amount_sat`, `bolt11`, `backend_invoice_id`, `payment_hash` and
+/// `expires_at` follow for the same reason (a payment of the replacement would otherwise be read
+/// against the predecessor's data). `status` resets `EXPIRED -> OPEN`, never from `PAID`: capture
+/// books only an OPEN row, so a refreshed-but-EXPIRED invoice would route the replacement's payment
+/// down the terminal-refund arm instead of provisioning the buyer. A row already PAID or carrying a
+/// `settled_at` is never touched — money was booked against its data. Same-invoice re-issues write
+/// identical values, so the `DO UPDATE` is a no-op for them. The pre-ADR-0022 `DO NOTHING` kept the
+/// retired bolt11 and hash beside a fresh correlation; same-transaction commit alone does not make two
+/// rows agree — the refresh is what does. (PR #90 codex + CodeRabbit round 12.)
+pub fn upsert_renewal_invoice(tx: &Transaction, row: &RenewalInvoiceRow) -> Result<()> {
+    tx.execute(
+        "INSERT INTO invoice
+            (id, subscription_id, external_id, backend_invoice_id, payment_hash, kind,
+             bolt11, amount_sat, status, expires_at, issued_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'renewal', ?6, ?7, 'OPEN', ?8, ?9)
+         ON CONFLICT(external_id) DO UPDATE SET
+             id                 = excluded.id,
+             backend_invoice_id = excluded.backend_invoice_id,
+             payment_hash       = excluded.payment_hash,
+             bolt11             = excluded.bolt11,
+             amount_sat         = excluded.amount_sat,
+             expires_at         = excluded.expires_at,
+             status             = CASE WHEN invoice.status = 'EXPIRED' THEN 'OPEN'
+                                       ELSE invoice.status END
+           WHERE invoice.status <> 'PAID' AND invoice.settled_at IS NULL",
+        rusqlite::params![
+            row.id,
+            row.subscription_id,
+            row.external_id,
+            row.backend_invoice_id,
+            row.payment_hash,
+            row.bolt11,
+            row.amount_sat,
+            row.expires_at,
+            row.now,
+        ],
+    )?;
+    Ok(())
+}
+
 /// A unit of work the store actor runs on its `Connection`. Each job does its sqlite work
 /// synchronously and sends the typed reply on its own oneshot.
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;

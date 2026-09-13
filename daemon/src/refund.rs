@@ -129,6 +129,11 @@ struct RefundRow {
     /// When the row was created (unix secs). Used to detect a refund stuck PENDING (deferred without a
     /// pay) past [`RESOLUTION_STUCK_ALERT_S`] so the operator is alerted (review P2).
     created_at: i64,
+    /// The ADR-0022 legacy-import fence (SPEC §11): `Some` means this attempt's pre-send witness may
+    /// have been lost with the side file, so the driver must not `prepare_pay` (let alone pay or
+    /// re-resolve) it until the backend's own audit or the operator clears the stamp. Parked at the
+    /// mint point; `RefundStuck` keeps firing.
+    migration_unverified_at: Option<i64>,
 }
 
 /// The per-row result, mapped 1:1 onto a [`RefundReport`] counter.
@@ -325,6 +330,23 @@ impl Refunder {
         let now = self.clock.now();
         let external_id = external_id_of(&row);
 
+        // ADR-0022 FENCE, before anything else touches this row: a legacy attempt whose pre-send
+        // witness may have been lost with the side file is PARKED at the mint point. No resolution
+        // (that could mint a new generation and pay again), no `prepare_pay`, no POST — only the
+        // existing stuck alert, until the backend's own audit adopts a positive match or the operator
+        // clears the stamp (`lnrent migration clear-fence`). Absence is never clearance.
+        if let Some(stamped_at) = row.migration_unverified_at {
+            tracing::error!(
+                refund = %row.id,
+                stamped_at,
+                "refund is fenced migration_unverified (ADR-0022): its pre-send witness may have \
+                 been lost with the legacy index; parked — clear with `lnrent migration clear-fence` \
+                 after checking the wallet's own records, or wait for the backend audit"
+            );
+            self.maybe_alert_stuck(&row, now).await;
+            return Ok(Outcome::Noop);
+        }
+
         // INV-3 PROVENANCE GUARD FIRST (spec §3.3): a refund MUST correspond to a payment actually
         // received for this order, and the stored gross MUST match that received amount. No provenance,
         // a missing/non-positive received amount, or a row-vs-provenance mismatch parks FAILED at ERROR
@@ -414,6 +436,21 @@ impl Refunder {
         // reports the net `pay_sat` that went out, not the gross (review P2).
         if self.already_paid(&key).await {
             return self.finish_sent(&row, None, pay_sat, now).await;
+        }
+
+        // ADR-0022: the backend's PREPARED pay-map row commits in the SAME transaction as the ledger
+        // transition that authorises this send — a CAS re-asserting the row is still PENDING and
+        // unfenced — with the backend's pay guard leased to the store actor through that commit.
+        // `pay(key)` below then only READS the row. A prepare failure (the node unreachable, an
+        // unparseable destination) is a transient defer: nothing was sent, so the pay-attempts cap is
+        // untouched.
+        match self.authorise_send(&row, &key, &bolt11, now).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(Outcome::Noop),
+            Err(e) => {
+                tracing::warn!(refund = %row.id, error = %format!("{e:#}"), "refund prepare failed; row stays PENDING");
+                return self.commit_resolution_retry(&row, now).await;
+            }
         }
 
         // INV-1: pay the fee-adjusted `pay_sat` (<= net cap), bounded by `received` so the backend's
@@ -837,6 +874,42 @@ impl Refunder {
             .map_err(|e| PlanError::Transient(format!("persisting refund resolution: {e}")))
     }
 
+    /// The ADR-0022 authorising transaction for one send: `prepare_pay` (the backend's check-and-create
+    /// under its own pay guard), then ONE transaction that CASes the attempt as still `PENDING` and
+    /// unfenced and runs the backend's `persist` (the PREPARED row) — the guard riding
+    /// `Store::transaction_then` as the lease, dropped by the actor after the commit. Returns `false`
+    /// when the CAS lost (the row was terminalized or fenced under us): nothing was persisted and the
+    /// caller must not pay.
+    async fn authorise_send(
+        &self,
+        row: &RefundRow,
+        key: &str,
+        bolt11: &str,
+        now: i64,
+    ) -> Result<bool> {
+        let prepared = self.payment.prepare_pay(key, bolt11).await?;
+        let id = row.id.clone();
+        let persist = prepared.persist;
+        self.store
+            .transaction_then(
+                move |tx| {
+                    let n = tx.execute(
+                        "UPDATE refund_attempt SET updated_at=?2
+                          WHERE id=?1 AND status='PENDING' AND migration_unverified_at IS NULL",
+                        params![id, now],
+                    )?;
+                    if n == 0 {
+                        return Ok(false);
+                    }
+                    persist(tx)?;
+                    Ok(true)
+                },
+                prepared.lease,
+                None,
+            )
+            .await
+    }
+
     /// `Succeeded` per the backend's idempotency-key status — the refund already went out on this
     /// key. Only `Succeeded` counts as paid; an `Unknown`/`Pending`/`Failed` (or a lookup error) is
     /// not, so the caller falls through to `pay`, which the key dedups.
@@ -1177,7 +1250,7 @@ impl Refunder {
                 let mut stmt = c.prepare(
                     "SELECT r.id, r.subscription_id, r.dest, r.amount_sat, r.idempotency_key,
                             s.buyer_pubkey, r.resolved_bolt11, r.resolved_expiry, r.resolution_gen,
-                            r.created_at
+                            r.created_at, r.migration_unverified_at
                        FROM refund_attempt r
                        LEFT JOIN subscription s ON s.id = r.subscription_id
                       WHERE r.status='PENDING'
@@ -1196,6 +1269,7 @@ impl Refunder {
                             resolved_expiry: r.get(7)?,
                             resolution_gen: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
                             created_at: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                            migration_unverified_at: r.get(10)?,
                         })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
