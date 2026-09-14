@@ -1144,11 +1144,18 @@ pub(crate) async fn money_sweep_view(store: &Store) -> Result<Value> {
                 [],
                 |r| r.get(0),
             )?;
-            let fenced_sweeps: i64 = c.query_row(
-                "SELECT count(*) FROM sweep_attempt WHERE migration_unverified_at IS NOT NULL",
-                [],
-                |r| r.get(0),
-            )?;
+            // Sweeps have no list verb and a FAILED one raises no SweepStuck, so the ids are the only
+            // way an operator learns what to pass to `clear-fence` (codex #91 P2, fourth round).
+            let fenced_sweep_ids: Vec<serde_json::Value> = c
+                .prepare(
+                    "SELECT id, status FROM sweep_attempt
+                      WHERE migration_unverified_at IS NOT NULL ORDER BY id",
+                )?
+                .query_map([], |r| {
+                    Ok(json!({ "id": r.get::<_, String>(0)?, "status": r.get::<_, String>(1)? }))
+                })?
+                .collect::<Result<_, _>>()?;
+            let fenced_sweeps = fenced_sweep_ids.len();
             Ok(json!({
                 "earned_msat": surplus.earned_msat,
                 "reserved_msat": surplus.reserved_msat,
@@ -1157,6 +1164,7 @@ pub(crate) async fn money_sweep_view(store: &Store) -> Result<Value> {
                 "last_sweep": last_sweep,
                 "migration_fenced_refunds": fenced_refunds,
                 "migration_fenced_sweeps": fenced_sweeps,
+                "migration_fenced_sweep_ids": fenced_sweep_ids,
             }))
         })
         .await

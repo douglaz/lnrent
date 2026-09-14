@@ -3990,6 +3990,11 @@ mod tests {
         let money = money_data(&store, &payment).await;
         assert_eq!(money["migration_fenced_refunds"], json!(2));
         assert_eq!(money["migration_fenced_sweeps"], json!(1));
+        assert_eq!(
+            money["migration_fenced_sweep_ids"],
+            json!([{ "id": "sweep:fenced", "status": "PENDING" }]),
+            "the fenced sweep ids are listed (there is no sweep list verb)"
+        );
         // Drop the PENDING one so the rest of this test is unchanged.
         store
             .transaction(|tx| {

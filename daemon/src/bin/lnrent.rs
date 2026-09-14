@@ -229,9 +229,10 @@ async fn main() -> ExitCode {
         } => {
             if !yes {
                 eprintln!(
-                    "refusing without --yes: clearing the fence on `{id}` lets the daemon prepare and \
-                     pay it as a first attempt. Check the wallet's own outgoing records for it first, \
-                     then re-run with --yes --note \"<what you checked>\"."
+                    "refusing without --yes: clearing the fence on `{id}` lets it be paid — a PENDING \
+                     attempt on the driver's next pass, a FAILED one once you also retry or resubmit \
+                     it (the reply names the step). Check the wallet's own outgoing records for it \
+                     first, then re-run with --yes --note \"<what you checked>\"."
                 );
                 return exit_for("bad_request");
             }
@@ -402,10 +403,27 @@ fn money_human_text(v: &serde_json::Value) -> String {
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     if fenced_refunds + fenced_sweeps > 0 {
+        // There is no sweep list verb, so the fenced sweep ids are named here (codex #91 P2).
+        let sweep_ids: Vec<String> = v
+            .get("migration_fenced_sweep_ids")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|s| {
+                        format!(
+                            "{} ({})",
+                            s.get("id").and_then(serde_json::Value::as_str).unwrap_or("?"),
+                            s.get("status").and_then(serde_json::Value::as_str).unwrap_or("?")
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         lines.push(format!(
             "Fenced (ADR-0022 migration_unverified): {fenced_refunds} refund(s), {fenced_sweeps} \
-             sweep(s) — parked, never paid or retried on their own; `lnrent refunds` lists the \
-             refunds; {FENCE_REMEDY}"
+             sweep(s){} — parked, never paid or retried on their own, and a FAILED one raises no \
+             alert; `lnrent refunds` lists the refunds; {FENCE_REMEDY}",
+            if sweep_ids.is_empty() { String::new() } else { format!(" [{}]", sweep_ids.join(", ")) }
         ));
     }
     let unbookable = v
@@ -884,7 +902,7 @@ fn refunds_human_text(v: &serde_json::Value) -> String {
     if fenced > 0 {
         lines.push(format!(
             "  {fenced} FENCED migration_unverified (ADR-0022): parked whatever their status says — \
-             never paid, never retried, RefundStuck keeps alerting; {FENCE_REMEDY}"
+             never paid, never retried, and a FAILED one raises no alert until you act; {FENCE_REMEDY}"
         ));
     }
     for r in &rows {
@@ -1474,12 +1492,14 @@ mod tests {
             "gross_liability_sat": 0, "required_msat": 0, "parked_count": 0, "ready": true,
             "warning": null, "degraded_read_only": false, "readiness_backend": "fedimint",
             "migration_fenced_refunds": 1, "migration_fenced_sweeps": 1,
+            "migration_fenced_sweep_ids": [{"id": "sweep:abc", "status": "FAILED"}],
         }));
         assert!(
-            money.contains("Fenced (ADR-0022 migration_unverified): 1 refund(s), 1 sweep(s)")
+            money.contains("Fenced (ADR-0022 migration_unverified): 1 refund(s), 1 sweep(s) [sweep:abc (FAILED)]")
                 && money.contains("migration clear-fence"),
-            "{money}"
+            "names the fenced sweep id, the only place an operator can get it: {money}"
         );
+        assert!(!text.contains("keeps alerting"), "a FAILED fenced refund raises no alert: {text}");
         // And nothing is printed when there is nothing fenced (or the daemon predates the field).
         let quiet = money_human_text(&json!({
             "expected_msat": 0, "gateway_ok": true, "federation_ok": true,
