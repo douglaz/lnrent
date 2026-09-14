@@ -1685,6 +1685,56 @@ fn a_fresh_install_first_invoice_backup_is_v3_and_restores() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// codex #91 P2: the crash window between the import commit (marker = SHA-256 of the side file) and
+/// the `*.imported` rename leaves BOTH on disk. A backup taken there must not carry a vacuumed side
+/// file — its bytes no longer hash to the marker and the restored dir would refuse to boot as a
+/// different-instant restore. The self-contained snapshot omits it, in both modes, and the restored
+/// dir boots AlreadyMigrated.
+#[test]
+fn a_crash_window_backup_omits_the_already_imported_side_file_and_the_restore_boots() {
+    use sha2::Digest as _;
+    let base = temp_dir("crash-window");
+    let data_dir = base.join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    populate_state_db(&data_dir);
+    populate_phoenixd_index(&data_dir, "legacy-map");
+    let side = data_dir.join("phoenixd_index.db");
+    let hash = hex::encode(sha2::Sha256::digest(fs::read(&side).unwrap()));
+    mark_self_contained(&data_dir, &hash);
+
+    for (tag, pw) in [("plain", None), ("enc", pass("pw"))] {
+        let dest = base.join(format!("backup-{tag}"));
+        let m = backup(&data_dir, &dest, pw.clone()).unwrap();
+        assert_eq!(
+            (m.version, m.self_contained, m.phoenixd_index),
+            (3, true, false),
+            "{tag}: a self-contained snapshot does not capture the side file"
+        );
+        let restored = base.join(format!("restored-{tag}"));
+        restore(&dest, &restored, false, pw).unwrap();
+        assert!(!restored.join("phoenixd_index.db").exists(), "{tag}: no side file restored");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let store = lnrentd::store::Store::open_spawn(restored.join("lnrent.sqlite")).unwrap();
+            let out = lnrentd::legacy_import::run(
+                &store,
+                lnrentd::legacy_import::Backend::Phoenixd,
+                &NoProbe,
+                &restored.join("phoenixd_index.db"),
+                1_000,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out, lnrentd::legacy_import::Outcome::AlreadyMigrated, "{tag}");
+            drop(store);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+    }
+    // The source dir itself is untouched: the side file is still there for the boot to rename.
+    assert!(side.exists());
+    let _ = fs::remove_dir_all(&base);
+}
+
 /// An lnv2-only PRE-migration backup is v1 and carries `lnv2_index.db` inside `fedimint/`; it restores
 /// as before (the first boot on the restored dir imports it).
 #[test]

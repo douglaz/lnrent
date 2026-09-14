@@ -250,8 +250,9 @@ pub struct Manifest {
     pub fedimint_config: bool,
     /// `operator.seed` was present and captured.
     pub operator_seed: bool,
-    /// `phoenixd_index.db` was present and captured. Defaulted so pre-phoenixd v1 manifests remain
-    /// restorable by this v2 reader; backups carrying it use v2 so a v1 reader fails closed.
+    /// `phoenixd_index.db` was present and captured (never while `self_contained`: the books already
+    /// hold it). Defaulted so pre-phoenixd v1 manifests remain restorable by this v2 reader; backups
+    /// carrying it use v2 so a v1 reader fails closed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub phoenixd_index: bool,
     /// ADR-0022: the snapshotted `lnrent.sqlite` carries the `migration` marker, so every backend
@@ -391,12 +392,21 @@ fn backup_plaintext(data_dir: &Path, dest: &Path, src_db: &Path) -> Result<Manif
         &dest.join(FEDIMINT_CONFIG_FILE),
     )?;
     let operator_seed = copy_if_present(&data_dir.join(SEED_FILE), &dest.join(SEED_FILE))?;
-    let phoenixd_index = vacuum_if_present(
-        &data_dir.join(PHOENIXD_INDEX_FILE),
-        &dest.join(PHOENIXD_INDEX_FILE),
-    )?;
     // ADR-0022: v3 iff the SNAPSHOT carries the migration marker (read from the bytes restore gets).
     let self_contained = snapshot_is_self_contained(&dest_db)?;
+    // A self-contained snapshot has already absorbed the side file, so a side file still on disk is
+    // the crash window between the import commit and the `*.imported` rename: its content is in the
+    // books and its hash is in the marker. It is NOT captured — VACUUM would rewrite its bytes, the
+    // restored copy's hash would then miss the marker, and the boot on the restored dir would refuse
+    // as a different-instant restore (codex #91 P2). Without it the restored dir boots AlreadyMigrated.
+    let phoenixd_index = if self_contained {
+        false
+    } else {
+        vacuum_if_present(
+            &data_dir.join(PHOENIXD_INDEX_FILE),
+            &dest.join(PHOENIXD_INDEX_FILE),
+        )?
+    };
 
     // 4. Make every DATA file's directory entry durable BEFORE the manifest. With this fsync ordering
     //    the manifest is the last entry to hit disk, so its presence on recovery truly implies a
@@ -472,11 +482,17 @@ fn backup_encrypted(
     ));
     let age_path = dest.join(BACKUP_AGE_FILE);
     let mut self_contained = false;
+    let mut artifacts = artifacts;
     let bundled = (|| -> Result<()> {
         vacuum_into(src_db, &vacuum_tmp)?;
         harden_file_0600(&vacuum_tmp)?;
         // ADR-0022: v3 iff the SNAPSHOT carries the migration marker.
         self_contained = snapshot_is_self_contained(&vacuum_tmp)?;
+        // Same rule as the plaintext body: a self-contained snapshot does not capture the (already
+        // imported) side file, whose vacuumed bytes would no longer hash to the marker.
+        if self_contained {
+            artifacts.phoenixd_index = false;
+        }
         let phoenixd_snapshot = if artifacts.phoenixd_index {
             vacuum_into(
                 &data_dir.join(PHOENIXD_INDEX_FILE),
@@ -511,6 +527,7 @@ fn backup_encrypted(
     // Make the artifact's directory entry durable BEFORE the manifest (manifest-last ordering).
     fsync_dir(dest)?;
 
+    let phoenixd_index = artifacts.phoenixd_index;
     let manifest = Manifest {
         schema: BACKUP_SCHEMA.to_string(),
         version: format_version(self_contained, phoenixd_index),

@@ -102,7 +102,9 @@ enum DevCmd {
 
 #[derive(Subcommand)]
 enum MigrationCmd {
-    /// Release the fence on ONE attempt so the driver re-prepares it as a first attempt. Only you
+    /// Release the fence on ONE attempt. Clearing does not by itself re-drive it: a PENDING attempt
+    /// is prepared and paid on the driver's next pass as a first attempt; a FAILED refund still
+    /// needs `refund-retry <id>`, a FAILED sweep a resubmission (the reply names the step). Only you
     /// can weigh the wallet's own outgoing records, its balance and the buyer's word: check them
     /// first, say what you checked in --note (journaled), and confirm with --yes. Same authority as
     /// `sweep --yes` — this can let a refund be paid.
