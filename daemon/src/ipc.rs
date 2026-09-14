@@ -1716,9 +1716,8 @@ mod tests {
     use crate::backends::{
         Invoice, MockPayment, PayStatus, PaymentBackend, PaymentStatus, Settlement,
     };
-    use crate::store::{Store, SCHEMA};
+    use crate::store::Store;
     use async_trait::async_trait;
-    use rusqlite::Connection;
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::mpsc;
@@ -2338,8 +2337,7 @@ mod tests {
         };
 
         // Start the daemon side while the poller is watching the path.
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let conn = crate::store::open_memory().unwrap(); // full runtime schema (ADR-0022 fence column)
         let store = Store::spawn(conn);
         let recipes = Arc::new(Vec::<Recipe>::new());
         let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
@@ -2487,8 +2485,7 @@ mod tests {
     // its reply.
     #[tokio::test]
     async fn shutdown_drain_is_not_wedged_by_an_idle_client() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let conn = crate::store::open_memory().unwrap(); // full runtime schema (ADR-0022 fence column)
         conn.execute(
             "INSERT INTO subscription (id, recipe_id, state, created_at) VALUES ('s1','dummy','ACTIVE',1)",
             [],
@@ -2629,8 +2626,7 @@ mod tests {
     // the committed-but-unreplied kill window y4m.13 closed for idle peers, reopened by slow dispatch.
     #[tokio::test]
     async fn slow_read_only_op_does_not_pin_the_shutdown_drain() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let conn = crate::store::open_memory().unwrap(); // full runtime schema (ADR-0022 fence column)
         let store = Store::spawn(conn);
         let recipes = Arc::new(Vec::<Recipe>::new());
         let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
@@ -2715,8 +2711,7 @@ mod tests {
     // the mutating commit AND completes promptly.
     #[tokio::test]
     async fn mutating_op_completes_through_drain_despite_a_slow_readonly_op() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let conn = crate::store::open_memory().unwrap(); // full runtime schema (ADR-0022 fence column)
         conn.execute(
             "INSERT INTO subscription (id, recipe_id, state, created_at) VALUES ('s1','dummy','ACTIVE',1)",
             [],
