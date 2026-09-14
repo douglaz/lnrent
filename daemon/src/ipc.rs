@@ -1183,7 +1183,8 @@ async fn refund_retry(store: &Store, id: &str, now: i64) -> Reply {
         /// ADR-0022: the row carries `migration_unverified_at`. A retry resets FAILED->PENDING and
         /// `plan_payment` may then re-resolve to a fresh payment hash — if the omitted map row was the
         /// witness to a wallet payment that succeeded after the row was marked FAILED, that pays
-        /// twice. The fence is cleared only by the backend's audit or `migration clear-fence`.
+        /// twice. The fence is cleared only by `migration clear-fence` (a backend audit that adopts a
+        /// matching payment is a future bead, not shipped).
         Fenced,
     }
     let id = id.to_string();
@@ -1246,7 +1247,8 @@ async fn refund_retry(store: &Store, id: &str, now: i64) -> Reply {
                  have been lost with the legacy index, and a retry could re-resolve and pay a \
                  second time. Check the wallet's own outgoing records for this refund, then \
                  `lnrent migration clear-fence {id} --note \"<what you checked>\" --yes` to release \
-                 it, or wait for the backend audit to adopt a matching payment"
+                 it (the only shipped release; a backend audit that adopts a matching payment is a \
+                 future bead)"
             ),
         ),
         Err(e) => Reply::err("internal", e.to_string()),

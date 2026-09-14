@@ -368,8 +368,8 @@ the binary and start it. On that boot lnrentd:
 2. stamps as `migration_unverified` every non-terminal or retryable-FAILED refund/sweep attempt that
    has no backend payment id and no pay-map row — the file cannot tell "never started" from "started,
    witness lost" — and every FAILED attempt whose pay-map row is NOT failed (the map says the payment
-   may have gone out), and PARKS them: never paid, never retried, a fenced sweep's cap stays
-   subtracted from the surplus. A fenced PENDING row keeps raising `RefundStuck` / `SweepStuck`; a
+   may have gone out), and PARKS them: not paid or retried while fenced — the legacy outcome is
+   unknown and MAY already have paid — and a fenced sweep's cap stays subtracted from the surplus. A fenced PENDING row keeps raising `RefundStuck` / `SweepStuck`; a
    fenced FAILED row raises nothing until you look — `lnrent refunds` and `lnrent money` list them;
 3. records completion in the `migration` table in the SAME transaction, then renames the side file
    `*.imported`. A crash between the two is recognised on the next boot and finished.

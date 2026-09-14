@@ -77,8 +77,9 @@ enum Cmd {
         yes: bool,
     },
     /// ADR-0022 legacy-import fences. A refund/sweep attempt stamped `migration_unverified` at the
-    /// first migrated boot is parked (never paid, never retried) because its pre-send witness may
-    /// have been lost with the old index file; the daemon never releases it on absence.
+    /// first migrated boot is parked — not paid or retried while fenced — because its pre-send
+    /// witness may have been lost with the old index file: its legacy outcome is unknown and it MAY
+    /// already have paid. The daemon never releases it on absence; only `clear-fence` does.
     Migration {
         #[command(subcommand)]
         cmd: MigrationCmd,

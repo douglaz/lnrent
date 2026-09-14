@@ -493,7 +493,7 @@ impl Sweeper {
                 self.maybe_alert_stuck(
                     &row,
                     self.clock.now(),
-                    "fenced migration_unverified (ADR-0022); needs the operator or the backend audit",
+                    "fenced migration_unverified (ADR-0022); needs the operator (`lnrent migration clear-fence`)",
                 )
                 .await;
                 continue;

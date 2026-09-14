@@ -341,7 +341,7 @@ impl Refunder {
                 stamped_at,
                 "refund is fenced migration_unverified (ADR-0022): its pre-send witness may have \
                  been lost with the legacy index; parked — clear with `lnrent migration clear-fence` \
-                 after checking the wallet's own records, or wait for the backend audit"
+                 after checking the wallet's own records (the only shipped release)"
             );
             self.maybe_alert_stuck(&row, now).await;
             return Ok(Outcome::Noop);
