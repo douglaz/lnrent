@@ -21,7 +21,7 @@
 //!   (b) every NON-terminal `refund_attempt` (status != 'SENT', incl. unpriceable). Fail closed:
 //!   when a receipt's finality is unprovable it is RESERVED, never sweepable.
 //! - `paid_out_msat`  = Σ gross of SENT `refund_attempt` rows + Σ `max_outlay_msat` of in-flight
-//!   (SENT/PENDING) `sweep_attempt` rows.
+//!   (SENT/PENDING, or ADR-0022-fenced) `sweep_attempt` rows.
 //! - `outlay_msat`    = a gateway QUOTE for the pay about to be made
 //!   ([`crate::backends::PaymentBackend::refund_required_outlay_msat`]) — pricing, NOT a balance read.
 //!
@@ -162,9 +162,14 @@ pub(crate) fn read_surplus(conn: &Connection, exclude_sweep_id: Option<&str>) ->
     let reserved_msat: u128 = reserved.values().map(|s| u128::from(*s) * 1000).sum();
 
     // In-flight sweep caps (SENT/PENDING) already committed to a payout — minus the row being
-    // crash-recovered (see `exclude_sweep_id`).
-    let mut stmt =
-        conn.prepare("SELECT id, max_outlay_msat FROM sweep_attempt WHERE status IN ('SENT', 'PENDING')")?;
+    // crash-recovered (see `exclude_sweep_id`). A FENCED row counts too, whatever its status: the
+    // import could not verify that the legacy attempt did not pay, so its cap stays committed until
+    // the operator clears the fence (codex #91 P1) — releasing it would let a fresh sweep spend the
+    // same receipts twice if the legacy payment landed.
+    let mut stmt = conn.prepare(
+        "SELECT id, max_outlay_msat FROM sweep_attempt
+          WHERE status IN ('SENT', 'PENDING') OR migration_unverified_at IS NOT NULL",
+    )?;
     let rows = stmt.query_map([], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     })?;
@@ -202,6 +207,10 @@ pub enum SweepError {
     /// The pay is in-flight but unconfirmed; the durable row stays PENDING for recovery
     /// (`sweep_in_flight`).
     InFlight(String),
+    /// ADR-0022: this invoice's row is fenced `migration_unverified_at` — a legacy attempt whose
+    /// outcome the import could not verify; it may already have paid. Refused until the operator
+    /// clears the fence (`sweep_fenced`).
+    Fenced(String),
     /// An unexpected store/internal error (`internal`).
     Internal(anyhow::Error),
 }
@@ -215,6 +224,7 @@ impl SweepError {
             SweepError::Insufficient(_) => "sweep_insufficient",
             SweepError::FeeRose(_) => "sweep_fee_rose",
             SweepError::InFlight(_) => "sweep_in_flight",
+            SweepError::Fenced(_) => "sweep_fenced",
             SweepError::Internal(_) => "internal",
         }
     }
@@ -226,7 +236,8 @@ impl SweepError {
             | SweepError::Busy(m)
             | SweepError::Insufficient(m)
             | SweepError::FeeRose(m)
-            | SweepError::InFlight(m) => m.clone(),
+            | SweepError::InFlight(m)
+            | SweepError::Fenced(m) => m.clone(),
             SweepError::Internal(e) => format!("{e:#}"),
         }
     }
@@ -276,6 +287,8 @@ enum PayOutcome {
 /// The gate decision from the ONE serialized gate+write transaction.
 enum GateDecision {
     AlreadySent(ExecOutcome),
+    /// The row for this invoice is fenced (ADR-0022); nothing is written.
+    Fenced,
     Busy,
     Insufficient(Surplus),
     Proceed,
@@ -407,6 +420,14 @@ impl Sweeper {
             .map_err(SweepError::Internal)?
         {
             GateDecision::AlreadySent(outcome) => return Ok(outcome),
+            GateDecision::Fenced => {
+                return Err(SweepError::Fenced(format!(
+                    "sweep {id} is fenced migration_unverified (ADR-0022): a legacy attempt whose \
+                     outcome the import could not verify, so it may already have paid. Check the \
+                     wallet's own outgoing records, then `lnrent migration clear-fence {id} --note \
+                     \"<what you checked>\" --yes` and resubmit"
+                )))
+            }
             GateDecision::Busy => {
                 return Err(SweepError::Busy(
                     "another sweep is already in flight; only one at a time".to_string(),
@@ -786,15 +807,37 @@ impl Sweeper {
             .transaction_then(move |tx| {
                 // Re-submit of the SAME invoice: a completed sweep returns its cached SENT row; a
                 // still-PENDING one is busy (the drive will finish it).
-                let existing: Option<(String, Option<i64>, i64, Option<String>)> = tx
+                struct Existing {
+                    status: String,
+                    amt: Option<i64>,
+                    cap: i64,
+                    pid: Option<String>,
+                    fenced_at: Option<i64>,
+                }
+                let existing = tx
                     .query_row(
-                        "SELECT status, amount_sat, max_outlay_msat, backend_payment_id
+                        "SELECT status, amount_sat, max_outlay_msat, backend_payment_id,
+                                migration_unverified_at
                            FROM sweep_attempt WHERE id=?1",
                         params![id_s],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        |r| {
+                            Ok(Existing {
+                                status: r.get(0)?,
+                                amt: r.get(1)?,
+                                cap: r.get(2)?,
+                                pid: r.get(3)?,
+                                fenced_at: r.get(4)?,
+                            })
+                        },
                     )
                     .optional()?;
-                if let Some((status, amt, cap, pid)) = existing {
+                if let Some(Existing { status, amt, cap, pid, fenced_at }) = existing {
+                    // ADR-0022: a fenced row — whatever its status — is a legacy attempt that may
+                    // already have paid. The "FAILED -> re-attempt" path below must not reset it to
+                    // PENDING and pay again (codex #91 P1); only `clear-fence` releases it.
+                    if fenced_at.is_some() {
+                        return Ok(GateDecision::Fenced);
+                    }
                     if status == "SENT" {
                         return Ok(GateDecision::AlreadySent(ExecOutcome {
                             id: id_s.clone(),
@@ -2468,5 +2511,76 @@ mod tests {
         assert_eq!(payment.sends(), 0, "nothing was sent");
         assert_eq!(single_sweep_status(&store).await, "PENDING", "the cap stays counted");
         assert_eq!(alert_count(&store, "sweep_stuck").await, 1, "SweepStuck fires for a parked row");
+    }
+
+    /// codex #91 P1 (ADR-0022): a fenced FAILED sweep — a legacy attempt the import could not verify —
+    /// must not be re-attempted by resubmitting the same invoice (the FAILED->PENDING re-attempt path
+    /// would pay a possibly-already-paid destination twice), and its cap stays committed in the
+    /// surplus so a DIFFERENT sweep cannot spend the same receipts before the operator clears it.
+    #[tokio::test]
+    async fn a_fenced_failed_sweep_is_neither_resubmittable_nor_released_from_surplus() {
+        let store = mem_store();
+        seed_final_receipt(&store, "order:A", "A", 100_000).await;
+        // `mint_bolt11` has ONE payment hash, so the fenced legacy row is the minted invoice's own id
+        // for the resubmit half, and is re-seeded under another id for the different-sweep half.
+        let bolt11 = mint_bolt11(60_000 * 1000, META, 1_000, 3_600);
+        let (hash, _) = parse_sweep_invoice(&bolt11, 1_000).unwrap();
+        let id = format!("sweep:{hash}");
+        let seed_fenced_failed = |id: String, bolt11: String| {
+            let store = store.clone();
+            async move {
+                store
+                    .transaction(move |tx| {
+                        tx.execute(
+                            "INSERT INTO sweep_attempt (id, bolt11, amount_sat, max_outlay_msat, status,
+                                attempts, migration_unverified_at, created_at)
+                             VALUES (?1, ?2, 60000, 60000000, 'FAILED', 1, 42, 0)",
+                            params![id, bolt11],
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            }
+        };
+        seed_fenced_failed(id.clone(), bolt11.clone()).await;
+        let payment = Arc::new(SweepPayment::new());
+        let s = sweeper(&store, payment.clone());
+
+        // Same invoice again: refused as fenced, nothing paid, the row untouched.
+        let err = s.execute(&bolt11).await.unwrap_err();
+        assert_eq!(err.code(), "sweep_fenced");
+        assert!(err.message().contains("clear-fence"), "{}", err.message());
+        assert_eq!(payment.sends(), 0, "a fenced row is never paid");
+        let (status, fenced) = {
+            let id = id.clone();
+            store
+                .read(move |c| {
+                    Ok(c.query_row(
+                        "SELECT status, migration_unverified_at FROM sweep_attempt WHERE id=?1",
+                        params![id],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+                    )?)
+                })
+                .await
+                .unwrap()
+        };
+        assert_eq!((status.as_str(), fenced), ("FAILED", Some(42)), "still parked behind the fence");
+
+        // A DIFFERENT sweep while a fenced FAILED legacy row exists: its cap (60_000_000) is committed,
+        // so surplus is 100_000_000 - 60_000_000 and the 60_000-sat invoice is insufficient. RED on a
+        // surplus that counts SENT/PENDING only (the fenced row is FAILED).
+        store
+            .transaction(move |tx| {
+                tx.execute("DELETE FROM sweep_attempt", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        seed_fenced_failed("sweep:legacy-other".to_string(), "lnbc1legacy".to_string()).await;
+        let surplus = store.read(|c| read_surplus(c, None)).await.unwrap();
+        assert_eq!(surplus.paid_out_msat, 60_000_000, "the fenced cap counts as paid out");
+        assert_eq!(s.execute(&bolt11).await.unwrap_err().code(), "sweep_insufficient");
+        assert_eq!(payment.sends(), 0);
     }
 }

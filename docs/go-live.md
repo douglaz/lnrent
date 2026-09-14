@@ -395,7 +395,9 @@ fixed by editing the database by hand (ADR-0001: one audited writer).
   of its payment hash — is missing from the file. Same remedy as the mismatched restore above.
 
 **Parked attempts.** `lnrent refunds` lists refunds; a fenced one is refused by `lnrent
-refund-retry` with a message naming the fence. The daemon never clears a phoenixd fence on its own:
+refund-retry` with a message naming the fence. `lnrent money` names fenced sweeps by id; resubmitting
+a fenced sweep's invoice is refused (`sweep_fenced`), and its cap stays subtracted from the surplus
+until the fence is cleared, because the legacy attempt may have paid. The daemon never clears a phoenixd fence on its own:
 phoenixd's outgoing list omits an in-flight payment, its clock is unrelated to lnrent's, and its own
 database can be wiped and restored with funds surviving by seed, so absence proves nothing. Check
 the wallet's own outgoing records for the attempt's destination, decide, then release it:

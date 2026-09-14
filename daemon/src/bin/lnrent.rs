@@ -162,7 +162,7 @@ fn exit_code_for(err_code: &str) -> u8 {
         // the operator, not daemon failures, so both land on 3 with the rest of them.
         "bad_request" | "invalid_state" | "dev_disabled" | "unsupported" | "sweep_invalid"
         | "sweep_unpriceable" | "sweep_busy" | "sweep_insufficient" | "sweep_fee_rose"
-        | "sweep_in_flight" | "listing_blocked" | "listing_unverified" => 3,
+        | "sweep_in_flight" | "sweep_fenced" | "listing_blocked" | "listing_unverified" => 3,
         // A read-only request cancelled because the daemon is gracefully shutting down (lnrent-j3c):
         // a TRANSIENT restart race (the reply carries retryable:true), not a hard failure. Map it to
         // the same transient IPC/connection exit as an unreachable daemon (`ipc_unreachable`) so shell

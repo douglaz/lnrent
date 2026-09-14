@@ -963,7 +963,7 @@ pub async fn dispatch_with_alert_visibility(
         Request::Sweep { bolt11 } => {
             // Execute: gate + durable PENDING intent + capped pay. Ledger-only authorization; the
             // structured refusals (`sweep_invalid`/`sweep_unpriceable`/`sweep_busy`/
-            // `sweep_insufficient`/`sweep_fee_rose`) never move money. No alert sink is wired here
+            // `sweep_insufficient`/`sweep_fee_rose`/`sweep_fenced`) never move money. No alert sink is wired here
             // (the operator gets this structured reply live); the supervisor's drive carries alerts.
             let sweeper =
                 crate::sweep::Sweeper::new(store.clone(), payment.clone(), clock.clone());
@@ -2102,8 +2102,9 @@ mod tests {
     }
 
     async fn serve_temp() -> (Store, std::path::PathBuf) {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        // The full runtime schema, not the bare §11 SCHEMA: the money path reads ADR-0022's
+        // `migration_unverified_at`, which only the migrations add.
+        let conn = crate::store::open_memory().unwrap();
         // seed one subscription
         conn.execute(
             "INSERT INTO subscription (id, recipe_id, state, created_at) VALUES ('s1','dummy','ACTIVE',1)",
