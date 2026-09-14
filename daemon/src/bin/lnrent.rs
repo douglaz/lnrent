@@ -411,10 +411,13 @@ fn money_human_text(v: &serde_json::Value) -> String {
             .map(|a| {
                 a.iter()
                     .map(|s| {
+                        // The bolt11 rides along: a cleared FAILED sweep is re-driven only by
+                        // `lnrent sweep <bolt11> --yes`, and nothing else in the CLI prints it.
                         format!(
-                            "{} ({})",
+                            "{} ({}) {}",
                             s.get("id").and_then(serde_json::Value::as_str).unwrap_or("?"),
-                            s.get("status").and_then(serde_json::Value::as_str).unwrap_or("?")
+                            s.get("status").and_then(serde_json::Value::as_str).unwrap_or("?"),
+                            s.get("bolt11").and_then(serde_json::Value::as_str).unwrap_or("?")
                         )
                     })
                     .collect()
@@ -1495,10 +1498,10 @@ mod tests {
             "gross_liability_sat": 0, "required_msat": 0, "parked_count": 0, "ready": true,
             "warning": null, "degraded_read_only": false, "readiness_backend": "fedimint",
             "migration_fenced_refunds": 1, "migration_fenced_sweeps": 1,
-            "migration_fenced_sweep_ids": [{"id": "sweep:abc", "status": "FAILED"}],
+            "migration_fenced_sweep_ids": [{"id": "sweep:abc", "status": "FAILED", "bolt11": "lnbc1abc"}],
         }));
         assert!(
-            money.contains("Fenced (ADR-0022 migration_unverified): 1 refund(s), 1 sweep(s) [sweep:abc (FAILED)]")
+            money.contains("Fenced (ADR-0022 migration_unverified): 1 refund(s), 1 sweep(s) [sweep:abc (FAILED) lnbc1abc]")
                 && money.contains("migration clear-fence"),
             "names the fenced sweep id, the only place an operator can get it: {money}"
         );

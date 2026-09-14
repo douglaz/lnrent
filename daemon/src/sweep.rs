@@ -1187,15 +1187,20 @@ pub(crate) async fn money_sweep_view(store: &Store) -> Result<Value> {
                 [],
                 |r| r.get(0),
             )?;
-            // Sweeps have no list verb and a FAILED one raises no SweepStuck, so the ids are the only
-            // way an operator learns what to pass to `clear-fence` (codex #91 P2, fourth round).
+            // Sweeps have no list verb and a FAILED one raises no SweepStuck, so this is the only
+            // way an operator learns the id to pass to `clear-fence` and the bolt11 a cleared FAILED
+            // sweep must be resubmitted with (codex #91 P2, fourth and tenth rounds).
             let fenced_sweep_ids: Vec<serde_json::Value> = c
                 .prepare(
-                    "SELECT id, status FROM sweep_attempt
+                    "SELECT id, status, bolt11 FROM sweep_attempt
                       WHERE migration_unverified_at IS NOT NULL ORDER BY id",
                 )?
                 .query_map([], |r| {
-                    Ok(json!({ "id": r.get::<_, String>(0)?, "status": r.get::<_, String>(1)? }))
+                    Ok(json!({
+                        "id": r.get::<_, String>(0)?,
+                        "status": r.get::<_, String>(1)?,
+                        "bolt11": r.get::<_, String>(2)?,
+                    }))
                 })?
                 .collect::<Result<_, _>>()?;
             let fenced_sweeps = fenced_sweep_ids.len();
