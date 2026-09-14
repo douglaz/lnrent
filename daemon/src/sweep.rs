@@ -1137,12 +1137,26 @@ pub(crate) async fn money_sweep_view(store: &Store) -> Result<Value> {
                     },
                 )
                 .optional()?;
+            // ADR-0022: attempts parked behind the legacy-import fence. They never leave PENDING /
+            // FAILED on their own, so the money view names them and their remedy (codex #91 P2).
+            let fenced_refunds: i64 = c.query_row(
+                "SELECT count(*) FROM refund_attempt WHERE migration_unverified_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?;
+            let fenced_sweeps: i64 = c.query_row(
+                "SELECT count(*) FROM sweep_attempt WHERE migration_unverified_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?;
             Ok(json!({
                 "earned_msat": surplus.earned_msat,
                 "reserved_msat": surplus.reserved_msat,
                 "paid_out_msat": surplus.paid_out_msat,
                 "surplus_msat": surplus.surplus_msat(),
                 "last_sweep": last_sweep,
+                "migration_fenced_refunds": fenced_refunds,
+                "migration_fenced_sweeps": fenced_sweeps,
             }))
         })
         .await

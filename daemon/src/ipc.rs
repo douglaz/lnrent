@@ -1140,7 +1140,7 @@ fn dest_form_label(dest: Option<&str>) -> &'static str {
 fn query_refunds(c: &rusqlite::Connection, now: i64) -> Result<Vec<Value>> {
     let mut stmt = c.prepare(
         "SELECT id, subscription_id, dest, amount_sat, status, COALESCE(attempts, 0),
-                created_at, updated_at
+                created_at, updated_at, migration_unverified_at
            FROM refund_attempt
           WHERE status IN ('PENDING','FAILED')
           ORDER BY updated_at DESC, id",
@@ -1149,6 +1149,10 @@ fn query_refunds(c: &rusqlite::Connection, now: i64) -> Result<Vec<Value>> {
         .query_map([], |r| {
             let dest: Option<String> = r.get(2)?;
             let created_at: Option<i64> = r.get(6)?;
+            // ADR-0022: a fenced row is PARKED whatever its status says — the driver refuses to
+            // prepare it and `refund-retry` refuses it — so the list must say so, or an operator
+            // reading the documented CLI sees an ordinary pending refund forever (codex #91 P2).
+            let fenced_at: Option<i64> = r.get(8)?;
             Ok(json!({
                 "id": r.get::<_, String>(0)?,
                 "subscription_id": r.get::<_, Option<String>>(1)?,
@@ -1159,6 +1163,8 @@ fn query_refunds(c: &rusqlite::Connection, now: i64) -> Result<Vec<Value>> {
                 "created_at": created_at,
                 "updated_at": r.get::<_, Option<i64>>(7)?,
                 "age_s": created_at.map(|c| now - c),
+                "migration_fenced": fenced_at.is_some(),
+                "migration_unverified_at": fenced_at,
             }))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1197,11 +1203,14 @@ async fn refund_retry(store: &Store, id: &str, now: i64) -> Reply {
                 let Some((status, sub, idempotency_key, fenced_at)) = row else {
                     return Ok(Retry::NotParked);
                 };
-                if status != "FAILED" {
-                    return Ok(Retry::NotParked);
-                }
+                // The fence answers FIRST, whatever the status: a fenced PENDING row is parked by
+                // the driver, and "not parked" would send the operator looking for a state the row
+                // will never leave on its own (codex #91 P2).
                 if fenced_at.is_some() {
                     return Ok(Retry::Fenced);
+                }
+                if status != "FAILED" {
+                    return Ok(Retry::NotParked);
                 }
 
                 tx.execute(
@@ -3931,6 +3940,48 @@ mod tests {
         let err = retry.error.unwrap();
         assert_eq!(err.code, "invalid_state");
         assert!(err.message.contains("migration_unverified") && err.message.contains("clear-fence"));
+
+        // A fenced PENDING row answers the SAME fence, not "not parked" (codex #91 P2), and the
+        // refund list projects the fence so `lnrent refunds` can name the remedy.
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO refund_attempt (id, subscription_id, dest, amount_sat, idempotency_key,
+                        status, attempts, migration_unverified_at, created_at, updated_at)
+                     VALUES ('r-fenced-pending', 's2', 'c@d.com', 500, 'refund:r-fenced-pending',
+                             'PENDING', 0, 77, 100, 200)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let retry = run(Request::RefundRetry { id: "r-fenced-pending".into() }).await;
+        let err = retry.error.unwrap();
+        assert!(
+            err.message.contains("clear-fence"),
+            "a fenced PENDING row names the fence, not 'not parked': {}",
+            err.message
+        );
+        let list = run(Request::Refunds).await.data.unwrap();
+        let fenced: Vec<bool> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["migration_fenced"].as_bool().unwrap())
+            .collect();
+        assert_eq!(fenced, vec![true, true], "both fenced rows are flagged in the list");
+        let money = money_data(&store, &payment).await;
+        assert_eq!(money["migration_fenced_refunds"], json!(2));
+        assert_eq!(money["migration_fenced_sweeps"], json!(1));
+        // Drop the PENDING one so the rest of this test is unchanged.
+        store
+            .transaction(|tx| {
+                tx.execute("DELETE FROM refund_attempt WHERE id='r-fenced-pending'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
         let (status, fenced): (String, Option<i64>) = store
             .read(|c| {
                 Ok(c.query_row(
