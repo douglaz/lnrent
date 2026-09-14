@@ -421,8 +421,9 @@ fn money_human_text(v: &serde_json::Value) -> String {
             .unwrap_or_default();
         lines.push(format!(
             "Fenced (ADR-0022 migration_unverified): {fenced_refunds} refund(s), {fenced_sweeps} \
-             sweep(s){} — parked, never paid or retried on their own, and a FAILED one raises no \
-             alert; `lnrent refunds` lists the refunds; {FENCE_REMEDY}",
+             sweep(s){} — parked: not paid or retried while fenced, but the legacy outcome is \
+             unknown and MAY already have paid; a FAILED one raises no alert; `lnrent refunds` lists \
+             the refunds; {FENCE_REMEDY}",
             if sweep_ids.is_empty() { String::new() } else { format!(" [{}]", sweep_ids.join(", ")) }
         ));
     }
@@ -902,7 +903,8 @@ fn refunds_human_text(v: &serde_json::Value) -> String {
     if fenced > 0 {
         lines.push(format!(
             "  {fenced} FENCED migration_unverified (ADR-0022): parked whatever their status says — \
-             never paid, never retried, and a FAILED one raises no alert until you act; {FENCE_REMEDY}"
+             not paid or retried while fenced, but the legacy outcome is unknown and MAY already have \
+             paid; a FAILED one raises no alert until you act; {FENCE_REMEDY}"
         ));
     }
     for r in &rows {
@@ -1500,6 +1502,11 @@ mod tests {
             "names the fenced sweep id, the only place an operator can get it: {money}"
         );
         assert!(!text.contains("keeps alerting"), "a FAILED fenced refund raises no alert: {text}");
+        // coderabbit #91: a fence means the outcome is UNKNOWN; neither view may say "never paid".
+        for t in [&text, &money] {
+            assert!(!t.contains("never paid"), "{t}");
+            assert!(t.contains("MAY already have paid"), "{t}");
+        }
         // And nothing is printed when there is nothing fenced (or the daemon predates the field).
         let quiet = money_human_text(&json!({
             "expected_msat": 0, "gateway_ok": true, "federation_ok": true,
