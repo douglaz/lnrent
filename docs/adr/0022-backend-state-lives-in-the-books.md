@@ -3,7 +3,8 @@
 **Status: BUILT** by lnrent-chgb (2026-09): the correlation tables live in `lnrent.sqlite`
 (`store::apply_backend_schemas`), issuance and send ride the caller's transaction
 (`PaymentBackend::issue_invoice` / `prepare_pay`, `Store::transaction_then`), the legacy side files
-are imported once at boot (`daemon/src/legacy_import.rs`), and backups are format v3. The Context
+are imported once at boot (`daemon/src/legacy_import.rs`), and backups taken after the first
+migrated boot are format v3 (a pre-migration data dir still backs up as v1/v2). The Context
 below describes the pre-ADR-0022 state it replaced. Follow-up beads still open against this ADR are
 derivable, not listed:
 

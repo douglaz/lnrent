@@ -199,7 +199,22 @@ fn v1_references_phoenixd(state_db: &Path) -> Result<Option<String>> {
 /// ADR-0023 no longer reports — and there is no safe reconstruction. Given at RESTORE, not at the next
 /// boot. A v1 backup of a mock or lnv2-only deployment restores as before (lnv2's side file lives
 /// under `fedimint/` and is captured in v1; the first boot imports it).
-fn refuse_v1_referencing_phoenixd(manifest: &Manifest, state_db: &Path) -> Result<()> {
+fn check_restored_state_db(manifest: &Manifest, state_db: &Path) -> Result<()> {
+    // The manifest is plaintext metadata, so its `self_contained` claim must be checked against the
+    // DB it describes (coderabbit #91): a v1 set relabelled v3 would otherwise pass the pairing check
+    // and install books whose correlation is gone; the next phoenixd boot then refuses to start.
+    // Refused HERE, where the operator can still pick another backup, and symmetrically (a v3 DB
+    // under a downgraded manifest is the same lie in the other direction).
+    let marker = snapshot_is_self_contained(state_db)?;
+    if marker != manifest.self_contained {
+        bail!(
+            "refusing to restore: the manifest says self_contained={} (format {}) but the state DB \
+             {} carry the ADR-0022 migration marker; the manifest does not describe this DB",
+            manifest.self_contained,
+            manifest.version,
+            if marker { "does" } else { "does not" }
+        );
+    }
     if manifest.version != MIN_SUPPORTED_BACKUP_FORMAT_VERSION {
         return Ok(());
     }
@@ -521,7 +536,7 @@ fn backup_encrypted(
 /// `phoenixd_index.db` beside the state DB and the NEXT daemon boot runs the one legacy import
 /// (`legacy_import`) — the restore itself imports nothing, because the import's coverage tiebreak
 /// needs the live backend. v1 is refused when its books reference phoenixd
-/// (`refuse_v1_referencing_phoenixd`); a mock or lnv2-only v1 restores as before.
+/// (`check_restored_state_db`); a mock or lnv2-only v1 restores as before.
 ///
 /// Refuses to clobber a non-empty `data_dir` unless `force` is set (the CLI maps `--force` here); the
 /// default is a fresh/empty target. The whole backup set is validated against the manifest BEFORE any
@@ -642,7 +657,7 @@ pub fn restore(
         }
         // ADR-0022: a v1 backup referencing phoenixd has no correlation to restore. Refused HERE,
         // before the target is touched, rather than producing a directory the next boot refuses.
-        refuse_v1_referencing_phoenixd(&manifest, &src_db)?;
+        check_restored_state_db(&manifest, &src_db)?;
         if manifest.fedimint_config && !is_regular_file(&src.join(FEDIMINT_CONFIG_FILE)) {
             bail!(
                 "backup is incomplete/corrupt: manifest records {FEDIMINT_CONFIG_FILE} but it is missing"
@@ -1079,7 +1094,7 @@ fn finalize_decrypted_staging(stage: &Path, manifest: &Manifest) -> Result<()> {
     }
     // ADR-0022: the v1 phoenixd-reference refusal, applied to the DECRYPTED state DB inside staging —
     // the swap never runs, so the target stays untouched.
-    refuse_v1_referencing_phoenixd(manifest, &db)?;
+    check_restored_state_db(manifest, &db)?;
     harden_and_fsync_tree(stage)
 }
 

@@ -1492,6 +1492,50 @@ fn a_v3_manifest_without_the_self_contained_flag_is_refused() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// coderabbit #91: a manifest relabelled to claim (or deny) self-containment is refused at restore
+/// against the DB's ACTUAL marker, in both directions and in both modes — a v1 set relabelled v3 would
+/// otherwise install books with no correlation, which the next phoenixd boot refuses to start on.
+#[test]
+fn a_manifest_whose_self_contained_claim_disagrees_with_the_db_marker_is_refused() {
+    let relabel = |manifest_path: &std::path::Path, version: u64, self_contained: bool| {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.insert("version".into(), serde_json::json!(version));
+        o.insert("self_contained".into(), serde_json::json!(self_contained));
+        fs::write(manifest_path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    };
+    let base = temp_dir("relabel");
+    // v1 DB (no marker) relabelled as a v3 set: plaintext and encrypted.
+    let v1_dir = base.join("v1");
+    fs::create_dir_all(&v1_dir).unwrap();
+    populate_state_db(&v1_dir);
+    for (tag, pw) in [("plain", None), ("enc", pass("pw"))] {
+        let dest = base.join(format!("v1-as-v3-{tag}"));
+        let m = backup(&v1_dir, &dest, pw.clone()).unwrap();
+        assert_eq!((m.version, m.self_contained), (1, false));
+        relabel(&dest.join("MANIFEST.json"), 3, true);
+        let target = base.join(format!("restored-{tag}"));
+        let err = restore(&dest, &target, false, pw).unwrap_err();
+        assert!(
+            err.to_string().contains("does not carry the ADR-0022 migration marker"),
+            "{tag}: {err}"
+        );
+        assert!(!target.join("lnrent.sqlite").exists(), "{tag}: the target was not touched");
+    }
+    // v3 DB (marker present) downgraded to a v1 manifest.
+    let v3_dir = base.join("v3");
+    fs::create_dir_all(&v3_dir).unwrap();
+    populate_state_db(&v3_dir);
+    mark_self_contained(&v3_dir, "fresh");
+    let dest = base.join("v3-as-v1");
+    assert_eq!(backup(&v3_dir, &dest, None).unwrap().version, 3);
+    relabel(&dest.join("MANIFEST.json"), 1, false);
+    let err = restore(&dest, &base.join("restored-downgrade"), false, None).unwrap_err();
+    assert!(err.to_string().contains("does carry the ADR-0022 migration marker"), "{err}");
+    let _ = fs::remove_dir_all(&base);
+}
+
 /// `restore` REFUSES a format-1 backup whose books reference phoenixd — at restore, naming the row —
 /// on the EXACT predicate: `invoice.id LIKE 'phoenixd-%'` (the prefix lives on the store's id column),
 /// or a SENT / id-bearing attempt while the persisted backend is phoenixd. A hash sitting only in
