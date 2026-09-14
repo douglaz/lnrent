@@ -131,8 +131,10 @@ struct RefundRow {
     created_at: i64,
     /// The ADR-0022 legacy-import fence (SPEC §11): `Some` means this attempt's pre-send witness may
     /// have been lost with the side file, so the driver must not `prepare_pay` (let alone pay or
-    /// re-resolve) it until the backend's own audit or the operator clears the stamp. Parked at the
-    /// mint point; `RefundStuck` keeps firing.
+    /// re-resolve) it until the operator clears the stamp (`migration clear-fence`; a backend audit
+    /// that adopts a match is a future bead). Parked at the mint point. Only a fenced PENDING row
+    /// reaches this driver and keeps `RefundStuck` firing; a fenced FAILED row is not selected by
+    /// `pending_refunds` and raises nothing until the operator looks (`lnrent refunds` lists it).
     migration_unverified_at: Option<i64>,
 }
 

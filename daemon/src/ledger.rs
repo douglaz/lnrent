@@ -36,6 +36,9 @@ struct RefundCommitment {
     resolution_gen: i64,
     amount_msat: u128,
     status: String,
+    /// ADR-0022 legacy-import fence: the pre-send witness may be lost, so the backend's answer for
+    /// this key proves nothing about whether the legacy payment landed. Committed unconditionally.
+    fenced: bool,
 }
 
 /// The three §D terms read in ONE store pass. Receipts + sweep caps are final; the refund rows
@@ -57,9 +60,13 @@ pub async fn expected_msat(store: &Store, payment: &Arc<dyn PaymentBackend>) -> 
     // subtracted: the outgoing contract has locked those funds even before the row flips to SENT.
     // Terminal Failed means funds returned and a retry still needs liquidity, so it is not
     // subtracted even though a historical pay-index row exists.
+    // A FENCED row (ADR-0022) is committed whatever its status and whatever the backend says: the
+    // fence exists because the witness that would let the backend answer may be lost, and the
+    // legacy payment may have landed — overstating holdings here would let reconcile report false
+    // drift and readiness claim funds that already left (codex #91 P2, eleventh round).
     let mut committed_msat: u128 = 0;
     for r in &reads.refunds {
-        let committed = if r.status == "SENT" {
+        let committed = if r.status == "SENT" || r.fenced {
             true
         } else {
             // The SAME started-evidence disambiguator INV-2/recovery use: the evidence lives under
@@ -147,7 +154,8 @@ pub(crate) fn sum_receipts_msat(conn: &Connection) -> Result<u128> {
 /// nothing, so it is skipped here.
 fn load_refund_commitments(conn: &Connection) -> Result<Vec<RefundCommitment>> {
     let mut stmt = conn.prepare(
-        "SELECT id, idempotency_key, amount_sat, status, resolution_gen
+        "SELECT id, idempotency_key, amount_sat, status, resolution_gen,
+                migration_unverified_at IS NOT NULL
            FROM refund_attempt",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -157,11 +165,12 @@ fn load_refund_commitments(conn: &Connection) -> Result<Vec<RefundCommitment>> {
             r.get::<_, Option<i64>>(2)?,
             r.get::<_, String>(3)?,
             r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+            r.get::<_, bool>(5)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, idempotency_key, amount_sat, status, resolution_gen) = row?;
+        let (id, idempotency_key, amount_sat, status, resolution_gen, fenced) = row?;
         let Some(sat) = positive_sat(amount_sat) else {
             continue;
         };
@@ -170,13 +179,15 @@ fn load_refund_commitments(conn: &Connection) -> Result<Vec<RefundCommitment>> {
             resolution_gen,
             amount_msat: u128::from(sat) * 1000,
             status,
+            fenced,
         });
     }
     Ok(out)
 }
 
 /// Σ `max_outlay_msat` of in-flight (SENT/PENDING) sweep rows — operator payouts that have locked
-/// funds out of the wallet. The `sweep_attempt` table is owned by urw.3 and does NOT exist yet, so
+/// funds out of the wallet — plus every ADR-0022-fenced row whatever its status (its legacy payment
+/// may have landed; the sweep surplus counts it the same way). The `sweep_attempt` table is owned by urw.3 and does NOT exist yet, so
 /// probe `sqlite_master` FIRST: absent ⇒ this term is 0 (querying a missing table would panic).
 /// Keeps the helper forward-complete for when urw.3 lands.
 fn sum_sweep_caps_msat(conn: &Connection) -> Result<u128> {
@@ -191,7 +202,7 @@ fn sum_sweep_caps_msat(conn: &Connection) -> Result<u128> {
     let sum_msat: i64 = conn.query_row(
         "SELECT COALESCE(SUM(max_outlay_msat), 0)
            FROM sweep_attempt
-          WHERE status IN ('SENT', 'PENDING')",
+          WHERE status IN ('SENT', 'PENDING') OR migration_unverified_at IS NOT NULL",
         [],
         |r| r.get(0),
     )?;
@@ -216,7 +227,7 @@ fn positive_msat(amount: Option<i64>) -> Option<u128> {
 mod tests {
     use super::*;
     use crate::backends::{Invoice, PayStatus, PaymentStatus, Settlement};
-    use crate::store::{Store, SCHEMA};
+    use crate::store::Store;
     use async_trait::async_trait;
     use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
@@ -279,8 +290,9 @@ mod tests {
     }
 
     fn store_with(setup: impl FnOnce(&Connection)) -> Store {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        // The full runtime schema (migrations included): the ledger reads ADR-0022's
+        // `migration_unverified_at`, which the bare §11 SCHEMA does not carry.
+        let conn = crate::store::open_memory().unwrap();
         setup(&conn);
         Store::spawn(conn)
     }
@@ -444,6 +456,39 @@ mod tests {
             expected_msat(&store, &no_start_payment()).await.unwrap(),
             75_000
         );
+    }
+
+    /// ADR-0022 (codex #91 P2): a fenced attempt is committed whatever its status and whatever the
+    /// backend answers — a fenced FAILED refund the backend calls Failed, and a fenced FAILED sweep,
+    /// both subtract. RED on a ledger that keys only on status / started evidence.
+    #[tokio::test]
+    async fn fenced_refunds_and_sweeps_are_committed_whatever_their_status() {
+        let store = store_with(|c| {
+            c.execute(
+                "INSERT INTO invoice (id, external_id, kind, amount_sat, status)
+                 VALUES ('i1', 'ext', 'order', 100, 'PAID')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO refund_attempt (id, dest, amount_sat, idempotency_key, status, attempts,
+                    resolution_gen, migration_unverified_at)
+                 VALUES ('r-fenced', 'd', 10, 'refund:fenced', 'FAILED', 3, 0, 42)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO sweep_attempt (id, status, max_outlay_msat, migration_unverified_at)
+                 VALUES ('sw-fenced', 'FAILED', 5000, 42)",
+                [],
+            )
+            .unwrap();
+        });
+        let dbl = Arc::new(StartedPayment::default());
+        dbl.set_status("refund:fenced", PayStatus::Failed);
+        let payment: Arc<dyn PaymentBackend> = dbl;
+        // 100_000 − 10_000 (fenced refund, despite Failed) − 5_000 (fenced FAILED sweep) = 85_000.
+        assert_eq!(expected_msat(&store, &payment).await.unwrap(), 85_000);
     }
 
     #[tokio::test]

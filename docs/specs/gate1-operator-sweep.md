@@ -210,8 +210,9 @@ alerting spec §F).
 - Zero-amount bolt11, expired bolt11, quote failure (`sweep_unpriceable`), and a second concurrent
   sweep (`sweep_busy`) are structured refusals; nothing is written to `refund_attempt`; a sweep
   never enters the refund LIABILITY set (`required_msat` unchanged) — but it DOES reduce
-  ledger-expected holdings (`expected_msat` subtracts SENT/PENDING sweep caps, per the alerting
-  spec §D), so readiness correctly reflects that a committed payout shrinks coverage.
+  ledger-expected holdings (`expected_msat` subtracts SENT/PENDING sweep caps — and, per
+  ADR-0022, every fenced `migration_unverified_at` sweep cap whatever its status — per the
+  alerting spec §D), so readiness correctly reflects that a committed payout shrinks coverage.
 - Works identically on `MockPayment` (no balance concept needed — the gate never asks for one).
 
 ## Suggested implementation order
