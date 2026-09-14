@@ -992,6 +992,16 @@ fn analyse(conn: &Connection, backend: Backend, legacy: &Legacy, now: i64) -> Re
                     None => true,
                 };
                 let status_ok = !sent || m.status == "SUCCEEDED";
+                if bolt11_ok && id_ok && a.status == "FAILED" && m.status != "FAILED" {
+                    // The books say the payment definitely failed but the map — the row the backend
+                    // wrote around the send — says PREPARED / PENDING / SUCCEEDED: two instants that
+                    // disagree about whether money left. Not a refusal (the pair agrees on WHICH
+                    // payment) but not coverage either: fence it, so its cap stays committed in the
+                    // surplus and a retry waits for the operator (codex #91 P1, sixth round). A
+                    // re-drive after clearance adopts a SUCCEEDED row rather than paying again.
+                    plan.stamp.push((a.table, a.id.clone()));
+                    continue;
+                }
                 if !(bolt11_ok && id_ok && status_ok) {
                     plan.refusal.get_or_insert(format!(
                         "{} {} (pay key {}, status {}) disagrees with its {} row (bolt11 agrees: \
@@ -1968,6 +1978,38 @@ CREATE TABLE IF NOT EXISTS lnv2_pay (
         );
         assert_eq!(fence(&store, "refund_attempt", "ref-e1").await, Some(NOW));
         assert_eq!(fence(&store, "sweep_attempt", "sweep:h2").await, Some(NOW));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// codex #91 P1 (sixth round): a FAILED attempt whose pay-map row is NOT FAILED (PREPARED / PENDING /
+    /// SUCCEEDED) is two instants disagreeing about whether money left. It is fenced — never accepted
+    /// as plain coverage, which would release a FAILED sweep's cap to a different sweep — while a
+    /// FAILED attempt over a FAILED map row is ordinary coverage.
+    #[tokio::test]
+    async fn a_failed_attempt_over_a_non_failed_map_row_is_fenced_not_covered() {
+        let dir = temp_dir();
+        let store = mem_store();
+        seed_sweep(&store, "sweep:h3", "FAILED", "lnbc-s3", None).await;
+        seed_sweep(&store, "sweep:h4", "FAILED", "lnbc-s4", None).await;
+        seed_refund(&store, "e1", "FAILED", "buyer@ln.example", Some("lnbc-r1"), 1, None).await;
+        let refund_key = crate::refund::gen_key("e1", 1);
+        let file = legacy_file(&dir, Backend::Phoenixd, |c| {
+            seed_phx_pay(c, "sweep:h3", "lnbc-s3", None, "SUCCEEDED");
+            seed_phx_pay(c, "sweep:h4", "lnbc-s4", None, "FAILED");
+            seed_phx_pay(c, &refund_key, "lnbc-r1", None, "PREPARED");
+        });
+        let probe = FakeProbe::default();
+        let out = run(&store, Backend::Phoenixd, &probe, &file, NOW).await.unwrap();
+        assert_eq!(
+            out,
+            Outcome::Imported { receive_rows: 0, pay_rows: 3, repaired: 0, reaped: 0, stamped: 2 }
+        );
+        assert_eq!(fence(&store, "sweep_attempt", "sweep:h3").await, Some(NOW), "SUCCEEDED map: fenced");
+        assert_eq!(fence(&store, "refund_attempt", "ref-e1").await, Some(NOW), "PREPARED map: fenced");
+        assert_eq!(fence(&store, "sweep_attempt", "sweep:h4").await, None, "FAILED map: plain coverage");
+        // And the fenced FAILED sweep's cap is committed in the surplus (sweep.rs counts fenced rows).
+        let surplus = store.read(|c| crate::sweep::read_surplus(c, None)).await.unwrap();
+        assert!(surplus.paid_out_msat > 0, "the fenced sweep cap counts: {surplus:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
