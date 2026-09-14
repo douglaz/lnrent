@@ -44,7 +44,10 @@ reserved_msat = Σ gross, counted ONCE per external_id (the same de-dup rule INV
                 • every non-terminal refund_attempt (PENDING or otherwise unresolved,
                   INCLUDING unpriceable ones — gross always bounds the INV-1-capped outlay)
 paid_out_msat = Σ gross of refund_attempt rows SENT (gross ≥ actual outlay, by INV-1)
-              + Σ max_outlay_msat of sweep_attempt rows SENT or PENDING
+              + Σ max_outlay_msat of sweep_attempt rows SENT or PENDING, or fenced
+                `migration_unverified_at IS NOT NULL` whatever their status (ADR-0022:
+                the legacy import could not verify that the attempt did not pay, so its
+                cap stays committed until the operator clears the fence)
 
 surplus_msat  = receipts_msat − reserved_msat − paid_out_msat
 
