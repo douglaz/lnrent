@@ -1258,8 +1258,10 @@ async fn refund_retry(store: &Store, id: &str, now: i64) -> Reply {
 /// never clears a phoenixd stamp on absence (an in-flight legacy POST has no `completedAt`, the clocks
 /// are unrelated, and phoenixd's own DB can be wiped and restored with funds surviving by seed), so
 /// the operator — who can weigh phoenixd's records, the wallet balance and the buyer's word — is the
-/// only party besides the backend's positive-match audit who may. After clearance the driver
-/// re-prepares the attempt exactly as a first attempt.
+/// only party besides the backend's positive-match audit who may. After clearance a PENDING attempt
+/// is re-prepared by the driver exactly as a first attempt; a FAILED one stays FAILED (the drivers
+/// select PENDING only), so the reply names the second step — `refund-retry` for a refund, a
+/// resubmission for a sweep — instead of implying the clearance alone re-drives it (codex #91 P2).
 async fn migration_clear_fence(store: &Store, id: &str, note: &str, now: i64) -> Reply {
     if note.trim().is_empty() {
         return Reply::err(
@@ -1268,7 +1270,7 @@ async fn migration_clear_fence(store: &Store, id: &str, note: &str, now: i64) ->
         );
     }
     let (id_s, note_s) = (id.to_string(), note.trim().to_string());
-    let res: Result<Option<&'static str>> = store
+    let res: Result<Option<(&'static str, String)>> = store
         .transaction(move |tx| {
             for table in ["refund_attempt", "sweep_attempt"] {
                 let n = tx.execute(
@@ -1287,14 +1289,28 @@ async fn migration_clear_fence(store: &Store, id: &str, note: &str, now: i64) ->
                             now
                         ],
                     )?;
-                    return Ok(Some(table));
+                    let status: String = tx.query_row(
+                        &format!("SELECT status FROM {table} WHERE id=?1"),
+                        rusqlite::params![id_s],
+                        |r| r.get(0),
+                    )?;
+                    return Ok(Some((table, status)));
                 }
             }
             Ok(None)
         })
         .await;
     match res {
-        Ok(Some(table)) => Reply::ok(json!({ "id": id, "table": table, "cleared": true })),
+        Ok(Some((table, status))) => {
+            let next = match (table, status.as_str()) {
+                (_, "PENDING") => "the driver prepares and pays it on its next pass".to_string(),
+                ("refund_attempt", _) => {
+                    format!("still {status}: run `lnrent refund-retry {id}` to re-drive it")
+                }
+                _ => format!("still {status}: resubmit the sweep (`lnrent sweep <bolt11>`) to re-drive it"),
+            };
+            Reply::ok(json!({ "id": id, "table": table, "cleared": true, "status": status, "next": next }))
+        }
         Ok(None) => Reply::err(
             "not_found",
             format!("no fenced refund or sweep attempt `{id}` (nothing carries migration_unverified_at)"),
@@ -4004,7 +4020,16 @@ mod tests {
         })
         .await;
         assert!(cleared.ok, "{:?}", cleared.error);
-        assert_eq!(cleared.data.unwrap()["table"], "refund_attempt");
+        let data = cleared.data.unwrap();
+        assert_eq!(data["table"], "refund_attempt");
+        // codex #91 P2: the drivers select PENDING only, so a cleared FAILED row is NOT re-driven by
+        // the clearance — the reply must name the second step rather than imply it is.
+        assert_eq!(data["status"], "FAILED");
+        assert!(
+            data["next"].as_str().unwrap().contains("refund-retry r-fenced"),
+            "names the retry verb: {}",
+            data["next"]
+        );
         let fenced: Option<i64> = store
             .read(|c| {
                 Ok(c.query_row(
@@ -4035,7 +4060,9 @@ mod tests {
             note: "wallet shows no outgoing for this hash".into(),
         })
         .await;
-        assert_eq!(cleared.data.unwrap()["table"], "sweep_attempt");
+        let data = cleared.data.unwrap();
+        assert_eq!((data["table"].as_str(), data["status"].as_str()), (Some("sweep_attempt"), Some("PENDING")));
+        assert!(data["next"].as_str().unwrap().contains("next pass"), "{}", data["next"]);
         // And an id with no fence is not_found.
         let none = run(Request::MigrationClearFence { id: "sweep:fenced".into(), note: "again".into() }).await;
         assert_eq!(none.error.unwrap().code, "not_found");
