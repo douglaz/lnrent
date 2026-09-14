@@ -1309,7 +1309,7 @@ async fn migration_clear_fence(store: &Store, id: &str, note: &str, now: i64) ->
                 ("refund_attempt", _) => {
                     format!("still {status}: run `lnrent refund-retry {id}` to re-drive it")
                 }
-                _ => format!("still {status}: resubmit the sweep (`lnrent sweep <bolt11>`) to re-drive it"),
+                _ => format!("still {status}: resubmit the sweep (`lnrent sweep <bolt11> --yes`) to re-drive it"),
             };
             Reply::ok(json!({ "id": id, "table": table, "cleared": true, "status": status, "next": next }))
         }

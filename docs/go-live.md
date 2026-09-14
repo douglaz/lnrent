@@ -413,7 +413,7 @@ The note is journaled to `event_log`, and the reply names the next step, because
 does not by itself re-drive the attempt: the drivers pick up `PENDING` rows only. A cleared `PENDING`
 attempt is prepared and paid on the driver's next pass exactly as a first attempt; a cleared `FAILED`
 refund still needs `lnrent refund-retry <attempt id>`, and a cleared `FAILED` sweep must be
-resubmitted (`lnrent sweep <bolt11>`). (A backend audit that ADOPTS a matching wallet record onto a parked
+resubmitted (`lnrent sweep <bolt11> --yes`; without `--yes` the CLI only quotes). (A backend audit that ADOPTS a matching wallet record onto a parked
 attempt — never a re-send — is lnrent-uxbd for phoenixd and lnrent-gjwy for lnv2.)
 
 **Backups after the upgrade** are format 3 and self-contained; restore accepts them as is.
