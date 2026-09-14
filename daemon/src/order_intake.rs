@@ -26,13 +26,13 @@ use lnrent_wire::{
     RenewRequest, SubCancel, WireError,
 };
 
-use crate::backends::PaymentBackend;
+use crate::backends::{Issued, PaymentBackend, Persist};
 use crate::clock::Clock;
 use crate::nostr_engine::{OrderHandler, Outbound};
 use crate::recipe::Recipe;
 use crate::refund_resolver::{detect_form, validate_dest_format, DestForm};
 use crate::reservation::{self, Budget, Request, Reserve};
-use crate::store::Store;
+use crate::store::{upsert_renewal_invoice, RenewalInvoiceRow, Store};
 
 /// Lightning expiry stamped on a first-order / renewal invoice (seconds). The order's capacity
 /// reservation is held until this same horizon, then released (§9.3). An internal default, not an
@@ -250,9 +250,17 @@ impl OrderIntake {
         //    it payable, and gets a fresh one only once the provider has terminated it (epj).
         let external_id = format!("order:{sender_hex}:{}", req.id);
         let amount_sat = listing.amount_sat as u64;
-        let invoice = match self
+        // ADR-0022: the backend's receive-map row comes back as `persist`, committed below in the
+        // SAME transaction as the `invoice` row; `lease` (the backend's create guard) and
+        // `after_commit` go to the store actor with it.
+        let Issued {
+            invoice,
+            persist,
+            lease,
+            after_commit,
+        } = match self
             .payment
-            .create_invoice(
+            .issue_invoice(
                 amount_sat,
                 &format!("lnrent order {order_id}"),
                 INVOICE_EXPIRY_S,
@@ -260,7 +268,7 @@ impl OrderIntake {
             )
             .await
         {
-            Ok(inv) => inv,
+            Ok(issued) => issued,
             Err(e) => {
                 // No sub committed yet — release the HELD reservation, then a structured error.
                 // The detail stays in the local log: backend/gateway internals must not reach an
@@ -331,9 +339,13 @@ impl OrderIntake {
             amount_sat: invoice.amount_sat as i64,
             inv_expires_at: invoice.expires_at,
             response_json,
+            persist,
             now,
         };
-        let committed = self.store.transaction(move |tx| owned.write(tx)).await;
+        let committed = self
+            .store
+            .transaction_then(move |tx| owned.write(tx), lease, after_commit)
+            .await;
         let winner = match committed {
             // The operator withdrew the listing while we were minting the invoice. Nothing was
             // written and the hold was released in that same transaction, so answer the Buyer the
@@ -703,9 +715,14 @@ impl OrderIntake {
         dedupe: Option<(&PublicKey, &str)>,
     ) -> Result<Msg> {
         let amount_sat = self.recipe.pricing.amount_sat;
-        let invoice = self
+        let Issued {
+            invoice,
+            persist,
+            lease,
+            after_commit,
+        } = self
             .payment
-            .create_invoice(
+            .issue_invoice(
                 amount_sat,
                 &format!("lnrent renewal {subscription_id}"),
                 invoice_expiry_s,
@@ -741,9 +758,13 @@ impl OrderIntake {
                     serde_json::to_string(&response).unwrap_or_default(),
                 )
             }),
+            persist,
             now,
         };
-        let cached = self.store.transaction(move |tx| owned.write(tx)).await?;
+        let cached = self
+            .store
+            .transaction_then(move |tx| owned.write(tx), lease, after_commit)
+            .await?;
         match cached {
             Some(json) => {
                 Ok(serde_json::from_str(&json)
@@ -1001,6 +1022,9 @@ struct OrderWrite {
     amount_sat: i64,
     inv_expires_at: i64,
     response_json: String,
+    /// The backend's receive-map row (ADR-0022), run beside the `invoice` insert on the COMMITTED
+    /// path only — a refusal branch persists no invoice and therefore no correlation.
+    persist: Persist,
     now: i64,
 }
 
@@ -1125,6 +1149,9 @@ impl OrderWrite {
                 self.now,
             ],
         )?;
+        // The backend's own receive-map row, in THIS transaction (ADR-0022, SPEC §6.6 issuance
+        // ordering): the correlation commits with the invoice it correlates, or not at all.
+        (self.persist)(tx)?;
         tx.execute(
             "INSERT INTO inbound_request
                 (sender_pubkey, request_id, kind, response_msg_type, response_json, created_at)
@@ -1187,6 +1214,8 @@ struct RenewalWrite {
     /// `(sender_hex, request_id, response_json)` for a buyer renew.request; `None` for a daemon
     /// soft-date renewal (nothing to dedupe).
     dedupe: Option<(String, String, String)>,
+    /// The backend's receive-map row (ADR-0022), run beside the invoice upsert.
+    persist: Persist,
     now: i64,
 }
 
@@ -1211,25 +1240,24 @@ impl RenewalWrite {
                 return Ok(Some(json));
             }
         }
-        // Idempotent on external_id: re-issuing the same cycle never creates a 2nd invoice.
-        tx.execute(
-            "INSERT INTO invoice
-                (id, subscription_id, external_id, backend_invoice_id, payment_hash, kind,
-                 bolt11, amount_sat, status, expires_at, issued_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'renewal', ?6, ?7, 'OPEN', ?8, ?9)
-             ON CONFLICT(external_id) DO NOTHING",
-            params![
-                self.inv_id,
-                self.subscription_id,
-                self.external_id,
-                self.backend_invoice_id,
-                self.payment_hash,
-                self.bolt11,
-                self.amount_sat,
-                self.inv_expires_at,
-                self.now,
-            ],
+        // Idempotent on external_id: re-issuing the same cycle never creates a 2nd invoice. A
+        // provider-terminated REPLACEMENT refreshes the row to the successor (ADR-0022), in the same
+        // transaction as the successor's correlation below.
+        upsert_renewal_invoice(
+            tx,
+            &RenewalInvoiceRow {
+                id: self.inv_id,
+                subscription_id: self.subscription_id.clone(),
+                external_id: self.external_id.clone(),
+                backend_invoice_id: self.backend_invoice_id,
+                payment_hash: self.payment_hash,
+                bolt11: self.bolt11,
+                amount_sat: self.amount_sat,
+                expires_at: self.inv_expires_at,
+                now: self.now,
+            },
         )?;
+        (self.persist)(tx)?;
         if let Some((sender_hex, request_id, response_json)) = self.dedupe {
             tx.execute(
                 "INSERT INTO inbound_request
@@ -4120,5 +4148,196 @@ mod tests {
             matches!(out3.only().1, Msg::OrderInvoice(_)),
             "a second buyer key is unaffected by A's cap"
         );
+    }
+
+    /// ADR-0022 issuance atomicity (SPEC §6.6): the backend's receive-map row is committed by the
+    /// SAME transaction as the `invoice` row. A `persist` that fails rolls the whole issuance back —
+    /// no subscription, no invoice, the hold released, the buyer told `unavailable` — so a crash or
+    /// error between `issue_invoice` and the commit can never leave a half-written correlation. RED on
+    /// master, where the backend committed its side-file row before the order write ran.
+    struct PersistFails {
+        inner: MockPayment,
+    }
+
+    #[async_trait::async_trait]
+    impl PaymentBackend for PersistFails {
+        async fn create_invoice(&self, a: u64, m: &str, e: u32, x: &str) -> Result<Invoice> {
+            self.inner.create_invoice(a, m, e, x).await
+        }
+        async fn issue_invoice(&self, a: u64, m: &str, e: u32, x: &str) -> Result<crate::backends::Issued> {
+            let invoice = self.inner.create_invoice(a, m, e, x).await?;
+            Ok(crate::backends::Issued::new(
+                invoice,
+                |_tx: &rusqlite::Transaction| Err(anyhow::anyhow!("correlation row could not be written")),
+                Box::new(()),
+                None::<fn()>,
+            ))
+        }
+        async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
+            self.inner.lookup(id).await
+        }
+        async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            self.inner.lookup_settlement(id).await
+        }
+        async fn pay(&self, d: &str, a: u64, k: &str) -> Result<String> {
+            self.inner.pay(d, a, k).await
+        }
+        async fn payment_status(&self, id: &str) -> Result<PayStatus> {
+            self.inner.payment_status(id).await
+        }
+        async fn payment_status_by_key(&self, k: &str) -> Result<PayStatus> {
+            self.inner.payment_status_by_key(k).await
+        }
+        async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
+            self.inner.watch().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_correlation_persist_rolls_the_whole_issuance_back() {
+        let store = mem_store();
+        let recipe = dummy_recipe();
+        let listing_id = "30402:op:dummy-1";
+        seed_listing(&store, listing_id, "dummy", recipe.pricing.amount_sat as i64).await;
+        let handler = OrderIntake::new(
+            store.clone(),
+            Arc::new(PersistFails {
+                inner: MockPayment::new(),
+            }),
+            Arc::new(TestClock::new(1000)),
+            recipe,
+            budget_with_room(),
+            u32::MAX,
+        );
+        let out = RecordingOutbound::default();
+        handler
+            .handle(
+                Keys::generate().public_key(),
+                order("q-persist", listing_id, json!({})),
+                &out,
+            )
+            .await
+            .unwrap();
+
+        let err = expect_order_error(&out);
+        assert_eq!(err.error.code, "unavailable");
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM subscription").await,
+            0,
+            "no subscription survives a failed correlation write"
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM invoice").await,
+            0,
+            "no invoice row either — the two commit together or not at all"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM reservation WHERE state IN ('HELD','CONSUMED')"
+            )
+            .await,
+            0,
+            "the capacity hold is released"
+        );
+    }
+
+    /// ADR-0022 "The interface": the listing-withdrawn refusal commits WITHOUT the invoice, so the
+    /// backend's `after_commit` hook (the lnv2 live watcher) must NOT run — it would leave a terminal
+    /// task working against an absent row. A committed order runs it exactly once. Pinned at the
+    /// ORDER WRITE level (the ADR names this branch), not only on the store primitive.
+    struct HookCounting {
+        inner: MockPayment,
+        store: Store,
+        withdraw_listing: Option<String>,
+        hooks: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl PaymentBackend for HookCounting {
+        async fn create_invoice(&self, a: u64, m: &str, e: u32, x: &str) -> Result<Invoice> {
+            self.inner.create_invoice(a, m, e, x).await
+        }
+        async fn issue_invoice(&self, a: u64, m: &str, e: u32, x: &str) -> Result<crate::backends::Issued> {
+            if let Some(id) = self.withdraw_listing.clone() {
+                self.store
+                    .transaction(move |tx| {
+                        tx.execute("UPDATE listing SET state='WITHDRAWN' WHERE id=?1", params![id])?;
+                        Ok(())
+                    })
+                    .await?;
+            }
+            let invoice = self.inner.create_invoice(a, m, e, x).await?;
+            let hooks = self.hooks.clone();
+            Ok(crate::backends::Issued::new(
+                invoice,
+                |_tx: &rusqlite::Transaction| Ok(()),
+                Box::new(()),
+                Some(move || {
+                    hooks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }),
+            ))
+        }
+        async fn lookup(&self, id: &str) -> Result<PaymentStatus> {
+            self.inner.lookup(id).await
+        }
+        async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
+            self.inner.lookup_settlement(id).await
+        }
+        async fn pay(&self, d: &str, a: u64, k: &str) -> Result<String> {
+            self.inner.pay(d, a, k).await
+        }
+        async fn payment_status(&self, id: &str) -> Result<PayStatus> {
+            self.inner.payment_status(id).await
+        }
+        async fn payment_status_by_key(&self, k: &str) -> Result<PayStatus> {
+            self.inner.payment_status_by_key(k).await
+        }
+        async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Settlement>> {
+            self.inner.watch().await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_listing_withdrawn_refusal_never_runs_the_backends_post_commit_hook() {
+        for (withdraw, expected_hooks, expected_invoices) in [(false, 1usize, 1i64), (true, 0, 0)] {
+            let store = mem_store();
+            let recipe = dummy_recipe();
+            let listing_id = "30402:op:dummy-1";
+            seed_listing(&store, listing_id, "dummy", recipe.pricing.amount_sat as i64).await;
+            let hooks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let handler = OrderIntake::new(
+                store.clone(),
+                Arc::new(HookCounting {
+                    inner: MockPayment::new(),
+                    store: store.clone(),
+                    withdraw_listing: withdraw.then(|| listing_id.to_string()),
+                    hooks: hooks.clone(),
+                }),
+                Arc::new(TestClock::new(1000)),
+                recipe,
+                budget_with_room(),
+                u32::MAX,
+            );
+            let out = RecordingOutbound::default();
+            handler
+                .handle(
+                    Keys::generate().public_key(),
+                    order("q-hook", listing_id, json!({})),
+                    &out,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                count(&store, "SELECT count(*) FROM invoice").await,
+                expected_invoices,
+                "withdraw={withdraw}"
+            );
+            assert_eq!(
+                hooks.load(std::sync::atomic::Ordering::SeqCst),
+                expected_hooks,
+                "withdraw={withdraw}: the hook runs iff the invoice was persisted"
+            );
+        }
     }
 }

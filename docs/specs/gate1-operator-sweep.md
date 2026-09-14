@@ -44,7 +44,10 @@ reserved_msat = Σ gross, counted ONCE per external_id (the same de-dup rule INV
                 • every non-terminal refund_attempt (PENDING or otherwise unresolved,
                   INCLUDING unpriceable ones — gross always bounds the INV-1-capped outlay)
 paid_out_msat = Σ gross of refund_attempt rows SENT (gross ≥ actual outlay, by INV-1)
-              + Σ max_outlay_msat of sweep_attempt rows SENT or PENDING
+              + Σ max_outlay_msat of sweep_attempt rows SENT or PENDING, or fenced
+                `migration_unverified_at IS NOT NULL` whatever their status (ADR-0022:
+                the legacy import could not verify that the attempt did not pay, so its
+                cap stays committed until the operator clears the fence)
 
 surplus_msat  = receipts_msat − reserved_msat − paid_out_msat
 
@@ -207,8 +210,9 @@ alerting spec §F).
 - Zero-amount bolt11, expired bolt11, quote failure (`sweep_unpriceable`), and a second concurrent
   sweep (`sweep_busy`) are structured refusals; nothing is written to `refund_attempt`; a sweep
   never enters the refund LIABILITY set (`required_msat` unchanged) — but it DOES reduce
-  ledger-expected holdings (`expected_msat` subtracts SENT/PENDING sweep caps, per the alerting
-  spec §D), so readiness correctly reflects that a committed payout shrinks coverage.
+  ledger-expected holdings (`expected_msat` subtracts SENT/PENDING sweep caps — and, per
+  ADR-0022, every fenced `migration_unverified_at` sweep cap whatever its status — per the
+  alerting spec §D), so readiness correctly reflects that a committed payout shrinks coverage.
 - Works identically on `MockPayment` (no balance concept needed — the gate never asks for one).
 
 ## Suggested implementation order

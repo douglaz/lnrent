@@ -24,9 +24,54 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lnrentd::backends::{PayStatus, PaymentBackend, PaymentStatus};
+use lnrentd::backends::{Invoice, PayStatus, PaymentBackend, PaymentStatus};
 use lnrentd::clock::{Clock, SystemClock};
 use lnrentd::lnv2_backend::Lnv2Payment;
+use lnrentd::store::Store;
+
+/// The daemon's state DB for a live data dir (ADR-0022: the lnv2 correlation tables live in it, so
+/// the backend is constructed over the store, and every issuance/send commits through it).
+fn open_store(data_dir: &std::path::Path) -> Store {
+    Store::open_spawn(data_dir.join("lnrent.sqlite")).expect("open the state DB")
+}
+
+/// The caller's half of ADR-0022 issuance: `issue_invoice` + commit of its persist closure.
+async fn issue(
+    backend: &Lnv2Payment,
+    store: &Store,
+    amount_sat: u64,
+    memo: &str,
+    expiry_s: u32,
+    external_id: &str,
+) -> anyhow::Result<Invoice> {
+    let issued = backend
+        .issue_invoice(amount_sat, memo, expiry_s, external_id)
+        .await?;
+    let persist = issued.persist;
+    store
+        .transaction_then(move |tx| persist(tx), issued.lease, issued.after_commit)
+        .await?;
+    Ok(issued.invoice)
+}
+
+/// The caller's half of an ADR-0022 send: `prepare_pay` + commit of the PREPARED row, then the pay.
+async fn pay(
+    backend: &Lnv2Payment,
+    store: &Store,
+    bolt11: &str,
+    amount_sat: u64,
+    gross_sat: u64,
+    key: &str,
+) -> anyhow::Result<String> {
+    let prepared = backend.prepare_pay(key, bolt11).await?;
+    let persist = prepared.persist;
+    store
+        .transaction_then(move |tx| persist(tx), prepared.lease, None)
+        .await?;
+    backend
+        .pay_refund_capped(bolt11, amount_sat, gross_sat, key)
+        .await
+}
 
 /// Run `fedimint-cli <args>` (the devimint internal client) and parse its JSON stdout. A non-object
 /// response is wrapped as a JSON string so single-value outputs still parse.
@@ -112,7 +157,8 @@ async fn lnv2_receive_and_pay_live() {
     let root_secret = [17u8; 32];
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
-    let backend = Lnv2Payment::join_or_open(&invite, &data_dir, &root_secret, clock.clone())
+    let store = open_store(&data_dir);
+    let backend = Lnv2Payment::join_or_open(&invite, &data_dir, &root_secret, store.clone(), clock.clone())
         .await
         .expect("join the regtest federation via lnv2");
 
@@ -120,12 +166,10 @@ async fn lnv2_receive_and_pay_live() {
     let mut settlements = backend.watch().await.expect("open settlement stream");
 
     // 1. create_invoice is idempotent on external_id.
-    let inv = backend
-        .create_invoice(recv_sat, "lnrent lnv2 receive", 3600, &ext)
+    let inv = issue(&backend, &store, recv_sat, "lnrent lnv2 receive", 3600, &ext)
         .await
         .expect("mint an lnv2 gateway bolt11");
-    let inv_again = backend
-        .create_invoice(recv_sat, "lnrent lnv2 receive", 3600, &ext)
+    let inv_again = issue(&backend, &store, recv_sat, "lnrent lnv2 receive", 3600, &ext)
         .await
         .expect("create_invoice idempotent");
     assert_eq!(inv.id, inv_again.id, "same external_id -> same invoice");
@@ -177,7 +221,7 @@ async fn lnv2_receive_and_pay_live() {
     let dest = bolt11_of(&fedimint_cli(&["ln-invoice", "--amount", &pay_msat]));
     let pay_id = tokio::time::timeout(
         Duration::from_secs(90),
-        backend.pay_refund_capped(&dest, pay_sat, recv_sat, &refund_key),
+        pay(&backend, &store, &dest, pay_sat, recv_sat, &refund_key),
     )
     .await
     .expect("pay completes within 90s")
@@ -188,8 +232,7 @@ async fn lnv2_receive_and_pay_live() {
         "the refund key is Succeeded"
     );
     // Re-pay the same key: idempotent, no double-pay.
-    let pay_id_again = backend
-        .pay_refund_capped(&dest, pay_sat, recv_sat, &refund_key)
+    let pay_id_again = pay(&backend, &store, &dest, pay_sat, recv_sat, &refund_key)
         .await
         .expect("pay idempotent on key");
     assert_eq!(
@@ -225,14 +268,14 @@ async fn lnv2_send_failure_is_terminal_live() {
     let root_secret = [19u8; 32];
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
-    let backend = Lnv2Payment::join_or_open(&invite, &data_dir, &root_secret, clock.clone())
+    let store = open_store(&data_dir);
+    let backend = Lnv2Payment::join_or_open(&invite, &data_dir, &root_secret, store.clone(), clock.clone())
         .await
         .expect("join the regtest federation via lnv2");
     let mut settlements = backend.watch().await.expect("open settlement stream");
 
     // Fund the wallet so a send can be attempted at all.
-    let inv = backend
-        .create_invoice(fund_sat, "fund", 3600, &ext)
+    let inv = issue(&backend, &store, fund_sat, "fund", 3600, &ext)
         .await
         .expect("mint invoice");
     fedimint_cli(&["ln-pay", &inv.bolt11]);
@@ -254,7 +297,7 @@ async fn lnv2_send_failure_is_terminal_live() {
 
     let first = tokio::time::timeout(
         Duration::from_secs(90),
-        backend.pay_refund_capped(&dest, pay_sat, fund_sat, &refund_key),
+        pay(&backend, &store, &dest, pay_sat, fund_sat, &refund_key),
     )
     .await
     .expect("pay attempt completes within 90s");
@@ -266,8 +309,7 @@ async fn lnv2_send_failure_is_terminal_live() {
     );
 
     // NO-RETRY: re-driving the SAME key stays terminal Err — it does not re-send the same bolt11.
-    let again = backend
-        .pay_refund_capped(&dest, pay_sat, fund_sat, &refund_key)
+    let again = pay(&backend, &store, &dest, pay_sat, fund_sat, &refund_key)
         .await;
     assert!(
         again.is_err(),
@@ -311,12 +353,12 @@ async fn lnv2_backup_restore_preserves_ecash_live() {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
     // --- fund + pay the first refund out under key1 -----------------------------------------------
-    let backend = Lnv2Payment::join_or_open(&invite, &src_dir, &root_secret, clock.clone())
+    let store = open_store(&src_dir);
+    let backend = Lnv2Payment::join_or_open(&invite, &src_dir, &root_secret, store.clone(), clock.clone())
         .await
         .expect("join the regtest federation via lnv2");
     let mut settlements = backend.watch().await.expect("open settlement stream");
-    let inv = backend
-        .create_invoice(recv_sat, "lnv2 bk fund", 3600, &ext)
+    let inv = issue(&backend, &store, recv_sat, "lnv2 bk fund", 3600, &ext)
         .await
         .expect("mint an lnv2 gateway bolt11");
     fedimint_cli(&["ln-pay", &inv.bolt11]);
@@ -329,7 +371,7 @@ async fn lnv2_backup_restore_preserves_ecash_live() {
     let dest1 = bolt11_of(&fedimint_cli(&["ln-invoice", "--amount", &pay1_msat]));
     tokio::time::timeout(
         Duration::from_secs(90),
-        backend.pay_refund_capped(&dest1, pay1_sat, recv_sat, &key1),
+        pay(&backend, &store, &dest1, pay1_sat, recv_sat, &key1),
     )
     .await
     .expect("pay1 completes within 90s")
@@ -345,8 +387,10 @@ async fn lnv2_backup_restore_preserves_ecash_live() {
     //     reproduction — here the focus is the fedimint POSITION surviving restore). ---------------
     drop(settlements);
     drop(backend);
-    rusqlite::Connection::open(src_dir.join("lnrent.sqlite"))
-        .expect("create a stub state DB so backup() has one to capture");
+    // The store actor owns the sqlite connection; dropping the last handle stops it. Give it a
+    // moment to close before the cold backup opens the file.
+    drop(store);
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let bk_dest = std::env::temp_dir().join(format!("lnrent-lnv2-bk-dest-{}", std::process::id()));
     let restored = data_dir("lnv2-bk-restored");
     // restore() refuses a non-empty target; use a fresh dir so a re-run starts clean.
@@ -356,7 +400,8 @@ async fn lnv2_backup_restore_preserves_ecash_live() {
         .expect("restore into a fresh data dir");
 
     // --- reopen on the RESTORED dir: prior pay status survives + the ecash is still SPENDABLE -------
-    let backend2 = Lnv2Payment::join_or_open(&invite, &restored, &root_secret, clock.clone())
+    let store2 = open_store(&restored);
+    let backend2 = Lnv2Payment::join_or_open(&invite, &restored, &root_secret, store2.clone(), clock.clone())
         .await
         .expect("reopen the lnv2 client from the restored backup");
     assert_eq!(
@@ -368,7 +413,7 @@ async fn lnv2_backup_restore_preserves_ecash_live() {
     let dest2 = bolt11_of(&fedimint_cli(&["ln-invoice", "--amount", &pay2_msat]));
     tokio::time::timeout(
         Duration::from_secs(90),
-        backend2.pay_refund_capped(&dest2, pay2_sat, recv_sat, &key2),
+        pay(&backend2, &store2, &dest2, pay2_sat, recv_sat, &key2),
     )
     .await
     .expect("pay2 completes within 90s")

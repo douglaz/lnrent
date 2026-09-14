@@ -1311,7 +1311,7 @@ CREATE TABLE refund_attempt (        -- durable refund ledger (ADR-0009, §6.6; 
   resolved_bolt11 TEXT,              -- concrete bolt11 a LN-address/LNURL `dest` resolved to (cached; a retry re-pays the SAME invoice)
   resolved_expiry INTEGER,           -- the resolved invoice's expiry; only a CURRENT-gen Failed+expired invoice is ever re-resolved
   resolution_gen INTEGER NOT NULL DEFAULT 0,  -- 0 = bolt11 pass-through (no resolution); 1+ once resolved (binds each re-resolution to its own key)
-  migration_unverified_at INTEGER,   -- ADR-0022 fence (decided, not yet built): set by the legacy import on a non-terminal OR retryable FAILED attempt whose
+  migration_unverified_at INTEGER,   -- ADR-0022 fence (built, lnrent-chgb): set by the legacy import on a non-terminal OR retryable FAILED attempt whose
                                      --   pre-send witness may have been lost; while set, the driver refuses prepare_pay; cleared ONLY by
                                      --   the backend's own clearance on a POSITIVE match (uxbd's boot wallet audit adopts for phoenixd;
                                      --   lnrent-lnv2-migration-unverified-clearance-gjwy for lnv2 — the l5kk proof bead clears nothing) or
@@ -1435,9 +1435,18 @@ identity and status) are tables in this same database, declared by the backend m
 applied by the store. They commit in the same transaction as the `invoice` /
 `refund_attempt` / `sweep_attempt` row they correlate (§6.6), so the books cannot disagree
 with their own correlation. What stays outside is the wallet's own state: phoenixd's database
-on the phoenixd host, and the fedimint client's RocksDB (ADR-0015). *(Status: decided, not yet
-built — both maps are still side files `phoenixd_index.db` / `lnv2_index.db` at the time of
-writing.)*
+on the phoenixd host, and the fedimint client's RocksDB (ADR-0015). The pre-ADR-0022 side files
+`phoenixd_index.db` / `lnv2_index.db` are imported once by the first boot on the new binary
+(`daemon/src/legacy_import.rs`) and renamed `*.imported`; the `migration` table records that
+import (one row per side file: its sha256, or `fresh` / `parked` when there was nothing to
+import), and the backup writer stamps format v3 only when that row is present.
+
+```sql
+CREATE TABLE migration (              -- ADR-0022: this database is self-contained from here on
+  name TEXT PRIMARY KEY,               -- the retired side file (phoenixd_index.db | lnv2_index.db)
+  content_hash TEXT NOT NULL,          -- sha256 of the imported file, or 'fresh' | 'parked'
+  completed_at INTEGER NOT NULL);
+```
 
 ## 12. Deployment
 

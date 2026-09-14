@@ -78,12 +78,26 @@
 //!    schedule was verified against, and the operator clears that refusal by configuring a schedule
 //!    they verified for their release (`[phoenixd] fee_schedule_version/fee_base_msat/fee_ppm`).
 //!
+//! ## Where the maps live (ADR-0022)
+//! Both correlation maps — `phoenixd_invoice` (receive) and `phoenixd_pay` (pay) — are tables IN
+//! `lnrent.sqlite`, declared by [`SCHEMA`] here and applied by the store on every open. Their rows
+//! are CREATED only inside the caller's own `Store::transaction_then`: [`PaymentBackend::issue_invoice`]
+//! hands back the receive-map insert as a closure the issuance transaction runs beside the `invoice`
+//! row, and [`PaymentBackend::prepare_pay`] hands back the `PREPARED` pay-map insert the refund/sweep
+//! driver runs beside the ledger transition that authorises the send. Status transitions on rows that
+//! already exist (SUCCEEDED / FAILED, the receive-map refresh of a still-payable bolt11) are this
+//! backend's own writes through the same store handle. So the books and their correlation cannot
+//! disagree, and the "index divergence" condition the pre-ADR-0022 side file could produce is
+//! unreachable: a missing row is a bug, reported at `error` and refused, never an operator incident.
+//! The legacy side file `phoenixd_index.db` is imported once at boot (`legacy_import.rs`) and renamed.
+//!
 //! ## Idempotency + crash story (the `phoenixd_pay` map)
 //! `payinvoice` takes no idempotency parameter, so the durable local map is lnrent's own dedup:
 //!  - The destination bolt11's **payment hash is derivable BEFORE the call** (it is encoded in the
-//!    invoice), so — exactly like lnv2's deterministic attempt-0 operation id — we commit a
-//!    `PREPARED` row containing `(bolt11, payment_hash)` BEFORE `POST /payinvoice`, and recovery
-//!    resolves it through `outgoingbyhash` (fact 3).
+//!    invoice), so — exactly like lnv2's deterministic attempt-0 operation id — the driver commits a
+//!    `PREPARED` row containing `(bolt11, payment_hash)` BEFORE `POST /payinvoice` (via
+//!    `prepare_pay`, in its authorising transaction), and recovery resolves it through
+//!    `outgoingbyhash` (fact 3). `pay(key)` READS that row and never creates one.
 //!  - **Crash before the POST lands** -> 404 -> the retry re-runs the whole preflight (INV-1
 //!    included) and pays. **Crash after it landed** -> the record is present -> adopt it, never a
 //!    second POST. **A transport error** is NOT proof the payment did not start (unlike lnv2's
@@ -102,21 +116,19 @@
 //!    cannot catch because it keys on the hash. So any path that can write `FAILED` over money that
 //!    already left pays the buyer twice.
 //!
-//!    `phoenixd_pay` lives in `phoenixd_index.db`, so a lost or restored index makes a key with a
-//!    real outbound payment look untouched. `PREPARED` and NO ROW are both resolved by an
-//!    `outgoingbyhash` probe before `start_pay` (the latter is lnrent-qvjz) — **except** on the
-//!    no-row [8A] exit, where a hash another live key owns short-circuits to `start_pay` unprobed.
-//!    That exit predates lnrent-qvjz. A stale `FAILED` is NOT probed, and no probe in `pay_inner`
-//!    can reach it: the Refunder decides on `PayStatus::Failed && expired` and never calls `pay` for
-//!    that key again. It does still call `payment_status_by_key` (`daemon/src/refund.rs:583`), which
-//!    is a pure DB read today — so making that read consult `outgoingbyhash` before answering
-//!    `Failed` is one shape the fix could take, and this layer is not the wrong place for it.
-//!    Tracked as
-//!    `lnrent-stale-failed-restore-double-pay-uxbd`; closing it needs the `FAILED` status itself to
-//!    carry evidence, which is a change above this layer. Anyone adding a route into `start_pay`
-//!    must probe the hash first.
+//!    `phoenixd_pay` now commits with the ledger row it correlates (ADR-0022), so "the index lost the
+//!    row" is no longer a reachable state — the only pay row `pay_inner` ever sees is one the driver
+//!    prepared, and it is resolved by an `outgoingbyhash` probe before `start_pay`. A key with NO row
+//!    is refused outright (the driver must prepare first). A stale `FAILED` from a RESTORED backup is
+//!    NOT probed, and no probe in `pay_inner` can reach it: the Refunder decides on
+//!    `PayStatus::Failed && expired` and never calls `pay` for that key again. It does still call
+//!    `payment_status_by_key`, which is a pure DB read — so making that read consult `outgoingbyhash`
+//!    before answering `Failed` is one shape the fix could take, and this layer is not the wrong
+//!    place for it. Tracked as `lnrent-stale-failed-restore-double-pay-uxbd`; closing it needs the
+//!    `FAILED` status itself to carry evidence, which is a change above this layer. Anyone adding a
+//!    route into `start_pay` must probe the hash first.
 //!
-//!    None of this makes restarting on a diverged index safe. Both exits of `Sweeper::drive`'s
+//!    None of this makes restarting on a rolled-back backup safe. Both exits of `Sweeper::drive`'s
 //!    not-started arm that refuse to send now share one probe of this backend by hash before they
 //!    may terminalize ([`PaymentBackend::outbound_status_by_ref`] via `Sweeper::resolve_or_park`,
 //!    `daemon/src/sweep.rs`): the expired intent (lnrent-7wbo) and the intent whose committed cap the
@@ -173,9 +185,8 @@
 //! move funds) are already worked out there to port.
 //!
 use std::collections::HashSet;
-use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -185,16 +196,16 @@ use tokio::sync::mpsc;
 
 use crate::alerts::{Alert, AlertDispatcher, AlertKind};
 use crate::backends::{
-    safe_phoenixd_version, BackendKind, Invoice, PayStatus, PaymentBackend, PaymentStatus,
-    PhoenixdProbe, PhoenixdReadinessError, Settlement, REDACTED_PHOENIXD_VERSION,
+    safe_phoenixd_version, BackendKind, Invoice, Issued, PayStatus, PaymentBackend, PaymentStatus,
+    PhoenixdProbe, PhoenixdReadinessError, Prepared, Settlement, REDACTED_PHOENIXD_VERSION,
 };
 use crate::clock::Clock;
+use crate::store::Store;
 
-/// The lnrent-owned sqlite index beside the operator state DB: the create-once
-/// `external_id -> invoice` receive map plus the `idempotency_key -> (bolt11, payment_hash)` pay map.
-/// phoenixd owns all the MONEY state (it is the wallet); this file holds only the correlations
-/// phoenixd cannot answer for us.
-const INDEX_DB_FILE: &str = "phoenixd_index.db";
+/// The PRE-ADR-0022 side file beside the state DB that held the two correlation maps. No longer
+/// opened by this backend: the boot-time legacy import (`legacy_import.rs`) folds it into
+/// `lnrent.sqlite` once and renames it `*.imported`; `backup.rs` still recognises it in a v2 backup.
+pub const LEGACY_INDEX_FILE: &str = "phoenixd_index.db";
 
 /// Bound on an ordinary phoenixd API round-trip (reads, invoice creation).
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -297,7 +308,10 @@ const STATUS_PREPARED: &str = "PREPARED";
 const STATUS_SUCCEEDED: &str = "SUCCEEDED";
 const STATUS_FAILED: &str = "FAILED";
 
-const INDEX_SCHEMA: &str = "\
+/// This backend's correlation tables, applied by `store::open` to `lnrent.sqlite` on every open
+/// (ADR-0022 "Schema, static, all of it"). `CREATE ... IF NOT EXISTS` throughout; a later change to
+/// any of these is a migration in `store::MIGRATIONS`, never a backend-private `ALTER`.
+pub const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS phoenixd_invoice (
     external_id   TEXT NOT NULL,
     invoice_id    TEXT PRIMARY KEY,
@@ -597,56 +611,34 @@ impl PhoenixdPayment {
     /// Test-only read of the durable first-sighting instant. The write happens before the
     /// alert-sink enabled check, and only a direct read proves that ordering.
     #[cfg(test)]
-    pub(crate) fn first_refusal_at_for_test(&self, invoice_id: &str) -> Option<i64> {
-        let conn = self.index.lock().unwrap();
-        conn.query_row(
-            "SELECT first_refusal_at FROM phoenixd_unbookable_settlement WHERE invoice_id = ?1",
-            rusqlite::params![invoice_id],
-            |r| r.get::<_, i64>(0),
-        )
-        .optional()
-        .expect("reading the timing row")
+    pub(crate) async fn first_refusal_at_for_test(&self, invoice_id: &str) -> Option<i64> {
+        let invoice_id = invoice_id.to_string();
+        self.store
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT first_refusal_at FROM phoenixd_unbookable_settlement WHERE invoice_id = ?1",
+                    rusqlite::params![invoice_id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?)
+            })
+            .await
+            .expect("reading the timing row")
     }
 }
 
-/// ONE subject for the whole condition, deliberately not one per invoice: the index and the state DB
-/// diverge as a UNIT (a lost or stale-restored `phoenixd_index.db`), every affected invoice carries
-/// the identical remedy, and catch-up re-observes each OPEN invoice every tick — so a per-invoice
-/// subject would put N copies of one message into the outbox that carries `provision.ready` and
-/// `billing.*`, every cooldown, forever (outbox rows are never reaped, `store.rs`).
-async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_id: &str) {
-    alert_unbookable(
-        alerts,
-        "index_diverged".to_string(),
-        // Kept deliberately under `MAX_ALERT_DETAIL_CHARS` with a REAL invoice id (73 chars:
-        // `phoenixd-` + a 64-hex payment hash) — the cap truncates from the tail, and the tail here
-        // is the "never recreate or expire an affected INVOICE" instruction (the invoice, not the
-        // wallet: an earlier wording left "it" attached to the wallet, which cannot be expired). `a_full_length_unbookable_detail_is_not_truncated`
-        // in the sibling test module is what holds that.
-        //
-        // This message carries NO `restore` command because there is no safe one. Deciding a
-        // backup is safe needs to know which refunds already went out, and lnrent's only record of
-        // that is `phoenixd_pay` in the index whose loss IS the incident — reasoning from the
-        // corrupted evidence. The phoenixd WALLET is also excluded from the backup by design
-        // (`backup.rs:27-34`), so a restore leaves a clean dedup map over payments phoenixd still
-        // holds. Three schemes for proving a restore safe were refuted across eight review passes
-        // on lnrent-ole, every one a double pay; repair TOOLING is lnrent-8scw.
-        format!(
-            "INDEX DIVERGENCE: invoice {invoice_id} absent from {INDEX_DB_FILE} — payment state \
-             UNKNOWN: lnrent can neither book nor expire it. ONE ALERT COVERS THEM ALL: every \
-             invoice whose index row is gone is affected, not only this one. REMEDY, IN THIS \
-             ORDER: run `lnrent --data-dir <this daemon's data dir> listing withdraw` FIRST, \
-             while the daemon is still up (it needs that daemon's socket; the flag defaults to \
-             ./data), THEN stop it — and do NOT restart it, and do NOT restore a \
-             backup. Either can pay a refund a SECOND time: the record of which refunds already \
-             paid lived in the lost index, while phoenixd keeps that history. Keep the data dir \
-             and phoenixd's history intact and settle the affected buyers out of band from \
-             phoenixd's own records. Full detail in the index-divergence section of \
-             docs/go-live.md. Leave phoenixd on its original wallet, and never recreate or expire \
-             an affected invoice."
-        ),
-    )
-    .await;
+/// A `phoenixd_invoice` row the books still reference is GONE. Under ADR-0022 the row commits in the
+/// same transaction as the `invoice` row it correlates and no code path deletes one, so this is a
+/// BUG in this daemon, not an operator incident: log at `error` and let the caller fail closed (every
+/// caller treats the `Err` as "defer, retry next tick"). The pre-ADR-0022 `index_diverged` operator
+/// condition and its runbook are gone with the side file that could produce it.
+fn log_missing_correlation(invoice_id: &str, seam: &str) {
+    tracing::error!(
+        invoice = %invoice_id,
+        seam,
+        "phoenixd_invoice row missing for an invoice the books hold — a correlation cannot be lost \
+         under ADR-0022 (it commits with the invoice row), so this is a daemon bug; failing closed"
+    );
 }
 
 /// Report a fee-credit refusal that has stood for [`UNBOOKABLE_SETTLEMENT_ALERT_S`], **or** that the
@@ -667,7 +659,7 @@ async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_i
 /// and it would have sent them to hand-reconcile a receipt funding still books. The remedy text is
 /// caller-independent for that reason; only the timing differs.
 ///
-/// ONE subject, like [`alert_index_divergence`] and for the same reason: the refusal is a WALLET-level
+/// ONE subject for the whole condition, deliberately not one per invoice: the refusal is a WALLET-level
 /// judgement, not a per-invoice one. phoenixd publishes no per-receipt fee-credit attribution, so
 /// ADR-0019 rejects at the wallet level on purpose ("wallet-level rejection is MAXIMAL precision"),
 /// which means N held-back receipts are N sightings of ONE condition with ONE remedy. A per-invoice
@@ -678,7 +670,7 @@ async fn alert_index_divergence(alerts: &Option<Arc<AlertDispatcher>>, invoice_i
 /// stays in the detail as the concrete example; the text says outright that it covers the rest.
 async fn alert_fee_credit_refusal(
     alerts: &Option<Arc<AlertDispatcher>>,
-    index: &Mutex<Connection>,
+    store: &Store,
     refusal: &FeeCreditRefusal,
     now: i64,
 ) {
@@ -698,7 +690,13 @@ async fn alert_fee_credit_refusal(
     // back to alerting IMMEDIATELY: without a first-observation instant there is no threshold to
     // wait out, and the cooldown still bounds the volume. Speaking early is the safe direction here;
     // silence is not.
-    let timing = match idx_record_fee_credit_refusal(index, &refusal.invoice_id, now) {
+    let timing = {
+        let invoice_id = refusal.invoice_id.clone();
+        store
+            .transaction(move |tx| idx_record_fee_credit_refusal(tx, &invoice_id, now))
+            .await
+    };
+    let timing = match timing {
         Ok(timing) => Some(timing),
         Err(e) => {
             tracing::warn!(
@@ -1069,21 +1067,29 @@ fn parse_dest(bolt11: &str) -> Result<ParsedDest> {
 // The backend
 // ---------------------------------------------------------------------------------------------------
 
-/// The phoenixd payment backend: the HTTP operations seam, the lnrent-owned correlation index, the
-/// registered settlement sender, and a clock for expiry windows and terminal stamps.
+/// The phoenixd payment backend: the HTTP operations seam, the shared state-DB handle its
+/// correlation tables live in (ADR-0022), the registered settlement sender, and a clock for expiry
+/// windows and terminal stamps.
 pub struct PhoenixdPayment {
     ops: Arc<dyn PhoenixdOps>,
-    index: Arc<Mutex<Connection>>,
+    /// The ONE store every other reader and writer uses (ADR-0001 sole writer). Reads and this
+    /// backend's own status transitions go through it; row CREATION rides the caller's transaction.
+    store: Store,
     clock: Arc<dyn Clock>,
     /// The trampoline schedule INV-1 reserves against, and the phoenixd release it was verified on
     /// (ADR-0019: a version-verified default the operator can replace for their own release).
     fee_schedule: FeeSchedule,
-    /// Serializes `create_invoice`'s check -> create -> insert so two concurrent same-`external_id`
-    /// callers cannot both create a phoenixd invoice.
-    create_lock: tokio::sync::Mutex<()>,
-    /// Serializes the pay check -> POST -> record critical section so two concurrent same-key callers
-    /// cannot both reach `payinvoice` before either recorded its `PREPARED` witness. Bounded: every
-    /// call it spans carries an explicit HTTP timeout ([`HTTP_TIMEOUT`] / [`PAY_TIMEOUT`]).
+    /// Serializes `issue_invoice`'s check -> create -> persist so two concurrent same-`external_id`
+    /// callers cannot both create a phoenixd invoice. `Arc` so the OWNED guard can leave this struct
+    /// as `Issued::lease`: the store actor holds it through the caller's COMMIT (ADR-0022), which is
+    /// what makes the second caller find the committed row instead of a still-invisible one.
+    create_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes the pay critical section. Taken TWICE in sequence per payment (ADR-0022): once by
+    /// `prepare_pay`, across the cross-key hash check and the row creation, held as `Prepared::lease`
+    /// until the driver's authorising transaction commits; once by `pay(key)`, across
+    /// `outgoingbyhash` -> `payinvoice` -> the terminal write's commit, so two concurrent retries of
+    /// one key that both read `PREPARED` cannot both POST. Bounded: every call it spans carries an
+    /// explicit HTTP timeout ([`HTTP_TIMEOUT`] / [`PAY_TIMEOUT`]).
     ///
     /// Unlike lnv2 — which funds under the lock and then awaits the terminal WITHOUT it — phoenixd's
     /// `payinvoice` is a single synchronous call that both starts and completes the payment, so the
@@ -1092,7 +1098,7 @@ pub struct PhoenixdPayment {
     /// That is throughput, not correctness, and it is what lnrent-26b already assumes the backend's
     /// pay lock provides; a per-key lock registry would only be worth its mechanism if refund volume
     /// ever made serial pays the bottleneck.
-    pay_start_lock: tokio::sync::Mutex<()>,
+    pay_start_lock: Arc<tokio::sync::Mutex<()>>,
     /// Optional durable operator-alert sink; no money decision reads it.
     alerts: Option<Arc<AlertDispatcher>>,
 }
@@ -1100,41 +1106,36 @@ pub struct PhoenixdPayment {
 impl PhoenixdPayment {
     /// Open the backend against an operator-managed phoenixd at `url` (already transport-validated by
     /// `config::validate_phoenixd_url`: https, or http to loopback only), authenticating with
-    /// `api_password`. Creates/opens the lnrent-owned index under the data dir (0600, symlink-refused).
-    /// Does NOT contact phoenixd — a node that is momentarily down must not wedge daemon startup; the
-    /// readiness seams (`backend_ready` / `refund_gateway_ready`) report reachability instead.
+    /// `api_password`. `store` is the daemon's already-open state DB, whose `phoenixd_*` tables the
+    /// store applied on open (ADR-0022) — this backend opens no file of its own. Does NOT contact
+    /// phoenixd — a node that is momentarily down must not wedge daemon startup; the readiness seams
+    /// (`backend_ready` / `refund_gateway_ready`) report reachability instead.
     pub fn open(
         url: &str,
         api_password: &str,
         fee_schedule: FeeSchedule,
-        data_dir: &Path,
+        store: Store,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
         let ops = real::RealPhoenixdOps::new(url, api_password)?;
-        let index_path = data_dir.join(INDEX_DB_FILE);
-        crate::fedimint_paths::prepare_private_file(&index_path, "phoenixd lnrent index db")
-            .context("preparing the phoenixd index db path")?;
-        let conn = Connection::open(&index_path).context("opening phoenixd index db")?;
-        conn.execute_batch(INDEX_SCHEMA)
-            .context("initialising phoenixd index schema")?;
-        Ok(Self::with_ops(Arc::new(ops), conn, clock, fee_schedule))
+        Ok(Self::with_ops(Arc::new(ops), store, clock, fee_schedule))
     }
 
-    /// Assemble a backend around an already-built ops seam + index connection (shared by the real
+    /// Assemble a backend around an already-built ops seam + store handle (shared by the real
     /// constructor and the tests).
     fn with_ops(
         ops: Arc<dyn PhoenixdOps>,
-        index: Connection,
+        store: Store,
         clock: Arc<dyn Clock>,
         fee_schedule: FeeSchedule,
     ) -> Self {
         Self {
             ops,
-            index: Arc::new(Mutex::new(index)),
+            store,
             clock,
             fee_schedule,
-            create_lock: tokio::sync::Mutex::new(()),
-            pay_start_lock: tokio::sync::Mutex::new(()),
+            create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pay_start_lock: Arc::new(tokio::sync::Mutex::new(())),
             alerts: None,
         }
     }
@@ -1212,7 +1213,12 @@ impl PhoenixdPayment {
         &self,
         invoice_id: &str,
     ) -> Result<Option<(InvoiceRow, Vec<PhoenixdIncoming>)>> {
-        let Some(row) = idx_get_by_invoice_id(&self.index, invoice_id)? else {
+        let id = invoice_id.to_string();
+        let Some(row) = self
+            .store
+            .read(move |c| idx_get_by_invoice_id(c, &id))
+            .await?
+        else {
             return Ok(None);
         };
         let records = self
@@ -1221,6 +1227,171 @@ impl PhoenixdPayment {
             .await
             .context("looking up the phoenixd incoming payment for an lnrent invoice")?;
         Ok(Some((row, records)))
+    }
+
+    /// Decide WHICH invoice `issue_invoice` hands back for `external_id`: the cached row (reused,
+    /// or its local window refreshed while phoenixd still reports it payable), a phoenixd-side
+    /// orphan recovered by `externalId` (crash-window idempotency), or a freshly created one. Pure
+    /// decision + phoenixd calls: it writes NOTHING. The returned invoice is exactly the row
+    /// `Issued::persist` upserts in the caller's transaction (ADR-0022), which is also what makes
+    /// the local-window refresh durable only together with the caller's own refresh of the
+    /// `invoice` row.
+    async fn resolve_invoice(
+        &self,
+        cached: Option<Invoice>,
+        amount_sat: u64,
+        memo: &str,
+        expiry_s: u32,
+        external_id: &str,
+    ) -> Result<Invoice> {
+        // Crash-window idempotency, and the reason this backend needs no receive oplog scan: phoenixd
+        // INDEXES incoming payments by `externalId`, so an invoice created by a previous attempt that
+        // died before the local row was written is recoverable — unlike lnv2, where each receive
+        // draws a fresh tweak and cannot be looked up by our key at all.
+        let existing = self
+            .ops
+            .incoming_by_external_id(external_id)
+            .await
+            .context("checking phoenixd for an existing invoice for this external id")?;
+        let now = self.clock.now();
+        let expires_at = now + i64::from(expiry_s);
+        if let Some(inv) = cached {
+            let Some(record) = find_incoming_by_hash(&existing, &inv.payment_hash) else {
+                bail!(
+                    "phoenixd no longer returns the cached invoice for external id {external_id} \
+                     (hash {}); refusing to create a second invoice while the first payment state \
+                     is unknown",
+                    inv.payment_hash
+                );
+            };
+            if record.requested_sat != amount_sat {
+                bail!(
+                    "phoenixd cached invoice for external id {external_id} requests {} sat, but \
+                     {amount_sat} sat was asked for; refusing to reuse or replace it",
+                    record.requested_sat
+                );
+            }
+            if record.is_paid {
+                // Preserve the ORIGINAL local expiry: completedAt determines whether capture treats
+                // this payment as timely or late, and extending the window would change that fact.
+                return Ok(inv);
+            }
+            if !record.is_expired {
+                // phoenixd still reports the bolt11 payable, so a replay may safely reopen lnrent's
+                // local window around this SAME invoice; creating a second live invoice would make a
+                // payment racing this check ambiguous. Since `expirySeconds` now carries lnrent's
+                // window down, the two windows end at the same instant (phoenixd's a hair later — it
+                // counts from ITS create time), so this branch is the narrow skew case rather than
+                // the routine one it was when phoenixd kept its own 24 h default. The reopened local
+                // window can therefore outlast the bolt11: the cost is a reservation held until it
+                // lapses, never a payment lnrent fails to see, and it is preferable to minting a
+                // second invoice for an id phoenixd still says is payable.
+                if now < inv.expires_at {
+                    return Ok(inv);
+                }
+                let refreshed = Invoice { expires_at, ..inv };
+                return Ok(refreshed);
+            }
+            // The exact cached invoice is definitively expired and unpaid at phoenixd. It cannot
+            // move money now, so a successor may be created. The old invoice-id row remains in the
+            // index so any still-OPEN state-store row can continue to resolve and expire normally.
+        }
+        if let Some(record) = select_reusable_incoming(&existing) {
+            if record.requested_sat != amount_sat {
+                // The external id is deterministic per invoice class (§6.6), so a stored invoice for a
+                // DIFFERENT amount means lnrent and phoenixd disagree about this order. Minting a
+                // second invoice under one external id would make settlement ambiguous, and reusing
+                // one for the wrong amount would misbill — fail closed for the operator instead.
+                bail!(
+                    "phoenixd already holds an invoice for external id {external_id} requesting \
+                     {} sat, but {amount_sat} sat was asked for; refusing to reuse or duplicate it",
+                    record.requested_sat
+                );
+            }
+            // A PAID record's window is HISTORY, not a window to reopen: the cached arm above
+            // preserves the original precisely because the instant capture judges the settlement
+            // against (timely vs late) must not move. There is no local row to preserve on THIS path
+            // (it is the crash-window recovery one), so the original window is recovered from
+            // phoenixd's own `expiresAt` when the node reports one, and only a node that does not
+            // falls back to a fresh window. An UNPAID record keeps the fresh window — see the cached
+            // arm's note on why reopening lnrent's window around a still-payable bolt11 is the safe
+            // direction there.
+            let expires_at = match (record.is_paid, epoch_secs_from_ms(record.expires_at_ms)) {
+                (true, Some(original)) => original,
+                _ => expires_at,
+            };
+            let inv = Invoice {
+                id: invoice_id_for(&record.payment_hash),
+                external_id: external_id.to_string(),
+                backend_invoice_id: record.payment_hash.clone(),
+                payment_hash: record.payment_hash.clone(),
+                bolt11: record.bolt11.clone(),
+                amount_sat: record.requested_sat,
+                expires_at,
+            };
+            return Ok(inv);
+        }
+
+        // lnrent's own window is pushed DOWN to phoenixd as `expirySeconds` (MEASURED honoured on the
+        // live 0.9.0 node; omitting it would leave the bolt11 payable for phoenixd's 24 h default,
+        // far past the reservation lnrent released). `expires_at` still stores that window locally
+        // because it is what `lookup` and reconcile/reservation release key on, and because lnrent
+        // must keep judging the invoice by its OWN clock rather than by a remote flag.
+        let created = self
+            .ops
+            .create_invoice(amount_sat, memo, external_id, expiry_s)
+            .await
+            .context("creating a phoenixd invoice")?;
+        if created.amount_sat != amount_sat {
+            bail!(
+                "phoenixd createinvoice returned amountSat {}, but lnrent requested {amount_sat}; \
+                 refusing to persist or bill the mismatched invoice",
+                created.amount_sat
+            );
+        }
+        // The JSON side-fields are NOT authoritative on their own — the buyer pays the `serialized`
+        // BOLT11, and everything downstream keys on `paymentHash`. A phoenixd (or a terminating
+        // TLS proxy, which the remote deployment shape explicitly allows) returning a bolt11 that
+        // encodes a DIFFERENT hash would have lnrent index a hash nobody can ever pay: the buyer's
+        // payment would settle against the bolt11's real hash while `lookup_settlement` searched for
+        // the indexed one, so the settlement is permanently unobservable — buyer paid, no service,
+        // no refund. A different encoded AMOUNT misbills the buyer. Parse the invoice lnrent is
+        // about to hand out and require it to agree with the fields lnrent is about to persist.
+        let parsed = lightning_invoice::Bolt11Invoice::from_str(&created.bolt11)
+            .context("parsing the bolt11 phoenixd returned from createinvoice")?;
+        if !parsed
+            .payment_hash()
+            .to_string()
+            .eq_ignore_ascii_case(&created.payment_hash)
+        {
+            bail!(
+                "phoenixd createinvoice returned paymentHash {} but a bolt11 encoding {}; refusing \
+                 to persist an invoice whose settlement lnrent could never observe",
+                created.payment_hash,
+                parsed.payment_hash()
+            );
+        }
+        match parsed.amount_milli_satoshis() {
+            Some(msat) if msat == amount_sat.saturating_mul(1000) => {}
+            other => bail!(
+                "phoenixd createinvoice returned a bolt11 encoding {:?} msat, but lnrent requested \
+                 {amount_sat} sat; refusing to bill the buyer a mismatched amount",
+                other
+            ),
+        }
+        let inv = Invoice {
+            id: invoice_id_for(&created.payment_hash),
+            external_id: external_id.to_string(),
+            // phoenixd has no invoice id distinct from the payment hash.
+            backend_invoice_id: created.payment_hash.clone(),
+            payment_hash: created.payment_hash,
+            bolt11: created.bolt11,
+            amount_sat: created.amount_sat,
+            expires_at,
+        };
+        // The create-once anchor is the CALLER's commit of `Issued::persist` beside the invoice row
+        // (ADR-0022): the buyer never sees a bolt11 whose correlation is not durable with its order.
+        Ok(inv)
     }
 
     /// The pay/refund core. Idempotent on `idempotency_key` via the durable `phoenixd_pay` map,
@@ -1235,7 +1406,7 @@ impl PhoenixdPayment {
         // The whole critical section is serialized: unlike lnv2 there is no second dedup layer we
         // control, so two concurrent callers must never both reach `payinvoice` for one key.
         let _guard = self.pay_start_lock.lock().await;
-        match pay_get(&self.index, idempotency_key)? {
+        match self.pay_row(idempotency_key).await? {
             Some(row) if row.status == STATUS_SUCCEEDED => {
                 // Idempotent: never re-pay. The stored phoenixd payment id IS the backend payment id
                 // every caller keys on — `payment_status` looks a row up `WHERE payment_id = ?`, so
@@ -1251,9 +1422,27 @@ impl PhoenixdPayment {
             }
             Some(row) if row.status == STATUS_PREPARED => {
                 // Crash / ambiguity recovery. `outgoingbyhash` is the sole authority (fact 3).
-                match self.ops.outgoing_by_hash(&row.payment_hash).await? {
+                // Validate the echoed hash BEFORE classifying, so it protects every arm below: a
+                // record naming another hash is evidence about neither this payment's success nor
+                // its failure, and adopting it would credit someone else's payment to this key.
+                // Case-INSENSITIVE, since phoenixd's echo casing is unmeasured; the row keeps OUR
+                // canonical lowercase hash, which is what [8A]'s case-sensitive SQL `=` reads.
+                let probed = match self.ops.outgoing_by_hash(&row.payment_hash).await? {
+                    Some(record) if !record.payment_hash.eq_ignore_ascii_case(&row.payment_hash) => {
+                        bail!(
+                            "phoenixd returned an outgoing record for hash {} when asked about {}; \
+                             refusing to classify key {idempotency_key} on a record that is not \
+                             about its destination",
+                            record.payment_hash,
+                            row.payment_hash
+                        )
+                    }
+                    other => other,
+                };
+                match probed {
                     Some(record) if record.is_paid => {
-                        self.adopt_paid(idempotency_key, &record, amount_sat, cap)
+                        self.adopt_paid(idempotency_key, &record, &row.payment_hash, amount_sat, cap)
+                            .await
                     }
                     // An unpaid record leaves the key `Pending`: the Refunder re-awaits it without
                     // ever re-quoting or minting a new payment hash, and a permanently ambiguous one
@@ -1354,112 +1543,25 @@ impl PhoenixdPayment {
                 "phoenixd pay key {idempotency_key} has invalid persisted status {:?}",
                 row.status
             ),
-            // NO ROW (lnrent-qvjz). Either an ordinary first attempt, or an index loss — and local
-            // state cannot tell them apart, because `phoenixd_pay` lives in the very map the incident
-            // loses while the money it described left from phoenixd's own wallet, whose history
-            // survives independently (`daemon/src/backup.rs:27-34`). "No row" is the absence of
-            // evidence. Left unprobed it writes a false `FAILED`; see the module header for why that
-            // is a double pay rather than a retry.
-            //
-            // Why this is NOT the attribution the `PREPARED` arm above refuses. That arm must prove a
-            // record belongs to THIS attempt in order to UNLOCK a re-POST, and every scheme for it
-            // was refuted because a wrong answer double pays. This arm only ever refuses, or adopts a
-            // record phoenixd itself reports PAID for the hash we were about to send to — which the
-            // header already documents as ours when absent from the local map. It also asks phoenixd
-            // rather than reasoning from lnrent's own ledger, which is why the second refuted
-            // scheme's failure mode does not apply.
-            //
-            // `require_prepared_node` is deliberately NOT reused: it bails when a key has no recorded
-            // node identity, which is true of every fresh key, so it would refuse every first
-            // payment. The residual it guards — the wallet swapped under us — stays open here, as the
-            // header already accepts for an adopted foreign payment.
-            None => {
-                let dest = parse_dest(bolt11)?;
-                // [8A] first, and not re-implemented here: a hash some OTHER live key owns is
-                // refused by `start_pay`, which never funds. Refusing here instead would leave the
-                // key `Unknown` and give one path two behaviours. This exit reaches `start_pay`
-                // UNPROBED — the residual the header names.
-                if pay_other_key_for_hash(&self.index, &dest.payment_hash, idempotency_key)?
-                    .is_some()
-                {
-                    return self
-                        .start_pay(bolt11, amount_sat, idempotency_key, cap)
-                        .await;
-                }
-                // Validate the hash BEFORE classifying, so it protects the refuse path too: a
-                // record naming another hash would otherwise report OUR destination as unresolved
-                // and send the operator into withdraw/stop/settle-by-hand over someone else's
-                // invoice.
-                //
-                // Case-INSENSITIVE, like `reusable_incoming` and unlike the pay-path neighbour
-                // below: lnrent has NOT measured which case `outgoingbyhash` echoes, and a spurious
-                // mismatch would bail every drive forever and strand a refund the wallet already
-                // paid, while a spurious match is caught by [8A] and the adopt path's accounting.
-                let probed = match self.ops.outgoing_by_hash(&dest.payment_hash).await? {
-                    Some(record)
-                        if !record
-                            .payment_hash
-                            .eq_ignore_ascii_case(&dest.payment_hash) =>
-                    {
-                        bail!(
-                        "phoenixd returned an outgoing record for hash {} when asked about {}; \
-                         refusing to classify key {idempotency_key} on a record that is not about \
-                         its destination",
-                        record.payment_hash,
-                        dest.payment_hash
-                        )
-                    }
-                    other => other,
-                };
-                match probed {
-                    Some(record) if record.is_paid => self.adopt_paid_without_row(
-                        idempotency_key,
-                        bolt11,
-                        &dest.payment_hash,
-                        &record,
-                        amount_sat,
-                        cap,
-                    ),
-                    // Bind the record's shape, for the same reason the PREPARED arm does: an operator
-                    // reading a stuck refund cannot see this file, and calling an in-flight payment
-                    // "failed" would state something false about it.
-                    Some(record) => bail!(
-                        "phoenixd has an outgoing record for hash {} that it does not report as \
-                         paid ({}), but lnrent holds no local payment row for key \
-                         {idempotency_key} — the record and the bookkeeping that would explain it \
-                         disagree, which is the shape of a lost or restored {INDEX_DB_FILE}. \
-                         lnrent refuses to send this destination again and records NO failure for \
-                         it: a recorded failure would let the refund re-resolve to a NEW invoice \
-                         and pay a second time, which phoenixd's same-invoice dedup could not \
-                         catch. For a REFUND this surfaces as a RefundStuck operator alert. For a \
-                         SWEEP the next drive treats the intent as never started and, once the \
-                         stored invoice has expired, asks this same endpoint by hash before it \
-                         decides anything (lnrent-sweep-failed-ledger-lie-7wbo). This unresolved \
-                         record leaves the sweep PENDING with its cap reserved and eventually \
-                         surfaces as SweepStuck. \
-                         Either way settling it needs a human who can read the wallet's own \
-                         payment list; do not pay this destination out of band while a payment for \
-                         it may still be in flight.",
-                        dest.payment_hash,
-                        if record.completed_at_ms.is_none() {
-                            "and carries no completion time, which on the release lnrent measured \
-                             is the shape of a payment still IN FLIGHT"
-                        } else {
-                            "but does carry a completion time, which on the release lnrent measured \
-                             means it failed — though phoenixd returns only one record per hash, so \
-                             that failure cannot be proven to be this attempt"
-                        }
-                    ),
-                    // A clean 404 proves this wallet has no payment for this hash, so sending it now
-                    // cannot be a second payment AT THIS WALLET. `start_pay`'s precondition is
-                    // genuinely met, expiry refusals included.
-                    None => {
-                        self.start_pay(bolt11, amount_sat, idempotency_key, cap)
-                            .await
-                    }
-                }
-            }
+            // NO ROW. Under ADR-0022 `pay(key)` READS the row the driver committed via `prepare_pay`
+            // in its authorising transaction and never creates one, so a missing row here is a
+            // caller that skipped `prepare_pay` — a bug — not the "lost index" incident the
+            // pre-ADR-0022 no-row arm (lnrent-qvjz) existed to probe. That incident is unreachable
+            // now (the row commits with the ledger row) and its legacy shape is fenced by the
+            // import's `migration_unverified_at` stamp instead. Refuse without touching phoenixd; the
+            // key stays `Unknown`, which the drivers re-await rather than terminalize.
+            None => bail!(
+                "phoenixd pay key {idempotency_key} has no PREPARED row; the driver must run \
+                 prepare_pay inside its authorising transaction before pay (ADR-0022) — refusing to \
+                 send"
+            ),
         }
+    }
+
+    /// The `phoenixd_pay` row for `key`, read through the store.
+    async fn pay_row(&self, key: &str) -> Result<Option<PayRow>> {
+        let key = key.to_string();
+        self.store.read(move |c| pay_get(c, &key)).await
     }
 
     /// Fund a NEW phoenixd payment for `idempotency_key`.
@@ -1497,17 +1599,19 @@ impl PhoenixdPayment {
         // rejection after PREPARED would become ambiguous again. Refuse it definitively before
         // writing another recovery witness or issuing a second POST.
         if self.clock.now() >= dest.expires_at {
-            return self.refuse(
-                idempotency_key,
-                bolt11,
-                &dest.payment_hash,
-                format!(
-                    "phoenixd refund pay refused for key {idempotency_key}: destination invoice \
-                     expired at {} (now {})",
-                    dest.expires_at,
-                    self.clock.now()
-                ),
-            );
+            return self
+                .refuse(
+                    idempotency_key,
+                    bolt11,
+                    &dest.payment_hash,
+                    format!(
+                        "phoenixd refund pay refused for key {idempotency_key}: destination invoice \
+                         expired at {} (now {})",
+                        dest.expires_at,
+                        self.clock.now()
+                    ),
+                )
+                .await;
         }
 
         // Structural amount preflight. `payinvoice` sends the invoice's ENCODED amount, but the cap
@@ -1518,35 +1622,42 @@ impl PhoenixdPayment {
         match dest.amount_msat {
             Some(invoice_msat) if u128::from(invoice_msat) == payout_msat => {}
             Some(invoice_msat) => {
-                return self.refuse(
-                    idempotency_key,
-                    bolt11,
-                    &dest.payment_hash,
-                    format!(
-                        "phoenixd refund pay refused for key {idempotency_key}: invoice amount \
-                         {invoice_msat} msat != owed {amount_sat} sat ({payout_msat} msat)"
-                    ),
-                )
+                return self
+                    .refuse(
+                        idempotency_key,
+                        bolt11,
+                        &dest.payment_hash,
+                        format!(
+                            "phoenixd refund pay refused for key {idempotency_key}: invoice amount \
+                             {invoice_msat} msat != owed {amount_sat} sat ({payout_msat} msat)"
+                        ),
+                    )
+                    .await
             }
             None => {
-                return self.refuse(
-                    idempotency_key,
-                    bolt11,
-                    &dest.payment_hash,
-                    format!(
-                        "phoenixd refund pay refused for key {idempotency_key}: the destination \
-                         invoice encodes no amount, and the verified payinvoice form cannot bound \
-                         what an amountless payment would send"
-                    ),
-                )
+                return self
+                    .refuse(
+                        idempotency_key,
+                        bolt11,
+                        &dest.payment_hash,
+                        format!(
+                            "phoenixd refund pay refused for key {idempotency_key}: the destination \
+                             invoice encodes no amount, and the verified payinvoice form cannot bound \
+                             what an amountless payment would send"
+                        ),
+                    )
+                    .await
             }
         }
 
         // [8A] cross-order guard: phoenixd dedups by payment hash node-wide, so paying a bolt11 that
         // ANOTHER key already owns would let us adopt someone else's payment as this refund's success
-        // — a silent under-refund. Refuse before spending anything.
-        if let Some(other_key) =
-            pay_other_key_for_hash(&self.index, &dest.payment_hash, idempotency_key)?
+        // — a silent under-refund. Refuse before spending anything. `prepare_pay` already ran this
+        // check under the lease; it is repeated here because the pay lock is a SEPARATE acquisition
+        // and the map can have moved in between.
+        if let Some(other_key) = self
+            .other_key_for_hash(&dest.payment_hash, idempotency_key)
+            .await?
         {
             tracing::error!(
                 key = idempotency_key,
@@ -1555,15 +1666,17 @@ impl PhoenixdPayment {
                  ([8A] cross-order same-invoice collision) — refusing to pay so we can never credit \
                  one real payment to two lnrent refunds"
             );
-            return self.refuse(
-                idempotency_key,
-                bolt11,
-                &dest.payment_hash,
-                format!(
-                    "phoenixd refund pay refused for key {idempotency_key}: its destination invoice \
-                     is already owned by idempotency key {other_key}"
-                ),
-            );
+            return self
+                .refuse(
+                    idempotency_key,
+                    bolt11,
+                    &dest.payment_hash,
+                    format!(
+                        "phoenixd refund pay refused for key {idempotency_key}: its destination \
+                         invoice is already owned by idempotency key {other_key}"
+                    ),
+                )
+                .await;
         }
 
         // INV-1: the total outlay (payout + the RESERVED trampoline fee, since phoenixd offers no
@@ -1573,35 +1686,42 @@ impl PhoenixdPayment {
             let reserve_msat = self.fee_schedule.fee_msat(payout_msat);
             let outlay_msat = payout_msat.saturating_add(reserve_msat);
             if outlay_msat > ceiling_msat {
-                return self.refuse(
-                    idempotency_key,
-                    bolt11,
-                    &dest.payment_hash,
-                    format!(
-                        "phoenixd refund pay refused for key {idempotency_key}: payout {amount_sat} \
-                         sat plus the reserved trampoline fee ({reserve_msat} msat) is \
-                         {outlay_msat} msat, exceeding the INV-1 cap ({ceiling_msat} msat)"
-                    ),
-                );
+                return self
+                    .refuse(
+                        idempotency_key,
+                        bolt11,
+                        &dest.payment_hash,
+                        format!(
+                            "phoenixd refund pay refused for key {idempotency_key}: payout \
+                             {amount_sat} sat plus the reserved trampoline fee ({reserve_msat} \
+                             msat) is {outlay_msat} msat, exceeding the INV-1 cap ({ceiling_msat} \
+                             msat)"
+                        ),
+                    )
+                    .await;
             }
         }
 
         // The reserve above is safe only for the live-verified 0.9.0 fee schedule. Probe immediately
-        // before the durable intent so a mismatch or probe error leaves neither PREPARED nor a
+        // before the durable intent so a mismatch or probe error leaves the row as it was and no
         // payinvoice POST behind. The same answer carries the node IDENTITY the witness is stamped
         // with, so recovery can tell "this node never paid it" from "a different node never paid it".
         let node = self.require_supported_version().await?;
 
-        // Every refusal is behind us: commit the recovery witness, then POST. A crash between the two
-        // leaves no row (Unknown -> the next drive re-runs this whole preflight); a crash after it
-        // leaves the witness `outgoingbyhash` resolves.
-        pay_upsert_prepared(
-            &self.index,
-            idempotency_key,
-            bolt11,
-            &dest.payment_hash,
-            &node.node_id,
-        )?;
+        // Every refusal is behind us: re-arm the recovery witness on the EXISTING row (the driver
+        // created it via `prepare_pay`; this is a status transition, CAS on not-SUCCEEDED), then
+        // POST. A crash after it leaves the witness `outgoingbyhash` resolves.
+        {
+            let (key, b11, hash, node_id) = (
+                idempotency_key.to_string(),
+                bolt11.to_string(),
+                dest.payment_hash.clone(),
+                node.node_id.clone(),
+            );
+            self.store
+                .transaction(move |tx| pay_upsert_prepared(tx, &key, &b11, &hash, &node_id))
+                .await?;
+        }
 
         match self.ops.pay_invoice(bolt11).await {
             Ok(PayAttempt::Paid {
@@ -1618,13 +1738,8 @@ impl PhoenixdPayment {
                         dest.payment_hash
                     );
                 }
-                pay_mark_succeeded(
-                    &self.index,
-                    idempotency_key,
-                    &dest.payment_hash,
-                    Some(&payment_id),
-                    self.clock.now(),
-                )?;
+                self.mark_succeeded(idempotency_key, &dest.payment_hash, &payment_id)
+                    .await?;
                 self.audit_inv1(idempotency_key, &dest.payment_hash, payout_msat, cap)
                     .await;
                 Ok(payment_id)
@@ -1644,7 +1759,8 @@ impl PhoenixdPayment {
                 );
                 match self.ops.outgoing_by_hash(&dest.payment_hash).await {
                     Ok(Some(record)) if record.is_paid => {
-                        self.adopt_paid(idempotency_key, &record, amount_sat, cap)
+                        self.adopt_paid(idempotency_key, &record, &dest.payment_hash, amount_sat, cap)
+                            .await
                     }
                     // No paid record: nothing moved for this hash, but phoenixd also gave no proof
                     // that it never will. Stay PREPARED (Pending) either way so the next drive
@@ -1705,88 +1821,61 @@ impl PhoenixdPayment {
     ///
     /// "Advance to a fresh invoice generation" is the hazard — see the module header, WHY A FALSE
     /// `FAILED` IS A DOUBLE PAY. Never call this on a key whose hash the probe has not cleared.
-    fn refuse(
+    async fn refuse(
         &self,
         idempotency_key: &str,
         bolt11: &str,
         payment_hash: &str,
         message: String,
     ) -> Result<String> {
-        pay_upsert_failed(
-            &self.index,
-            idempotency_key,
-            bolt11,
-            payment_hash,
+        let (key, b11, hash, now) = (
+            idempotency_key.to_string(),
+            bolt11.to_string(),
+            payment_hash.to_string(),
             self.clock.now(),
-        )?;
+        );
+        self.store
+            .transaction(move |tx| pay_upsert_failed(tx, &key, &b11, &hash, now))
+            .await?;
         bail!(message)
     }
 
-    /// Bind an EXISTING paid phoenixd payment to our key (crash recovery, or phoenixd's own dedup of
-    /// a bolt11 we already POSTed). Never starts a payment.
-    fn adopt_paid(
-        &self,
-        idempotency_key: &str,
-        record: &PhoenixdOutgoing,
-        amount_sat: u64,
-        cap: PayCap,
-    ) -> Result<String> {
-        pay_mark_succeeded(
-            &self.index,
-            idempotency_key,
-            &record.payment_hash,
-            Some(&record.payment_id),
+    /// Terminal SUCCESS on the row for `key`, through the store (CAS on the payment hash).
+    async fn mark_succeeded(&self, key: &str, payment_hash: &str, payment_id: &str) -> Result<()> {
+        let (key, hash, pid, now) = (
+            key.to_string(),
+            payment_hash.to_string(),
+            payment_id.to_string(),
             self.clock.now(),
-        )?;
-        log_inv1_overrun(
-            idempotency_key,
-            sat_to_msat(amount_sat),
-            record.fees_msat,
-            cap,
         );
-        Ok(record.payment_id.clone())
+        self.store
+            .transaction(move |tx| pay_mark_succeeded(tx, &key, &hash, Some(&pid), now))
+            .await
     }
 
-    /// Adopt a paid record for a key that has NO local row (lnrent-qvjz).
-    ///
-    /// [`Self::adopt_paid`] cannot serve this case. Its CAS updates an existing `PREPARED` witness,
-    /// and a missing witness is precisely what an index loss leaves behind — so it fails closed on
-    /// the one shape this arm exists to handle. The terminal row is inserted directly, never via
-    /// `PREPARED`, which would transiently name a hash recovery could adopt (see the ordering note
-    /// in [`Self::start_pay`]).
-    ///
-    /// Both protections the vanished row would have supplied live at the CALL SITE and are NOT
-    /// duplicated here: `pay_inner`'s no-row arm bails on a hash mismatch (what the CAS did through
-    /// `WHERE payment_hash = ?`) and hands an [8A] collision to `start_pay`, all under
-    /// `pay_start_lock`. A copy here could never fire, and a guard that cannot fire is not a guard.
-    ///
-    /// `canonical_hash` is the hash WE parsed from the bolt11, and it is what gets stored — never
-    /// `record.payment_hash`. The two are equal only up to ASCII case (the probe compares them
-    /// case-insensitively, since phoenixd's echo case is unmeasured), and storing phoenixd's casing
-    /// would be a money bug: `pay_other_key_for_hash` matches with SQLite `=`, which IS
-    /// case-sensitive, so an upper-case row would be invisible to [8A] and a second key on the same
-    /// bolt11 could adopt the same payment as its own success.
-    ///
-    /// `node_id` stays NULL. This attempt was never prepared against a known wallet, and the schema
-    /// already defines NULL as "unknown identity, which recovery treats as unproven". Recording
-    /// whichever wallet happens to answer now would be writing a guess down as a fact.
-    fn adopt_paid_without_row(
+    /// The FIRST other key holding `payment_hash` in a non-`FAILED` state ([8A]), through the store.
+    async fn other_key_for_hash(&self, payment_hash: &str, our_key: &str) -> Result<Option<String>> {
+        let (hash, key) = (payment_hash.to_string(), our_key.to_string());
+        self.store
+            .read(move |c| pay_other_key_for_hash(c, &hash, &key))
+            .await
+    }
+
+    /// Bind an EXISTING paid phoenixd payment to our key (crash recovery, or phoenixd's own dedup of
+    /// a bolt11 we already POSTed). Never starts a payment. `canonical_hash` is the hash WE parsed
+    /// from the bolt11 (the row's), never `record.payment_hash`: the two are equal only up to ASCII
+    /// case (the caller compared them case-insensitively), and the CAS in `pay_mark_succeeded` and
+    /// [8A]'s `pay_other_key_for_hash` both match with SQLite's case-sensitive `=`.
+    async fn adopt_paid(
         &self,
         idempotency_key: &str,
-        bolt11: &str,
-        canonical_hash: &str,
         record: &PhoenixdOutgoing,
+        canonical_hash: &str,
         amount_sat: u64,
         cap: PayCap,
     ) -> Result<String> {
-        pay_insert_adopted_succeeded(
-            &self.index,
-            idempotency_key,
-            bolt11,
-            canonical_hash,
-            record,
-            self.clock.now(),
-        )?;
+        self.mark_succeeded(idempotency_key, canonical_hash, &record.payment_id)
+            .await?;
         log_inv1_overrun(
             idempotency_key,
             sat_to_msat(amount_sat),
@@ -1821,6 +1910,31 @@ impl PhoenixdPayment {
     }
 }
 
+/// The legacy import's tiebreaker (ADR-0022): phoenixd's CURRENT view of one receive, read by
+/// `externalId` and matched on the payment hash. Paid or still payable establishes the invoice; an
+/// `isExpired` unpaid record is terminal-unpaid; no record proves nothing (phoenixd forgets).
+#[async_trait]
+impl crate::legacy_import::LegacyProbe for PhoenixdPayment {
+    async fn receive_state(
+        &self,
+        external_id: &str,
+        _invoice_id: &str,
+        payment_hash: &str,
+    ) -> Result<crate::legacy_import::ReceiveState> {
+        use crate::legacy_import::ReceiveState;
+        let records = self
+            .ops
+            .incoming_by_external_id(external_id)
+            .await
+            .context("asking phoenixd for the incoming records of a legacy invoice")?;
+        Ok(match find_incoming_by_hash(&records, payment_hash) {
+            Some(r) if r.is_paid || !r.is_expired => ReceiveState::Established,
+            Some(_) => ReceiveState::TerminalUnpaid,
+            None => ReceiveState::Absent,
+        })
+    }
+}
+
 fn log_inv1_overrun(idempotency_key: &str, payout_msat: u128, fees_msat: u64, cap: PayCap) {
     if let Some(excess_msat) = inv1_overrun_msat(payout_msat, fees_msat, cap.ceiling_msat()) {
         tracing::error!(
@@ -1838,167 +1952,102 @@ fn log_inv1_overrun(idempotency_key: &str, payout_msat: u128, fees_msat: u64, ca
 impl PaymentBackend for PhoenixdPayment {
     async fn create_invoice(
         &self,
+        _amount_sat: u64,
+        _memo: &str,
+        _expiry_s: u32,
+        external_id: &str,
+    ) -> Result<Invoice> {
+        // REFUSED on purpose (ADR-0022): committing the receive-map row on its own is exactly the
+        // split this backend no longer has. Production issues through `issue_invoice` and commits the
+        // returned `persist` beside the `invoice` row; there is no backend-owned path that creates a
+        // correlation outside the caller's transaction.
+        bail!(
+            "PhoenixdPayment::create_invoice is not a valid entry point (external_id {external_id}): \
+             callers must use issue_invoice and commit its persist closure in their own transaction \
+             (ADR-0022)"
+        )
+    }
+
+    async fn issue_invoice(
+        &self,
         amount_sat: u64,
         memo: &str,
         expiry_s: u32,
         external_id: &str,
-    ) -> Result<Invoice> {
-        // Serialize check -> create -> insert so two concurrent same-external_id callers can't both
-        // create an invoice.
-        let _guard = self.create_lock.lock().await;
-        let cached = idx_get_invoice(&self.index, external_id)?;
-
-        // Crash-window idempotency, and the reason this backend needs no receive oplog scan: phoenixd
-        // INDEXES incoming payments by `externalId`, so an invoice created by a previous attempt that
-        // died before the local row was written is recoverable — unlike lnv2, where each receive
-        // draws a fresh tweak and cannot be looked up by our key at all.
-        let existing = self
-            .ops
-            .incoming_by_external_id(external_id)
-            .await
-            .context("checking phoenixd for an existing invoice for this external id")?;
-        let now = self.clock.now();
-        let expires_at = now + i64::from(expiry_s);
-        if let Some(inv) = cached {
-            let Some(record) = find_incoming_by_hash(&existing, &inv.payment_hash) else {
-                bail!(
-                    "phoenixd no longer returns the cached invoice for external id {external_id} \
-                     (hash {}); refusing to create a second invoice while the first payment state \
-                     is unknown",
-                    inv.payment_hash
-                );
-            };
-            if record.requested_sat != amount_sat {
-                bail!(
-                    "phoenixd cached invoice for external id {external_id} requests {} sat, but \
-                     {amount_sat} sat was asked for; refusing to reuse or replace it",
-                    record.requested_sat
-                );
-            }
-            if record.is_paid {
-                // Preserve the ORIGINAL local expiry: completedAt determines whether capture treats
-                // this payment as timely or late, and extending the window would change that fact.
-                return Ok(inv);
-            }
-            if !record.is_expired {
-                // phoenixd still reports the bolt11 payable, so a replay may safely reopen lnrent's
-                // local window around this SAME invoice; creating a second live invoice would make a
-                // payment racing this check ambiguous. Since `expirySeconds` now carries lnrent's
-                // window down, the two windows end at the same instant (phoenixd's a hair later — it
-                // counts from ITS create time), so this branch is the narrow skew case rather than
-                // the routine one it was when phoenixd kept its own 24 h default. The reopened local
-                // window can therefore outlast the bolt11: the cost is a reservation held until it
-                // lapses, never a payment lnrent fails to see, and it is preferable to minting a
-                // second invoice for an id phoenixd still says is payable.
-                if now < inv.expires_at {
-                    return Ok(inv);
-                }
-                let refreshed = Invoice { expires_at, ..inv };
-                idx_upsert(&self.index, &refreshed)?;
-                return Ok(refreshed);
-            }
-            // The exact cached invoice is definitively expired and unpaid at phoenixd. It cannot
-            // move money now, so a successor may be created. The old invoice-id row remains in the
-            // index so any still-OPEN state-store row can continue to resolve and expire normally.
-        }
-        if let Some(record) = select_reusable_incoming(&existing) {
-            if record.requested_sat != amount_sat {
-                // The external id is deterministic per invoice class (§6.6), so a stored invoice for a
-                // DIFFERENT amount means lnrent and phoenixd disagree about this order. Minting a
-                // second invoice under one external id would make settlement ambiguous, and reusing
-                // one for the wrong amount would misbill — fail closed for the operator instead.
-                bail!(
-                    "phoenixd already holds an invoice for external id {external_id} requesting \
-                     {} sat, but {amount_sat} sat was asked for; refusing to reuse or duplicate it",
-                    record.requested_sat
-                );
-            }
-            // A PAID record's window is HISTORY, not a window to reopen: the cached arm above
-            // preserves the original precisely because the instant capture judges the settlement
-            // against (timely vs late) must not move. There is no local row to preserve on THIS path
-            // (it is the crash-window recovery one), so the original window is recovered from
-            // phoenixd's own `expiresAt` when the node reports one, and only a node that does not
-            // falls back to a fresh window. An UNPAID record keeps the fresh window — see the cached
-            // arm's note on why reopening lnrent's window around a still-payable bolt11 is the safe
-            // direction there.
-            let expires_at = match (record.is_paid, epoch_secs_from_ms(record.expires_at_ms)) {
-                (true, Some(original)) => original,
-                _ => expires_at,
-            };
-            let inv = Invoice {
-                id: invoice_id_for(&record.payment_hash),
-                external_id: external_id.to_string(),
-                backend_invoice_id: record.payment_hash.clone(),
-                payment_hash: record.payment_hash.clone(),
-                bolt11: record.bolt11.clone(),
-                amount_sat: record.requested_sat,
-                expires_at,
-            };
-            idx_upsert(&self.index, &inv)?;
-            return Ok(inv);
-        }
-
-        // lnrent's own window is pushed DOWN to phoenixd as `expirySeconds` (MEASURED honoured on the
-        // live 0.9.0 node; omitting it would leave the bolt11 payable for phoenixd's 24 h default,
-        // far past the reservation lnrent released). `expires_at` still stores that window locally
-        // because it is what `lookup` and reconcile/reservation release key on, and because lnrent
-        // must keep judging the invoice by its OWN clock rather than by a remote flag.
-        let created = self
-            .ops
-            .create_invoice(amount_sat, memo, external_id, expiry_s)
-            .await
-            .context("creating a phoenixd invoice")?;
-        if created.amount_sat != amount_sat {
-            bail!(
-                "phoenixd createinvoice returned amountSat {}, but lnrent requested {amount_sat}; \
-                 refusing to persist or bill the mismatched invoice",
-                created.amount_sat
-            );
-        }
-        // The JSON side-fields are NOT authoritative on their own — the buyer pays the `serialized`
-        // BOLT11, and everything downstream keys on `paymentHash`. A phoenixd (or a terminating
-        // TLS proxy, which the remote deployment shape explicitly allows) returning a bolt11 that
-        // encodes a DIFFERENT hash would have lnrent index a hash nobody can ever pay: the buyer's
-        // payment would settle against the bolt11's real hash while `lookup_settlement` searched for
-        // the indexed one, so the settlement is permanently unobservable — buyer paid, no service,
-        // no refund. A different encoded AMOUNT misbills the buyer. Parse the invoice lnrent is
-        // about to hand out and require it to agree with the fields lnrent is about to persist.
-        let parsed = lightning_invoice::Bolt11Invoice::from_str(&created.bolt11)
-            .context("parsing the bolt11 phoenixd returned from createinvoice")?;
-        if !parsed
-            .payment_hash()
-            .to_string()
-            .eq_ignore_ascii_case(&created.payment_hash)
-        {
-            bail!(
-                "phoenixd createinvoice returned paymentHash {} but a bolt11 encoding {}; refusing \
-                 to persist an invoice whose settlement lnrent could never observe",
-                created.payment_hash,
-                parsed.payment_hash()
-            );
-        }
-        match parsed.amount_milli_satoshis() {
-            Some(msat) if msat == amount_sat.saturating_mul(1000) => {}
-            other => bail!(
-                "phoenixd createinvoice returned a bolt11 encoding {:?} msat, but lnrent requested \
-                 {amount_sat} sat; refusing to bill the buyer a mismatched amount",
-                other
-            ),
-        }
-        let inv = Invoice {
-            id: invoice_id_for(&created.payment_hash),
-            external_id: external_id.to_string(),
-            // phoenixd has no invoice id distinct from the payment hash.
-            backend_invoice_id: created.payment_hash.clone(),
-            payment_hash: created.payment_hash,
-            bolt11: created.bolt11,
-            amount_sat: created.amount_sat,
-            expires_at,
+    ) -> Result<Issued> {
+        // Serialize check -> create -> persist so two concurrent same-external_id callers can't both
+        // create an invoice. The OWNED guard leaves as `Issued::lease`: the store actor holds it
+        // through the caller's commit, so the second caller's check runs against the COMMITTED row.
+        let guard = self.create_lock.clone().lock_owned().await;
+        let cached = {
+            let ext = external_id.to_string();
+            self.store.read(move |c| idx_get_invoice(c, &ext)).await?
         };
-        // The create-once anchor: persist BEFORE returning, so the buyer never sees a bolt11 whose
-        // correlation row is not durable.
-        idx_upsert(&self.index, &inv)?;
-        Ok(inv)
+        let invoice = self
+            .resolve_invoice(cached, amount_sat, memo, expiry_s, external_id)
+            .await?;
+        // The create-once anchor: the caller commits this row in the SAME transaction as its `invoice`
+        // row (SPEC §6.6), so the buyer never sees a bolt11 whose correlation is not durable, and a
+        // crash before that commit leaves only a phoenixd-side orphan the deterministic-external_id
+        // retry recovers (live or paid) or replaces (provider-expired unpaid).
+        let row = invoice.clone();
+        Ok(Issued::new(
+            invoice,
+            move |tx| idx_upsert(tx, &row),
+            Box::new(guard),
+            None::<fn()>,
+        ))
+    }
+
+    async fn prepare_pay(&self, idempotency_key: &str, bolt11: &str) -> Result<Prepared> {
+        // The pay guard, OWNED, so it can ride `Prepared::lease` through the driver's commit: a second
+        // key targeting the same bolt11 cannot pass ITS [8A] check until this PREPARED row is visible,
+        // so two PREPARED rows for one hash are impossible by construction (ADR-0022).
+        let guard = self.pay_start_lock.clone().lock_owned().await;
+        if let Some(row) = self.pay_row(idempotency_key).await? {
+            if row.status != STATUS_FAILED {
+                // SUCCEEDED or PREPARED: the row exists and `pay(key)` resolves it. Nothing to write,
+                // nothing to hold.
+                drop(guard);
+                return Ok(Prepared::none());
+            }
+            // FAILED provably never POSTed (module-header invariant): re-prepare it below, exactly
+            // as `start_pay` re-runs the preflight for a FAILED key.
+        }
+        let dest = parse_dest(bolt11)?;
+        let (key, b11, hash) = (
+            idempotency_key.to_string(),
+            bolt11.to_string(),
+            dest.payment_hash.clone(),
+        );
+        // [8A] under the lease. A collision is recorded as the row's TERMINAL refusal — never as a
+        // bare `Err`, and never via PREPARED (which would name a hash recovery could adopt) — so the
+        // driver's `pay` -> `Failed` -> re-resolve path advances it exactly as today.
+        if let Some(other_key) = self
+            .other_key_for_hash(&dest.payment_hash, idempotency_key)
+            .await?
+        {
+            tracing::error!(
+                key = idempotency_key,
+                other_key,
+                "phoenixd: refund destination bolt11 is already owned by a DIFFERENT idempotency key \
+                 ([8A] cross-order same-invoice collision) at prepare — recording the refusal"
+            );
+            let now = self.clock.now();
+            return Ok(Prepared {
+                persist: Box::new(move |tx| pay_upsert_failed(tx, &key, &b11, &hash, now)),
+                lease: Box::new(guard),
+            });
+        }
+        // The witness is stamped with the node IDENTITY it was prepared against, so recovery can tell
+        // "this node never paid it" from "a different node never paid it" (`require_prepared_node`).
+        // The same call is the fee-schedule version gate, so an incompatible node refuses here,
+        // before any row exists.
+        let node = self.require_supported_version().await?;
+        Ok(Prepared {
+            persist: Box::new(move |tx| pay_upsert_prepared(tx, &key, &b11, &hash, &node.node_id)),
+            lease: Box::new(guard),
+        })
     }
 
     #[allow(clippy::disallowed_methods)] // the backend's own internal delegate, not a decider
@@ -2009,26 +2058,23 @@ impl PaymentBackend for PhoenixdPayment {
     async fn lookup_settlement(&self, id: &str) -> Result<(PaymentStatus, Option<i64>)> {
         let Some((row, records)) = self.incoming_for_invoice(id).await? else {
             // FAIL CLOSED, not `Expired`. No path DELETES a `phoenixd_invoice` row (there is no
-            // index GC — module header), so a missing row for an id lnrent's state DB still holds
-            // is DIVERGENCE between the two files, never a lapsed invoice: the index is the only
-            // thing that can map this id to its `externalId`, so the payment's true state is
-            // UNKNOWN. Answering `Expired` would let reconcile expire an invoice phoenixd may have
-            // been PAID — stranding the buyer's money with no capture and no refund. `Err` instead
-            // makes every caller defer and retry (reconcile.rs:617/660/1240 and the supervisor's
-            // settlement catch-up all treat it as "retry next tick"), so the divergence surfaces in
-            // operator logs instead of silently expiring paid money. Same discipline, and the same
-            // reason, as lnv2's `PAID_UNRECOVERED` bail (`classify_indexed_settlement` in
-            // `lnv2_backend.rs`, shared by both of its settlement seams) and
-            // `received_amount_msat` below. NOTE for lnrent-rpa, the deferred index-GC bead: a
-            // reaper that deletes rows must keep any invoice reconcile can still `lookup`
-            // (y4m.15's rule), or it turns this fail-closed arm into a permanent retry.
-            //
-            // The refusal is right and stays; what it lacked was an operator (lnrent-gc7). Logs are
-            // not a notification, and only a human can reconcile the two files.
-            alert_index_divergence(&self.alerts, id).await;
+            // index GC — module header), and under ADR-0022 the row commits with the `invoice` row it
+            // correlates, so a missing row for an id the books still hold is a BUG, never a lapsed
+            // invoice: the row is the only thing that can map this id to its `externalId`, so the
+            // payment's true state is UNKNOWN. Answering `Expired` would let reconcile expire an
+            // invoice phoenixd may have been PAID — stranding the buyer's money with no capture and
+            // no refund. `Err` instead makes every caller defer and retry (reconcile and the
+            // supervisor's settlement catch-up all treat it as "retry next tick"). Same discipline as
+            // lnv2's `PAID_UNRECOVERED` bail and `received_amount_msat` below. The pre-ADR-0022
+            // `index_diverged` operator condition is gone with the side file that could cause it;
+            // this stays an assertion (error log + refusal). NOTE for lnrent-rpa, the deferred
+            // index-GC bead: a reaper that deletes rows must keep any invoice reconcile can still
+            // `lookup` (y4m.15's rule), or it turns this fail-closed arm into a permanent retry.
+            log_missing_correlation(id, "lookup_settlement");
             bail!(
-                "phoenixd has no index row for invoice {id}; its payment state is UNKNOWN (the \
-                 lnrent index and state DB have diverged), so it must not be treated as expired"
+                "phoenixd_invoice row missing for invoice {id}; its payment state is UNKNOWN, so it \
+                 must not be treated as expired (a daemon bug under ADR-0022 — the row commits with \
+                 the invoice)"
             );
         };
         let Some(record) = find_incoming_by_hash(&records, &row.payment_hash) else {
@@ -2059,11 +2105,10 @@ impl PaymentBackend for PhoenixdPayment {
         // (fact 1). When the exact credit cannot be read we fail CLOSED with `Err`, which settlement
         // catch-up treats as "skip and retry" rather than booking a guess.
         let Some((row, records)) = self.incoming_for_invoice(invoice_id).await? else {
-            // The same index/state divergence `lookup_settlement` fails closed on, reached from the
-            // credit seam instead (lnrent-gc7). Both share the one subject, so the two sightings of
-            // one divergence collapse into one DM.
-            alert_index_divergence(&self.alerts, invoice_id).await;
-            bail!("phoenixd has no invoice row for {invoice_id}; refusing to guess its credit");
+            // The same missing-correlation assertion `lookup_settlement` fails closed on, reached
+            // from the credit seam instead.
+            log_missing_correlation(invoice_id, "received_amount_msat");
+            bail!("phoenixd_invoice row missing for {invoice_id}; refusing to guess its credit");
         };
         match find_incoming_by_hash(&records, &row.payment_hash) {
             Some(record) if record.is_paid => {
@@ -2082,7 +2127,7 @@ impl PaymentBackend for PhoenixdPayment {
                         if let Some(refusal) = e.downcast_ref::<FeeCreditRefusal>() {
                             alert_fee_credit_refusal(
                                 &self.alerts,
-                                &self.index,
+                                &self.store,
                                 refusal,
                                 self.clock.now(),
                             )
@@ -2162,21 +2207,28 @@ impl PaymentBackend for PhoenixdPayment {
     }
 
     async fn payment_status(&self, payment_id: &str) -> Result<PayStatus> {
-        Ok(map_pay_status(pay_status_by_payment_id(
-            &self.index,
-            payment_id,
-        )?))
+        let pid = payment_id.to_string();
+        Ok(map_pay_status(
+            self.store
+                .read(move |c| pay_status_by_payment_id(c, &pid))
+                .await?,
+        ))
     }
 
     async fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus> {
-        Ok(map_pay_status(pay_status_by_key(
-            &self.index,
-            idempotency_key,
-        )?))
+        let key = idempotency_key.to_string();
+        Ok(map_pay_status(
+            self.store.read(move |c| pay_status_by_key(c, &key)).await?,
+        ))
     }
 
     async fn payment_started_by_key(&self, idempotency_key: &str) -> Result<bool> {
-        Ok(pay_status_by_key(&self.index, idempotency_key)?.is_some())
+        let key = idempotency_key.to_string();
+        Ok(self
+            .store
+            .read(move |c| pay_status_by_key(c, &key))
+            .await?
+            .is_some())
     }
 
     /// phoenixd can classify a hash even when the local `phoenixd_pay` index is lost (lnrent-7wbo):
@@ -2339,7 +2391,7 @@ impl PaymentBackend for PhoenixdPayment {
     async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
         let (tx, rx) = mpsc::channel(64);
         let ops = self.ops.clone();
-        let index = self.index.clone();
+        let store = self.store.clone();
         let clock = self.clock.clone();
         let alerts = self.alerts.clone();
         tokio::spawn(async move {
@@ -2348,7 +2400,7 @@ impl PaymentBackend for PhoenixdPayment {
             // never committed.
             let mut retired: HashSet<String> = HashSet::new();
             loop {
-                if !poll_settlements_once(&ops, &index, &clock, &alerts, &tx, &mut retired).await {
+                if !poll_settlements_once(&ops, &store, &clock, &alerts, &tx, &mut retired).await {
                     break;
                 }
                 tokio::select! {
@@ -2362,7 +2414,9 @@ impl PaymentBackend for PhoenixdPayment {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// sqlite index helpers (std::sync::Mutex; the lock never crosses an `.await`)
+// sqlite correlation-table helpers. Synchronous, over the connection the store actor hands a closure
+// (`&Connection` for reads, `&Transaction` — which derefs to it — for writes), so every one of them
+// runs on the sole-writer actor (ADR-0001) and inside whatever transaction the caller opened.
 // ---------------------------------------------------------------------------------------------------
 
 /// A `phoenixd_invoice` row: the correlation phoenixd cannot answer for us.
@@ -2372,8 +2426,7 @@ struct InvoiceRow {
     expires_at: i64,
 }
 
-fn idx_get_invoice(index: &Mutex<Connection>, external_id: &str) -> Result<Option<Invoice>> {
-    let conn = index.lock().unwrap();
+fn idx_get_invoice(conn: &Connection, external_id: &str) -> Result<Option<Invoice>> {
     conn.query_row(
         "SELECT external_id, invoice_id, bolt11, payment_hash, amount_sat, expires_at
            FROM phoenixd_invoice
@@ -2398,11 +2451,7 @@ fn idx_get_invoice(index: &Mutex<Connection>, external_id: &str) -> Result<Optio
     .context("reading phoenixd_invoice by external_id")
 }
 
-fn idx_get_by_invoice_id(
-    index: &Mutex<Connection>,
-    invoice_id: &str,
-) -> Result<Option<InvoiceRow>> {
-    let conn = index.lock().unwrap();
+fn idx_get_by_invoice_id(conn: &Connection, invoice_id: &str) -> Result<Option<InvoiceRow>> {
     conn.query_row(
         "SELECT external_id, payment_hash, expires_at FROM phoenixd_invoice WHERE invoice_id = ?1",
         params![invoice_id],
@@ -2418,8 +2467,9 @@ fn idx_get_by_invoice_id(
     .context("reading phoenixd_invoice by invoice_id")
 }
 
-fn idx_upsert(index: &Mutex<Connection>, inv: &Invoice) -> Result<()> {
-    let conn = index.lock().unwrap();
+/// Insert the receive-map row, or refresh it in place for the same `invoice_id` (a still-payable
+/// bolt11 whose local window `resolve_invoice` reopened).
+fn idx_upsert(conn: &Connection, inv: &Invoice) -> Result<()> {
     conn.execute(
         "INSERT INTO phoenixd_invoice
             (external_id, invoice_id, bolt11, payment_hash, amount_sat, expires_at)
@@ -2459,11 +2509,10 @@ struct RefusalTiming {
 /// callers still propagate the original refusal if this fails, and no booking decision reads either
 /// one.
 fn idx_record_fee_credit_refusal(
-    index: &Mutex<Connection>,
+    conn: &Connection,
     invoice_id: &str,
     now: i64,
 ) -> Result<RefusalTiming> {
-    let conn = index.lock().unwrap();
     conn.execute(
         "INSERT INTO phoenixd_unbookable_settlement (invoice_id, first_refusal_at)
          VALUES (?1, ?2)
@@ -2510,11 +2559,7 @@ struct SettlementPollRow {
 /// reaper — module header). Filtering in the loop would still read, allocate and discard every
 /// historical row every 5 s, forever, while holding the index lock the money path also takes.
 /// `phoenixd_invoice_by_expires_at` makes it a range scan.
-fn idx_pollable_invoices(
-    index: &Mutex<Connection>,
-    watch_floor: i64,
-) -> Result<Vec<SettlementPollRow>> {
-    let conn = index.lock().unwrap();
+fn idx_pollable_invoices(conn: &Connection, watch_floor: i64) -> Result<Vec<SettlementPollRow>> {
     let mut stmt = conn
         .prepare(
             "SELECT external_id, invoice_id, payment_hash, amount_sat
@@ -2566,7 +2611,7 @@ fn idx_pollable_invoices(
 /// before it heals anything.
 async fn poll_settlements_once(
     ops: &Arc<dyn PhoenixdOps>,
-    index: &Arc<Mutex<Connection>>,
+    store: &Store,
     clock: &Arc<dyn Clock>,
     alerts: &Option<Arc<AlertDispatcher>>,
     tx: &mpsc::Sender<Settlement>,
@@ -2575,7 +2620,10 @@ async fn poll_settlements_once(
     // The clock backstop, applied as the query's floor (see above): a row whose bolt11 lapsed this
     // long ago can never settle again, so it is never read, let alone round-tripped.
     let watch_floor = clock.now().saturating_sub(SETTLEMENT_POLL_GRACE_SECS);
-    let rows = match idx_pollable_invoices(index, watch_floor) {
+    let rows = match store
+        .read(move |c| idx_pollable_invoices(c, watch_floor))
+        .await
+    {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(
@@ -2638,7 +2686,7 @@ async fn poll_settlements_once(
                 // same refusal the cooldown still yields one DM. Typed downcast, never error text: a
                 // `getbalance` outage fails here too and has a different remedy.
                 if let Some(refusal) = e.downcast_ref::<FeeCreditRefusal>() {
-                    alert_fee_credit_refusal(alerts, index, refusal, clock.now()).await;
+                    alert_fee_credit_refusal(alerts, store, refusal, clock.now()).await;
                 }
                 continue;
             }
@@ -2668,8 +2716,7 @@ struct PayRow {
     node_id: Option<String>,
 }
 
-fn pay_get(index: &Mutex<Connection>, key: &str) -> Result<Option<PayRow>> {
-    let conn = index.lock().unwrap();
+fn pay_get(conn: &Connection, key: &str) -> Result<Option<PayRow>> {
     conn.query_row(
         "SELECT payment_hash, payment_id, status, node_id
            FROM phoenixd_pay WHERE idempotency_key = ?1",
@@ -2687,8 +2734,7 @@ fn pay_get(index: &Mutex<Connection>, key: &str) -> Result<Option<PayRow>> {
     .context("reading phoenixd_pay by key")
 }
 
-fn pay_status_by_key(index: &Mutex<Connection>, key: &str) -> Result<Option<String>> {
-    let conn = index.lock().unwrap();
+fn pay_status_by_key(conn: &Connection, key: &str) -> Result<Option<String>> {
     conn.query_row(
         "SELECT status FROM phoenixd_pay WHERE idempotency_key = ?1",
         params![key],
@@ -2698,8 +2744,7 @@ fn pay_status_by_key(index: &Mutex<Connection>, key: &str) -> Result<Option<Stri
     .context("reading phoenixd_pay status by key")
 }
 
-fn pay_status_by_payment_id(index: &Mutex<Connection>, payment_id: &str) -> Result<Option<String>> {
-    let conn = index.lock().unwrap();
+fn pay_status_by_payment_id(conn: &Connection, payment_id: &str) -> Result<Option<String>> {
     conn.query_row(
         "SELECT status FROM phoenixd_pay WHERE payment_id = ?1",
         params![payment_id],
@@ -2713,11 +2758,10 @@ fn pay_status_by_payment_id(index: &Mutex<Connection>, payment_id: &str) -> Resu
 /// `FAILED` row is excluded because the module-header invariant makes it "never POSTed" — it owns no
 /// payment and must not block a legitimate one.
 fn pay_other_key_for_hash(
-    index: &Mutex<Connection>,
+    conn: &Connection,
     payment_hash: &str,
     our_key: &str,
 ) -> Result<Option<String>> {
-    let conn = index.lock().unwrap();
     conn.query_row(
         "SELECT idempotency_key FROM phoenixd_pay
           WHERE payment_hash = ?1 AND idempotency_key <> ?2 AND status <> 'FAILED'
@@ -2729,17 +2773,17 @@ fn pay_other_key_for_hash(
     .context("checking phoenixd_pay for a cross-key payment-hash collision")
 }
 
-/// Commit the `PREPARED` witness before `payinvoice`. Re-preparing a `FAILED` key is allowed (that
-/// row provably never POSTed); a `SUCCEEDED` row is CAS-protected so no path can ever walk a
-/// completed payment back to in-flight.
+/// Write the `PREPARED` witness: CREATED by `prepare_pay`'s closure in the driver's authorising
+/// transaction (ADR-0022), re-armed on the existing row by `start_pay` immediately before
+/// `payinvoice`. Re-preparing a `FAILED` key is allowed (that row provably never POSTed); a
+/// `SUCCEEDED` row is CAS-protected so no path can ever walk a completed payment back to in-flight.
 fn pay_upsert_prepared(
-    index: &Mutex<Connection>,
+    conn: &Connection,
     key: &str,
     bolt11: &str,
     payment_hash: &str,
     node_id: &str,
 ) -> Result<()> {
-    let conn = index.lock().unwrap();
     let changed = conn
         .execute(
             "INSERT INTO phoenixd_pay (idempotency_key, bolt11, payment_hash, node_id, status)
@@ -2757,47 +2801,15 @@ fn pay_upsert_prepared(
     Ok(())
 }
 
-/// Insert a terminal `SUCCEEDED` row for a payment adopted with no prior witness (lnrent-qvjz).
-///
-/// `INSERT`, not upsert: a conflict fails closed rather than clobbering real bookkeeping.
-fn pay_insert_adopted_succeeded(
-    index: &Mutex<Connection>,
-    key: &str,
-    bolt11: &str,
-    canonical_hash: &str,
-    record: &PhoenixdOutgoing,
-    terminal_at: i64,
-) -> Result<()> {
-    let conn = index.lock().unwrap();
-    let changed = conn
-        .execute(
-            "INSERT INTO phoenixd_pay
-                 (idempotency_key, bolt11, payment_hash, node_id, payment_id, status, terminal_at)
-             VALUES (?1, ?2, ?3, NULL, ?4, 'SUCCEEDED', ?5)
-             ON CONFLICT(idempotency_key) DO NOTHING",
-            params![key, bolt11, canonical_hash, record.payment_id, terminal_at],
-        )
-        .context("recording an adopted phoenixd payment with no prior witness")?;
-    if changed != 1 {
-        bail!(
-            "phoenixd pay key {key} gained a row while its adopted payment for hash {} was being \
-             recorded; refusing to overwrite it",
-            record.payment_hash
-        );
-    }
-    Ok(())
-}
-
 /// Terminal SUCCESS, CAS-guarded on the payment hash so a stale caller cannot overwrite a row that
 /// was rebound to a different destination.
 fn pay_mark_succeeded(
-    index: &Mutex<Connection>,
+    conn: &Connection,
     key: &str,
     payment_hash: &str,
     payment_id: Option<&str>,
     terminal_at: i64,
 ) -> Result<()> {
-    let conn = index.lock().unwrap();
     let changed = conn
         .execute(
             "UPDATE phoenixd_pay SET status = 'SUCCEEDED', payment_id = ?3, terminal_at = ?4
@@ -2822,13 +2834,12 @@ fn pay_mark_succeeded(
 /// where no payment was started ([7A]); CAS-guarded on the row NOT being `SUCCEEDED`, so a refusal
 /// can never demote a completed payment.
 fn pay_upsert_failed(
-    index: &Mutex<Connection>,
+    conn: &Connection,
     key: &str,
     bolt11: &str,
     payment_hash: &str,
     terminal_at: i64,
 ) -> Result<()> {
-    let conn = index.lock().unwrap();
     conn.execute(
         "INSERT INTO phoenixd_pay (idempotency_key, bolt11, payment_hash, status, terminal_at)
          VALUES (?1, ?2, ?3, 'FAILED', ?4)

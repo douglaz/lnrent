@@ -22,6 +22,10 @@ pub mod fedimint_paths;
 pub mod lnv2_backend;
 pub mod identity;
 pub mod ipc;
+/// ADR-0022 boot-time import of the pre-ADR-0022 backend side files (`phoenixd_index.db`,
+/// `lnv2_index.db`) into `lnrent.sqlite`, with coverage validation, the `migration_unverified_at`
+/// fence, and the `migration` marker the v3 backup writer keys on.
+pub mod legacy_import;
 /// Ledger-authoritative money core (lnrent-urw.10): `expected_msat`, the LOCAL sqlite lower bound on
 /// spendable wallet holdings that replaces the live federation balance in every automatic path.
 pub mod ledger;

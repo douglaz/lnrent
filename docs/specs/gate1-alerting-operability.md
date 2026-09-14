@@ -178,6 +178,9 @@ CREATE TABLE teardown_failure (
   receipt base as the sweep spec) − Σ gross of refund_attempt rows that are SENT
   **or whose pay has durable started evidence in the local pay index** (the same started-evidence
   disambiguator INV-2/recovery already use) − Σ max_outlay_msat of SENT/PENDING sweep rows`.
+  ADR-0022 adds: a refund or sweep attempt fenced `migration_unverified_at` is committed whatever
+  its status and whatever the backend answers for its key (the witness may be lost and the legacy
+  payment may have landed).
   Started-but-not-yet-SENT refunds must be subtracted: once the backend op starts, the outgoing
   contract locks those funds out of the spendable wallet, so a bound that still counts them would
   sit ABOVE the real spendable balance and §F would report false DRIFT (and readiness would

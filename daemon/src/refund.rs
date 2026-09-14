@@ -129,6 +129,13 @@ struct RefundRow {
     /// When the row was created (unix secs). Used to detect a refund stuck PENDING (deferred without a
     /// pay) past [`RESOLUTION_STUCK_ALERT_S`] so the operator is alerted (review P2).
     created_at: i64,
+    /// The ADR-0022 legacy-import fence (SPEC §11): `Some` means this attempt's pre-send witness may
+    /// have been lost with the side file, so the driver must not `prepare_pay` (let alone pay or
+    /// re-resolve) it until the operator clears the stamp (`migration clear-fence`; a backend audit
+    /// that adopts a match is a future bead). Parked at the mint point. Only a fenced PENDING row
+    /// reaches this driver and keeps `RefundStuck` firing; a fenced FAILED row is not selected by
+    /// `pending_refunds` and raises nothing until the operator looks (`lnrent refunds` lists it).
+    migration_unverified_at: Option<i64>,
 }
 
 /// The per-row result, mapped 1:1 onto a [`RefundReport`] counter.
@@ -325,6 +332,23 @@ impl Refunder {
         let now = self.clock.now();
         let external_id = external_id_of(&row);
 
+        // ADR-0022 FENCE, before anything else touches this row: a legacy attempt whose pre-send
+        // witness may have been lost with the side file is PARKED at the mint point. No resolution
+        // (that could mint a new generation and pay again), no `prepare_pay`, no POST — only the
+        // existing stuck alert, until the backend's own audit adopts a positive match or the operator
+        // clears the stamp (`lnrent migration clear-fence`). Absence is never clearance.
+        if let Some(stamped_at) = row.migration_unverified_at {
+            tracing::error!(
+                refund = %row.id,
+                stamped_at,
+                "refund is fenced migration_unverified (ADR-0022): its pre-send witness may have \
+                 been lost with the legacy index; parked — clear with `lnrent migration clear-fence` \
+                 after checking the wallet's own records (the only shipped release)"
+            );
+            self.maybe_alert_stuck(&row, now).await;
+            return Ok(Outcome::Noop);
+        }
+
         // INV-3 PROVENANCE GUARD FIRST (spec §3.3): a refund MUST correspond to a payment actually
         // received for this order, and the stored gross MUST match that received amount. No provenance,
         // a missing/non-positive received amount, or a row-vs-provenance mismatch parks FAILED at ERROR
@@ -414,6 +438,21 @@ impl Refunder {
         // reports the net `pay_sat` that went out, not the gross (review P2).
         if self.already_paid(&key).await {
             return self.finish_sent(&row, None, pay_sat, now).await;
+        }
+
+        // ADR-0022: the backend's PREPARED pay-map row commits in the SAME transaction as the ledger
+        // transition that authorises this send — a CAS re-asserting the row is still PENDING and
+        // unfenced — with the backend's pay guard leased to the store actor through that commit.
+        // `pay(key)` below then only READS the row. A prepare failure (the node unreachable, an
+        // unparseable destination) is a transient defer: nothing was sent, so the pay-attempts cap is
+        // untouched.
+        match self.authorise_send(&row, &key, &bolt11, now).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(Outcome::Noop),
+            Err(e) => {
+                tracing::warn!(refund = %row.id, error = %format!("{e:#}"), "refund prepare failed; row stays PENDING");
+                return self.commit_resolution_retry(&row, now).await;
+            }
         }
 
         // INV-1: pay the fee-adjusted `pay_sat` (<= net cap), bounded by `received` so the backend's
@@ -837,6 +876,42 @@ impl Refunder {
             .map_err(|e| PlanError::Transient(format!("persisting refund resolution: {e}")))
     }
 
+    /// The ADR-0022 authorising transaction for one send: `prepare_pay` (the backend's check-and-create
+    /// under its own pay guard), then ONE transaction that CASes the attempt as still `PENDING` and
+    /// unfenced and runs the backend's `persist` (the PREPARED row) — the guard riding
+    /// `Store::transaction_then` as the lease, dropped by the actor after the commit. Returns `false`
+    /// when the CAS lost (the row was terminalized or fenced under us): nothing was persisted and the
+    /// caller must not pay.
+    async fn authorise_send(
+        &self,
+        row: &RefundRow,
+        key: &str,
+        bolt11: &str,
+        now: i64,
+    ) -> Result<bool> {
+        let prepared = self.payment.prepare_pay(key, bolt11).await?;
+        let id = row.id.clone();
+        let persist = prepared.persist;
+        self.store
+            .transaction_then(
+                move |tx| {
+                    let n = tx.execute(
+                        "UPDATE refund_attempt SET updated_at=?2
+                          WHERE id=?1 AND status='PENDING' AND migration_unverified_at IS NULL",
+                        params![id, now],
+                    )?;
+                    if n == 0 {
+                        return Ok(false);
+                    }
+                    persist(tx)?;
+                    Ok(true)
+                },
+                prepared.lease,
+                None,
+            )
+            .await
+    }
+
     /// `Succeeded` per the backend's idempotency-key status — the refund already went out on this
     /// key. Only `Succeeded` counts as paid; an `Unknown`/`Pending`/`Failed` (or a lookup error) is
     /// not, so the caller falls through to `pay`, which the key dedups.
@@ -1177,7 +1252,7 @@ impl Refunder {
                 let mut stmt = c.prepare(
                     "SELECT r.id, r.subscription_id, r.dest, r.amount_sat, r.idempotency_key,
                             s.buyer_pubkey, r.resolved_bolt11, r.resolved_expiry, r.resolution_gen,
-                            r.created_at
+                            r.created_at, r.migration_unverified_at
                        FROM refund_attempt r
                        LEFT JOIN subscription s ON s.id = r.subscription_id
                       WHERE r.status='PENDING'
@@ -1196,6 +1271,7 @@ impl Refunder {
                             resolved_expiry: r.get(7)?,
                             resolution_gen: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
                             created_at: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                            migration_unverified_at: r.get(10)?,
                         })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1321,17 +1397,17 @@ mod tests {
     use super::*;
     use crate::backends::{Invoice, PaymentStatus, Settlement};
     use crate::clock::TestClock;
-    use crate::store::{Store, SCHEMA};
+    use crate::store::Store;
     use async_trait::async_trait;
-    use rusqlite::{Connection, OptionalExtension};
+    use rusqlite::OptionalExtension;
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
     use tokio::sync::mpsc;
 
     fn mem_store() -> Store {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        Store::spawn(conn)
+        // The FULL runtime schema (migrations + the ADR-0022 backend tables), not the raw baseline:
+        // the drivers read `migration_unverified_at`, which only migration 12 adds.
+        Store::spawn(crate::store::open_memory().unwrap())
     }
 
     /// A configurable PaymentBackend for the refunder's tests. By default it dedups `pay` on the key
@@ -3769,5 +3845,62 @@ mod tests {
         ] {
             assert_eq!(refund_row(&store, id).await.0, "SENT");
         }
+    }
+
+    // ADR-0022 (lnrent-chgb): the `migration_unverified_at` fence. A legacy attempt whose pre-send
+    // witness may have been lost is PARKED at the mint point — no resolution, no prepare, no POST —
+    // and only the stuck alert keeps firing. RED first: without the fence the drive resolves and pays.
+    #[tokio::test]
+    async fn a_migration_fenced_refund_is_parked_never_paid_and_keeps_alerting_stuck() {
+        let store = mem_store();
+        let payment = Arc::new(TestPayment::new());
+        let clock = TestClock::new(RESOLUTION_STUCK_ALERT_S + 1);
+        seed_sub(&store, "sub-1", "REFUND_DUE", "buyer-hex").await;
+        seed_refund(&store, "sub-1", Some(LN_ADDR), Some(500)).await;
+        seed_reservation(&store, "sub-1").await;
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "UPDATE refund_attempt SET migration_unverified_at=42 WHERE id='ref-order:sub-1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let r = refunder_with_alerts(&store, &payment, &clock, "op-npub-hex");
+
+        let report = r.drive().await.unwrap();
+        assert_eq!(
+            (report.sent, report.retried, report.failed),
+            (0, 0, 0),
+            "a fenced row is a no-op for the drive"
+        );
+        assert_eq!(payment.pay_calls(), 0, "nothing was POSTed");
+        let (status, gen, resolved): (String, i64, Option<String>) = store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT status, resolution_gen, resolved_bolt11 FROM refund_attempt
+                      WHERE id='ref-order:sub-1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (status.as_str(), gen, resolved),
+            ("PENDING", 0, None),
+            "no resolution was minted either — a new generation would be a new payment hash"
+        );
+        assert_eq!(
+            operator_alerts(&store).await,
+            vec![(
+                "op-npub-hex".to_string(),
+                "refund_stuck".to_string(),
+                "ref-order:sub-1".to_string()
+            )],
+            "RefundStuck keeps firing for a parked row"
+        );
     }
 }

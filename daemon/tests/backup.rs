@@ -1403,3 +1403,355 @@ fn cli_backup_resolves_data_dir_from_config_file() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+// --- ADR-0022 (lnrent-chgb): format v3, the v1 phoenixd-reference refusal, and the first-boot marker
+
+/// A backend view for `legacy_import::run` in a test that never disagrees (no probes needed).
+struct NoProbe;
+
+#[async_trait::async_trait]
+impl lnrentd::legacy_import::LegacyProbe for NoProbe {
+    async fn receive_state(
+        &self,
+        _external_id: &str,
+        _invoice_id: &str,
+        _payment_hash: &str,
+    ) -> anyhow::Result<lnrentd::legacy_import::ReceiveState> {
+        Ok(lnrentd::legacy_import::ReceiveState::Absent)
+    }
+}
+
+/// Stamp the ADR-0022 marker directly (what the first migrated boot writes).
+fn mark_self_contained(data_dir: &std::path::Path, content: &str) {
+    let conn = store::open(data_dir.join("lnrent.sqlite")).unwrap();
+    conn.execute(
+        "INSERT INTO migration (name, content_hash, completed_at) VALUES ('phoenixd_index.db', ?1, 1)",
+        [content],
+    )
+    .unwrap();
+}
+
+/// The writer stamps v3 ONLY when the snapshot carries the migration marker; restore accepts v3
+/// unconditionally and the marker rides along. Both modes.
+#[test]
+fn a_self_contained_snapshot_is_stamped_v3_and_restores_in_both_modes() {
+    let base = temp_dir("v3");
+    let data_dir = base.join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    populate_state_db(&data_dir);
+    // Without the marker: the pre-ADR-0022 rule (no side file -> v1).
+    let pre = backup(&data_dir, &base.join("pre"), None).unwrap();
+    assert_eq!((pre.version, pre.self_contained), (1, false));
+
+    // Any marker content earns v3: `fresh`, `parked` (attempts fenced at the first boot) or a hash.
+    let parked_dir = base.join("parked");
+    fs::create_dir_all(&parked_dir).unwrap();
+    populate_state_db(&parked_dir);
+    mark_self_contained(&parked_dir, "parked");
+    let parked = backup(&parked_dir, &base.join("parked-backup"), None).unwrap();
+    assert_eq!((parked.version, parked.self_contained), (3, true), "a parked dir's backups are v3");
+    restore(&base.join("parked-backup"), &base.join("parked-restored"), false, None).unwrap();
+
+    mark_self_contained(&data_dir, "fresh");
+    let plaintext = backup(&data_dir, &base.join("plaintext"), None).unwrap();
+    assert_eq!((plaintext.version, plaintext.self_contained), (3, true));
+    let encrypted = backup(&data_dir, &base.join("encrypted"), pass("correct horse battery staple")).unwrap();
+    assert_eq!((encrypted.version, encrypted.self_contained), (3, true));
+
+    let restored = base.join("restored");
+    let m = restore(&base.join("plaintext"), &restored, false, None).unwrap();
+    assert_eq!(m.version, 3);
+    let conn = store::open(restored.join("lnrent.sqlite")).unwrap();
+    let marker: String = conn
+        .query_row("SELECT content_hash FROM migration WHERE name='phoenixd_index.db'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(marker, "fresh", "the marker travels with the snapshot");
+    drop(conn);
+    let restored_enc = base.join("restored-enc");
+    restore(&base.join("encrypted"), &restored_enc, false, pass("correct horse battery staple")).unwrap();
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// A manifest whose version disagrees with its contents is refused (hand-edited / downgraded).
+#[test]
+fn a_v3_manifest_without_the_self_contained_flag_is_refused() {
+    let base = temp_dir("v3-pairing");
+    let data_dir = base.join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    populate_state_db(&data_dir);
+    mark_self_contained(&data_dir, "fresh");
+    let dest = base.join("backup");
+    backup(&data_dir, &dest, None).unwrap();
+    let manifest_path = dest.join("MANIFEST.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    v.as_object_mut().unwrap().remove("self_contained");
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    let err = restore(&dest, &base.join("restored"), false, None).unwrap_err();
+    assert!(err.to_string().contains("inconsistent"), "{err}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// coderabbit #91: a manifest relabelled to claim (or deny) self-containment is refused at restore
+/// against the DB's ACTUAL marker, in both directions and in both modes — a v1 set relabelled v3 would
+/// otherwise install books with no correlation, which the next phoenixd boot refuses to start on.
+#[test]
+fn a_manifest_whose_self_contained_claim_disagrees_with_the_db_marker_is_refused() {
+    let relabel = |manifest_path: &std::path::Path, version: u64, self_contained: bool| {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.insert("version".into(), serde_json::json!(version));
+        o.insert("self_contained".into(), serde_json::json!(self_contained));
+        fs::write(manifest_path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    };
+    let base = temp_dir("relabel");
+    // v1 DB (no marker) relabelled as a v3 set: plaintext and encrypted.
+    let v1_dir = base.join("v1");
+    fs::create_dir_all(&v1_dir).unwrap();
+    populate_state_db(&v1_dir);
+    for (tag, pw) in [("plain", None), ("enc", pass("pw"))] {
+        let dest = base.join(format!("v1-as-v3-{tag}"));
+        let m = backup(&v1_dir, &dest, pw.clone()).unwrap();
+        assert_eq!((m.version, m.self_contained), (1, false));
+        relabel(&dest.join("MANIFEST.json"), 3, true);
+        let target = base.join(format!("restored-{tag}"));
+        let err = restore(&dest, &target, false, pw).unwrap_err();
+        assert!(
+            err.to_string().contains("does not carry the ADR-0022 migration marker"),
+            "{tag}: {err}"
+        );
+        assert!(!target.join("lnrent.sqlite").exists(), "{tag}: the target was not touched");
+    }
+    // v3 DB (marker present) downgraded to a v1 manifest.
+    let v3_dir = base.join("v3");
+    fs::create_dir_all(&v3_dir).unwrap();
+    populate_state_db(&v3_dir);
+    mark_self_contained(&v3_dir, "fresh");
+    let dest = base.join("v3-as-v1");
+    assert_eq!(backup(&v3_dir, &dest, None).unwrap().version, 3);
+    relabel(&dest.join("MANIFEST.json"), 1, false);
+    let err = restore(&dest, &base.join("restored-downgrade"), false, None).unwrap_err();
+    assert!(err.to_string().contains("does carry the ADR-0022 migration marker"), "{err}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// `restore` REFUSES a format-1 backup whose books reference phoenixd — at restore, naming the row —
+/// on the EXACT predicate: `invoice.id LIKE 'phoenixd-%'` (the prefix lives on the store's id column),
+/// or a SENT / id-bearing attempt while the persisted backend is phoenixd. A hash sitting only in
+/// `backend_invoice_id` matches nothing (RED on a predicate that queries that column), the persisted
+/// selection alone is not a reference, and a mock/lnv2-only v1 backup still restores.
+#[test]
+fn restore_refuses_a_v1_backup_whose_books_reference_phoenixd() {
+    let base = temp_dir("v1-phoenixd");
+    let data_dir = base.join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    populate_state_db(&data_dir);
+    {
+        let conn = store::open(data_dir.join("lnrent.sqlite")).unwrap();
+        conn.execute(
+            "INSERT INTO invoice (id, external_id, backend_invoice_id, kind, amount_sat, status)
+             VALUES ('phoenixd-abcd', 'ext-p', 'abcd', 'order', 10, 'OPEN')",
+            [],
+        )
+        .unwrap();
+    }
+    let dest = base.join("backup");
+    let m = backup(&data_dir, &dest, None).unwrap();
+    assert_eq!(m.version, 1, "no side file, no marker: a v1 backup");
+    let err = restore(&dest, &base.join("restored"), false, None).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("format-1") && msg.contains("invoice phoenixd-abcd"), "{msg}");
+    assert!(!base.join("restored").exists(), "the target was never touched");
+
+    // The encrypted path refuses the same backup after decrypting into staging.
+    let enc = base.join("enc");
+    backup(&data_dir, &enc, pass("pw")).unwrap();
+    let err = restore(&enc, &base.join("restored-enc"), false, pass("pw")).unwrap_err();
+    assert!(err.to_string().contains("format-1"), "{err}");
+    assert!(!base.join("restored-enc").exists());
+
+    // A hash ONLY in backend_invoice_id (no phoenixd- prefix on the id) is NOT a reference.
+    let data_dir2 = base.join("data2");
+    fs::create_dir_all(&data_dir2).unwrap();
+    populate_state_db(&data_dir2);
+    {
+        let conn = store::open(data_dir2.join("lnrent.sqlite")).unwrap();
+        conn.execute(
+            "INSERT INTO invoice (id, external_id, backend_invoice_id, kind, amount_sat, status)
+             VALUES ('inv-plain', 'ext-q', 'abcd', 'order', 10, 'OPEN')",
+            [],
+        )
+        .unwrap();
+    }
+    let dest2 = base.join("backup2");
+    backup(&data_dir2, &dest2, None).unwrap();
+    restore(&dest2, &base.join("restored2"), false, None)
+        .expect("a bare hash in backend_invoice_id is not a phoenixd reference");
+
+    // A SENT attempt refuses ONLY while the persisted backend is phoenixd.
+    for (backend, expect_refusal) in [("phoenixd", true), ("mock", false)] {
+        let dd = base.join(format!("data-{backend}"));
+        fs::create_dir_all(&dd).unwrap();
+        populate_state_db(&dd);
+        {
+            let conn = store::open(dd.join("lnrent.sqlite")).unwrap();
+            conn.execute(
+                "INSERT INTO operator (payment_backend) VALUES (?1)",
+                [backend],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE refund_attempt SET status='SENT' WHERE id='ref1'",
+                [],
+            )
+            .unwrap();
+        }
+        let d = base.join(format!("backup-{backend}"));
+        backup(&dd, &d, None).unwrap();
+        let res = restore(&d, &base.join(format!("restored-{backend}")), false, None);
+        assert_eq!(
+            res.is_err(),
+            expect_refusal,
+            "payment_backend={backend}: {:?}",
+            res.err()
+        );
+        if expect_refusal {
+            assert!(res.unwrap_err().to_string().contains("refund_attempt ref1 (SENT)"));
+        }
+    }
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// A fresh phoenixd install: the first migrated boot writes the `fresh` marker, so the first backup
+/// after the first invoice is already v3 and restores — where an unchanged v1/v2 writer would produce a
+/// backup the v1 rule then refuses (RED on a writer that does not key on the marker).
+#[test]
+fn a_fresh_install_first_invoice_backup_is_v3_and_restores() {
+    let base = temp_dir("fresh-v3");
+    let data_dir = base.join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let store = lnrentd::store::Store::open_spawn(data_dir.join("lnrent.sqlite")).unwrap();
+        store
+            .transaction(|tx| {
+                tx.execute("INSERT INTO operator (payment_backend) VALUES ('phoenixd')", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let out = lnrentd::legacy_import::run(
+            &store,
+            lnrentd::legacy_import::Backend::Phoenixd,
+            &NoProbe,
+            &data_dir.join("phoenixd_index.db"),
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, lnrentd::legacy_import::Outcome::Fresh);
+        // The first invoice, committed with its correlation as the daemon does.
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO invoice (id, external_id, backend_invoice_id, kind, amount_sat, status)
+                     VALUES ('phoenixd-ffff', 'ext-1', 'ffff', 'order', 10, 'OPEN')",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO phoenixd_invoice (external_id, invoice_id, bolt11, payment_hash, amount_sat, expires_at)
+                     VALUES ('ext-1', 'phoenixd-ffff', 'lnbc', 'ffff', 10, 5)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    });
+    let dest = base.join("backup");
+    let m = backup(&data_dir, &dest, None).unwrap();
+    assert_eq!((m.version, m.self_contained), (3, true), "the fresh marker earns v3 from the first backup");
+    let restored = base.join("restored");
+    restore(&dest, &restored, false, None).expect("a v3 backup restores unconditionally");
+    let conn = store::open(restored.join("lnrent.sqlite")).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM phoenixd_invoice", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "the correlation is inside the snapshot");
+    drop(conn);
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// codex #91 P2: the crash window between the import commit (marker = SHA-256 of the side file) and
+/// the `*.imported` rename leaves BOTH on disk. A backup taken there must not carry a vacuumed side
+/// file — its bytes no longer hash to the marker and the restored dir would refuse to boot as a
+/// different-instant restore. The self-contained snapshot omits it, in both modes, and the restored
+/// dir boots AlreadyMigrated.
+#[test]
+fn a_crash_window_backup_omits_the_already_imported_side_file_and_the_restore_boots() {
+    use sha2::Digest as _;
+    let base = temp_dir("crash-window");
+    let data_dir = base.join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    populate_state_db(&data_dir);
+    populate_phoenixd_index(&data_dir, "legacy-map");
+    let side = data_dir.join("phoenixd_index.db");
+    let hash = hex::encode(sha2::Sha256::digest(fs::read(&side).unwrap()));
+    mark_self_contained(&data_dir, &hash);
+
+    for (tag, pw) in [("plain", None), ("enc", pass("pw"))] {
+        let dest = base.join(format!("backup-{tag}"));
+        let m = backup(&data_dir, &dest, pw.clone()).unwrap();
+        assert_eq!(
+            (m.version, m.self_contained, m.phoenixd_index),
+            (3, true, false),
+            "{tag}: a self-contained snapshot does not capture the side file"
+        );
+        let restored = base.join(format!("restored-{tag}"));
+        restore(&dest, &restored, false, pw).unwrap();
+        assert!(!restored.join("phoenixd_index.db").exists(), "{tag}: no side file restored");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let store = lnrentd::store::Store::open_spawn(restored.join("lnrent.sqlite")).unwrap();
+            let out = lnrentd::legacy_import::run(
+                &store,
+                lnrentd::legacy_import::Backend::Phoenixd,
+                &NoProbe,
+                &restored.join("phoenixd_index.db"),
+                1_000,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out, lnrentd::legacy_import::Outcome::AlreadyMigrated, "{tag}");
+            drop(store);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+    }
+    // The source dir itself is untouched: the side file is still there for the boot to rename.
+    assert!(side.exists());
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// An lnv2-only PRE-migration backup is v1 and carries `lnv2_index.db` inside `fedimint/`; it restores
+/// as before (the first boot on the restored dir imports it).
+#[test]
+fn an_lnv2_only_pre_migration_backup_stays_v1_and_restores_with_its_side_file() {
+    let base = temp_dir("lnv2-v1");
+    let data_dir = base.join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    populate_state_db(&data_dir);
+    populate_fedimint_dir(&data_dir);
+    let dest = base.join("backup");
+    let m = backup(&data_dir, &dest, None).unwrap();
+    assert_eq!((m.version, m.self_contained, m.phoenixd_index), (1, false, false));
+    let restored = base.join("restored");
+    restore(&dest, &restored, false, None).unwrap();
+    assert!(
+        restored.join("fedimint").join(FED_ID).join("lnv2_index.db").is_file(),
+        "the legacy lnv2 side file is restored for the boot import"
+    );
+    let _ = fs::remove_dir_all(&base);
+}

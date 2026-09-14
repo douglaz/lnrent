@@ -55,6 +55,9 @@ pub enum Request {
     /// Re-drive one parked-FAILED refund (lnrent-urw.5): reset it to PENDING so the refunder re-runs
     /// the real resolver + capped-pay path. The only refund actuator — there is no cancel/abandon.
     RefundRetry { id: String },
+    /// Release one ADR-0022 `migration_unverified_at` fence on a refund or sweep attempt, with the
+    /// operator's note journaled. Same authority as `Sweep`: an explicit, confirmed money action.
+    MigrationClearFence { id: String, note: String },
     /// DRY-RUN operator sweep quote (gate1-operator-sweep, urw.3): price the outlay + read the ledger
     /// surplus for `bolt11` and report the ALLOW/REFUSE verdict. No writes, no balance read.
     SweepQuote { bolt11: String },
@@ -121,6 +124,7 @@ impl Request {
     fn is_mutating(&self) -> bool {
         match self {
             Request::RefundRetry { .. }
+            | Request::MigrationClearFence { .. }
             | Request::Sweep { .. }
             | Request::ListingPublish { .. }
             | Request::ListingWithdraw
@@ -933,6 +937,10 @@ pub async fn dispatch_with_alert_visibility(
 
         Request::RefundRetry { id } => refund_retry(store, &id, clock.now()).await,
 
+        Request::MigrationClearFence { id, note } => {
+            migration_clear_fence(store, &id, &note, clock.now()).await
+        }
+
         Request::SweepQuote { bolt11 } => {
             // §surplus: a DRY-RUN over the ledger — price the outlay + read surplus, no writes and no
             // balance read. Verdict ALLOW iff surplus covers the outlay.
@@ -955,7 +963,7 @@ pub async fn dispatch_with_alert_visibility(
         Request::Sweep { bolt11 } => {
             // Execute: gate + durable PENDING intent + capped pay. Ledger-only authorization; the
             // structured refusals (`sweep_invalid`/`sweep_unpriceable`/`sweep_busy`/
-            // `sweep_insufficient`/`sweep_fee_rose`) never move money. No alert sink is wired here
+            // `sweep_insufficient`/`sweep_fee_rose`/`sweep_fenced`) never move money. No alert sink is wired here
             // (the operator gets this structured reply live); the supervisor's drive carries alerts.
             let sweeper =
                 crate::sweep::Sweeper::new(store.clone(), payment.clone(), clock.clone());
@@ -1132,7 +1140,7 @@ fn dest_form_label(dest: Option<&str>) -> &'static str {
 fn query_refunds(c: &rusqlite::Connection, now: i64) -> Result<Vec<Value>> {
     let mut stmt = c.prepare(
         "SELECT id, subscription_id, dest, amount_sat, status, COALESCE(attempts, 0),
-                created_at, updated_at
+                created_at, updated_at, migration_unverified_at
            FROM refund_attempt
           WHERE status IN ('PENDING','FAILED')
           ORDER BY updated_at DESC, id",
@@ -1141,6 +1149,10 @@ fn query_refunds(c: &rusqlite::Connection, now: i64) -> Result<Vec<Value>> {
         .query_map([], |r| {
             let dest: Option<String> = r.get(2)?;
             let created_at: Option<i64> = r.get(6)?;
+            // ADR-0022: a fenced row is PARKED whatever its status says — the driver refuses to
+            // prepare it and `refund-retry` refuses it — so the list must say so, or an operator
+            // reading the documented CLI sees an ordinary pending refund forever (codex #91 P2).
+            let fenced_at: Option<i64> = r.get(8)?;
             Ok(json!({
                 "id": r.get::<_, String>(0)?,
                 "subscription_id": r.get::<_, Option<String>>(1)?,
@@ -1151,6 +1163,8 @@ fn query_refunds(c: &rusqlite::Connection, now: i64) -> Result<Vec<Value>> {
                 "created_at": created_at,
                 "updated_at": r.get::<_, Option<i64>>(7)?,
                 "age_s": created_at.map(|c| now - c),
+                "migration_fenced": fenced_at.is_some(),
+                "migration_unverified_at": fenced_at,
             }))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1162,24 +1176,42 @@ fn query_refunds(c: &rusqlite::Connection, now: i64) -> Result<Vec<Value>> {
 /// `status='FAILED'` — a retry of a non-parked id mutates nothing and returns a structured error.
 /// Journaled. This is the ONLY refund actuator; there is deliberately no cancel/abandon.
 async fn refund_retry(store: &Store, id: &str, now: i64) -> Reply {
+    /// What the retry transaction found.
+    enum Retry {
+        Requeued,
+        NotParked,
+        /// ADR-0022: the row carries `migration_unverified_at`. A retry resets FAILED->PENDING and
+        /// `plan_payment` may then re-resolve to a fresh payment hash — if the omitted map row was the
+        /// witness to a wallet payment that succeeded after the row was marked FAILED, that pays
+        /// twice. The fence is cleared only by `migration clear-fence` (a backend audit that adopts a
+        /// matching payment is a future bead, not shipped).
+        Fenced,
+    }
     let id = id.to_string();
-    let res: Result<bool> = store
+    let res: Result<Retry> = store
         .transaction({
             let id = id.clone();
             move |tx| {
                 // Read the row's identity BEFORE mutating, to (a) gate on FAILED and (b) compute the
                 // stable billing.refund outbox id for the supersede below.
-                let row: Option<(String, Option<String>, String)> =
+                let row: Option<(String, Option<String>, String, Option<i64>)> =
                     rusqlite::OptionalExtension::optional(tx.query_row(
-                        "SELECT status, subscription_id, idempotency_key FROM refund_attempt WHERE id=?1",
+                        "SELECT status, subscription_id, idempotency_key, migration_unverified_at
+                           FROM refund_attempt WHERE id=?1",
                         rusqlite::params![id],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                     ))?;
-                let Some((status, sub, idempotency_key)) = row else {
-                    return Ok(false);
+                let Some((status, sub, idempotency_key, fenced_at)) = row else {
+                    return Ok(Retry::NotParked);
                 };
+                // The fence answers FIRST, whatever the status: a fenced PENDING row is parked by
+                // the driver, and "not parked" would send the operator looking for a state the row
+                // will never leave on its own (codex #91 P2).
+                if fenced_at.is_some() {
+                    return Ok(Retry::Fenced);
+                }
                 if status != "FAILED" {
-                    return Ok(false);
+                    return Ok(Retry::NotParked);
                 }
 
                 tx.execute(
@@ -1198,15 +1230,92 @@ async fn refund_retry(store: &Store, id: &str, now: i64) -> Reply {
                     "INSERT INTO event_log (subscription_id, kind, detail_json, at) VALUES (?, ?, ?, ?)",
                     rusqlite::params![sub, "refund_retry_requested", json!({"refund": id}).to_string(), now],
                 )?;
-                Ok(true)
+                Ok(Retry::Requeued)
             }
         })
         .await;
     match res {
-        Ok(true) => Reply::ok(json!({"id": id, "status": "PENDING", "requeued": true})),
-        Ok(false) => Reply::err(
+        Ok(Retry::Requeued) => Reply::ok(json!({"id": id, "status": "PENDING", "requeued": true})),
+        Ok(Retry::NotParked) => Reply::err(
             "invalid_state",
             format!("refund `{id}` is not a parked (FAILED) refund — nothing to retry"),
+        ),
+        Ok(Retry::Fenced) => Reply::err(
+            "invalid_state",
+            format!(
+                "refund `{id}` is fenced migration_unverified (ADR-0022): its pre-send witness may \
+                 have been lost with the legacy index, and a retry could re-resolve and pay a \
+                 second time. Check the wallet's own outgoing records for this refund, then \
+                 `lnrent migration clear-fence {id} --note \"<what you checked>\" --yes` to release \
+                 it (the only shipped release; a backend audit that adopts a matching payment is a \
+                 future bead)"
+            ),
+        ),
+        Err(e) => Reply::err("internal", e.to_string()),
+    }
+}
+
+/// `lnrent migration clear-fence` (ADR-0022): the OPERATOR's explicit release of one
+/// `migration_unverified_at` stamp on a refund or sweep attempt, journaled with their note. The daemon
+/// never clears a phoenixd stamp on absence (an in-flight legacy POST has no `completedAt`, the clocks
+/// are unrelated, and phoenixd's own DB can be wiped and restored with funds surviving by seed), so
+/// the operator — who can weigh phoenixd's records, the wallet balance and the buyer's word — is the
+/// only party besides the backend's positive-match audit who may. After clearance a PENDING attempt
+/// is re-prepared by the driver exactly as a first attempt; a FAILED one stays FAILED (the drivers
+/// select PENDING only), so the reply names the second step — `refund-retry` for a refund, a
+/// resubmission for a sweep — instead of implying the clearance alone re-drives it (codex #91 P2).
+async fn migration_clear_fence(store: &Store, id: &str, note: &str, now: i64) -> Reply {
+    if note.trim().is_empty() {
+        return Reply::err(
+            "bad_request",
+            "clear-fence requires --note describing what you checked (it is journaled)",
+        );
+    }
+    let (id_s, note_s) = (id.to_string(), note.trim().to_string());
+    let res: Result<Option<(&'static str, String)>> = store
+        .transaction(move |tx| {
+            for table in ["refund_attempt", "sweep_attempt"] {
+                let n = tx.execute(
+                    &format!(
+                        "UPDATE {table} SET migration_unverified_at=NULL
+                          WHERE id=?1 AND migration_unverified_at IS NOT NULL"
+                    ),
+                    rusqlite::params![id_s],
+                )?;
+                if n == 1 {
+                    tx.execute(
+                        "INSERT INTO event_log (subscription_id, kind, detail_json, at)
+                         VALUES (NULL, 'migration_fence_cleared', ?1, ?2)",
+                        rusqlite::params![
+                            json!({ "attempt": id_s, "table": table, "note": note_s }).to_string(),
+                            now
+                        ],
+                    )?;
+                    let status: String = tx.query_row(
+                        &format!("SELECT status FROM {table} WHERE id=?1"),
+                        rusqlite::params![id_s],
+                        |r| r.get(0),
+                    )?;
+                    return Ok(Some((table, status)));
+                }
+            }
+            Ok(None)
+        })
+        .await;
+    match res {
+        Ok(Some((table, status))) => {
+            let next = match (table, status.as_str()) {
+                (_, "PENDING") => "the driver prepares and pays it on its next pass".to_string(),
+                ("refund_attempt", _) => {
+                    format!("still {status}: run `lnrent refund-retry {id}` to re-drive it")
+                }
+                _ => format!("still {status}: resubmit the sweep (`lnrent sweep <bolt11> --yes`) to re-drive it"),
+            };
+            Reply::ok(json!({ "id": id, "table": table, "cleared": true, "status": status, "next": next }))
+        }
+        Ok(None) => Reply::err(
+            "not_found",
+            format!("no fenced refund or sweep attempt `{id}` (nothing carries migration_unverified_at)"),
         ),
         Err(e) => Reply::err("internal", e.to_string()),
     }
@@ -1607,9 +1716,8 @@ mod tests {
     use crate::backends::{
         Invoice, MockPayment, PayStatus, PaymentBackend, PaymentStatus, Settlement,
     };
-    use crate::store::{Store, SCHEMA};
+    use crate::store::Store;
     use async_trait::async_trait;
-    use rusqlite::Connection;
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::mpsc;
@@ -1860,9 +1968,9 @@ mod tests {
     }
 
     fn mem_store() -> Store {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        Store::spawn(conn)
+        // The FULL runtime schema (migrations + the ADR-0022 backend tables), not the raw baseline:
+        // the drivers read `migration_unverified_at`, which only migration 12 adds.
+        Store::spawn(crate::store::open_memory().unwrap())
     }
 
     async fn money_data(store: &Store, payment: &Arc<dyn PaymentBackend>) -> Value {
@@ -1995,8 +2103,9 @@ mod tests {
     }
 
     async fn serve_temp() -> (Store, std::path::PathBuf) {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        // The full runtime schema, not the bare §11 SCHEMA: the money path reads ADR-0022's
+        // `migration_unverified_at`, which only the migrations add.
+        let conn = crate::store::open_memory().unwrap();
         // seed one subscription
         conn.execute(
             "INSERT INTO subscription (id, recipe_id, state, created_at) VALUES ('s1','dummy','ACTIVE',1)",
@@ -2228,8 +2337,7 @@ mod tests {
         };
 
         // Start the daemon side while the poller is watching the path.
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let conn = crate::store::open_memory().unwrap(); // full runtime schema (ADR-0022 fence column)
         let store = Store::spawn(conn);
         let recipes = Arc::new(Vec::<Recipe>::new());
         let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
@@ -2377,8 +2485,7 @@ mod tests {
     // its reply.
     #[tokio::test]
     async fn shutdown_drain_is_not_wedged_by_an_idle_client() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let conn = crate::store::open_memory().unwrap(); // full runtime schema (ADR-0022 fence column)
         conn.execute(
             "INSERT INTO subscription (id, recipe_id, state, created_at) VALUES ('s1','dummy','ACTIVE',1)",
             [],
@@ -2519,8 +2626,7 @@ mod tests {
     // the committed-but-unreplied kill window y4m.13 closed for idle peers, reopened by slow dispatch.
     #[tokio::test]
     async fn slow_read_only_op_does_not_pin_the_shutdown_drain() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let conn = crate::store::open_memory().unwrap(); // full runtime schema (ADR-0022 fence column)
         let store = Store::spawn(conn);
         let recipes = Arc::new(Vec::<Recipe>::new());
         let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
@@ -2605,8 +2711,7 @@ mod tests {
     // the mutating commit AND completes promptly.
     #[tokio::test]
     async fn mutating_op_completes_through_drain_despite_a_slow_readonly_op() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let conn = crate::store::open_memory().unwrap(); // full runtime schema (ADR-0022 fence column)
         conn.execute(
             "INSERT INTO subscription (id, recipe_id, state, created_at) VALUES ('s1','dummy','ACTIVE',1)",
             [],
@@ -3798,5 +3903,172 @@ mod tests {
         assert_eq!(data["surplus_msat"], json!(4_000)); // 7_000 earned − 3_000 swept
         assert_eq!(data["last_sweep"]["id"], "sweep:h");
         assert_eq!(data["last_sweep"]["status"], "SENT");
+    }
+
+    // ADR-0022 (lnrent-chgb): `refund-retry` refuses a FAILED row that carries the
+    // `migration_unverified_at` fence (a retry resets to PENDING and may re-resolve to a fresh hash),
+    // and `migration clear-fence` is the operator's journaled release.
+    #[tokio::test]
+    async fn refund_retry_refuses_a_fenced_row_and_clear_fence_releases_it() {
+        let store = mem_store();
+        let recipes = Arc::new(Vec::<Recipe>::new());
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::TestClock::new(1_000));
+        let payment: Arc<dyn PaymentBackend> = Arc::new(crate::backends::MockPayment::new());
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO refund_attempt (id, subscription_id, dest, amount_sat, idempotency_key,
+                        status, attempts, migration_unverified_at, created_at, updated_at)
+                     VALUES ('r-fenced', 's1', 'a@b.com', 500, 'refund:r-fenced', 'FAILED', 5, 77, 100, 200)",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO sweep_attempt (id, bolt11, amount_sat, max_outlay_msat, status,
+                        attempts, migration_unverified_at, created_at)
+                     VALUES ('sweep:fenced', 'lnbc1', 40000, 40000000, 'PENDING', 0, 77, 100)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let run = |req: Request| {
+            let (store, recipes, clock, payment) =
+                (store.clone(), recipes.clone(), clock.clone(), payment.clone());
+            async move {
+                dispatch(
+                    req,
+                    &store,
+                    &recipes,
+                    &clock,
+                    &payment,
+                    &RelayStatusCell::new(),
+                    &no_listing_relay(),
+                )
+                .await
+            }
+        };
+
+        let retry = run(Request::RefundRetry { id: "r-fenced".into() }).await;
+        assert!(!retry.ok, "a fenced row is not retryable");
+        let err = retry.error.unwrap();
+        assert_eq!(err.code, "invalid_state");
+        assert!(err.message.contains("migration_unverified") && err.message.contains("clear-fence"));
+
+        // A fenced PENDING row answers the SAME fence, not "not parked" (codex #91 P2), and the
+        // refund list projects the fence so `lnrent refunds` can name the remedy.
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO refund_attempt (id, subscription_id, dest, amount_sat, idempotency_key,
+                        status, attempts, migration_unverified_at, created_at, updated_at)
+                     VALUES ('r-fenced-pending', 's2', 'c@d.com', 500, 'refund:r-fenced-pending',
+                             'PENDING', 0, 77, 100, 200)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let retry = run(Request::RefundRetry { id: "r-fenced-pending".into() }).await;
+        let err = retry.error.unwrap();
+        assert!(
+            err.message.contains("clear-fence"),
+            "a fenced PENDING row names the fence, not 'not parked': {}",
+            err.message
+        );
+        let list = run(Request::Refunds).await.data.unwrap();
+        let fenced: Vec<bool> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["migration_fenced"].as_bool().unwrap())
+            .collect();
+        assert_eq!(fenced, vec![true, true], "both fenced rows are flagged in the list");
+        let money = money_data(&store, &payment).await;
+        assert_eq!(money["migration_fenced_refunds"], json!(2));
+        assert_eq!(money["migration_fenced_sweeps"], json!(1));
+        assert_eq!(
+            money["migration_fenced_sweep_ids"],
+            json!([{ "id": "sweep:fenced", "status": "PENDING", "bolt11": "lnbc1" }]),
+            "the fenced sweep ids and bolt11s are listed (there is no sweep list verb)"
+        );
+        // Drop the PENDING one so the rest of this test is unchanged.
+        store
+            .transaction(|tx| {
+                tx.execute("DELETE FROM refund_attempt WHERE id='r-fenced-pending'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (status, fenced): (String, Option<i64>) = store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT status, migration_unverified_at FROM refund_attempt WHERE id='r-fenced'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!((status.as_str(), fenced), ("FAILED", Some(77)), "nothing moved");
+
+        // A note is required (it is journaled).
+        let bad = run(Request::MigrationClearFence { id: "r-fenced".into(), note: "  ".into() }).await;
+        assert_eq!(bad.error.unwrap().code, "bad_request");
+
+        let cleared = run(Request::MigrationClearFence {
+            id: "r-fenced".into(),
+            note: "checked phoenixd outgoing: nothing for this hash".into(),
+        })
+        .await;
+        assert!(cleared.ok, "{:?}", cleared.error);
+        let data = cleared.data.unwrap();
+        assert_eq!(data["table"], "refund_attempt");
+        // codex #91 P2: the drivers select PENDING only, so a cleared FAILED row is NOT re-driven by
+        // the clearance — the reply must name the second step rather than imply it is.
+        assert_eq!(data["status"], "FAILED");
+        assert!(
+            data["next"].as_str().unwrap().contains("refund-retry r-fenced"),
+            "names the retry verb: {}",
+            data["next"]
+        );
+        let fenced: Option<i64> = store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT migration_unverified_at FROM refund_attempt WHERE id='r-fenced'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(fenced, None, "the fence is released");
+        let journal: String = store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT detail_json FROM event_log WHERE kind='migration_fence_cleared'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert!(journal.contains("r-fenced") && journal.contains("checked phoenixd outgoing"));
+
+        // Now the retry goes through, and the sweep row is cleared by the same verb.
+        assert!(run(Request::RefundRetry { id: "r-fenced".into() }).await.ok);
+        let cleared = run(Request::MigrationClearFence {
+            id: "sweep:fenced".into(),
+            note: "wallet shows no outgoing for this hash".into(),
+        })
+        .await;
+        let data = cleared.data.unwrap();
+        assert_eq!((data["table"].as_str(), data["status"].as_str()), (Some("sweep_attempt"), Some("PENDING")));
+        assert!(data["next"].as_str().unwrap().contains("next pass"), "{}", data["next"]);
+        // And an id with no fence is not_found.
+        let none = run(Request::MigrationClearFence { id: "sweep:fenced".into(), note: "again".into() }).await;
+        assert_eq!(none.error.unwrap().code, "not_found");
+        assert!(Request::MigrationClearFence { id: "x".into(), note: "n".into() }.is_mutating());
     }
 }

@@ -112,6 +112,11 @@ async fn json_money_returns_reply_envelope() {
             "gross_liability_sat",
             "last_sweep",
             "liability_count",
+            // ADR-0022 (codex #91 P2): attempts parked behind the legacy-import fence are named
+            // here because `parked_count` (FAILED) cannot see a fenced PENDING row.
+            "migration_fenced_refunds",
+            "migration_fenced_sweep_ids",
+            "migration_fenced_sweeps",
             "paid_out_msat",
             "parked_count",
             "ready",

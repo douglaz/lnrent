@@ -454,7 +454,8 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
                 (mock.clone(), Some(mock))
             }
             PaymentMode::Fedimint => {
-                let backend = build_fedimint_backend(&operator, clock.clone()).await?;
+                let backend =
+                    build_fedimint_backend(&operator, store.clone(), clock.clone()).await?;
                 (backend, None)
             }
             // `phoenixd` (lnrent-xk3) is reachable here ONLY when the operator explicitly accepted an
@@ -463,7 +464,13 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
             // is where the refusal lives so nothing is persisted before it fires. It uses real time ->
             // NO clock-sync.
             PaymentMode::Phoenixd => {
-                let backend = build_phoenixd_backend(&operator, clock.clone(), alerts.clone())?;
+                let backend = build_phoenixd_backend(
+                    &operator,
+                    store.clone(),
+                    clock.clone(),
+                    alerts.clone(),
+                )
+                .await?;
                 (backend, None)
             }
         };
@@ -526,6 +533,7 @@ async fn run_daemon(mut raw: Zeroizing<RawConfig>) -> Result<()> {
 #[cfg(feature = "fedimint")]
 async fn build_fedimint_backend(
     operator: &config::Operator,
+    store: lnrentd::store::Store,
     clock: Arc<dyn Clock>,
 ) -> Result<Arc<dyn PaymentBackend>> {
     let fedi = operator
@@ -537,10 +545,26 @@ async fn build_fedimint_backend(
         &fedi.invite,
         &operator.config.data_dir,
         operator.identity.fedimint_root_secret(),
-        clock,
+        store.clone(),
+        clock.clone(),
     )
     .await
     .context("joining the configured lnv2 Fedimint federation")?;
+    // ADR-0022: fold the pre-ADR-0022 `lnv2_index.db` (if this data dir has one) into the state DB,
+    // validating coverage against the federation's own view, BEFORE anything reads the new tables.
+    let side_file = backend
+        .legacy_index_path()
+        .context("lnv2 backend has no federation directory for the legacy import")?;
+    let outcome = lnrentd::legacy_import::run(
+        &store,
+        lnrentd::legacy_import::Backend::Lnv2,
+        &backend,
+        &side_file,
+        clock.now(),
+    )
+    .await
+    .context("ADR-0022 legacy lnv2 index import")?;
+    tracing::info!(?outcome, "ADR-0022 lnv2 legacy import step");
     tracing::info!("lnv2 fedimint payment backend joined; real ecash money path active");
     Ok(Arc::new(backend))
 }
@@ -548,6 +572,7 @@ async fn build_fedimint_backend(
 #[cfg(not(feature = "fedimint"))]
 async fn build_fedimint_backend(
     _operator: &config::Operator,
+    _store: lnrentd::store::Store,
     _clock: Arc<dyn Clock>,
 ) -> Result<Arc<dyn PaymentBackend>> {
     anyhow::bail!("payment_backend=fedimint requires building lnrentd with --features fedimint")
@@ -557,8 +582,9 @@ async fn build_fedimint_backend(
 /// HTTP client of the operator's OWN external phoenixd node. Available in every build (no cargo
 /// feature), and deliberately does not contact the node here — a momentarily-down phoenixd must not
 /// wedge daemon startup; readiness is reported by the preflight/doctor seams instead.
-fn build_phoenixd_backend(
+async fn build_phoenixd_backend(
     operator: &config::Operator,
+    store: lnrentd::store::Store,
     clock: Arc<dyn Clock>,
     alerts: Arc<AlertDispatcher>,
 ) -> Result<Arc<dyn PaymentBackend>> {
@@ -592,12 +618,28 @@ fn build_phoenixd_backend(
         &phoenixd.url,
         &phoenixd.api_password,
         fee_schedule.clone(),
-        &operator.config.data_dir,
-        clock,
+        store.clone(),
+        clock.clone(),
     )
     .context("opening the phoenixd payment backend")?
-    // lnrent-gc7: report fee-credit refusal and index/state divergence through the durable sink.
+    // lnrent-gc7: report the fee-credit refusal through the durable sink.
     .with_alerts(alerts);
+    // ADR-0022: fold the pre-ADR-0022 `phoenixd_index.db` (if this data dir has one) into the state
+    // DB, validating coverage against phoenixd's own view, BEFORE anything reads the new tables.
+    let side_file = operator
+        .config
+        .data_dir
+        .join(lnrentd::phoenixd_backend::LEGACY_INDEX_FILE);
+    let outcome = lnrentd::legacy_import::run(
+        &store,
+        lnrentd::legacy_import::Backend::Phoenixd,
+        &backend,
+        &side_file,
+        clock.now(),
+    )
+    .await
+    .context("ADR-0022 legacy phoenixd index import")?;
+    tracing::info!(?outcome, "ADR-0022 phoenixd legacy import step");
     tracing::info!(
         url = %phoenixd.url,
         fee_schedule_version = %fee_schedule.verified_version,

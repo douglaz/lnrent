@@ -76,6 +76,14 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// ADR-0022 legacy-import fences. A refund/sweep attempt stamped `migration_unverified` at the
+    /// first migrated boot is parked — not paid or retried while fenced — because its pre-send
+    /// witness may have been lost with the old index file: its legacy outcome is unknown and it MAY
+    /// already have paid. The daemon never releases it on absence; only `clear-fence` does.
+    Migration {
+        #[command(subcommand)]
+        cmd: MigrationCmd,
+    },
     /// Admin: force-suspend a subscription.
     Suspend { id: String },
     /// Admin: force-resume a suspended subscription.
@@ -91,6 +99,27 @@ enum Cmd {
 enum DevCmd {
     /// Settle the open MockPayment invoice for a subscription.
     Settle { subscription_id: String },
+}
+
+#[derive(Subcommand)]
+enum MigrationCmd {
+    /// Release the fence on ONE attempt. Clearing does not by itself re-drive it: a PENDING attempt
+    /// is prepared and paid on the driver's next pass as a first attempt; a FAILED refund still
+    /// needs `refund-retry <id>`, a FAILED sweep a resubmission (the reply names the step). Only you
+    /// can weigh the wallet's own outgoing records, its balance and the buyer's word: check them
+    /// first, say what you checked in --note (journaled), and confirm with --yes. Same authority as
+    /// `sweep --yes` — this can let a refund be paid.
+    #[command(name = "clear-fence")]
+    ClearFence {
+        /// The refund_attempt or sweep_attempt id (`lnrent refunds` lists refunds).
+        id: String,
+        /// What you verified before releasing it (required; journaled to event_log).
+        #[arg(long)]
+        note: String,
+        /// Confirm the release (without it the command only explains what it would do).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -134,7 +163,7 @@ fn exit_code_for(err_code: &str) -> u8 {
         // the operator, not daemon failures, so both land on 3 with the rest of them.
         "bad_request" | "invalid_state" | "dev_disabled" | "unsupported" | "sweep_invalid"
         | "sweep_unpriceable" | "sweep_busy" | "sweep_insufficient" | "sweep_fee_rose"
-        | "sweep_in_flight" | "listing_blocked" | "listing_unverified" => 3,
+        | "sweep_in_flight" | "sweep_fenced" | "listing_blocked" | "listing_unverified" => 3,
         // A read-only request cancelled because the daemon is gracefully shutting down (lnrent-j3c):
         // a TRANSIENT restart race (the reply carries retryable:true), not a hard failure. Map it to
         // the same transient IPC/connection exit as an unreachable daemon (`ipc_unreachable`) so shell
@@ -196,6 +225,23 @@ async fn main() -> ExitCode {
         Cmd::Listing {
             cmd: ListingCmd::Withdraw,
         } => (Request::ListingWithdraw, HumanRender::Listing),
+        Cmd::Migration {
+            cmd: MigrationCmd::ClearFence { id, note, yes },
+        } => {
+            if !yes {
+                eprintln!(
+                    "refusing without --yes: clearing the fence on `{id}` lets it be paid — a PENDING \
+                     attempt on the driver's next pass, a FAILED one once you also retry or resubmit \
+                     it (the reply names the step). Check the wallet's own outgoing records for it \
+                     first, then re-run with --yes --note \"<what you checked>\"."
+                );
+                return exit_for("bad_request");
+            }
+            (
+                Request::MigrationClearFence { id, note },
+                HumanRender::Generic,
+            )
+        }
         Cmd::Suspend { id } => (Request::AdminSuspend { id }, HumanRender::Generic),
         Cmd::Resume { id } => (Request::AdminResume { id }, HumanRender::Generic),
         Cmd::Dev {
@@ -347,6 +393,44 @@ fn money_human_text(v: &serde_json::Value) -> String {
         "Outstanding liabilities: {gross} sat gross, {required} msat required"
     ));
     lines.push(format!("Parked count: {parked}"));
+    // ADR-0022 fenced attempts: parked by the legacy import, invisible in `parked_count` (which
+    // counts FAILED), and cleared only by the backend audit or the operator (codex #91 P2).
+    let fenced_refunds = v
+        .get("migration_fenced_refunds")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let fenced_sweeps = v
+        .get("migration_fenced_sweeps")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if fenced_refunds + fenced_sweeps > 0 {
+        // There is no sweep list verb, so the fenced sweep ids are named here (codex #91 P2).
+        let sweep_ids: Vec<String> = v
+            .get("migration_fenced_sweep_ids")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|s| {
+                        // The bolt11 rides along: a cleared FAILED sweep is re-driven only by
+                        // `lnrent sweep <bolt11> --yes`, and nothing else in the CLI prints it.
+                        format!(
+                            "{} ({}) {}",
+                            s.get("id").and_then(serde_json::Value::as_str).unwrap_or("?"),
+                            s.get("status").and_then(serde_json::Value::as_str).unwrap_or("?"),
+                            s.get("bolt11").and_then(serde_json::Value::as_str).unwrap_or("?")
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        lines.push(format!(
+            "Fenced (ADR-0022 migration_unverified): {fenced_refunds} refund(s), {fenced_sweeps} \
+             sweep(s){} — parked: not paid or retried while fenced, but the legacy outcome is \
+             unknown and MAY already have paid; a FAILED one raises no alert; `lnrent refunds` lists \
+             the refunds; {FENCE_REMEDY}",
+            if sweep_ids.is_empty() { String::new() } else { format!(" [{}]", sweep_ids.join(", ")) }
+        ));
+    }
     let unbookable = v
         .get("recent_unbookable_settlement_alerts")
         .and_then(serde_json::Value::as_u64)
@@ -789,32 +873,59 @@ fn render_teardowns_human(v: &serde_json::Value) {
 /// Human render for `lnrent refunds` (lnrent-urw.5): the non-terminal + parked refunds, or a clean
 /// line. `refund-retry <id>` re-drives a parked (FAILED) one.
 fn render_refunds_human(v: &serde_json::Value) {
+    println!("{}", refunds_human_text(v));
+}
+
+/// The remedy for an ADR-0022 fenced attempt, printed wherever one is listed. One string so the
+/// refunds list and the money view cannot drift on what the operator is told to run.
+const FENCE_REMEDY: &str = "release with `lnrent migration clear-fence <id> --note \"<what you \
+                            checked>\" --yes` after checking the wallet's own outgoing records";
+
+fn refunds_human_text(v: &serde_json::Value) -> String {
     let rows = v.as_array().cloned().unwrap_or_default();
     if rows.is_empty() {
-        println!("No pending or parked refunds.");
-        return;
+        return "No pending or parked refunds.".to_string();
     }
+    let is_fenced = |r: &serde_json::Value| {
+        r.get("migration_fenced")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    // A fenced row is parked by the fence, not by FAILED: `refund-retry` refuses it, so it must not be
+    // counted among the rows that verb can re-drive (codex #91 P2).
     let parked = rows
         .iter()
-        .filter(|r| r.get("status").and_then(serde_json::Value::as_str) == Some("FAILED"))
+        .filter(|r| {
+            r.get("status").and_then(serde_json::Value::as_str) == Some("FAILED") && !is_fenced(r)
+        })
         .count();
-    println!(
+    let fenced = rows.iter().filter(|r| is_fenced(r)).count();
+    let mut lines = vec![format!(
         "Refunds: \x1b[1m{}\x1b[0m ({parked} parked FAILED — retry with `lnrent refund-retry <id>`)",
         rows.len()
-    );
+    )];
+    if fenced > 0 {
+        lines.push(format!(
+            "  {fenced} FENCED migration_unverified (ADR-0022): parked whatever their status says — \
+             not paid or retried while fenced, but the legacy outcome is unknown and MAY already have \
+             paid; a FAILED one raises no alert until you act; {FENCE_REMEDY}"
+        ));
+    }
     for r in &rows {
         let s = |k: &str| r.get(k).and_then(serde_json::Value::as_str).unwrap_or("?");
         let n = |k: &str| r.get(k).and_then(serde_json::Value::as_i64);
-        println!(
-            "  \u{2022} {} \u{b7} {} \u{b7} {} sat \u{b7} {} \u{b7} {} attempt(s) \u{b7} age {}s",
+        lines.push(format!(
+            "  \u{2022} {} \u{b7} {} \u{b7} {} sat \u{b7} {}{} \u{b7} {} attempt(s) \u{b7} age {}s",
             s("id"),
             s("dest_form"),
             n("amount_sat").map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
             s("status"),
+            if is_fenced(r) { " (FENCED)" } else { "" },
             n("attempts").unwrap_or(0),
             n("age_s").unwrap_or(0),
-        );
+        ));
     }
+    lines.join("\n")
 }
 
 /// The `lnrent sweep <bolt11> [--yes]` quote-then-confirm flow (gate1-operator-sweep, urw.3): render
@@ -1365,6 +1476,50 @@ mod tests {
     // cancelled by a graceful shutdown) must map to the TRANSIENT ipc/connection exit 4 — the same
     // bucket as an unreachable daemon — so an agent retries a restart race instead of reading the
     // default exit 1 as a hard failure.
+    /// codex #91 P2 (ADR-0022): a fenced attempt must be visible in the operator views with its
+    /// remedy, and must not be counted as a `refund-retry`-able park.
+    #[test]
+    fn fenced_attempts_are_named_with_their_remedy_in_refunds_and_money() {
+        let refunds = json!([
+            {"id": "r-ok", "dest_form": "ln_address", "amount_sat": 5, "status": "FAILED",
+             "attempts": 5, "age_s": 10, "migration_fenced": false},
+            {"id": "r-fenced", "dest_form": "ln_address", "amount_sat": 5, "status": "PENDING",
+             "attempts": 0, "age_s": 10, "migration_fenced": true, "migration_unverified_at": 7},
+        ]);
+        let text = refunds_human_text(&refunds);
+        assert!(text.contains("(1 parked FAILED"), "the fenced row is not a retryable park: {text}");
+        assert!(text.contains("1 FENCED migration_unverified"), "{text}");
+        assert!(text.contains("migration clear-fence"), "names the remedy: {text}");
+        assert!(text.contains("r-fenced \u{b7} ln_address \u{b7} 5 sat \u{b7} PENDING (FENCED)"), "{text}");
+        assert!(!text.contains("r-ok \u{b7} ln_address \u{b7} 5 sat \u{b7} FAILED (FENCED)"), "{text}");
+
+        let money = money_human_text(&json!({
+            "expected_msat": 0, "gateway_ok": true, "federation_ok": true,
+            "gross_liability_sat": 0, "required_msat": 0, "parked_count": 0, "ready": true,
+            "warning": null, "degraded_read_only": false, "readiness_backend": "fedimint",
+            "migration_fenced_refunds": 1, "migration_fenced_sweeps": 1,
+            "migration_fenced_sweep_ids": [{"id": "sweep:abc", "status": "FAILED", "bolt11": "lnbc1abc"}],
+        }));
+        assert!(
+            money.contains("Fenced (ADR-0022 migration_unverified): 1 refund(s), 1 sweep(s) [sweep:abc (FAILED) lnbc1abc]")
+                && money.contains("migration clear-fence"),
+            "names the fenced sweep id, the only place an operator can get it: {money}"
+        );
+        assert!(!text.contains("keeps alerting"), "a FAILED fenced refund raises no alert: {text}");
+        // coderabbit #91: a fence means the outcome is UNKNOWN; neither view may say "never paid".
+        for t in [&text, &money] {
+            assert!(!t.contains("never paid"), "{t}");
+            assert!(t.contains("MAY already have paid"), "{t}");
+        }
+        // And nothing is printed when there is nothing fenced (or the daemon predates the field).
+        let quiet = money_human_text(&json!({
+            "expected_msat": 0, "gateway_ok": true, "federation_ok": true,
+            "gross_liability_sat": 0, "required_msat": 0, "parked_count": 0, "ready": true,
+            "warning": null, "degraded_read_only": false, "readiness_backend": "fedimint",
+        }));
+        assert!(!quiet.contains("Fenced"), "{quiet}");
+    }
+
     #[test]
     fn exit_code_for_maps_the_error_taxonomy() {
         assert_eq!(exit_code_for("not_found"), 2);
