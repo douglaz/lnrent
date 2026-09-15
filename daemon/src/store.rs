@@ -1020,12 +1020,6 @@ impl Store {
         .await
     }
 
-    /// Liability set for INV-2 refund-readiness. Buckets are de-duplicated by `external_id` with
-    /// precedence: refund_attempt > paid-undelivered order > unreconciled settlement.
-    pub async fn refund_readiness_liabilities(&self) -> Result<Vec<RefundReadinessLiability>> {
-        self.read(load_refund_readiness_liabilities).await
-    }
-
     /// Prune durable business idempotency caches past the retention window. The cutoff uses SQLite
     /// wall time, capped by the daemon clock that stamps these rows, so synthetic-clock tests and a
     /// lagging daemon clock do not over-prune. RUNNING op invocations are never removed: they are the
@@ -1264,6 +1258,10 @@ impl Store {
     }
 }
 
+/// Liability set for INV-2 refund-readiness. Buckets are de-duplicated by `external_id` with
+/// precedence: refund_attempt > paid-undelivered order > unreconciled settlement. Read in the SAME
+/// store pass as the ledger terms (`supervisor::refund_readiness_report_with_probe`) so one report
+/// sees one state of the books.
 pub(crate) fn load_refund_readiness_liabilities(
     conn: &Connection,
 ) -> Result<Vec<RefundReadinessLiability>> {

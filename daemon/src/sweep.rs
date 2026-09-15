@@ -536,7 +536,7 @@ impl Sweeper {
                 }
                 PayStatus::Unknown => {
                     // No key row (the pre-send witness commits with the ledger row, ADR-0022, so a
-                    // started op reads `Pending` above): the pay MAY never have started, so this
+                    // started op reads one of the three arms above): the pay MAY never have started, so this
                     // branch may START a fresh one. Re-validate the stored invoice against the CURRENT clock first
                     // (codex): an intent written shortly before downtime can have expired since —
                     // paying it would either park PENDING forever (cap stuck, blocking new sweeps) or,

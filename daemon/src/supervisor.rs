@@ -31,8 +31,8 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::backends::{BackendKind, 
-    PayStatus, PaymentBackend, PaymentStatus, PhoenixdProbe, PhoenixdReadinessError, Settlement,
+use crate::backends::{BackendKind,
+    PaymentBackend, PaymentStatus, PhoenixdProbe, PhoenixdReadinessError, Settlement,
 };
 use crate::capture::{capture, Capture};
 use crate::clock::Clock;
@@ -1310,7 +1310,9 @@ pub(crate) struct RefundReadinessReport {
     /// for compatibility (lnrent-p2e; see [`RefundReadinessWarning::as_str`]).
     federation_ok: bool,
     /// Failed-parked refunds (CONTEXT.md § Parked): `FAILED` and NOT fenced — released by
-    /// `lnrent refund-retry <id>`. The same set `lnrent refunds` counts as "parked FAILED".
+    /// `lnrent refund-retry <id>`. The same rule `lnrent refunds` applies to its "parked FAILED"
+    /// figure, over the readiness liabilities (rows with received-funds provenance,
+    /// `store::load_refund_readiness_liabilities`); the list shows every such row.
     parked_count: usize,
     /// Fence-parked refunds (ADR-0022, whatever their status) — released only by
     /// `lnrent migration clear-fence`. Their money is Committed, never Required liquidity.
@@ -1844,13 +1846,13 @@ async fn refund_readiness_report_from_liabilities(
                 if refund.status != "PENDING" {
                     continue;
                 }
-                // Required liquidity = Owed ∧ ¬Committed ∧ ¬Parked. The witness comes from the SAME
-                // observation `expected_msat` subtracted from; a row the snapshot did not see (inserted
-                // between the read and now) has no witness and is priced, which is the safe side.
-                let pay = snapshot
+                // Required liquidity = Owed ∧ ¬Committed ∧ ¬Parked. Committed is read from the SAME
+                // snapshot `expected_msat` subtracted it from; a row the snapshot did not see (inserted
+                // between the read and now) is not committed and is priced, which is the safe side.
+                if snapshot
                     .refund(&refund.idempotency_key)
-                    .map_or(PayStatus::Unknown, |r| r.pay);
-                if crate::ledger::committed(&refund.status, refund.fenced, pay) {
+                    .is_some_and(|r| r.committed())
+                {
                     continue;
                 }
                 match pending_refund_required_msat(liability, refund, payment).await {
@@ -2168,7 +2170,7 @@ mod tests {
     // Test doubles delegate through the bare seams; clippy.toml's denylist guards production.
     #![allow(clippy::disallowed_methods)]
     use super::*;
-    use crate::backends::{Invoice, REDACTED_PHOENIXD_VERSION};
+    use crate::backends::{Invoice, PayStatus, REDACTED_PHOENIXD_VERSION};
     use crate::store::migrate;
     use nostr_relay_builder::MockRelay;
     use nostr_sdk::Keys;

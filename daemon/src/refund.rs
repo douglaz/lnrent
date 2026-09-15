@@ -532,10 +532,10 @@ impl Refunder {
                     PlanError::Transient(format!("refund status lookup for {key} failed: {e}"))
                 })?;
             // The pre-send witness commits in the same transaction as the ledger row (ADR-0022), so a
-            // started op always reads `Pending` here and is re-awaited on the SAME key/payment-hash
-            // with NO re-quote — a gateway outage / fee rise must not strand a payment that can still
-            // land (codex P2). `Unknown` IS "no row": only it, or a returned-funds `Failed`, quotes the
-            // cap for a genuinely new payment.
+            // started op never reads `Unknown` here: an in-flight one reads `Pending` and is re-awaited
+            // on the SAME key/payment-hash with NO re-quote — a gateway outage / fee rise must not
+            // strand a payment that can still land (codex P2). `Unknown` IS "no row": only it, or a
+            // returned-funds `Failed`, quotes the cap for a genuinely new payment.
             return match st {
                 PayStatus::Succeeded => Ok(PlanOutcome::AlreadySent {
                     pay_sat: bolt11_sat,

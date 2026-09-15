@@ -36,8 +36,9 @@ use std::sync::Arc;
 /// started-then-failed Attempt is NOT committed and a retry still needs liquidity.
 ///
 /// There is no "started evidence" distinct from the status read: both shipped backends answer
-/// `payment_status_by_key` from the same pay row they would have answered "started" from, and every
-/// stored status maps to a non-`Unknown` variant, so `Unknown` IS "no row" (lnrent-2v2v).
+/// `payment_status_by_key` from the same pay row they would have answered "started" from, and each
+/// backend's `map_pay_status` covers every status it writes, so `Unknown` IS "no row"
+/// (lnrent-2v2v).
 pub(crate) fn committed(status: &str, fenced: bool, pay: PayStatus) -> bool {
     status == "SENT" || fenced || matches!(pay, PayStatus::Pending | PayStatus::Succeeded)
 }
@@ -105,6 +106,7 @@ impl LedgerSnapshot {
 
     /// The refund row with this ledger anchor (`refund_attempt.idempotency_key`, UNIQUE), if it was
     /// present when the snapshot was read.
+    // ponytail: linear scan per lookup; index by key if refund rows ever number in the thousands.
     pub(crate) fn refund(&self, idempotency_key: &str) -> Option<&RefundCommitment> {
         self.reads
             .refunds
@@ -122,13 +124,17 @@ pub async fn expected_msat(store: &Store, payment: &Arc<dyn PaymentBackend>) -> 
     Ok(observe(reads, payment.as_ref()).await?.expected_msat())
 }
 
-/// Probe each refund row's pay witness exactly ONCE.
+/// Probe each refund row's pay witness exactly ONCE. A row already Committed by its status or its
+/// fence is not probed: the witness could not change the answer, and a lookup error on it must not
+/// fail a report that never needed it.
 pub(crate) async fn observe(
     mut reads: LedgerReads,
     payment: &dyn PaymentBackend,
 ) -> Result<LedgerSnapshot> {
     for r in &mut reads.refunds {
-        r.pay = attempt_pay_status(payment, &r.pay_key).await?;
+        if !r.committed() {
+            r.pay = attempt_pay_status(payment, &r.pay_key).await?;
+        }
     }
     Ok(LedgerSnapshot { reads })
 }
@@ -545,6 +551,61 @@ mod tests {
         dbl.set_status("refund:fenced", PayStatus::Failed);
         let payment: Arc<dyn PaymentBackend> = dbl;
         // 100_000 − 10_000 (fenced refund, despite Failed) − 5_000 (fenced FAILED sweep) = 85_000.
+        assert_eq!(expected_msat(&store, &payment).await.unwrap(), 85_000);
+    }
+
+    /// A row Committed by its status or fence needs no witness, so a backend that cannot answer for
+    /// it must not fail the report (`observe` skips the probe). RED on an observe that probes every row.
+    #[tokio::test]
+    async fn observe_does_not_probe_rows_committed_by_status_or_fence() {
+        struct UnqueryablePayment;
+        #[async_trait]
+        impl PaymentBackend for UnqueryablePayment {
+            async fn create_invoice(&self, _: u64, _: &str, _: u32, _: &str) -> Result<Invoice> {
+                unimplemented!()
+            }
+            async fn lookup(&self, _: &str) -> Result<PaymentStatus> {
+                unimplemented!()
+            }
+            async fn lookup_settlement(&self, _: &str) -> Result<(PaymentStatus, Option<i64>)> {
+                unimplemented!()
+            }
+            async fn pay(&self, _: &str, _: u64, _: &str) -> Result<String> {
+                unimplemented!()
+            }
+            async fn payment_status(&self, _: &str) -> Result<PayStatus> {
+                unimplemented!()
+            }
+            async fn payment_status_by_key(&self, key: &str) -> Result<PayStatus> {
+                anyhow::bail!("backend index unreadable for {key}")
+            }
+            async fn watch(&self) -> Result<mpsc::Receiver<Settlement>> {
+                unimplemented!()
+            }
+        }
+        let store = store_with(|c| {
+            c.execute(
+                "INSERT INTO invoice (id, external_id, kind, amount_sat, status)
+                 VALUES ('i1', 'ext', 'order', 100, 'PAID')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO refund_attempt (id, dest, amount_sat, idempotency_key, status, attempts, resolution_gen)
+                 VALUES ('r-sent', 'd', 10, 'refund:sent', 'SENT', 1, 0)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO refund_attempt (id, dest, amount_sat, idempotency_key, status, attempts,
+                    resolution_gen, migration_unverified_at)
+                 VALUES ('r-fenced', 'd', 5, 'refund:fenced', 'FAILED', 3, 0, 42)",
+                [],
+            )
+            .unwrap();
+        });
+        let payment: Arc<dyn PaymentBackend> = Arc::new(UnqueryablePayment);
+        // 100_000 − 10_000 (SENT) − 5_000 (fenced) = 85_000, with no backend read at all.
         assert_eq!(expected_msat(&store, &payment).await.unwrap(), 85_000);
     }
 
