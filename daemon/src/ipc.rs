@@ -1718,7 +1718,7 @@ mod tests {
     };
     use crate::store::Store;
     use async_trait::async_trait;
-    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::mpsc;
 
@@ -1804,7 +1804,6 @@ mod tests {
         gateway_ok: StdMutex<bool>,
         gateway_sequence: StdMutex<VecDeque<bool>>,
         statuses: StdMutex<HashMap<String, PayStatus>>,
-        started: StdMutex<HashSet<String>>,
         calls: StdMutex<Vec<&'static str>>,
     }
 
@@ -1816,7 +1815,6 @@ mod tests {
                 gateway_ok: StdMutex::new(gateway_ok),
                 gateway_sequence: StdMutex::new(VecDeque::new()),
                 statuses: StdMutex::new(HashMap::new()),
-                started: StdMutex::new(HashSet::new()),
                 calls: StdMutex::new(Vec::new()),
             }
         }
@@ -1828,7 +1826,6 @@ mod tests {
                 gateway_ok: StdMutex::new(false),
                 gateway_sequence: StdMutex::new(VecDeque::from(gateway_ok)),
                 statuses: StdMutex::new(HashMap::new()),
-                started: StdMutex::new(HashSet::new()),
                 calls: StdMutex::new(Vec::new()),
             }
         }
@@ -1896,11 +1893,6 @@ mod tests {
                 .unwrap()
                 .get(key)
                 .unwrap_or(&PayStatus::Unknown))
-        }
-
-        async fn payment_started_by_key(&self, key: &str) -> Result<bool> {
-            self.record("payment_started_by_key");
-            Ok(self.started.lock().unwrap().contains(key))
         }
 
         async fn available_balance_msat(&self) -> Result<Option<u64>> {
@@ -3225,7 +3217,6 @@ mod tests {
             "refund_gateway_ready",
             "refund_required_outlay_msat",
             "payment_status_by_key",
-            "payment_started_by_key",
         ] {
             assert!(
                 calls.contains(&required),
@@ -3236,10 +3227,7 @@ mod tests {
             assert!(
                 matches!(
                     *call,
-                    "refund_gateway_ready"
-                        | "refund_required_outlay_msat"
-                        | "payment_status_by_key"
-                        | "payment_started_by_key"
+                    "refund_gateway_ready" | "refund_required_outlay_msat" | "payment_status_by_key"
                 ),
                 "money made a non-read-only or balance-reading payment call: {calls:?}"
             );

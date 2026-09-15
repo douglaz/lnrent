@@ -278,13 +278,18 @@ applied. Define two related numbers:
 The liability rows are:
 
 1. **Refund ledger rows:** every `refund_attempt` whose status is not `SENT` and whose provenance shows
-   received funds. ALL such rows count in `gross` (visibility). For `required_outlay_msat`: a `PENDING`
-   row WITHOUT an in-flight backend payment (none started, or current gen `Failed+expired`) is an
-   as-yet-unstarted liability and contributes; a `PENDING` row whose current generation already has a
-   PENDING/Unknown backend payment is in-flight (funds committed) and contributes 0. `FAILED` rows are
-   parked/manual liabilities (money received, not refunded) — counted in `gross`, surfaced as
-   `parked_count`, never retried or hidden. Dust/no-destination/manual failures do not vanish from
-   accounting because automation parked them.
+   received funds. ALL such rows count in `gross` (visibility). For `required_outlay_msat`
+   (CONTEXT.md *Required liquidity* = Owed ∧ ¬Committed ∧ ¬Parked): a `PENDING` row that is not
+   Committed (no backend witness, or a current-gen `Failed` — funds returned) is an as-yet-unstarted
+   liability and contributes; a `PENDING` row whose current generation has a `Pending`/`Succeeded`
+   witness is Committed (already subtracted from expected holdings) and contributes 0. The witness is
+   read ONCE per report, from the same snapshot `expected_msat` is derived from (`ledger::observe`),
+   so a witness that flips mid-report cannot land on both sides of the compare. Parked rows are
+   attention items, not liquidity: `FAILED` unfenced rows are failed-parked (money received, not
+   refunded) — counted in `gross`, surfaced as `parked_count`, released by `refund-retry`; rows
+   carrying the ADR-0022 fence are fence-parked whatever their status — Committed, surfaced as
+   `fence_parked_count`, released only by `migration clear-fence`. Neither is retried or hidden;
+   dust/no-destination/manual failures do not vanish from accounting because automation parked them.
 2. **Paid order not yet delivered:** an order invoice with received-payment provenance (`invoice.kind =
    'order'` and (`invoice.status = 'PAID'` or `invoice.settled_at IS NOT NULL`)) whose subscription is in
    `PENDING`, `PROVISIONING`, or `REFUND_DUE`, excluding any external_id already represented by a
@@ -322,8 +327,8 @@ else:
         WARN with {gross, required_msat, bal_msat, gateway_ok=false, parked_count}
     else if bal_msat is Some(b) AND b < required_msat:
         WARN with {gross, required_msat, bal_msat=b, gateway_ok=true, parked_count}
-    else if parked_count > 0:
-        WARN/ERROR manual-liability alert with {gross_parked, parked_count}, not a "fund ecash" warning
+    else if parked_count + fence_parked_count > 0:
+        WARN/ERROR manual-liability alert with {gross_parked, parked_count, fence_parked_count}, not a "fund ecash" warning
     else:
         -> no warning
 ```

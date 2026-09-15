@@ -28,69 +28,112 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// A refund_attempt row that MIGHT lock funds out of the spendable wallet. Read locally, then
-/// classified async: a `SENT` row, or one whose CURRENT-generation pay has durable started evidence
-/// in the local pay index, has committed its funds and is subtracted.
-struct RefundCommitment {
-    external_id: String,
-    resolution_gen: i64,
-    amount_msat: u128,
-    status: String,
-    /// ADR-0022 legacy-import fence: the pre-send witness may be lost, so the backend's answer for
-    /// this key proves nothing about whether the legacy payment landed. Committed unconditionally.
-    fenced: bool,
+/// **Committed** (CONTEXT.md § Billing), defined ONCE and re-derived per read, never stored: the
+/// books must assume this Attempt's money has left the wallet or is locked out of it — it was sent,
+/// it is Fenced (ADR-0022: the witness that would let the backend answer may be lost, and the legacy
+/// payment may have landed), or the backend holds a pay witness that is pending or succeeded. A
+/// conservative exclusion, not proof the funds moved. A terminal `Failed` returns the funds, so a
+/// started-then-failed Attempt is NOT committed and a retry still needs liquidity.
+///
+/// There is no "started evidence" distinct from the status read: both shipped backends answer
+/// `payment_status_by_key` from the same pay row they would have answered "started" from, and every
+/// stored status maps to a non-`Unknown` variant, so `Unknown` IS "no row" (lnrent-2v2v).
+pub(crate) fn committed(status: &str, fenced: bool, pay: PayStatus) -> bool {
+    status == "SENT" || fenced || matches!(pay, PayStatus::Pending | PayStatus::Succeeded)
 }
 
-/// The three §D terms read in ONE store pass. Receipts + sweep caps are final; the refund rows
-/// still need the async started-evidence probe before they can be subtracted.
-struct LedgerReads {
+/// The ONE production read of a backend's pay witness for an Attempt's pay key (a refund's
+/// `gen_key`, a sweep's id). Drivers call this for their transition decisions — they need the
+/// four-way [`PayStatus`], never a money predicate — and every money reader goes through
+/// [`observe`]. `clippy.toml` refuses the bare trait method everywhere else.
+#[allow(clippy::disallowed_methods)] // the sanctioned delegate
+pub(crate) async fn attempt_pay_status(payment: &dyn PaymentBackend, key: &str) -> Result<PayStatus> {
+    payment.payment_status_by_key(key).await
+}
+
+/// One refund Attempt's state as the books see it: lifecycle status, fence, and the backend's pay
+/// witness under its CURRENT-generation pay key (`refund:<ext>` for gen 0, `refund:<ext>:g<n>` for
+/// gen>=1 — the key the BACKEND saw, not the stable `idempotency_key` ledger anchor). The amount is
+/// the row's refundable wallet-credit cap; it is 0 for a row with no whole-sat amount, which then
+/// subtracts nothing but still carries its witness for readiness.
+pub(crate) struct RefundCommitment {
+    pub(crate) idempotency_key: String,
+    pay_key: String,
+    amount_msat: u128,
+    status: String,
+    fenced: bool,
+    /// Filled by [`observe`]; `Unknown` until then.
+    pub(crate) pay: PayStatus,
+}
+
+impl RefundCommitment {
+    pub(crate) fn committed(&self) -> bool {
+        committed(&self.status, self.fenced, self.pay)
+    }
+}
+
+/// The §D terms read in ONE store pass. Receipts + sweep caps are final; the refund rows still need
+/// the backend witness ([`observe`]) before they can be classified.
+pub(crate) struct LedgerReads {
     receipts_msat: u128,
     refunds: Vec<RefundCommitment>,
     sweep_caps_msat: u128,
 }
 
-/// The ledger's conservative lower bound on spendable wallet holdings, in msats (spec §D).
-///
-/// Pure LOCAL: the sqlite ledger + the local pay index (`payment_started_by_key`). Makes NO
-/// federation balance call. `u128` throughout with saturating subtraction, so the result is ≥ 0.
-pub async fn expected_msat(store: &Store, payment: &Arc<dyn PaymentBackend>) -> Result<u128> {
-    let reads = store.read(read_ledger_terms).await?;
-
-    // Subtract the refunds whose funds are already committed. A started-but-PENDING refund MUST be
-    // subtracted: the outgoing contract has locked those funds even before the row flips to SENT.
-    // Terminal Failed means funds returned and a retry still needs liquidity, so it is not
-    // subtracted even though a historical pay-index row exists.
-    // A FENCED row (ADR-0022) is committed whatever its status and whatever the backend says: the
-    // fence exists because the witness that would let the backend answer may be lost, and the
-    // legacy payment may have landed — overstating holdings here would let reconcile report false
-    // drift and readiness claim funds that already left (codex #91 P2, eleventh round).
-    let mut committed_msat: u128 = 0;
-    for r in &reads.refunds {
-        let committed = if r.status == "SENT" || r.fenced {
-            true
-        } else {
-            // The SAME started-evidence disambiguator INV-2/recovery use: the evidence lives under
-            // the CURRENT-generation pay key the BACKEND saw (`refund:<ext>` for gen 0,
-            // `refund:<ext>:g<n>` for gen>=1), NOT the stable `idempotency_key` ledger anchor.
-            let key = gen_key(&r.external_id, r.resolution_gen);
-            match payment.payment_status_by_key(&key).await? {
-                PayStatus::Succeeded | PayStatus::Pending => true,
-                PayStatus::Failed => false,
-                PayStatus::Unknown => payment.payment_started_by_key(&key).await?,
-            }
-        };
-        if committed {
-            committed_msat = committed_msat.saturating_add(r.amount_msat);
-        }
-    }
-
-    Ok(reads
-        .receipts_msat
-        .saturating_sub(committed_msat)
-        .saturating_sub(reads.sweep_caps_msat))
+/// [`LedgerReads`] after ONE observation of every refund row's pay witness. A report that needs
+/// both expected holdings and per-refund classification (readiness) builds this once and reads
+/// both from it, so a witness that flips between two probes can never land on both sides of
+/// `expected < required` (lnrent-4br3).
+pub(crate) struct LedgerSnapshot {
+    reads: LedgerReads,
 }
 
-fn read_ledger_terms(conn: &Connection) -> Result<LedgerReads> {
+impl LedgerSnapshot {
+    /// `Σ receipts − Σ committed refund caps − Σ sweep caps`, saturating at 0 (spec §D).
+    pub(crate) fn expected_msat(&self) -> u128 {
+        let committed_msat = self
+            .reads
+            .refunds
+            .iter()
+            .filter(|r| r.committed())
+            .fold(0u128, |acc, r| acc.saturating_add(r.amount_msat));
+        self.reads
+            .receipts_msat
+            .saturating_sub(committed_msat)
+            .saturating_sub(self.reads.sweep_caps_msat)
+    }
+
+    /// The refund row with this ledger anchor (`refund_attempt.idempotency_key`, UNIQUE), if it was
+    /// present when the snapshot was read.
+    pub(crate) fn refund(&self, idempotency_key: &str) -> Option<&RefundCommitment> {
+        self.reads
+            .refunds
+            .iter()
+            .find(|r| r.idempotency_key == idempotency_key)
+    }
+}
+
+/// The ledger's conservative lower bound on spendable wallet holdings, in msats (spec §D).
+///
+/// Pure LOCAL: the sqlite ledger + the backend's local pay index. Makes NO federation balance call.
+/// `u128` throughout with saturating subtraction, so the result is ≥ 0.
+pub async fn expected_msat(store: &Store, payment: &Arc<dyn PaymentBackend>) -> Result<u128> {
+    let reads = store.read(read_ledger_terms).await?;
+    Ok(observe(reads, payment.as_ref()).await?.expected_msat())
+}
+
+/// Probe each refund row's pay witness exactly ONCE.
+pub(crate) async fn observe(
+    mut reads: LedgerReads,
+    payment: &dyn PaymentBackend,
+) -> Result<LedgerSnapshot> {
+    for r in &mut reads.refunds {
+        r.pay = attempt_pay_status(payment, &r.pay_key).await?;
+    }
+    Ok(LedgerSnapshot { reads })
+}
+
+pub(crate) fn read_ledger_terms(conn: &Connection) -> Result<LedgerReads> {
     Ok(LedgerReads {
         receipts_msat: sum_receipts_msat(conn)?,
         refunds: load_refund_commitments(conn)?,
@@ -149,9 +192,8 @@ pub(crate) fn sum_receipts_msat(conn: &Connection) -> Result<u128> {
     Ok(received_by_ext.values().copied().sum())
 }
 
-/// Every refund_attempt row that MIGHT have committed funds. FAILED rows are included and filtered
-/// out by the started-evidence probe in [`expected_msat`]; a row with no whole-sat amount subtracts
-/// nothing, so it is skipped here.
+/// Every refund_attempt row. FAILED rows are included and excluded by [`committed`]; a row with no
+/// whole-sat amount carries `amount_msat: 0` (subtracts nothing) so readiness can still find it.
 fn load_refund_commitments(conn: &Connection) -> Result<Vec<RefundCommitment>> {
     let mut stmt = conn.prepare(
         "SELECT id, idempotency_key, amount_sat, status, resolution_gen,
@@ -171,15 +213,13 @@ fn load_refund_commitments(conn: &Connection) -> Result<Vec<RefundCommitment>> {
     let mut out = Vec::new();
     for row in rows {
         let (id, idempotency_key, amount_sat, status, resolution_gen, fenced) = row?;
-        let Some(sat) = positive_sat(amount_sat) else {
-            continue;
-        };
         out.push(RefundCommitment {
-            external_id: external_id_from(&idempotency_key, &id),
-            resolution_gen,
-            amount_msat: u128::from(sat) * 1000,
+            pay_key: gen_key(&external_id_from(&idempotency_key, &id), resolution_gen),
+            idempotency_key,
+            amount_msat: positive_sat(amount_sat).map_or(0, |sat| u128::from(sat) * 1000),
             status,
             fenced,
+            pay: PayStatus::Unknown,
         });
     }
     Ok(out)
@@ -229,22 +269,17 @@ mod tests {
     use crate::backends::{Invoice, PayStatus, PaymentStatus, Settlement};
     use crate::store::Store;
     use async_trait::async_trait;
-    use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::mpsc;
 
-    /// A payment double whose `payment_started_by_key` is steerable and whose
+    /// A payment double whose per-key `payment_status_by_key` is steerable and whose
     /// `available_balance_msat` PANICS — `expected_msat` must never read the federation balance.
     #[derive(Default)]
     struct StartedPayment {
-        started: StdMutex<HashSet<String>>,
         statuses: StdMutex<HashMap<String, PayStatus>>,
     }
 
     impl StartedPayment {
-        fn set_started(&self, key: &str) {
-            self.started.lock().unwrap().insert(key.to_string());
-        }
         fn set_status(&self, key: &str, status: PayStatus) {
             self.statuses
                 .lock()
@@ -278,9 +313,6 @@ mod tests {
                 .get(key)
                 .unwrap_or(&PayStatus::Unknown))
         }
-        async fn payment_started_by_key(&self, key: &str) -> Result<bool> {
-            Ok(self.started.lock().unwrap().contains(key))
-        }
         async fn available_balance_msat(&self) -> Result<Option<u64>> {
             panic!("expected_msat must never read the federation balance")
         }
@@ -299,6 +331,32 @@ mod tests {
 
     fn no_start_payment() -> Arc<dyn PaymentBackend> {
         Arc::new(StartedPayment::default())
+    }
+
+    /// CONTEXT.md § Committed, as a table: sent or fenced commit whatever the witness says; an
+    /// unfenced live row commits only on a Pending/Succeeded witness, and a terminal Failed (funds
+    /// returned) or no witness at all (Unknown) does not.
+    #[test]
+    fn committed_is_sent_or_fenced_or_a_live_witness() {
+        use PayStatus::*;
+        for (status, fenced, pay, want) in [
+            ("SENT", false, Unknown, true),
+            ("SENT", false, Failed, true),
+            ("PENDING", true, Failed, true),
+            ("FAILED", true, Unknown, true),
+            ("PENDING", false, Pending, true),
+            ("PENDING", false, Succeeded, true),
+            ("PENDING", false, Failed, false),
+            ("PENDING", false, Unknown, false),
+            ("FAILED", false, Unknown, false),
+            ("FAILED", false, Failed, false),
+        ] {
+            assert_eq!(
+                committed(status, fenced, pay),
+                want,
+                "committed({status:?}, fenced={fenced}, {pay:?})"
+            );
+        }
     }
 
     #[tokio::test]
@@ -406,12 +464,11 @@ mod tests {
             .unwrap();
         });
         let dbl = Arc::new(StartedPayment::default());
-        dbl.set_started("refund:started"); // gen 0 → the pay key equals the idempotency anchor
-        dbl.set_started("refund:terminal_failed");
+        dbl.set_status("refund:started", PayStatus::Pending); // gen 0 → the pay key equals the anchor
         dbl.set_status("refund:terminal_failed", PayStatus::Failed);
         let payment: Arc<dyn PaymentBackend> = dbl;
 
-        // 40 gross - 10 (SENT) - 10 (started Unknown) = 20 sat; failed/unstarted and terminal
+        // 40 gross - 10 (SENT) - 10 (started, Pending witness) = 20 sat; failed/unstarted and terminal
         // Failed pay-index rows are NOT subtracted because their funds are available for retry.
         assert_eq!(expected_msat(&store, &payment).await.unwrap(), 20_000);
     }

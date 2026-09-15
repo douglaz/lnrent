@@ -1412,18 +1412,9 @@ impl PaymentBackend for Lnv2Payment {
         ))
     }
 
-    async fn payment_started_by_key(&self, idempotency_key: &str) -> Result<bool> {
-        let key = idempotency_key.to_string();
-        Ok(self
-            .store
-            .read(move |c| pay_status_by_key(c, &key))
-            .await?
-            .is_some())
-    }
-
     /// lnv2 answers this from the FEDERATION's oplog, not from `lnv2_pay` — which is the whole point
     /// (lnrent-7wbo): the caller reaches this seam precisely when the local index may have lost the
-    /// row, and `payment_started_by_key` next door is a pure index read that answers `false` in that
+    /// row, and `payment_status_by_key` next door is a pure index read that answers `Unknown` in that
     /// case for a payment that really happened.
     ///
     /// The derivation needs no index at all. `send_operation_id` is DETERMINISTIC in the bolt11

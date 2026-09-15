@@ -85,6 +85,8 @@ pub struct RefundAttemptLiability {
     pub resolved_bolt11: Option<String>,
     pub resolved_expiry: Option<i64>,
     pub resolution_gen: i64,
+    /// ADR-0022 fence (`migration_unverified_at IS NOT NULL`): fence-parked whatever `status` says.
+    pub fenced: bool,
 }
 
 pub const SCHEMA: &str = r#"
@@ -1262,7 +1264,9 @@ impl Store {
     }
 }
 
-fn load_refund_readiness_liabilities(conn: &Connection) -> Result<Vec<RefundReadinessLiability>> {
+pub(crate) fn load_refund_readiness_liabilities(
+    conn: &Connection,
+) -> Result<Vec<RefundReadinessLiability>> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let refund_external_ids = load_refund_attempt_external_ids(conn)?;
@@ -1284,7 +1288,7 @@ fn load_refund_readiness_liabilities(conn: &Connection) -> Result<Vec<RefundRead
          SELECT r.external_id,
                 COALESCE(i.received_msat / 1000, i.amount_sat, journal.amount_sat) AS received_sat,
                 r.status, r.idempotency_key, r.dest, r.resolved_bolt11,
-                r.resolved_expiry, r.resolution_gen
+                r.resolved_expiry, r.resolution_gen, r.migration_unverified_at IS NOT NULL
            FROM (
                  SELECT *,
                         CASE
@@ -1312,6 +1316,7 @@ fn load_refund_readiness_liabilities(conn: &Connection) -> Result<Vec<RefundRead
             r.get::<_, Option<String>>(5)?,
             r.get::<_, Option<i64>>(6)?,
             r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+            r.get::<_, bool>(8)?,
         ))
     })?;
     for row in rows {
@@ -1324,6 +1329,7 @@ fn load_refund_readiness_liabilities(conn: &Connection) -> Result<Vec<RefundRead
             resolved_bolt11,
             resolved_expiry,
             resolution_gen,
+            fenced,
         ) = row?;
         let Some(gross_sat) = positive_sat(received_sat) else {
             continue;
@@ -1339,6 +1345,7 @@ fn load_refund_readiness_liabilities(conn: &Connection) -> Result<Vec<RefundRead
                     resolved_bolt11,
                     resolved_expiry,
                     resolution_gen,
+                    fenced,
                 }),
             });
         }

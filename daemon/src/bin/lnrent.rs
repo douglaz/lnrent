@@ -392,9 +392,24 @@ fn money_human_text(v: &serde_json::Value) -> String {
     lines.push(format!(
         "Outstanding liabilities: {gross} sat gross, {required} msat required"
     ));
-    lines.push(format!("Parked count: {parked}"));
-    // ADR-0022 fenced attempts: parked by the legacy import, invisible in `parked_count` (which
-    // counts FAILED), and cleared only by the backend audit or the operator (codex #91 P2).
+    // Parked (CONTEXT.md): failed-parked (`parked_count`, the same rows `lnrent refunds` counts as
+    // "parked FAILED") and fence-parked (`fence_parked_count`, ADR-0022; absent from a daemon that
+    // predates it), each with its own remedy.
+    let fence_parked = v
+        .get("fence_parked_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    lines.push(format!(
+        "Parked count: {parked} failed-parked (`lnrent refunds` lists them; `lnrent refund-retry <id>` \
+         re-drives one){}",
+        if fence_parked > 0 {
+            format!(", {fence_parked} fence-parked (see Fenced below)")
+        } else {
+            String::new()
+        }
+    ));
+    // ADR-0022 fenced attempts: parked by the legacy import, cleared only by the backend audit or
+    // the operator (codex #91 P2).
     let fenced_refunds = v
         .get("migration_fenced_refunds")
         .and_then(serde_json::Value::as_u64)
@@ -1463,7 +1478,8 @@ mod tests {
              Federation: not ok\n\
              Gateway: ok\n\
              Outstanding liabilities: 2 sat gross, 2000 msat required\n\
-             Parked count: 0\n\
+             Parked count: 0 failed-parked (`lnrent refunds` lists them; `lnrent refund-retry <id>` \
+             re-drives one)\n\
              Status: \u{1b}[1mNOT READY (FederationDown)\u{1b}[0m"
         );
     }

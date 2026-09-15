@@ -525,8 +525,8 @@ trait PaymentBackend {
 The sketch above is the original 6-method core. The landed trait (daemon/src/backends.rs) adds
 the money-hardening surface — most importantly **`pay_refund_capped`** (the INV-1 fee-capped
 refund pay; refunds MUST use it, never bare `pay`), plus `lookup_settlement`,
-`refund_net_sat` / `refund_required_outlay_msat`, `payment_started_by_key`,
-`available_balance_msat`, and `refund_gateway_ready`.
+`refund_net_sat` / `refund_required_outlay_msat`, `available_balance_msat`, and
+`refund_gateway_ready`.
 docs/specs/refund-money-path-hardening.md §3 is the source of truth for those.
 
 `PaymentStatus` (`Open` / `Paid` / `Expired`) describes an inbound **invoice**; an **outbound**
