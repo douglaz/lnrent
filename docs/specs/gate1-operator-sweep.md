@@ -127,9 +127,12 @@ docs/specs/gate1-alerting-operability.md §F — never by this authorization pat
   the backend's pay witness for the key (`ledger::attempt_pay_status`, the same read the refund
   path uses; since ADR-0022 the pre-send row commits with the ledger row, so a started op never
   reads `Unknown`) →
-  - **started** (`Succeeded` / `Pending` / `Failed` witness): re-await by key (fast-skip on
-    Succeeded, park on Failed) — funds are already committed; finishing is correct and cannot
-    double-pay;
+  - **`Succeeded`**: the money left; record SENT (`commit_sent`) — the cap stays consumed;
+  - **`Pending`**: in flight, funds Committed; re-await by key (`capped_pay` re-awaits the same
+    op) — finishing is correct and cannot double-pay;
+  - **`Failed`**: the backend terminally refused or failed the op before the sweep ledger could
+    park it; funds returned, so the row is parked FAILED (`commit_failed`) and its cap is released
+    to surplus — NOT re-awaited (`sweep.rs` `drive`, the `PayStatus::Failed` arm);
   - **not started** (`Unknown`): the recovery drive first RE-VALIDATES the stored bolt11 against the current
     clock, because an intent written shortly before downtime can have expired since. Two sub-cases:
     - **still payable**: RE-RUN the surplus gate against the current ledger before the capped send
