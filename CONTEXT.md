@@ -184,6 +184,57 @@ bounded. (ADR-0016 / docs/specs/gate1-operator-sweep.md; `lnrent sweep <bolt11>`
 by default and pays only with `--yes`.)
 _Avoid_: withdrawal, payout (ambiguous with refunds), cash out.
 
+**Attempt**:
+One intended outbound payment from the daemon's wallet, of exactly one *kind*: a Refund or a
+Sweep. An Attempt has a lifecycle — not started, in flight, sent, failed — and the daemon's
+knowledge of where it stands (its status, what pay witness the Payment backend holds for it,
+whether it is Fenced) is ONE thing, read the same way for both kinds and observed once per
+report, never cached across reports. How much money it commits
+is NOT part of the Attempt: a Refund's amount is a facet of its Receipt, a Sweep's is its own
+quoted cap, and the books count each in their own way.
+_Avoid_: payment (ambiguous with the Buyer-side act), payout, transfer, "the refund row".
+
+**Fence**:
+A mark on an Attempt saying the daemon cannot tell whether that payment already went out — the
+evidence that would settle it was lost (the ADR-0022 legacy import). Orthogonal to the
+lifecycle: a Fenced Attempt keeps its status, but the daemon will neither pay nor retry it, and
+treats its money as committed, until a human clears the Fence after checking the wallet's own
+records. Clearing releases the mark and nothing else.
+_Avoid_: hold, lock, quarantine, "unverified" on its own, "parked" (broader — see Parked).
+
+**Parked**:
+An Attempt that will not move again until someone acts, always with a stated reason and remedy.
+Two kinds: *failed-parked* (its own lifecycle ended in failure; released by an explicit retry or
+resubmission) and *fence-parked* (Fenced, whatever its status; released only by clearing the
+Fence). A Parked Attempt may still owe money (a Refund) or still commit money (a Fenced one);
+"parked" says nothing about the amount.
+_Avoid_: stuck (that is an Alert about a Pending Attempt taking too long), blocked, frozen,
+"FAILED" as a synonym (only one of the two kinds).
+
+**Committed**:
+Money the books must assume has left the wallet, or is locked out of it, on account of an
+Attempt: it was sent, or it is Fenced, or the Payment backend holds a pay witness for it that
+is pending or succeeded. A conservative exclusion, not proof the funds moved — a witness may
+precede the actual send. It is re-derived every time it is read and
+never stored, because it can reverse: a started payment that fails terminally returns its funds.
+Refunds and Sweeps are both Committed by this rule; what differs is the amount each commits.
+_Avoid_: paid, settled, spent, "in flight" (a lifecycle stage; a Sweep in flight is Committed,
+but so is a sent one).
+
+**Owed**:
+Money a Buyer is still due: every Refund not yet sent, whatever else is true of it — Parked,
+Fenced, or started. A Sweep is never Owed. Each owed Refund counts exactly once toward what the
+Operator may not take out, no matter how many other descriptions also apply to it.
+_Avoid_: liability (the readiness report's word for a broader set that includes receipts with no
+Refund yet), debt, reserved (the Surplus's bookkeeping name for the same money).
+
+**Required liquidity**:
+The part of what is Owed that the daemon will pay on its own and has not yet Committed: an
+unfenced Refund still in flight of its own accord. Parked Refunds of either kind are excluded —
+they are reported as needing a human, not as money the wallet must hold right now — and so is
+anything already Committed. This is the figure readiness compares against expected holdings.
+_Avoid_: required balance, coverage, shortfall (the warning, not the quantity).
+
 **Condition**:
 A durable, open situation the daemon has detected that it cannot resolve on its own right
 now and a human may have to act on: a paid receipt it refuses to book, an invoice the

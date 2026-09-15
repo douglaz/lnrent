@@ -1,0 +1,21 @@
+# Fable review — question 3 (what does "committed" mean?)
+
+Reviewer: Claude Fable 5.1 subagent, read-only, 2026-09-15. Brief: `committed-review-brief.md`.
+
+**Verdict:** Right question, mostly right answer — but two claims in it are false against the tree and one is self-contradictory; fix those before it becomes doc.
+
+**[P1]** brief l.40-41 vs `daemon/src/sweep.rs:133-137` — "surplus's paid-out IS Committed" is false today: refunds partition on `status == "SENT"` only; the started probe is never read (`read_surplus` is sync over `&Connection`, sweep.rs:73). No double-subtract exists now. Implemented literally (reserved = Owed at l.136, paid_out = Committed), a started PENDING refund lands in BOTH buckets and `surplus_msat` (sweep.rs:62-66) subtracts it twice.
+
+**[P1]** brief l.45-49 — the formula contradicts its prose. Required = Owed ∧ ¬Committed puts an unfenced FAILED refund into required liquidity (owed; ¬committed per `ledger.rs:78` "Failed ⇒ funds returned"), yet the prose says failed-parked is "attention, not liquidity" — which is what the tree does (`supervisor.rs:1808-1811` skips FAILED into `parked_count`). Pick one; the formula as written changes readiness for every parked refund.
+
+**[P2]** Committed is not stable and nobody claims it is: `refund.rs:475-483` (terminal Failed keeps the row PENDING, bumps attempts) + `ledger.rs:76-80` flip it true→false mid-lifecycle; the next generation (`refund.rs:653-683`, new key) flips it true again. Safe only because every consumer re-derives per read (`supervisor.rs:1256`, `1760`; `ipc.rs:851`) and none caches. State that as the rule.
+
+**[P2]** The probe is NOT a live backend call: `lnv2_backend.rs:1408-1422`, `phoenixd_backend.rs:2218-2230` read `lnv2_pay`/`phoenixd_pay` rows in lnrent.sqlite (`store.rs:452`). So Committed IS over local state — but behind an async trait, unreachable from `read_surplus(&Connection)`. "Defined once, consumed by every reader" needs either a SQL join on those tables or the admission that surplus needs no Committed for refunds (every refund row subtracts once regardless of bucket).
+
+**[P3]** Fenced PENDING sweep: `sweep.rs:858-865` counts `status='PENDING'` fence-blind, so it holds the single slot until clear-fence. That is the lifecycle "in flight" (CONTEXT.md:189), not a money predicate. Not a fourth money predicate; but Committed ⊋ in-flight (SENT and fenced-FAILED sweeps are committed, not in flight), so the slot must not be documented as Committed.
+
+**[P3]** Fenced FAILED refund after clear-fence: `ipc.rs:1264-1265, 1309-1311` — stays FAILED, so it moves from Committed (subtracted from expected) to failed-parked (neither subtracted nor required): `expected_msat` RISES the moment the operator admits it never paid. Matches the proposal's "attention item" but reads wrong operationally. QUESTION: if the audit finds the legacy payment DID land, I found no verb to mark it SENT — `refund-retry` (ipc.rs:1217-1221) would pay again.
+
+**[P3]** lnrent-4br3 fix is small: `store.rs:1284-1287` never selects `migration_unverified_at`; add the column and return 0 in `pending_refund_required_msat` beside the started arms (`supervisor.rs:1867-1868`).
+
+**Reasoning.** Item 1: the question is right, but it skips "does each reader need all three?" Readiness already IS Owed∧¬Committed minus the fence (its probe at `supervisor.rs:1864-1870` mirrors `ledger.rs:76-80` exactly); the only missing input is the fence column. Surplus needs Committed only for sweeps (`sweep.rs:169-172`, FAILED excluded) and for refunds needs merely "row exists" — reserved/paid_out is a display partition, not two predicates summed. Expected needs Committed alone. So: three predicates are the right vocabulary, but only readiness consumes all three; writing "every reader consumes all three" is what produces the P1 double-count. Item 3: no reader needs a fourth money predicate; the sweep slot and driver selection (`refund.rs:1258`, `sweep.rs:766-767`) consume the lifecycle status, already a CONTEXT.md term. Nothing in the three is unused. Ponytail path: leave the readers' shapes alone, add the fence column to the readiness CTE, and amend the proposal text to (a) surplus = every refund once + committed sweeps, (b) failed-parked is explicitly outside Required, (c) Committed is re-derived per read, never stored.

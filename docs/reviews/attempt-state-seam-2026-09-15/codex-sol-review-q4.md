@@ -1,0 +1,20 @@
+VERDICT: FAIL — Q4 is timely, but the proposed universal `AttemptState` reader conflates accounting observations with driver decisions and leaves correctness gaps at master `7927bfb`.
+
+[P1] [daemon/src/sweep.rs:575](/home/master/projects/lnrent/daemon/src/sweep.rs:575) — Pre-existing: recovery reads surplus before `authorise_send`; its later transaction checks only PENDING/unfenced ([sweep.rs:765](/home/master/projects/lnrent/daemon/src/sweep.rs:765)). A newly committed liability can therefore invalidate authorization before payment. Fresh `gate_and_write` correctly gates and persists atomically at [sweep.rs:868](/home/master/projects/lnrent/daemon/src/sweep.rs:868).
+
+[P2] [daemon/src/supervisor.rs:1760](/home/master/projects/lnrent/daemon/src/supervisor.rs:1760) — `expected_msat` observes each refund, then readiness observes it again at [supervisor.rs:1866](/home/master/projects/lnrent/daemon/src/supervisor.rs:1866). An unstarted→prepared transition can omit the amount from both committed subtraction and required liquidity. One reader does not fix this; one shared observation does.
+
+[P2] [daemon/src/lnv2_backend.rs:479](/home/master/projects/lnrent/daemon/src/lnv2_backend.rs:479) — `PREPARED` maps to `Pending`, while `payment_started_by_key` means merely “row exists” ([lnv2_backend.rs:1415](/home/master/projects/lnrent/daemon/src/lnv2_backend.rs:1415)); PREPARED explicitly precedes `send` ([lnv2_backend.rs:762](/home/master/projects/lnrent/daemon/src/lnv2_backend.rs:762)). This is safely conservative for accounting, but drivers need the actual phase, not a `started` boolean. QUESTION: does “started” mean wallet-started or locally reserved/may-have-started?
+
+[P2] [daemon/src/refund.rs:475](/home/master/projects/lnrent/daemon/src/refund.rs:475) — After-error and recovery reads drive adoption, retry, and re-resolution; sweep has the same distinction at [sweep.rs:926](/home/master/projects/lnrent/daemon/src/sweep.rs:926). They are transition-safety consumers, not money-predicate consumers.
+
+[P3] [daemon/src/order_intake.rs:1440](/home/master/projects/lnrent/daemon/src/order_intake.rs:1440) — The nine-cluster inventory mixes callers with test delegates and implementations. `order_intake`, `reconcile`, and IPC direct occurrences are test-only; production IPC calls `expected_msat` indirectly ([ipc.rs:851](/home/master/projects/lnrent/daemon/src/ipc.rs:851)).
+
+Suggestions
+
+- Add one atomic backend method returning typed `PayKeyEvidence` (`Absent`, `PreparedOrAmbiguous`, `Pending`, `Succeeded`, `Failed`), then build `AttemptState` in a standalone attempt-domain function—not on `Store`, through `&Connection + async backend`, or as a public SQL view.
+- Share one observed `AttemptState` collection between readiness’s expected and required calculations. Recheck recovery surplus inside its authorizing transaction.
+- Keep `outbound_status_by_ref` outside this seam. Future audits should use a separate transactional adoption writer that rebuilds correlation, marks SENT, clears the fence, and journals. QUESTION: that audit implementation is not yet present.
+- Add both old key methods to `clippy.toml`’s disallowed list, narrowly allow only the canonical evidence reader, and run: `nix develop . --command cargo clippy -p lnrentd --all-targets -- -D warnings`.
+
+The skipped prior question is consumer classification: raw payment evidence, accounting derivation, and state-transition decisions have different freshness requirements. The read abstraction can be shared, but cached money observations must not feed post-pay recovery decisions, and driver observations must never replace transactional authorization. The surplus itself correctly needs no started evidence: every unsent refund remains reserved ([sweep.rs:85](/home/master/projects/lnrent/daemon/src/sweep.rs:85)), while sweep caps are committed from PENDING/SENT/fenced rows ([sweep.rs:164](/home/master/projects/lnrent/daemon/src/sweep.rs:164)).
