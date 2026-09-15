@@ -263,8 +263,10 @@ applied. Define two related numbers:
 - `gross_liability_sat`: the received amount still owed/deliverable, for operator visibility.
 - `required_outlay_msat`: the **msat** balance an as-yet-UNSTARTED automated payment needs now. Summed
   ONLY over liability rows that would start a NEW outbound operation this drive; a row whose current
-  generation already has a PENDING/Unknown backend payment contributes 0 (funds already debited/locked —
-  counting it would falsely warn that fresh balance is needed). Per contributing row:
+  generation is Committed — a `Pending`/`Succeeded` backend witness, or the ADR-0022 fence — contributes
+  0 (funds already debited/locked — counting it would falsely warn that fresh balance is needed). An
+  absent witness (`Unknown` = no backend row) or a current-generation `Failed` (funds returned) is NOT
+  committed and contributes. Per contributing row:
     - a capped refund with a fixed/resolved `pay_sat`: `pay_sat*1000 + current_fee(pay_sat*1000)`;
     - a capped refund not yet resolved: `net_cap*1000 + current_fee(net_cap*1000)`;
     - a paid-but-undelivered order with NO refund row yet (a *potential* refund): the full
@@ -314,24 +316,31 @@ The liability rows are:
 backend). At boot (after recovery) and on each maintenance tick:
 
 ```
-liabilities = load_liabilities_from_store()
+gateway_ok, federation_ok = the liveness probes (RefundReadinessProbe)
+(ledger_terms, liabilities) = ONE store read            // one state of the books per report
+snapshot = ledger::observe(ledger_terms, payment)        // ONE pay-witness probe per uncommitted refund row
+expected_msat = snapshot.expected_msat()                 // §D/§E: the LOCAL books figure, never a wallet balance read
 if liabilities.is_empty():
-    -> no money-readiness warning (the fresh-operator case; INV-2)
+    -> no money-readiness warning (the fresh-operator case; INV-2); FederationDown still surfaces
 else:
-    gateway_ok = payment.refund_gateway_ready() or equivalent Fedimint health check
-    bal_msat = payment.available_balance_msat()   // None for backends without a balance concept -> skip balance compare
-    required_msat = sum(required_outlay_msat over NOT-in-flight automated liabilities priceable now)
+    required_msat = sum(required_outlay_msat over PENDING refund liabilities NOT Committed per the
+                        SAME snapshot, plus paid-undelivered / unreconciled buckets)
     gross = sum(gross_liability_sat over all liabilities, including parked/manual)
+    parked_count = FAILED and not fenced; fence_parked_count = fenced (any status)
 
-    if !gateway_ok:
-        WARN with {gross, required_msat, bal_msat, gateway_ok=false, parked_count}
-    else if bal_msat is Some(b) AND b < required_msat:
-        WARN with {gross, required_msat, bal_msat=b, gateway_ok=true, parked_count}
+    if !federation_ok:            WARN FederationDown
+    else if !gateway_ok:          WARN GatewayUnavailable
+    else if expected_msat < required_msat:
+        WARN InsufficientBalance with {gross, required_msat, expected_msat, parked_count}
+    else if unpriceable_count > 0: WARN Unpriceable (a liability could not be priced; coverage unconfirmed)
     else if parked_count + fence_parked_count > 0:
-        WARN/ERROR manual-liability alert with {gross_parked, parked_count, fence_parked_count}, not a "fund ecash" warning
+        WARN ParkedManual with {gross, parked_count, fence_parked_count}, not a "fund ecash" warning
     else:
         -> no warning
 ```
+
+(`daemon/src/supervisor.rs` `refund_readiness_report_with_probe` / `refund_readiness_report_from_liabilities`
+are the source of truth for this block.)
 
 Using `gross` as the balance threshold would be conservative but can be noisy: a capped refund may be
 coverable with `required_liquidity_sat < gross_liability_sat`. The warning condition is therefore based
