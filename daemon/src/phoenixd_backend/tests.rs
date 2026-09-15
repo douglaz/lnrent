@@ -1332,10 +1332,6 @@ async fn pay_records_the_key_and_never_pays_twice() {
         PayStatus::Succeeded
     );
     assert_eq!(be.payment_status(&id).await.unwrap(), PayStatus::Succeeded);
-    assert!(be
-        .payment_started_by_key("refund:order:1:g1")
-        .await
-        .unwrap());
 
     let again = be
         .pay_refund_capped_t(&bolt11, 120, 130, "refund:order:1:g1")

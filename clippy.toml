@@ -2,4 +2,5 @@ disallowed-methods = [
   { path = "lnrentd::backends::PaymentBackend::lookup", reason = "expiry/settlement decisions must use lookup_settlement_by_ref (lnrent-l07s)" },
   { path = "lnrentd::backends::PaymentBackend::lookup_settlement", reason = "expiry/settlement decisions must use lookup_settlement_by_ref (lnrent-l07s)" },
   { path = "lnrentd::backends::PaymentBackend::create_invoice", reason = "production issues through issue_invoice and commits its persist closure beside the invoice row in ONE transaction (ADR-0022)" },
+  { path = "lnrentd::backends::PaymentBackend::payment_status_by_key", reason = "money readers derive Committed from ONE ledger::observe snapshot per report; drivers read the witness through ledger::attempt_pay_status (lnrent-2v2v)" },
 ]

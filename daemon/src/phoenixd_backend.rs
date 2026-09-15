@@ -2222,15 +2222,6 @@ impl PaymentBackend for PhoenixdPayment {
         ))
     }
 
-    async fn payment_started_by_key(&self, idempotency_key: &str) -> Result<bool> {
-        let key = idempotency_key.to_string();
-        Ok(self
-            .store
-            .read(move |c| pay_status_by_key(c, &key))
-            .await?
-            .is_some())
-    }
-
     /// phoenixd can classify a hash even when the local `phoenixd_pay` index is lost (lnrent-7wbo):
     /// paid and in-flight records use the measured `isPaid`/`completedAt` discriminator, and a clean
     /// 404 is terminal failure evidence. A completed UNPAID record is deliberately NOT terminal —

@@ -269,21 +269,19 @@ pub trait PaymentBackend: Send + Sync {
     async fn payment_status(&self, payment_id: &str) -> Result<PayStatus>;
     /// Check an in-flight refund by its idempotency key after a crash (SPEC §6.6). An
     /// optimization only — retrying `pay(key)` is always safe (the key dedups).
+    ///
+    /// `Unknown` means the backend holds NO row for this key: both shipped backends answer from the
+    /// pay row they write before sending, and map every stored status to a non-`Unknown` variant.
+    /// Production reads it only through `ledger::attempt_pay_status` / `ledger::observe`
+    /// (`clippy.toml`), so every money reader derives Committed the same way (lnrent-2v2v).
     async fn payment_status_by_key(&self, idempotency_key: &str) -> Result<PayStatus>;
-    /// Whether this key has durable evidence of a started outbound operation. This disambiguates
-    /// `PayStatus::Unknown` for readiness: no record still needs liquidity; an unqueryable started
-    /// operation has already committed funds.
-    async fn payment_started_by_key(&self, _idempotency_key: &str) -> Result<bool> {
-        Ok(false)
-    }
     /// What the backend POSITIVELY knows about an outbound payment for this destination — the
     /// evidence a caller needs before it may declare such a payment dead (lnrent-7wbo).
     ///
     /// Takes the intent's OWN references, not an idempotency key, for two reasons. The key-shaped
-    /// answers next door are row-existence reads over a LOCAL index
-    /// ([`payment_status_by_key`](Self::payment_status_by_key),
-    /// [`payment_started_by_key`](Self::payment_started_by_key)), so a lost or restored index makes
-    /// them answer `Unknown`/`false` for a payment that really happened — exactly the incident this
+    /// answer next door is a row-existence read over a LOCAL index
+    /// ([`payment_status_by_key`](Self::payment_status_by_key)), so a lost or restored index makes
+    /// it answer `Unknown` for a payment that really happened — exactly the incident this
     /// seam exists to survive. And the two shipped backends key their durable history differently:
     /// phoenixd by PAYMENT HASH (`outgoingbyhash`), lnv2 by the deterministic attempt-0 OPERATION
     /// derived from the BOLT11 (`send_operation_id`). Both references are therefore passed; an

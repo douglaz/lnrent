@@ -31,8 +31,8 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::backends::{BackendKind, 
-    PayStatus, PaymentBackend, PaymentStatus, PhoenixdProbe, PhoenixdReadinessError, Settlement,
+use crate::backends::{BackendKind,
+    PaymentBackend, PaymentStatus, PhoenixdProbe, PhoenixdReadinessError, Settlement,
 };
 use crate::capture::{capture, Capture};
 use crate::clock::Clock;
@@ -48,7 +48,7 @@ use crate::relay_status::{
     RelayBlackoutMonitor, RelayStatusCell, RelayStatusRow, RELAY_BLACKOUT_ALERT_S,
 };
 use crate::reconcile::Reconciler;
-use crate::refund::{gen_key, parse_whole_sat, Refunder};
+use crate::refund::{parse_whole_sat, Refunder};
 use crate::refund_resolver::RefundResolver;
 use crate::sweep::Sweeper;
 use crate::reservation::Budget;
@@ -1309,7 +1309,14 @@ pub(crate) struct RefundReadinessReport {
     /// a different failure than a down gateway. Named for Fedimint because the wire token is kept
     /// for compatibility (lnrent-p2e; see [`RefundReadinessWarning::as_str`]).
     federation_ok: bool,
+    /// Failed-parked refunds (CONTEXT.md § Parked): `FAILED` and NOT fenced — released by
+    /// `lnrent refund-retry <id>`. The same rule `lnrent refunds` applies to its "parked FAILED"
+    /// figure, over the readiness liabilities (rows with received-funds provenance,
+    /// `store::load_refund_readiness_liabilities`); the list shows every such row.
     parked_count: usize,
+    /// Fence-parked refunds (ADR-0022, whatever their status) — released only by
+    /// `lnrent migration clear-fence`. Their money is Committed, never Required liquidity.
+    fence_parked_count: usize,
     /// PENDING liabilities that could not be priced this pass (transient quote/gateway error). Their
     /// cost is absent from `required_msat`, so coverage cannot be confirmed — forces a warning.
     unpriceable_count: usize,
@@ -1335,6 +1342,7 @@ impl Default for RefundReadinessReport {
             gateway_ok: true,
             federation_ok: true,
             parked_count: 0,
+            fence_parked_count: 0,
             unpriceable_count: 0,
             warning: None,
             voice: ReadinessVoice::Federation,
@@ -1353,6 +1361,7 @@ impl RefundReadinessReport {
             "gross_liability_sat": self.gross_liability_sat,
             "required_msat": self.required_msat,
             "parked_count": self.parked_count,
+            "fence_parked_count": self.fence_parked_count,
             "ready": self.warning.is_none(),
             "warning": self.warning.map(RefundReadinessWarning::as_str),
         });
@@ -1712,7 +1721,9 @@ async fn log_refund_readiness(store: &Store, payment: &Arc<dyn PaymentBackend>) 
             expected_msat = %report.expected_msat,
             gateway_ok = report.gateway_ok,
             parked_count = report.parked_count,
-            "refund readiness warning: parked refund liabilities require manual handling"
+            fence_parked_count = report.fence_parked_count,
+            "refund readiness warning: parked refund liabilities require manual handling \
+             (failed-parked: `lnrent refund-retry <id>`; fence-parked: `lnrent migration clear-fence`)"
         ),
         Some(RefundReadinessWarning::Unpriceable) => tracing::warn!(
             liabilities = report.liability_count,
@@ -1757,8 +1768,22 @@ pub(crate) async fn refund_readiness_report_with_probe(
     // — a pure LOCAL read (no federation balance call). Computed UNCONDITIONALLY so `lnrent money`
     // reports real expected holdings even at zero liabilities (as the old view showed the real
     // balance), and so the money display value is exactly the figure the verdict compares.
-    let expected_msat = crate::ledger::expected_msat(store, payment).await?;
-    let liabilities = store.refund_readiness_liabilities().await?;
+    //
+    // ONE observation per report (CONTEXT.md § Attempt, lnrent-4br3): the ledger terms and the
+    // liability rows come from the same store read, and every refund row's pay witness is probed
+    // exactly once, in `observe`. Both `expected_msat` and the per-refund classification below read
+    // that snapshot, so a witness that flips between two probes cannot land on both sides of
+    // `expected < required`.
+    let (reads, liabilities) = store
+        .read(|c| {
+            Ok((
+                crate::ledger::read_ledger_terms(c)?,
+                crate::store::load_refund_readiness_liabilities(c)?,
+            ))
+        })
+        .await?;
+    let snapshot = crate::ledger::observe(reads, payment.as_ref()).await?;
+    let expected_msat = snapshot.expected_msat();
     if liabilities.is_empty() {
         // Even with NO refund liabilities, a root-backend readiness failure must still surface
         // (codex): otherwise an idle/pre-go-live operator sees READY despite unreachable Fedimint
@@ -1776,12 +1801,12 @@ pub(crate) async fn refund_readiness_report_with_probe(
         });
     }
 
-    refund_readiness_report_from_liabilities(liabilities, expected_msat, payment, probe).await
+    refund_readiness_report_from_liabilities(liabilities, &snapshot, payment, probe).await
 }
 
 async fn refund_readiness_report_from_liabilities(
     liabilities: Vec<RefundReadinessLiability>,
-    expected_msat: u128,
+    snapshot: &crate::ledger::LedgerSnapshot,
     payment: &Arc<dyn PaymentBackend>,
     probe: &RefundReadinessProbe,
 ) -> Result<RefundReadinessReport> {
@@ -1791,10 +1816,11 @@ async fn refund_readiness_report_from_liabilities(
         liability_count: liabilities.len(),
         gross_liability_sat: 0,
         required_msat: 0,
-        expected_msat,
+        expected_msat: snapshot.expected_msat(),
         gateway_ok: probe.gateway_ok,
         federation_ok: probe.federation_ok,
         parked_count: 0,
+        fence_parked_count: 0,
         unpriceable_count: 0,
         warning: None,
         voice: probe.voice.clone(),
@@ -1805,11 +1831,28 @@ async fn refund_readiness_report_from_liabilities(
         report.gross_liability_sat += u128::from(liability.gross_sat);
         match &liability.source {
             RefundReadinessSource::RefundAttempt(refund) => {
+                // Parked (CONTEXT.md): an attention item with a remedy, not Required liquidity. The
+                // fence answers FIRST, whatever the status — the driver refuses a fenced row and its
+                // money is already Committed in `expected_msat`, so pricing it here would count it
+                // twice (lnrent-4br3).
+                if refund.fenced {
+                    report.fence_parked_count += 1;
+                    continue;
+                }
                 if refund.status == "FAILED" {
                     report.parked_count += 1;
                     continue;
                 }
                 if refund.status != "PENDING" {
+                    continue;
+                }
+                // Required liquidity = Owed ∧ ¬Committed ∧ ¬Parked. Committed is read from the SAME
+                // snapshot `expected_msat` subtracted it from; a row the snapshot did not see (inserted
+                // between the read and now) is not committed and is priced, which is the safe side.
+                if snapshot
+                    .refund(&refund.idempotency_key)
+                    .is_some_and(|r| r.committed())
+                {
                     continue;
                 }
                 match pending_refund_required_msat(liability, refund, payment).await {
@@ -1848,7 +1891,7 @@ async fn refund_readiness_report_from_liabilities(
         // reported ready) is missing from required_msat, so coverage cannot be confirmed — warn
         // rather than report "covered" and silently suppress a real liability (codex P2).
         Some(RefundReadinessWarning::Unpriceable)
-    } else if report.parked_count > 0 {
+    } else if report.parked_count + report.fence_parked_count > 0 {
         Some(RefundReadinessWarning::ParkedManual)
     } else {
         None
@@ -1856,38 +1899,19 @@ async fn refund_readiness_report_from_liabilities(
     Ok(report)
 }
 
+/// Price an uncommitted PENDING refund at the outlay its next pay would need: the persisted
+/// invoice's own amount, else a direct-bolt11 dest's, else the backend's quote on the gross.
 async fn pending_refund_required_msat(
     liability: &RefundReadinessLiability,
     refund: &RefundAttemptLiability,
     payment: &Arc<dyn PaymentBackend>,
 ) -> Result<u128> {
-    if let Some(bolt11) = refund.resolved_bolt11.as_deref() {
-        let key = gen_key(&liability.external_id, refund.resolution_gen);
-        match payment.payment_status_by_key(&key).await? {
-            PayStatus::Succeeded | PayStatus::Pending => return Ok(0),
-            PayStatus::Unknown if payment.payment_started_by_key(&key).await? => return Ok(0),
-            PayStatus::Unknown | PayStatus::Failed => {}
-        }
-        let pay_sat = parse_whole_sat(bolt11).unwrap_or(liability.gross_sat);
-        return payment
-            .refund_required_outlay_msat(liability.gross_sat, Some(pay_sat))
-            .await;
-    }
-
-    if let Some(pay_sat) = refund.dest.as_deref().and_then(|d| parse_whole_sat(d).ok()) {
-        let key = gen_key(&liability.external_id, 0);
-        match payment.payment_status_by_key(&key).await? {
-            PayStatus::Succeeded | PayStatus::Pending => return Ok(0),
-            PayStatus::Unknown if payment.payment_started_by_key(&key).await? => return Ok(0),
-            PayStatus::Unknown | PayStatus::Failed => {}
-        }
-        return payment
-            .refund_required_outlay_msat(liability.gross_sat, Some(pay_sat))
-            .await;
-    }
-
+    let pay_sat = match refund.resolved_bolt11.as_deref() {
+        Some(bolt11) => Some(parse_whole_sat(bolt11).unwrap_or(liability.gross_sat)),
+        None => refund.dest.as_deref().and_then(|d| parse_whole_sat(d).ok()),
+    };
     payment
-        .refund_required_outlay_msat(liability.gross_sat, None)
+        .refund_required_outlay_msat(liability.gross_sat, pay_sat)
         .await
 }
 
@@ -2146,11 +2170,11 @@ mod tests {
     // Test doubles delegate through the bare seams; clippy.toml's denylist guards production.
     #![allow(clippy::disallowed_methods)]
     use super::*;
-    use crate::backends::{Invoice, REDACTED_PHOENIXD_VERSION};
+    use crate::backends::{Invoice, PayStatus, REDACTED_PHOENIXD_VERSION};
     use crate::store::migrate;
     use nostr_relay_builder::MockRelay;
     use nostr_sdk::Keys;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::mpsc;
 
@@ -2169,7 +2193,9 @@ mod tests {
         gateway_ok: StdMutex<bool>,
         federation_ok: StdMutex<bool>,
         statuses: StdMutex<HashMap<String, PayStatus>>,
-        started: StdMutex<HashSet<String>>,
+        /// A status answered ONCE, on the first probe of that key, before `statuses` takes over —
+        /// a witness that flips between two probes of the same report (lnrent-4br3).
+        first_status: StdMutex<HashMap<String, PayStatus>>,
         required_by_gross: StdMutex<HashMap<u64, u128>>,
         fail_pricing: StdMutex<bool>,
         gateway_failure: StdMutex<Option<ReadinessFailure>>,
@@ -2182,7 +2208,7 @@ mod tests {
                 gateway_ok: StdMutex::new(gateway_ok),
                 federation_ok: StdMutex::new(true),
                 statuses: StdMutex::new(HashMap::new()),
-                started: StdMutex::new(HashSet::new()),
+                first_status: StdMutex::new(HashMap::new()),
                 required_by_gross: StdMutex::new(HashMap::new()),
                 fail_pricing: StdMutex::new(false),
                 gateway_failure: StdMutex::new(None),
@@ -2232,8 +2258,12 @@ mod tests {
                 .insert(key.to_string(), status);
         }
 
-        fn set_started(&self, key: &str) {
-            self.started.lock().unwrap().insert(key.to_string());
+        fn set_status_then(&self, key: &str, first: PayStatus, then: PayStatus) {
+            self.first_status
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), first);
+            self.set_status(key, then);
         }
 
         fn set_required(&self, gross_sat: u64, required_msat: u128) {
@@ -2284,16 +2314,15 @@ mod tests {
         }
 
         async fn payment_status_by_key(&self, key: &str) -> Result<PayStatus> {
+            if let Some(first) = self.first_status.lock().unwrap().remove(key) {
+                return Ok(first);
+            }
             Ok(*self
                 .statuses
                 .lock()
                 .unwrap()
                 .get(key)
                 .unwrap_or(&PayStatus::Unknown))
-        }
-
-        async fn payment_started_by_key(&self, key: &str) -> Result<bool> {
-            Ok(self.started.lock().unwrap().contains(key))
         }
 
         async fn available_balance_msat(&self) -> Result<Option<u64>> {
@@ -2889,18 +2918,18 @@ mod tests {
     }
 
     // A started-but-PENDING refund commits funds out of the float, pulling expected_msat below the
-    // floor even though the SAME receipts would clear it. This exercises the started-evidence path
-    // (`payment_started_by_key`) that `expected_msat` uses — steered on the double.
+    // floor even though the SAME receipts would clear it. This exercises the pay-witness path
+    // (`ledger::committed` on a Pending witness) that `expected_msat` uses — steered on the double.
     #[tokio::test]
     async fn holdings_floor_fires_when_started_pending_refund_drains_below_floor() {
         let store = mem_store();
         seed_subscription(&store, "sub-1", "PROVISIONING").await;
         // Receipts 5_000 msat; floor 2_000 sits BELOW them, so without the drain it would NOT fire.
         seed_invoice(&store, "sub-1", "extA", "order", 5, "PAID", Some(10), Some(10)).await;
-        // A gen-0 PENDING refund of 4 sat with started evidence commits 4_000 out ⇒ expected 1_000.
+        // A gen-0 PENDING refund of 4 sat with a Pending witness commits 4_000 out ⇒ expected 1_000.
         seed_refund_attempt(&store, "sub-1", "extR", 4, "PENDING", None, 0).await;
         let payment = Arc::new(ReadinessPayment::new(true));
-        payment.set_started(&crate::refund::gen_key("extR", 0)); // "refund:extR" ⇒ committed
+        payment.set_status(&crate::refund::gen_key("extR", 0), PayStatus::Pending); // "refund:extR"
         let payment: Arc<dyn PaymentBackend> = payment;
         let alerts = enabled_alerts(&store);
 
@@ -3733,8 +3762,13 @@ mod tests {
         );
     }
 
+    /// lnrent-4br3 / lnrent-2v2v: ONE observation per report. A witness that reads Pending on the
+    /// first probe and Failed on the next used to land on BOTH sides of the compare — subtracted
+    /// from `expected_msat` (Pending) AND priced into `required_msat` (Failed) — a false
+    /// InsufficientBalance on ample receipts. With one probe per report both sides see the same
+    /// witness, whichever it is. RED on a report that probes the key twice.
     #[tokio::test]
-    async fn readiness_in_flight_unknown_started_key_does_not_inflate_required() {
+    async fn readiness_witness_flipping_between_probes_cannot_land_on_both_sides() {
         let store = mem_store();
         seed_subscription(&store, "sub-1", "REFUND_DUE").await;
         seed_invoice(
@@ -3759,19 +3793,81 @@ mod tests {
         )
         .await;
         let payment = Arc::new(ReadinessPayment::new(true));
-        payment.set_status("refund:order:sub-1:g1", PayStatus::Unknown);
-        payment.set_started("refund:order:sub-1:g1");
+        payment.set_status_then("refund:order:sub-1:g1", PayStatus::Pending, PayStatus::Failed);
         payment.set_required(2, 2_000);
         let payment: Arc<dyn PaymentBackend> = payment;
 
         let report = readiness(&store, &payment).await;
 
         assert_eq!(report.gross_liability_sat, 2);
-        assert_eq!(report.required_msat, 0);
-        // The started pay is subtracted from expected too (its funds are locked), so expected and
-        // required both net to 0 — consistently covered, no false InsufficientBalance.
+        // The one witness this report saw was Pending: committed on both sides.
         assert_eq!(report.expected_msat, 0);
+        assert_eq!(report.required_msat, 0);
         assert_eq!(report.warning, None);
+    }
+
+    /// lnrent-4br3 pin: a fenced PENDING refund (ADR-0022) on a store with ample receipts. Its money
+    /// is Committed (subtracted from expected) and it is fence-parked, so it must NOT also be priced
+    /// into required (the double count that raised a false InsufficientBalance), and the report must
+    /// NOT say "ready" while the driver refuses to move the row: it names the fence, with the same
+    /// count `lnrent refunds` shows as FENCED. RED on a readiness scan that never reads the fence.
+    #[tokio::test]
+    async fn readiness_fenced_pending_refund_is_fence_parked_not_required_and_not_ready() {
+        let store = mem_store();
+        seed_subscription(&store, "sub-1", "REFUND_DUE").await;
+        seed_invoice(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            "order",
+            2,
+            "PAID",
+            Some(10),
+            Some(10),
+        )
+        .await;
+        seed_refund_attempt(
+            &store,
+            "sub-1",
+            "order:sub-1",
+            2,
+            "PENDING",
+            Some("persisted-bolt11"),
+            1,
+        )
+        .await;
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "UPDATE refund_attempt SET migration_unverified_at = 42 WHERE id = 'ref-order:sub-1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let payment = Arc::new(ReadinessPayment::new(true));
+        // The fence's own premise: the backend answers "no witness" for the legacy pay.
+        payment.set_status("refund:order:sub-1:g1", PayStatus::Unknown);
+        payment.set_required(2, 2_000);
+        let payment: Arc<dyn PaymentBackend> = payment;
+
+        let report = readiness(&store, &payment).await;
+
+        assert_eq!(report.gross_liability_sat, 2, "still owed, still visible");
+        assert_eq!(report.expected_msat, 0, "fenced ⇒ committed: subtracted from expected");
+        assert_eq!(report.required_msat, 0, "fence-parked is not required liquidity");
+        assert_eq!(report.parked_count, 0, "not failed-parked: `refund-retry` would refuse it");
+        assert_eq!(report.fence_parked_count, 1);
+        assert_eq!(
+            report.warning,
+            Some(RefundReadinessWarning::ParkedManual),
+            "never READY while the driver refuses the row"
+        );
+        let money = report.to_money_value(true, true);
+        assert_eq!(money["ready"], json!(false));
+        assert_eq!(money["fence_parked_count"], json!(1));
+        assert_eq!(money["parked_count"], json!(0));
     }
 
     #[tokio::test]

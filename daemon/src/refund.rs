@@ -526,26 +526,16 @@ impl Refunder {
             // STATUS-FIRST: a started gen-0 op (Succeeded/Pending) is re-awaited with NO re-quote, so a
             // gateway-down quote can never strand an in-flight/settled gen-0. Only a NEW gen-0 payment
             // (absent -> Unknown, or a returned-funds Failed) quotes the cap.
-            let st = self
-                .payment
-                .payment_status_by_key(&key)
+            let st = crate::ledger::attempt_pay_status(self.payment.as_ref(), &key)
                 .await
                 .map_err(|e| {
                     PlanError::Transient(format!("refund status lookup for {key} failed: {e}"))
                 })?;
-            // Unknown but the op actually STARTED (crash window: pay_bolt11_invoice committed before the
-            // index row was written) is an in-flight refund that may yet settle — re-await it on the SAME
-            // key/payment-hash (fedimint dedups), NEVER re-quote, or a gateway outage / fee rise could
-            // strand a payment that can still land (codex P2). Only a not-started Unknown or a
-            // returned-funds Failed quotes the cap for a genuinely new payment.
-            let started_unknown = matches!(st, PayStatus::Unknown)
-                && self
-                    .payment
-                    .payment_started_by_key(&key)
-                    .await
-                    .map_err(|e| {
-                        PlanError::Transient(format!("refund started-check for {key}: {e}"))
-                    })?;
+            // The pre-send witness commits in the same transaction as the ledger row (ADR-0022), so a
+            // started op never reads `Unknown` here: an in-flight one reads `Pending` and is re-awaited
+            // on the SAME key/payment-hash with NO re-quote — a gateway outage / fee rise must not
+            // strand a payment that can still land (codex P2). `Unknown` IS "no row": only it, or a
+            // returned-funds `Failed`, quotes the cap for a genuinely new payment.
             return match st {
                 PayStatus::Succeeded => Ok(PlanOutcome::AlreadySent {
                     pay_sat: bolt11_sat,
@@ -553,12 +543,6 @@ impl Refunder {
                 // Re-await an in-flight gen-0 with NO re-quote: its op was already bound to a gateway,
                 // so there is no quote-time gateway to carry (lnrent-y4m.18).
                 PayStatus::Pending => Ok(PlanOutcome::Pay {
-                    bolt11: dest.to_string(),
-                    gen: 0,
-                    pay_sat: bolt11_sat,
-                    gateway_hint: None,
-                }),
-                _ if started_unknown => Ok(PlanOutcome::Pay {
                     bolt11: dest.to_string(),
                     gen: 0,
                     pay_sat: bolt11_sat,
@@ -617,9 +601,7 @@ impl Refunder {
                 // can't see right now). Leave the row PENDING and retry the lookup next drive — NOT
                 // `unwrap_or(Unknown)`, which would let a transient lookup error masquerade as a
                 // genuine no-record Unknown and (for an expired row) wrongly re-resolve.
-                let st = self
-                    .payment
-                    .payment_status_by_key(&key)
+                let st = crate::ledger::attempt_pay_status(self.payment.as_ref(), &key)
                     .await
                     .map_err(|e| {
                         PlanError::Transient(format!("refund status lookup for {key} failed: {e}"))
@@ -917,7 +899,7 @@ impl Refunder {
     /// not, so the caller falls through to `pay`, which the key dedups.
     async fn already_paid(&self, idempotency_key: &str) -> bool {
         matches!(
-            self.payment.payment_status_by_key(idempotency_key).await,
+            crate::ledger::attempt_pay_status(self.payment.as_ref(), idempotency_key).await,
             Ok(PayStatus::Succeeded)
         )
     }
@@ -925,7 +907,7 @@ impl Refunder {
     /// Re-check the key after a `pay` error. Lookup errors are treated as `Unknown`: terminalizing
     /// while the backend cannot answer is unsafe because the payment may still settle later.
     async fn status_by_key_after_error(&self, idempotency_key: &str) -> PayStatus {
-        match self.payment.payment_status_by_key(idempotency_key).await {
+        match crate::ledger::attempt_pay_status(self.payment.as_ref(), idempotency_key).await {
             Ok(status) => status,
             Err(e) => {
                 tracing::warn!(
@@ -1440,7 +1422,6 @@ mod tests {
         failed_status: Option<PayStatus>,
         settle_then_fail: bool, // pay() records the settlement but returns Err (ambiguous timeout)
         status_lookup_fails: bool, // payment_status_by_key returns Err (an unqueryable backend)
-        started: HashSet<String>, // keys payment_started_by_key reports as an in-flight (oplog) op
         net_cap: Option<u64>, // refund_net_sat override (the fee-adjusted cap); None => full gross
         // Model the lnv2 NO-RETRY semantic: a definite Failed is terminal per invoice, so the gate must
         // re-resolve a fresh invoice instead of reusing. Default false = lnv1/mock (can reuse).
@@ -1472,11 +1453,6 @@ mod tests {
                 .unwrap()
                 .key_status
                 .insert(key.to_string(), status);
-        }
-        /// Report `key` as a STARTED-but-maybe-unrecorded op (fedimint's crash window) so an `Unknown`
-        /// status is treated as in-flight by `payment_started_by_key`.
-        fn set_started(&self, key: &str) {
-            self.inner.lock().unwrap().started.insert(key.to_string());
         }
         /// Override the fee-adjusted net cap that `refund_net_sat` returns.
         fn set_net_cap(&self, net_sat: u64) {
@@ -1566,9 +1542,6 @@ mod tests {
         }
         async fn lookup_settlement(&self, _: &str) -> Result<(PaymentStatus, Option<i64>)> {
             unimplemented!("refunder never looks up invoices")
-        }
-        async fn payment_started_by_key(&self, idempotency_key: &str) -> Result<bool> {
-            Ok(self.inner.lock().unwrap().started.contains(idempotency_key))
         }
         fn failed_refund_can_reuse_invoice(&self) -> bool {
             !self.inner.lock().unwrap().no_reuse_failed
@@ -3320,12 +3293,13 @@ mod tests {
         );
     }
 
-    /// A gen-0 direct-bolt11 refund whose status is Unknown but whose op ACTUALLY STARTED (fedimint
-    /// crash window) must be RE-AWAITED on the same key, NOT re-quoted. Even with the net cap now
-    /// BELOW the fixed bolt11 — which a re-quote path would park FAILED — the in-flight payment is
-    /// recovered and reaches SENT (codex P2: don't strand an in-flight refund on a gateway/fee change).
+    /// A gen-0 direct-bolt11 refund whose op ACTUALLY STARTED (a Pending witness — the pre-send row
+    /// commits with the ledger row, ADR-0022) must be RE-AWAITED on the same key, NOT re-quoted. Even
+    /// with the net cap now BELOW the fixed bolt11 — which a re-quote path would park FAILED — the
+    /// in-flight payment is recovered and reaches SENT (codex P2: don't strand an in-flight refund on
+    /// a gateway/fee change).
     #[tokio::test]
-    async fn gen0_unknown_started_reawaits_without_requote() {
+    async fn gen0_pending_reawaits_without_requote() {
         let store = mem_store();
         let payment = Arc::new(TestPayment::new());
         let clock = TestClock::new(1_000);
@@ -3333,17 +3307,16 @@ mod tests {
         let bolt11 = crate::refund_resolver::mint_bolt11(400_000, "meta", 1_000, 86_400); // 400 sat
         seed_refund(&store, "sub-1", Some(&bolt11), Some(500)).await; // gross 500
         seed_reservation(&store, "sub-1").await;
-        // Unknown but the op actually started; the cap has since dropped to 100 (< the 400 bolt11), so a
-        // re-quote path would park FAILED for exceeding the cap.
-        payment.set_key_status("refund:order:sub-1", PayStatus::Unknown);
-        payment.set_started("refund:order:sub-1");
+        // In flight; the cap has since dropped to 100 (< the 400 bolt11), so a re-quote path would
+        // park FAILED for exceeding the cap.
+        payment.set_key_status("refund:order:sub-1", PayStatus::Pending);
         payment.set_net_cap(100);
 
         let report = refunder(&store, &payment, &clock).drive().await.unwrap();
 
         assert_eq!(
             report.sent, 1,
-            "the in-flight gen-0 Unknown was re-awaited, not re-quoted/parked"
+            "the in-flight gen-0 Pending was re-awaited, not re-quoted/parked"
         );
         assert!(
             payment.was_paid("refund:order:sub-1"),

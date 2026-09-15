@@ -108,12 +108,15 @@ async fn json_money_returns_reply_envelope() {
             "earned_msat",
             "expected_msat",
             "federation_ok",
+            // lnrent-2v2v: fence-parked refund liabilities (ADR-0022), reported apart from the
+            // failed-parked `parked_count` because each has its own remedy.
+            "fence_parked_count",
             "gateway_ok",
             "gross_liability_sat",
             "last_sweep",
             "liability_count",
-            // ADR-0022 (codex #91 P2): attempts parked behind the legacy-import fence are named
-            // here because `parked_count` (FAILED) cannot see a fenced PENDING row.
+            // ADR-0022 (codex #91 P2): every fenced attempt (any status, sweeps too) is named here;
+            // `fence_parked_count` above is the readiness subset with received-funds provenance.
             "migration_fenced_refunds",
             "migration_fenced_sweep_ids",
             "migration_fenced_sweeps",

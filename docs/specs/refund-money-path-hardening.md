@@ -263,8 +263,10 @@ applied. Define two related numbers:
 - `gross_liability_sat`: the received amount still owed/deliverable, for operator visibility.
 - `required_outlay_msat`: the **msat** balance an as-yet-UNSTARTED automated payment needs now. Summed
   ONLY over liability rows that would start a NEW outbound operation this drive; a row whose current
-  generation already has a PENDING/Unknown backend payment contributes 0 (funds already debited/locked —
-  counting it would falsely warn that fresh balance is needed). Per contributing row:
+  generation is Committed — a `Pending`/`Succeeded` backend witness, or the ADR-0022 fence — contributes
+  0 (funds already debited/locked — counting it would falsely warn that fresh balance is needed). An
+  absent witness (`Unknown` = no backend row) or a current-generation `Failed` (funds returned) is NOT
+  committed and contributes. Per contributing row:
     - a capped refund with a fixed/resolved `pay_sat`: `pay_sat*1000 + current_fee(pay_sat*1000)`;
     - a capped refund not yet resolved: `net_cap*1000 + current_fee(net_cap*1000)`;
     - a paid-but-undelivered order with NO refund row yet (a *potential* refund): the full
@@ -278,13 +280,18 @@ applied. Define two related numbers:
 The liability rows are:
 
 1. **Refund ledger rows:** every `refund_attempt` whose status is not `SENT` and whose provenance shows
-   received funds. ALL such rows count in `gross` (visibility). For `required_outlay_msat`: a `PENDING`
-   row WITHOUT an in-flight backend payment (none started, or current gen `Failed+expired`) is an
-   as-yet-unstarted liability and contributes; a `PENDING` row whose current generation already has a
-   PENDING/Unknown backend payment is in-flight (funds committed) and contributes 0. `FAILED` rows are
-   parked/manual liabilities (money received, not refunded) — counted in `gross`, surfaced as
-   `parked_count`, never retried or hidden. Dust/no-destination/manual failures do not vanish from
-   accounting because automation parked them.
+   received funds. ALL such rows count in `gross` (visibility). For `required_outlay_msat`
+   (CONTEXT.md *Required liquidity* = Owed ∧ ¬Committed ∧ ¬Parked): a `PENDING` row that is not
+   Committed (no backend witness, or a current-gen `Failed` — funds returned) is an as-yet-unstarted
+   liability and contributes; a `PENDING` row whose current generation has a `Pending`/`Succeeded`
+   witness is Committed (already subtracted from expected holdings) and contributes 0. The witness is
+   read ONCE per report, from the same snapshot `expected_msat` is derived from (`ledger::observe`),
+   so a witness that flips mid-report cannot land on both sides of the compare. Parked rows are
+   attention items, not liquidity: `FAILED` unfenced rows are failed-parked (money received, not
+   refunded) — counted in `gross`, surfaced as `parked_count`, released by `refund-retry`; rows
+   carrying the ADR-0022 fence are fence-parked whatever their status — Committed, surfaced as
+   `fence_parked_count`, released only by `migration clear-fence`. Neither is retried or hidden;
+   dust/no-destination/manual failures do not vanish from accounting because automation parked them.
 2. **Paid order not yet delivered:** an order invoice with received-payment provenance (`invoice.kind =
    'order'` and (`invoice.status = 'PAID'` or `invoice.settled_at IS NOT NULL`)) whose subscription is in
    `PENDING`, `PROVISIONING`, or `REFUND_DUE`, excluding any external_id already represented by a
@@ -309,24 +316,31 @@ The liability rows are:
 backend). At boot (after recovery) and on each maintenance tick:
 
 ```
-liabilities = load_liabilities_from_store()
+gateway_ok, federation_ok = the liveness probes (RefundReadinessProbe)
+(ledger_terms, liabilities) = ONE store read            // one state of the books per report
+snapshot = ledger::observe(ledger_terms, payment)        // ONE pay-witness probe per uncommitted refund row
+expected_msat = snapshot.expected_msat()                 // §D/§E: the LOCAL books figure, never a wallet balance read
 if liabilities.is_empty():
-    -> no money-readiness warning (the fresh-operator case; INV-2)
+    -> no money-readiness warning (the fresh-operator case; INV-2); FederationDown still surfaces
 else:
-    gateway_ok = payment.refund_gateway_ready() or equivalent Fedimint health check
-    bal_msat = payment.available_balance_msat()   // None for backends without a balance concept -> skip balance compare
-    required_msat = sum(required_outlay_msat over NOT-in-flight automated liabilities priceable now)
+    required_msat = sum(required_outlay_msat over PENDING refund liabilities NOT Committed per the
+                        SAME snapshot, plus paid-undelivered / unreconciled buckets)
     gross = sum(gross_liability_sat over all liabilities, including parked/manual)
+    parked_count = FAILED and not fenced; fence_parked_count = fenced (any status)
 
-    if !gateway_ok:
-        WARN with {gross, required_msat, bal_msat, gateway_ok=false, parked_count}
-    else if bal_msat is Some(b) AND b < required_msat:
-        WARN with {gross, required_msat, bal_msat=b, gateway_ok=true, parked_count}
-    else if parked_count > 0:
-        WARN/ERROR manual-liability alert with {gross_parked, parked_count}, not a "fund ecash" warning
+    if !federation_ok:            WARN FederationDown
+    else if !gateway_ok:          WARN GatewayUnavailable
+    else if expected_msat < required_msat:
+        WARN InsufficientBalance with {gross, required_msat, expected_msat, parked_count}
+    else if unpriceable_count > 0: WARN Unpriceable (a liability could not be priced; coverage unconfirmed)
+    else if parked_count + fence_parked_count > 0:
+        WARN ParkedManual with {gross, parked_count, fence_parked_count}, not a "fund ecash" warning
     else:
         -> no warning
 ```
+
+(`daemon/src/supervisor.rs` `refund_readiness_report_with_probe` / `refund_readiness_report_from_liabilities`
+are the source of truth for this block.)
 
 Using `gross` as the balance threshold would be conservative but can be noisy: a capped refund may be
 coverable with `required_liquidity_sat < gross_liability_sat`. The warning condition is therefore based

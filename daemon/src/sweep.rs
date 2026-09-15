@@ -534,22 +534,10 @@ impl Sweeper {
                         .await?;
                     PayOutcome::Failed(reason)
                 }
-                PayStatus::Unknown if self.payment.payment_started_by_key(&row.id).await? => {
-                    // Durable evidence of an op in the fedimint crash window, but no key row yet:
-                    // re-await by key/payment hash. A definite FAILED key never reaches this branch.
-                    self.capped_pay(
-                        &row.id,
-                        &bolt11,
-                        &payment_hash,
-                        row.amount_sat,
-                        row.max_outlay_msat,
-                        self.clock.now(),
-                    )
-                    .await?
-                }
                 PayStatus::Unknown => {
-                    // No key evidence: the pay MAY never have started, so this branch may START a
-                    // fresh one. Re-validate the stored invoice against the CURRENT clock first
+                    // No key row (the pre-send witness commits with the ledger row, ADR-0022, so a
+                    // started op reads one of the three arms above): the pay MAY never have started, so this
+                    // branch may START a fresh one. Re-validate the stored invoice against the CURRENT clock first
                     // (codex): an intent written shortly before downtime can have expired since —
                     // paying it would either park PENDING forever (cap stuck, blocking new sweeps) or,
                     // on a no-validation backend, record an expired invoice SENT. (The
@@ -655,9 +643,9 @@ impl Sweeper {
     /// This is the ONE implementation of that decision table. Both exits of [`Sweeper::drive`]'s
     /// not-started arm that refuse to send — the expired intent (lnrent-7wbo) and the one the surplus
     /// no longer covers (lnrent-meqe) — call it, because they share a premise and therefore a hazard:
-    /// each fires when the key index says not-started, and `payment_status_by_key`/
-    /// `payment_started_by_key` are row-existence reads over a LOCAL index, so an index loss over an
-    /// in-flight sweep pay reads exactly like a sweep that never started. `commit_failed` would then
+    /// each fires when the key index says not-started, and `payment_status_by_key` is a
+    /// row-existence read over a LOCAL index, so an index loss over an in-flight sweep pay reads
+    /// exactly like a sweep that never started. `commit_failed` would then
     /// return this cap to surplus (`read_surplus` counts a sweep's cap only while SENT/PENDING) and
     /// DM the operator that the sweep failed; they re-run `lnrent sweep` with a fresh bolt11, which
     /// is a different `sweep:<payment_hash>` row that phoenixd's hash-keyed dedup cannot catch — a
@@ -950,7 +938,7 @@ impl Sweeper {
     /// Re-check the key after a pay error; a lookup error is treated as `Unknown` (terminalizing while
     /// the backend cannot answer is unsafe — the payment may still settle).
     async fn status_after_error(&self, key: &str) -> PayStatus {
-        match self.payment.payment_status_by_key(key).await {
+        match crate::ledger::attempt_pay_status(self.payment.as_ref(), key).await {
             Ok(status) => status,
             Err(e) => {
                 tracing::warn!(sweep = %key, error = %format!("{e:#}"), "sweep status lookup failed after pay error");
@@ -960,9 +948,9 @@ impl Sweeper {
     }
 
     /// Recovery status lookup. A lookup failure is non-terminal: the payment may still settle, so treat
-    /// it as `Unknown` and let the started-evidence branch decide whether to re-await or re-gate.
+    /// it as `Unknown` and let the not-started branch decide whether to re-gate.
     async fn recovery_status(&self, key: &str) -> PayStatus {
-        match self.payment.payment_status_by_key(key).await {
+        match crate::ledger::attempt_pay_status(self.payment.as_ref(), key).await {
             Ok(status) => status,
             Err(e) => {
                 tracing::warn!(sweep = %key, error = %format!("{e:#}"), "sweep recovery status lookup failed");
@@ -1220,6 +1208,8 @@ pub(crate) async fn money_sweep_view(store: &Store) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    // Test doubles delegate through the bare seams; clippy.toml's denylist guards production.
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use crate::backends::{Invoice, MockPayment, PaymentStatus, Settlement};
     use crate::clock::TestClock;
@@ -1418,7 +1408,6 @@ mod tests {
     #[derive(Default)]
     struct SweepPayState {
         paid: HashSet<String>,     // keys with a recorded send
-        started: HashSet<String>,  // keys payment_started_by_key reports as an in-flight op
         failed: HashSet<String>,   // keys whose pay refused (status_by_key -> Failed)
         pending: HashSet<String>,  // keys whose pay remains ambiguously in flight
         sends: usize,              // NEW sends (not idempotent re-awaits)
@@ -1435,24 +1424,18 @@ mod tests {
             st.quote_fee_msat = quote_fee_msat;
             st.pay_fee_msat = pay_fee_msat;
         }
-        /// Simulate execute having paid the key then crashed before SENT: the key is recorded paid AND
-        /// reports started evidence, so the drive re-awaits by key.
+        /// Simulate execute having paid the key then crashed before SENT: the key is recorded paid,
+        /// so the drive re-awaits by key.
         fn seed_started_paid(&self, key: &str) {
-            let mut st = self.inner.lock().unwrap();
-            st.paid.insert(key.to_string());
-            st.started.insert(key.to_string());
+            self.inner.lock().unwrap().paid.insert(key.to_string());
         }
         /// Simulate a backend preflight/cap failure that wrote a FAILED key row, then crashed before the
         /// sweep ledger row could be parked FAILED.
         fn seed_started_failed(&self, key: &str) {
-            let mut st = self.inner.lock().unwrap();
-            st.failed.insert(key.to_string());
-            st.started.insert(key.to_string());
+            self.inner.lock().unwrap().failed.insert(key.to_string());
         }
         fn seed_started_pending(&self, key: &str) {
-            let mut st = self.inner.lock().unwrap();
-            st.pending.insert(key.to_string());
-            st.started.insert(key.to_string());
+            self.inner.lock().unwrap().pending.insert(key.to_string());
         }
         /// Simulate an INDEX LOSS over an in-flight sweep pay (lnrent-7wbo): the outbound payment
         /// really left — so it counts in `sends`, and a second one would make that 2 — but every
@@ -1508,12 +1491,10 @@ mod tests {
                 // A gateway-fee rise refuses a NEW op; record a FAILED key (fedimint parity) so a
                 // status re-check reads Failed.
                 st.failed.insert(key.to_string());
-                st.started.insert(key.to_string());
                 anyhow::bail!("sweep cap refused: outlay {outlay} msat > cap {max_outlay_msat} msat");
             }
             st.sends += 1;
             st.paid.insert(key.to_string());
-            st.started.insert(key.to_string());
             Ok(format!("sweep-pay-{key}"))
         }
         async fn payment_status(&self, _: &str) -> Result<PayStatus> {
@@ -1530,9 +1511,6 @@ mod tests {
             } else {
                 PayStatus::Unknown
             })
-        }
-        async fn payment_started_by_key(&self, key: &str) -> Result<bool> {
-            Ok(self.inner.lock().unwrap().started.contains(key))
         }
         async fn available_balance_msat(&self) -> Result<Option<u64>> {
             panic!("the sweep path must never read the federation balance")
@@ -1608,9 +1586,6 @@ mod tests {
         }
         async fn payment_status_by_key(&self, k: &str) -> Result<PayStatus> {
             self.inner.payment_status_by_key(k).await
-        }
-        async fn payment_started_by_key(&self, k: &str) -> Result<bool> {
-            self.inner.payment_started_by_key(k).await
         }
         async fn available_balance_msat(&self) -> Result<Option<u64>> {
             self.inner.available_balance_msat().await
@@ -2133,8 +2108,8 @@ mod tests {
     #[tokio::test]
     async fn drive_never_terminalizes_an_expired_intent_the_backend_cannot_answer_for() {
         // lnrent-7wbo, the break test. An index loss over an IN-FLIGHT sweep pay leaves
-        // `payment_status_by_key` `Unknown` and `payment_started_by_key` false — indistinguishable
-        // from a sweep that never started — while the stored intent has expired meanwhile. Parking
+        // `payment_status_by_key` `Unknown` — indistinguishable from a sweep that never started —
+        // while the stored intent has expired meanwhile. Parking
         // that FAILED returns its cap to surplus and DMs the operator that the sweep failed; the
         // fresh `lnrent sweep` they then run mints a NEW payment hash, which phoenixd's hash-keyed
         // dedup cannot catch, so it is a genuine SECOND outbound payment. `SweepPayment` overrides
