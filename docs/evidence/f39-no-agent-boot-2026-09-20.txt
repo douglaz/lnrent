@@ -1,0 +1,28 @@
+# Evidence for lnrent-spec F39. Reproduce: bash scripts/f39-no-agent-boot.sh
+# under: nix shell nixpkgs#qemu nixpkgs#cloud-utils nixpkgs#openssh nixpkgs#curl
+
+=== F39 no-agent boot run  2026-09-20T18:53:02Z
+image:  debian-13-genericcloud-amd64.qcow2
+sha256: 5754395abffb1d384d50f6d0945d46d1beb7be42a7e786e4fc4a6f27270ab16f
+qemu:   QEMU emulator version 11.1.0
+ports:  ssh=59341 probe=56925 (chosen free at runtime)
+qemu pid 3005095 -- no -device virtio-serial, no guest-agent chardev, no agent share
+identity: guest reports hostname lnrent-f39 -- this run's VM, not a stray listener
+PASS  host-keys-readable-over-network  (= yes)
+      algorithms: 127.0.0.1:59341 ecdsa-sha2-nistp256 ssh-ed25519 ssh-rsa 
+PASS  readiness-probe-http  (= 200)
+PASS  buyer-key-login  (= buyer)
+PASS  seed-fragment-applied  (= 1)
+      cloud-init: status: done
+      datasource: nocloud
+PASS  no-virtio-serial-agent-channel  (= 0)
+PASS  no-guest-agent-process  (= 0)
+PASS  no-guest-agent-binary  (= 0)
+--- negative control
+PASS  negative-control: planted agent channel detected (= 1)
+PASS  negative-control: planted qemu-ga process detected (= 1)
+--- reboot
+PASS  readiness-probe-after-reboot  (= 200)
+PASS  host-keys-stable-across-reboot  (= 127.0.0.1:59341 ecdsa-sha2-nistp256 ssh-ed25519 ssh-rsa )
+PASS  no-agent-channel-after-reboot  (= 0)
+=== 12 passed, 0 failed
