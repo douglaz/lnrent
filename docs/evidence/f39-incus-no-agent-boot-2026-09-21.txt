@@ -11,18 +11,18 @@
 # NixOS VM that IS the Incus host:
 #   nixos-rebuild build-vm -I nixos-config=scripts/f39-incus-host-vm.nix
 # Needs nested KVM on the outer host (kvm_amd/kvm_intel parameters/nested = 1).
-=== F39 Incus no-agent boot run  2026-09-21T20:52:51Z
+=== F39 Incus no-agent boot run  2026-09-21T21:40:55Z
 host: Linux 6.18.49 x86_64  |  26.11pre1068089.c043004d1c69 (Zokor)
 incus version: 7.0.1
 kvm: present
 image:  debian-13-genericcloud-amd64.qcow2
 sha256: 5754395abffb1d384d50f6d0945d46d1beb7be42a7e786e4fc4a6f27270ab16f
 $ incus image import /tmp/f39-incus-no-agent-boot/metadata.tar.xz /tmp/f39-incus-no-agent-boot/debian-13-genericcloud-amd64.qcow2 --alias f39-stock
-Image imported with fingerprint: e3fe0ff1f051ca43be66ed5fe211c0a11dda5504a6ccd4a4a34776b454a1caca
+      Image imported with fingerprint: a2baff701b358e2b157ad68e3e02ac1c45cfca257ebce9504ab966350ea0ae68
 variant: A: stock image, no agent binary present
 $ incus init f39-stock lnrent-f39 --vm
       Creating lnrent-f39
-
+      
 $ incus config set lnrent-f39 cloud-init.user-data - < user-data   [ok]
 $ incus config set lnrent-f39 security.guestapi=false
       
@@ -38,7 +38,7 @@ $ incus config show lnrent-f39 --expanded
               sudo: ALL=(ALL) NOPASSWD:ALL
               shell: /bin/bash
               ssh_authorized_keys:
-                - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA5M5Z5lJa8avKZ90W/r+WITZJs/gEghBZRs0M4QLmpG root@f39host
+                - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEsE7Q/scdbZFFVDT5xF0VUUl7ETBsbDwRX4qalK6/0p root@f39host
           write_files:
             - path: /etc/lnrent-workload.conf
               permissions: '0644'
@@ -67,11 +67,11 @@ $ incus config show lnrent-f39 --expanded
         image.release: trixie
         security.guestapi: "false"
         volatile.apply_template: create
-        volatile.base_image: e3fe0ff1f051ca43be66ed5fe211c0a11dda5504a6ccd4a4a34776b454a1caca
-        volatile.cloud-init.instance-id: 40330f05-09c2-4a30-a81d-c4f926f14c41
-        volatile.eth0.hwaddr: 10:66:6a:05:bf:5d
-        volatile.uuid: 39bed970-4aff-4a08-a411-f9a0d891cbdb
-        volatile.uuid.generation: 39bed970-4aff-4a08-a411-f9a0d891cbdb
+        volatile.base_image: a2baff701b358e2b157ad68e3e02ac1c45cfca257ebce9504ab966350ea0ae68
+        volatile.cloud-init.instance-id: 26d827fe-7626-43ed-bb1c-417711f9a817
+        volatile.eth0.hwaddr: 10:66:6a:c2:39:2a
+        volatile.uuid: 2398e006-1a83-4bc0-a151-1f97b4aac5ca
+        volatile.uuid.generation: 2398e006-1a83-4bc0-a151-1f97b4aac5ca
       devices:
         cloud-init:
           source: cloud-init:config
@@ -95,12 +95,13 @@ $ incus list lnrent-f39
       +------------+---------+------+------------------------------------------------+-----------------+-----------+
       |    NAME    |  STATE  | IPV4 |                      IPV6                      |      TYPE       | SNAPSHOTS |
       +------------+---------+------+------------------------------------------------+-----------------+-----------+
-      | lnrent-f39 | RUNNING |      | fd42:9d7b:a97e:8840:1266:6aff:fe05:bf5d (eth0) | VIRTUAL-MACHINE | 0         |
+      | lnrent-f39 | RUNNING |      | fd42:9d7b:a97e:8840:1266:6aff:fec2:392a (eth0) | VIRTUAL-MACHINE | 0         |
       +------------+---------+------+------------------------------------------------+-----------------+-----------+
-lease: lnrent-f39 ->  fd42:9d7b:a97e:8840:1266:6aff:fe05:bf5d  (from incus network list-leases, not the agent)
+lease: lnrent-f39 ->  fd42:9d7b:a97e:8840:1266:6aff:fec2:392a  (from incus network list-leases, not the agent)
 PASS  guest-identifies-as-this-run  (= lnrent-f39)
 PASS  host-keys-readable-over-network  (= yes)
-      algorithms: ecdsa-sha2-nistp256 fd42:9d7b:a97e:8840:1266:6aff:fe05:bf5d:22 ssh-ed25519 ssh-rsa 
+      algorithms: ecdsa-sha2-nistp256 ssh-ed25519 ssh-rsa 
+      host-key fingerprints: 3 key(s) pinned
 PASS  readiness-probe-http  (= 200)
 PASS  buyer-key-login  (= buyer)
 PASS  seed-fragment-applied  (= 1)
@@ -113,6 +114,16 @@ PASS  no-dev-incus-in-guest  (= 0)
 PASS  no-agent-process  (= 0)
 PASS  no-agent-binary  (= 0)
 PASS  no-agent-unit-running  (= 0)
+      qemu.conf agent 9p share attached: 1
+      qemu.conf 9p mount_tags: mount_tag = "config" mount_tag = "agent" 
+      agent share path: path = "/nix/store/6y05sfrfgp7h15vmgffvf18wwl6qnwcz-incus-lts-7.0.1/share/agent"
+FAIL  no-agent-share-in-qemu-config  (expected 0, got 1)
+      guest kernel: 6.12.107+deb13-cloud-amd64
+      guest 9p filesystem support: 0
+      tenant mount of tag 'agent': no (contents: )
+NOTE  the tenant could not read the attached share only because this
+      image's kernel lacks 9p; that is an image property no requirement
+      in this set records or checks.
       agent channel attached by hypervisor: 2  (/dev/virtio-ports/org.linuxcontainers.*)
       9p config share mounted in guest: 0 mount(s)
       all virtio-ports: com.redhat.spice.0 org.linuxcontainers.incus org.linuxcontainers.lxd org.spice-space.webdav.0 
@@ -121,9 +132,12 @@ PASS  negative-control: planted agent process detected (= 1)
 $ incus restart lnrent-f39
       
 PASS  readiness-probe-after-reboot  (= 200)
-PASS  host-keys-stable-across-reboot  (= ecdsa-sha2-nistp256 fd42:9d7b:a97e:8840:1266:6aff:fe05:bf5d:22 ssh-ed25519 ssh-rsa )
-PASS  no-agent-after-reboot  (= 0)
-=== 14 passed, 0 failed
+PASS  host-keys-stable-across-reboot  (= ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCJBs/QXP4AxVC4Bwa4Am6i6S+qZULSnpSOrv+NxRtmcd7PshY5L7WHBmS6dfsMffkLaLMX4pAeZozMs69JAgHs=|ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDO6qEHbzOH80l0cfbD9LUgxtHaE1JwCUwaB+/qfQ1Bw|ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCNtHG5U0NUom/Z+qtOGkA/jXFjjSS47s0Lg51tilpEfnqY2+Ud1bTlPpH7F4VHBlz4o1uBImgDzsnXT4Gqfl+qgoemA9pYnLsLQh1wvIMieyIx42kyzBxSV3T7WOWyAosX8O6yz9yiyA+kIZEyYxiNmpVTYBpag3YqbMoXpADPnG48zyVebCyIETF+XHodDocKuoH+jOHRbuhh2ljSd0KpmT0CtrPg4qZRnX9VYDFVT9FaenFJBS2V+px0Uq2KbLjvj2lhGjTo8kKx6wbaLtCrer3qZfxXWYu1jKNQKr+GBPUt3ArpysgrrdixxGcC5rkPjPzZ4NA+V6BkRj/EyOsj6xDol68zNtZwiSQ00yPH1utv3YCgTn68Yj6VSktbc6GNJgs1FYyEAAQ0gIwNvMVaDvlCD4ncCm2SfoLzgMOzuC7dFHKYFh0qIhFnfrTA5l5127qaEWcGPwSX113aKYH57IRhlnymIET7TBTxds9Yy0+Akac31D+aBfsDWVY5Tnk=|)
+PASS  no-dev-incus-after-reboot  (= 0)
+PASS  no-agent-process-after-reboot  (= 0)
+PASS  no-agent-binary-after-reboot  (= 0)
+PASS  incus-exec-refused-after-reboot  (= no)
+=== 17 passed, 1 failed
 variant proven: A: stock image, no agent binary present
 $ incus delete -f lnrent-f39
       

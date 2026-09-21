@@ -201,8 +201,11 @@ PROBE_PORT=8080
 PASS=0; FAIL=0
 VM_IP=""
 KEYS=""
+ALGOS=""
 CHANNEL=""
 URLHOST=""
+# Hoisted: stage 10 repeats the process check after the reboot.
+AGENT_RE='^(incus-agent|lxd-agent|qemu-ga|qemu-guest-agent)$'
 # set -e is on. Every measurement below therefore ends in `|| true`: a probe
 # that fails is a result this run must RECORD, never a reason to abort it.
 
@@ -498,9 +501,16 @@ fi
 stage "Prove no agent, and that the seed still landed"
 if [[ -n "$VM_IP" ]]; then
   say "(d) host keys over an SSH key exchange, before trusting anything (ADR-0028 §3)"
-  KEYS="$(ssh-keyscan -T 5 "$VM_IP" 2>/dev/null | awk '{print $2}' | sort -u | tr '\n' ' ' || true)"
+  # ADR-0028 §3 pins the canonical `algorithm base64` form, so the stability
+  # check must carry the key material. Comparing $2 alone compares algorithm
+  # NAMES: every host key could rotate and the check would still pass.
+  # Filter to actual key lines: ssh-keyscan also emits a banner line whose
+  # second field is the version string, which otherwise pollutes the compare.
+  KEYS="$(ssh-keyscan -T 5 "$VM_IP" 2>/dev/null | awk '$2 ~ /^(ssh-|ecdsa-|sk-)/ {print $2" "$3}' | sort -u | tr '\n' '|' || true)"
+  ALGOS="$(ssh-keyscan -T 5 "$VM_IP" 2>/dev/null | awk '$2 ~ /^(ssh-|ecdsa-|sk-)/ {print $2}' | sort -u | tr '\n' ' ' || true)"
   check "host-keys-readable-over-network" "yes" "$([[ -n "$KEYS" ]] && echo yes || echo no)"
-  rec "      algorithms: $KEYS"
+  rec "      algorithms: $ALGOS"
+  rec "      host-key fingerprints: $(printf '%s' "$KEYS" | tr '|' '\n' | grep -c . || true) key(s) pinned"
 
   say "(c) readiness probe on the unit's own private address"
   check "readiness-probe-http" "200" \
@@ -516,7 +526,6 @@ if [[ -n "$VM_IP" ]]; then
   run incus exec "$VM" -- true
   check "incus-exec-refused" "no" "$(incus exec "$VM" -- true </dev/null >/dev/null 2>&1 && echo yes || echo no)"
   check "no-dev-incus-in-guest" "0" "$(gssh 'ls -d /dev/incus 2>/dev/null | wc -l')"
-  AGENT_RE='^(incus-agent|lxd-agent|qemu-ga|qemu-guest-agent)$'
   check "no-agent-process" "0" "$(gssh "ps -eo comm= | grep -cE '$AGENT_RE' || true")"
   check "no-agent-binary" "0" "$(gssh 'command -v incus-agent lxd-agent qemu-ga 2>/dev/null | wc -l')"
   check "no-agent-unit-running" "0" "$(gssh 'systemctl is-active incus-agent.service 2>/dev/null | grep -c ^active || true')"
@@ -526,6 +535,40 @@ if [[ -n "$VM_IP" ]]; then
   # into the qemu command line, so it is NOT an `incus config device` entry
   # and cannot be removed with `incus config device remove`. Counted on its
   # own, because a failure here does not impeach the seeding result above.
+  # The guest's mount list cannot answer SEC-45: a stock image has no agent
+  # udev rules, so it never mounts the share and reports 0 whether or not one
+  # is attached. Read the generated qemu config instead — Incus adds the config
+  # and agent 9p drives there, outside the `incus config device` list, so the
+  # fixtured device scan cannot see them either.
+  QCONF="/run/incus/$VM/qemu.conf"
+  if [[ -r "$QCONF" ]]; then
+    AGENT_SHARE="$(grep -c 'mount_tag = "agent"' "$QCONF" || true)"
+    rec "      qemu.conf agent 9p share attached: $AGENT_SHARE"
+    rec "      qemu.conf 9p mount_tags: $(grep -o 'mount_tag = "[a-z]*"' "$QCONF" | tr '\n' ' ' || true)"
+    rec "      agent share path: $(awk '/\[fsdev "qemu_agent"\]/,/^$/' "$QCONF" | grep '^path' || true)"
+    check "no-agent-share-in-qemu-config" "0" "$AGENT_SHARE"
+  else
+    AGENT_SHARE="unknown"
+    rec "      qemu.conf not readable at $QCONF; attachment UNMEASURED"
+  fi
+  # ADR-0026's stated worry is "a host-provided share the tenant can read, stop
+  # or impersonate". Test that directly -- and record WHY it fails, because a
+  # failed mount here is a property of the guest KERNEL, not of the hypervisor
+  # or of anything the Operator declared. Debian's genericcloud flavour ships
+  # no 9p modules; an image whose kernel has them can mount the very same
+  # attached share, with no change to the Incus configuration.
+  NINEP="$(gssh 'grep -c 9p /proc/filesystems || true' || true)"
+  rec "      guest kernel: $(gssh 'uname -r' || true)"
+  rec "      guest 9p filesystem support: ${NINEP:-unknown}"
+  MOUNTED="$(gssh 'sudo mkdir -p /mnt/f39a && sudo mount -t 9p -o trans=virtio,version=9p2000.L,ro agent /mnt/f39a 2>/dev/null && echo yes || echo no' || true)"
+  rec "      tenant mount of tag 'agent': ${MOUNTED:-unknown} (contents: $(gssh 'ls /mnt/f39a 2>/dev/null | tr "\n" " "' || true))"
+  if [[ "${NINEP:-0}" == "0" ]]; then
+    rec "NOTE  the tenant could not read the attached share only because this"
+    rec "      image's kernel lacks 9p; that is an image property no requirement"
+    rec "      in this set records or checks."
+  fi
+  gssh 'sudo umount /mnt/f39a 2>/dev/null; sudo rmdir /mnt/f39a 2>/dev/null' >/dev/null 2>&1 || true
+
   CHANNEL="$(gssh 'ls /dev/virtio-ports/ 2>/dev/null | grep -c linuxcontainers || true' || true)"
   CHANNEL="${CHANNEL:-unknown}"
   rec "      agent channel attached by hypervisor: $CHANNEL  (/dev/virtio-ports/org.linuxcontainers.*)"
@@ -557,8 +600,14 @@ if [[ -n "$VM_IP" ]]; then
   check "readiness-probe-after-reboot" "200" \
     "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://$URLHOST:$PROBE_PORT/lnrent-workload.conf")"
   check "host-keys-stable-across-reboot" "$KEYS" \
-    "$(ssh-keyscan -T 5 "$VM_IP" 2>/dev/null | awk '{print $2}' | sort -u | tr '\n' ' ')"
-  check "no-agent-after-reboot" "0" "$(gssh 'ls -d /dev/incus 2>/dev/null | wc -l')"
+    "$(ssh-keyscan -T 5 "$VM_IP" 2>/dev/null | awk '$2 ~ /^(ssh-|ecdsa-|sk-)/ {print $2" "$3}' | sort -u | tr '\n' '|')"
+  # Repeat the whole no-agent set, not just /dev/incus: checking one of four
+  # after a reboot does not re-establish the other three.
+  check "no-dev-incus-after-reboot" "0" "$(gssh 'ls -d /dev/incus 2>/dev/null | wc -l')"
+  check "no-agent-process-after-reboot" "0" "$(gssh "ps -eo comm= | grep -cE '$AGENT_RE' || true")"
+  check "no-agent-binary-after-reboot" "0" "$(gssh 'command -v incus-agent lxd-agent qemu-ga 2>/dev/null | wc -l')"
+  check "incus-exec-refused-after-reboot" "no" \
+    "$(incus exec "$VM" -- true </dev/null >/dev/null 2>&1 && echo yes || echo no)"
 fi
 rec "=== $PASS passed, $FAIL failed"
 rec "variant proven: $F39_VARIANT"
