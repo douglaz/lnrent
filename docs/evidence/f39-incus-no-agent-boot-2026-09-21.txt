@@ -1,0 +1,129 @@
+# Evidence for lnrent-spec F39, the Incus half. Companion to
+# f39-no-agent-boot-2026-09-20.txt, which measured the same claims under plain QEMU.
+#
+# Reproduce: bash scripts/f39-incus-no-agent-boot.sh   (an interactive wizard; it skips
+# any host-setup stage already satisfied, so on a working Incus host it goes straight
+# to the measurement).
+#
+# NOT runnable on a NixOS host whose firewall uses networking.firewall.extraCommands:
+# the incus module asserts networking.nftables.enable, and the nftables firewall
+# asserts extraCommands == "". Use scripts/f39-incus-host-vm.nix to build a throwaway
+# NixOS VM that IS the Incus host:
+#   nixos-rebuild build-vm -I nixos-config=scripts/f39-incus-host-vm.nix
+# Needs nested KVM on the outer host (kvm_amd/kvm_intel parameters/nested = 1).
+=== F39 Incus no-agent boot run  2026-09-21T20:52:51Z
+host: Linux 6.18.49 x86_64  |  26.11pre1068089.c043004d1c69 (Zokor)
+incus version: 7.0.1
+kvm: present
+image:  debian-13-genericcloud-amd64.qcow2
+sha256: 5754395abffb1d384d50f6d0945d46d1beb7be42a7e786e4fc4a6f27270ab16f
+$ incus image import /tmp/f39-incus-no-agent-boot/metadata.tar.xz /tmp/f39-incus-no-agent-boot/debian-13-genericcloud-amd64.qcow2 --alias f39-stock
+Image imported with fingerprint: e3fe0ff1f051ca43be66ed5fe211c0a11dda5504a6ccd4a4a34776b454a1caca
+variant: A: stock image, no agent binary present
+$ incus init f39-stock lnrent-f39 --vm
+      Creating lnrent-f39
+
+$ incus config set lnrent-f39 cloud-init.user-data - < user-data   [ok]
+$ incus config set lnrent-f39 security.guestapi=false
+      
+$ incus config device add lnrent-f39 cloud-init disk source=cloud-init:config
+      Device cloud-init added to lnrent-f39
+$ incus config show lnrent-f39 --expanded
+      architecture: x86_64
+      config:
+        cloud-init.user-data: |
+          #cloud-config
+          users:
+            - name: buyer
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              shell: /bin/bash
+              ssh_authorized_keys:
+                - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA5M5Z5lJa8avKZ90W/r+WITZJs/gEghBZRs0M4QLmpG root@f39host
+          write_files:
+            - path: /etc/lnrent-workload.conf
+              permissions: '0644'
+              content: |
+                workload=probe-demo
+                seeded_by=lnrent-seed-fragment
+            - path: /etc/systemd/system/lnrent-probe.service
+              permissions: '0644'
+              content: |
+                [Unit]
+                Description=lnrent readiness probe target
+                After=network.target
+                [Service]
+                # --bind :: is load-bearing: http.server defaults to 0.0.0.0, IPv4 only,
+                # and incusbr0 gives an agent-free guest only a v6 (SLAAC) address, so
+                # the default bind makes the probe unreachable on the address we have.
+                ExecStart=/usr/bin/python3 -m http.server 8080 --bind :: --directory /etc
+                Restart=always
+                [Install]
+                WantedBy=multi-user.target
+          runcmd:
+            - [ systemctl, daemon-reload ]
+            - [ systemctl, enable, --now, lnrent-probe.service ]
+        image.description: Debian 13 genericcloud, stock, no incus-agent
+        image.os: debian
+        image.release: trixie
+        security.guestapi: "false"
+        volatile.apply_template: create
+        volatile.base_image: e3fe0ff1f051ca43be66ed5fe211c0a11dda5504a6ccd4a4a34776b454a1caca
+        volatile.cloud-init.instance-id: 40330f05-09c2-4a30-a81d-c4f926f14c41
+        volatile.eth0.hwaddr: 10:66:6a:05:bf:5d
+        volatile.uuid: 39bed970-4aff-4a08-a411-f9a0d891cbdb
+        volatile.uuid.generation: 39bed970-4aff-4a08-a411-f9a0d891cbdb
+      devices:
+        cloud-init:
+          source: cloud-init:config
+          type: disk
+        eth0:
+          name: eth0
+          network: incusbr0
+          type: nic
+        root:
+          path: /
+          pool: default
+          type: disk
+      ephemeral: false
+      profiles:
+        - default
+      stateful: false
+      description: ""
+$ incus start lnrent-f39
+      
+$ incus list lnrent-f39
+      +------------+---------+------+------------------------------------------------+-----------------+-----------+
+      |    NAME    |  STATE  | IPV4 |                      IPV6                      |      TYPE       | SNAPSHOTS |
+      +------------+---------+------+------------------------------------------------+-----------------+-----------+
+      | lnrent-f39 | RUNNING |      | fd42:9d7b:a97e:8840:1266:6aff:fe05:bf5d (eth0) | VIRTUAL-MACHINE | 0         |
+      +------------+---------+------+------------------------------------------------+-----------------+-----------+
+lease: lnrent-f39 ->  fd42:9d7b:a97e:8840:1266:6aff:fe05:bf5d  (from incus network list-leases, not the agent)
+PASS  guest-identifies-as-this-run  (= lnrent-f39)
+PASS  host-keys-readable-over-network  (= yes)
+      algorithms: ecdsa-sha2-nistp256 fd42:9d7b:a97e:8840:1266:6aff:fe05:bf5d:22 ssh-ed25519 ssh-rsa 
+PASS  readiness-probe-http  (= 200)
+PASS  buyer-key-login  (= buyer)
+PASS  seed-fragment-applied  (= 1)
+      cloud-init: status: done
+      datasource: nocloud
+$ incus exec lnrent-f39 -- true
+      Error: VM agent isn't currently running
+PASS  incus-exec-refused  (= no)
+PASS  no-dev-incus-in-guest  (= 0)
+PASS  no-agent-process  (= 0)
+PASS  no-agent-binary  (= 0)
+PASS  no-agent-unit-running  (= 0)
+      agent channel attached by hypervisor: 2  (/dev/virtio-ports/org.linuxcontainers.*)
+      9p config share mounted in guest: 0 mount(s)
+      all virtio-ports: com.redhat.spice.0 org.linuxcontainers.incus org.linuxcontainers.lxd org.spice-space.webdav.0 
+SEC-45  NOT satisfiable: the agent channel is attached regardless of the image
+PASS  negative-control: planted agent process detected (= 1)
+$ incus restart lnrent-f39
+      
+PASS  readiness-probe-after-reboot  (= 200)
+PASS  host-keys-stable-across-reboot  (= ecdsa-sha2-nistp256 fd42:9d7b:a97e:8840:1266:6aff:fe05:bf5d:22 ssh-ed25519 ssh-rsa )
+PASS  no-agent-after-reboot  (= 0)
+=== 14 passed, 0 failed
+variant proven: A: stock image, no agent binary present
+$ incus delete -f lnrent-f39
+      
