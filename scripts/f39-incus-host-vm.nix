@@ -14,9 +14,20 @@
   networking.hostName = "f39host";
   virtualisation.incus.enable = true;
 
+  # libvirt alongside Incus, so both backends are measured on the same
+  # hardware, kernel and image and the evidence is comparable.
+  virtualisation.libvirtd.enable = true;
+  # libvirt puts its rules in `table ip libvirt_network`, which does not
+  # override the NixOS firewall's input drop in `table inet nixos-fw`, so the
+  # guest's DHCP is refused on virbr0. Incus needs no equivalent line: it
+  # installs its own inet table with explicit accepts for incusbr0. That
+  # difference is an operability datapoint for the backend choice, not a
+  # security one.
+  networking.firewall.trustedInterfaces = [ "virbr0" ];
+
   users.users.f39 = {
     isNormalUser = true;
-    extraGroups = [ "wheel" "incus-admin" ];
+    extraGroups = [ "wheel" "incus-admin" "libvirtd" ];
     initialPassword = "f39";
   };
   security.sudo.wheelNeedsPassword = false;
@@ -37,6 +48,9 @@
   # Everything the wizard shells out to.
   environment.systemPackages = with pkgs; [
     curl openssh coreutils gnutar xz gawk gnugrep python3 iproute2
+    # libvirt leg: virsh, and cloud-localds to build the NoCloud seed ISO
+    # that Incus generated for us via its cloud-init:config disk.
+    libvirt cloud-utils qemu_kvm
   ];
 
   system.stateVersion = "24.11";

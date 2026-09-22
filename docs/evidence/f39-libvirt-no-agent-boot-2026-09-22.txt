@@ -1,0 +1,210 @@
+# Evidence for lnrent-spec F66: the libvirt comparison leg.
+# Companion to f39-incus-no-agent-boot-2026-09-21.txt (Incus) and
+# f39-no-agent-boot-2026-09-20.txt (plain QEMU). Same box, same nested-KVM
+# harness, same pinned Debian 13 genericcloud image, same firmware (OVMF),
+# same check names, so the three read side by side.
+#
+# Reproduce: bash scripts/f39-libvirt-no-agent-boot.sh
+# Host VM: scripts/f39-incus-host-vm.nix (carries both incus and libvirtd).
+#
+# Three things a NixOS libvirt host needs that Incus did not:
+#   networking.firewall.trustedInterfaces = [ "virbr0" ];  or guest DHCP is
+#     silently dropped -- libvirt's rules live in `table ip libvirt_network`
+#     and do not override the `table inet nixos-fw` input drop, while Incus
+#     installs its own inet accepts for incusbr0.
+#   <os firmware='efi'>  or this image GRUB-loops with no kernel output.
+#   a file-backed serial console, or neither of the above is visible.
+=== F39/F66 libvirt no-agent boot run  2026-09-22T02:10:23Z
+host: Linux 6.18.49 x86_64  |  26.11pre1068089.c043004d1c69 (Zokor)
+$ virsh version
+      Compiled against library: libvirt 12.7.0
+      Using library: libvirt 12.7.0
+      Using API: QEMU 12.7.0
+      Running hypervisor: QEMU 11.1.0
+$ virsh net-list --all
+       Name      State    Autostart   Persistent
+      --------------------------------------------
+       default   active   yes         yes
+emulator: /run/libvirt/nix-emulators/qemu-system-x86_64
+libvirt: Compiled against library: libvirt 12.7.0 Using library: libvirt 12.7.0 Using API: QEMU 12.7.0 Running hypervisor: QEMU 11.1.0  
+image:  debian-13-genericcloud-amd64.qcow2
+sha256: 5754395abffb1d384d50f6d0945d46d1beb7be42a7e786e4fc4a6f27270ab16f
+$ qemu-img create -q -f qcow2 -b /tmp/f39-libvirt-no-agent-boot/debian-13-genericcloud-amd64.qcow2 -F qcow2 /tmp/f39-libvirt-no-agent-boot/overlay.qcow2 8G
+      
+$ cloud-localds /tmp/f39-libvirt-no-agent-boot/seed.iso /tmp/f39-libvirt-no-agent-boot/user-data /tmp/f39-libvirt-no-agent-boot/meta-data
+      
+declared devices: disk(virtio), cdrom(seed), interface(virtio), console
+declared NO <channel>, NO <filesystem>, NO agent port
+$ virsh define /tmp/f39-libvirt-no-agent-boot/domain.xml
+      Domain 'lnrent-f39-libvirt' defined from /tmp/f39-libvirt-no-agent-boot/domain.xml
+$ virsh start lnrent-f39-libvirt
+      Domain 'lnrent-f39-libvirt' started
+qemu argv read from /proc/1919/cmdline (3499 chars)
+PASS  qemu-argv-captured  (= yes)
+      agent-share tokens (virtfs/fsdev/mount_tag): 0
+      agent-channel tokens (guest_agent/virtserialport): 0
+      chardevs: -chardev socket,id=charmonitor,fd=32,server=on,wait=off -chardev file,id=charserial0,path=/dev/fdset/0,append=on 
+PASS  no-agent-share-in-qemu-cmdline  (= 0)
+PASS  no-agent-channel-in-qemu-cmdline  (= 0)
+$ virsh dumpxml lnrent-f39-libvirt
+      <domain type='kvm' id='3'>
+        <name>lnrent-f39-libvirt</name>
+        <uuid>b1fca332-b180-4c4a-8ccc-4603f0d75d43</uuid>
+        <memory unit='KiB'>1048576</memory>
+        <currentMemory unit='KiB'>1048576</currentMemory>
+        <vcpu placement='static'>2</vcpu>
+        <resource>
+          <partition>/machine</partition>
+        </resource>
+        <os firmware='efi'>
+          <type arch='x86_64' machine='pc-q35-11.1'>hvm</type>
+          <firmware>
+            <feature enabled='no' name='enrolled-keys'/>
+            <feature enabled='yes' name='secure-boot'/>
+          </firmware>
+          <loader readonly='yes' secure='yes' type='pflash' format='raw'>/run/libvirt/nix-ovmf/edk2-x86_64-secure-code.fd</loader>
+          <nvram template='/run/libvirt/nix-ovmf/edk2-i386-vars.fd' templateFormat='raw' format='raw'>/var/lib/libvirt/qemu/nvram/lnrent-f39-libvirt_VARS.fd</nvram>
+          <boot dev='hd'/>
+        </os>
+        <features>
+          <acpi/>
+          <apic/>
+          <smm state='on'/>
+        </features>
+        <cpu mode='host-passthrough' check='none' migratable='on'/>
+        <clock offset='utc'/>
+        <on_poweroff>destroy</on_poweroff>
+        <on_reboot>restart</on_reboot>
+        <on_crash>destroy</on_crash>
+        <devices>
+          <emulator>/run/libvirt/nix-emulators/qemu-system-x86_64</emulator>
+          <disk type='file' device='disk'>
+            <driver name='qemu' type='qcow2'/>
+            <source file='/tmp/f39-libvirt-no-agent-boot/overlay.qcow2' index='2'/>
+            <backingStore type='file' index='3'>
+              <format type='qcow2'/>
+              <source file='/tmp/f39-libvirt-no-agent-boot/debian-13-genericcloud-amd64.qcow2'/>
+              <backingStore/>
+            </backingStore>
+            <target dev='vda' bus='virtio'/>
+            <alias name='virtio-disk0'/>
+            <address type='pci' domain='0x0000' bus='0x03' slot='0x00' function='0x0'/>
+          </disk>
+          <disk type='file' device='cdrom'>
+            <driver name='qemu' type='raw'/>
+            <source file='/tmp/f39-libvirt-no-agent-boot/seed.iso' index='1'/>
+            <backingStore/>
+            <target dev='sda' bus='sata'/>
+            <readonly/>
+            <alias name='sata0-0-0'/>
+            <address type='drive' controller='0' bus='0' target='0' unit='0'/>
+          </disk>
+          <controller type='usb' index='0' model='qemu-xhci'>
+            <alias name='usb'/>
+            <address type='pci' domain='0x0000' bus='0x02' slot='0x00' function='0x0'/>
+          </controller>
+          <controller type='sata' index='0'>
+            <alias name='ide'/>
+            <address type='pci' domain='0x0000' bus='0x00' slot='0x1f' function='0x2'/>
+          </controller>
+          <controller type='pci' index='0' model='pcie-root'>
+            <alias name='pcie.0'/>
+          </controller>
+          <controller type='pci' index='1' model='pcie-root-port'>
+            <model name='pcie-root-port'/>
+            <target chassis='1' port='0x8'/>
+            <alias name='pci.1'/>
+            <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x0' multifunction='on'/>
+          </controller>
+          <controller type='pci' index='2' model='pcie-root-port'>
+            <model name='pcie-root-port'/>
+            <target chassis='2' port='0x9'/>
+            <alias name='pci.2'/>
+            <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x1'/>
+          </controller>
+          <controller type='pci' index='3' model='pcie-root-port'>
+            <model name='pcie-root-port'/>
+            <target chassis='3' port='0xa'/>
+            <alias name='pci.3'/>
+            <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x2'/>
+          </controller>
+          <controller type='pci' index='4' model='pcie-root-port'>
+            <model name='pcie-root-port'/>
+            <target chassis='4' port='0xb'/>
+            <alias name='pci.4'/>
+            <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x3'/>
+          </controller>
+          <controller type='pci' index='5' model='pcie-root-port'>
+            <model name='pcie-root-port'/>
+            <target chassis='5' port='0xc'/>
+            <alias name='pci.5'/>
+            <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x4'/>
+          </controller>
+          <interface type='network'>
+            <mac address='52:54:00:95:c9:19'/>
+            <source network='default' portid='bb0a5cd2-be56-4019-a9f2-0d4379db814e' bridge='virbr0'/>
+            <target dev='vnet2'/>
+            <model type='virtio'/>
+            <alias name='net0'/>
+            <address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x0'/>
+          </interface>
+          <serial type='file'>
+            <source path='/tmp/f39-libvirt-no-agent-boot/console.log'/>
+            <target type='isa-serial' port='0'>
+              <model name='isa-serial'/>
+            </target>
+            <alias name='serial0'/>
+          </serial>
+          <console type='file'>
+            <source path='/tmp/f39-libvirt-no-agent-boot/console.log'/>
+            <target type='serial' port='0'/>
+            <alias name='serial0'/>
+          </console>
+          <input type='mouse' bus='ps2'>
+            <alias name='input0'/>
+          </input>
+          <input type='keyboard' bus='ps2'>
+            <alias name='input1'/>
+          </input>
+          <audio id='1' type='none'/>
+          <watchdog model='itco' action='reset'>
+            <alias name='watchdog0'/>
+          </watchdog>
+          <memballoon model='virtio'>
+            <alias name='balloon0'/>
+            <address type='pci' domain='0x0000' bus='0x04' slot='0x00' function='0x0'/>
+          </memballoon>
+        </devices>
+        <seclabel type='dynamic' model='dac' relabel='yes'>
+          <label>+0:+0</label>
+          <imagelabel>+0:+0</imagelabel>
+        </seclabel>
+      </domain>
+mac: 52:54:00:95:c9:19
+lease: lnrent-f39-libvirt -> 192.168.122.184  (from virsh net-dhcp-leases, no agent)
+PASS  guest-identifies-as-this-run  (= lnrent-f39-libvirt)
+PASS  host-keys-readable-over-network  (= yes)
+      algorithms: ecdsa-sha2-nistp256 ssh-ed25519 ssh-rsa 
+PASS  readiness-probe-http  (= 200)
+PASS  buyer-key-login  (= buyer)
+PASS  seed-fragment-applied  (= 1)
+      cloud-init: status: done
+      datasource: nocloud
+PASS  no-agent-process  (= 0)
+PASS  no-agent-binary  (= 0)
+PASS  no-virtio-ports-in-guest  (= 0)
+      virtio-ports seen: 
+      guest kernel: 6.12.107+deb13-cloud-amd64
+      guest 9p support: 0
+PASS  negative-control: planted agent process detected (= 1)
+$ virsh reboot lnrent-f39-libvirt
+      Domain 'lnrent-f39-libvirt' is being rebooted
+PASS  readiness-probe-after-reboot  (= 200)
+PASS  host-keys-stable-across-reboot  (= ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBD3UUgCM/w8N7lxwSOtjI44sEwlwjPooL1K+BVoogOqGfUp0PNknvLGDebQzJBHei39B9zeKpjc2tBjW+OZRhYw=|ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMGZrIwEE8Sddqec2i/yD9VzewlxQxVELyHc8dUXJ2yK|ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDVWuqjWIM5ygoXblS94y4plsKPidgzuW4uey2CuF345102MDk73CMF3j0TpL1RiJrnB6je1OTS6Z51dXZx++QP01MupJBqkl6H4GGV3k+taf3X5mPn7+yW1HOEi+Tobbcc+BBp9DEHQPufAIk4s4WiUVCat+XuHlKvx8P7LfRNE60yGBCxm7DavmrCvZSRIQ9RTPR3JTZQNm1lrwPoG9QoZ8QAl829D6D5g1BbX5HM7763S5l5SE2RdfTuXVXVJsXf2DNQcREbeEjFpBJHbL3Y4xz4KoBctXKWHo/O0oYWiRP80caCbVfzfQD1d0t2rf9/ca3xefEB/ku2bcAWvoIOGCuceXQ9+i4EvWSKxXBFPONRtcC/hV2j8Mvc44meaStuK+24WFaLxrdkqyk6irZsogwElP9iLMDbgTK+HJmQsXAmY3p21r2t5AVfm6i0eYKl3mT4VfgBH0OcqKag18KrCPs1G6Qyws2wL+P5X2h6sFX/863ldIC4xj5uSmwsFQs=|)
+PASS  no-virtio-ports-after-reboot  (= 0)
+=== 15 passed, 0 failed
+$ virsh destroy lnrent-f39-libvirt
+      Domain 'lnrent-f39-libvirt' destroyed
+$ virsh undefine lnrent-f39-libvirt
+      error: Failed to undefine domain 'lnrent-f39-libvirt'
+      error: Requested operation is not valid: Cannot undefine domain with NVRAM/varstore
