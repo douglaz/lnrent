@@ -1,0 +1,44 @@
+# Evidence for lnrent-spec VMH-36: a tenant's ordinary image choice reaches the
+# Box-attached agent share. Companion to f39-incus-no-agent-boot-2026-09-21.txt,
+# which measured the same Box attaching the share while the guest could not open it.
+#
+# Why this run exists: three reviewers of VMH-36 independently noted that no
+# evidence file had ever tested a guest whose kernel CAN use the attached
+# transport. Every prior run tested reboot only. VMH-36's independence clause
+# rests on this, so it was measured rather than asserted.
+#
+# A first attempt tried `apt-get install linux-image-amd64` inside the guest and
+# failed with "Unable to locate package": the guest holds only an IPv6 ULA on
+# incusbr0 and has no route off it, so nothing was installed and the after-state
+# was the before-state. Reading only its final line would have shown "mount
+# FAILED" and supported the opposite conclusion. This run instead boots the image
+# a tenant wanting a normal kernel would install: Debian's "generic" variant,
+# whose stock kernel ships the 9p modules the "genericcloud" variant omits.
+#
+# Reproduce: bash scripts/f39-kernel-reaches-share.sh (harness:
+# scripts/f39-incus-host-vm.nix, Incus 7.0.1, same Box as the 09-21 run).
+
+image: debian-13-generic-amd64.qcow2
+sha256: b6e3a4dac69b38d55a763b1752e8fd7bb12e3948672a79fee4ef13fa53839d2f
+instance: user.lnrent.tier=1, security.guestapi=false, cloud-init:config disk,
+          no agent:config device -- identical configuration to the 09-21 run
+
+HOSTSIDE attachment: mount_tag = "config"  mount_tag = "agent"
+    (unchanged from the genericcloud run: the Box attaches the same facilities)
+
+GUEST kernel:                  6.12.107+deb13-amd64      (genericcloud run: 6.12.107+deb13-cloud-amd64)
+GUEST 9p in /proc/filesystems: 0 before modprobe, 1 after (genericcloud run: 0, no modules on disk)
+GUEST MOUNT of tag "agent":    MOUNTED                   (genericcloud run: FAILED, "unknown filesystem type '9p'")
+GUEST CONTENTS:                incus-agent.linux.i686 incus-agent.linux.x86_64
+                               incus-agent.windows.i686 incus-agent.windows.x86_64
+INCUS EXEC:                    Error: VM agent isn't currently running
+
+Reading: the Box attaches the same agent payload share to both units. Whether the
+tenant can read it is decided entirely by the kernel the tenant runs, which the
+tenant chooses. ADR-0026's "a host-provided share the tenant can read, stop or
+impersonate" is literally true of this unit. No agent runs, and the platform's
+exec is still refused, so this is reachability of the payload, not a live agent.
+
+Also measured, from the earlier attempt (f39 kernel probe v1): host-side
+attachment was identical before and after a guest reboot -- mount_tag "config"
+and "agent" both times.
