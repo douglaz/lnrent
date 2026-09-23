@@ -300,6 +300,21 @@ second untested while looking verified. If the test drives anything live — a r
 database, a running service, real money — do the red run in a disposable environment
 or not at all: a deliberately broken build can perform the harmful operation before
 any assertion notices.
+**A check has three outcomes: pass, fail, and could-not-measure.** The `sed` trap
+above has a twin on the measuring side: a command whose input is empty prints `0`,
+exits 0 and reads exactly like a clean result, so a check with only two outcomes
+reports a pass when it measured nothing. Four landed in one day: the tool the
+pipeline needed was not installed, so the count came back `0`; a pattern searched a
+47-character capture of a 3,000-character command line, so every forbidden token
+was "absent"; a comparison re-read a recorded value and compared it with itself;
+and an install step failed, so the "after" state was the "before" state. Every one
+exited 0 and every one measured nothing.
+Assert the observation before reading it — the tool resolves, the capture is the
+size you expect, the enumeration is non-empty where the thing enumerated exists —
+and emit a distinct value when it does not (`READ_FAILED`, never a count), so a
+check that could not look is never read as one that looked and found nothing. The
+red run above is this rule's other half: that one proves a check can fail, this one
+proves it looked.
 Gate for this repo: the CI matrix in "Building and testing" above — ALL of it. `cargo clippy
 --workspace --all-targets -- -D warnings && cargo test --workspace` is the inner loop, not the gate:
 it skips the `--no-default-features` legs (this repo ships a fedimint-disabled tree), the wasm
